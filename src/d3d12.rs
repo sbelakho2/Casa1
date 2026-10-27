@@ -41,7 +41,10 @@ use self::state_objects::{
     STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS, STATE_OBJECT_TYPE_COLLECTION,
     STATE_OBJECT_TYPE_EXECUTABLE, STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, StateObjectMemory,
 };
-use self::work_graphs::{D3d12DispatchGraphDesc, D3d12WorkGraph, D3d12WorkGraphMemoryRequirements};
+use self::work_graphs::{
+    D3d12DispatchGraphDesc, D3d12GpuRangeAndStride, D3d12WorkGraph,
+    D3d12WorkGraphMemoryRequirements,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct D3d12FeatureOptions {
@@ -319,6 +322,7 @@ pub struct D3d12WorkGraphProgram {
     pub program_name: String,
     pub flags: u32,
     pub backing_memory: Option<(u64, u64)>,
+    pub node_local_root_arguments_table: Option<D3d12GpuRangeAndStride>,
 }
 
 // ---------------------------------------------------------------------------
@@ -5310,6 +5314,7 @@ impl D3d12Runtime {
                             ),
                         ));
                     }
+                    graph.validate()?;
                 }
             }
             STATE_OBJECT_TYPE_COLLECTION => {
@@ -5658,6 +5663,18 @@ impl D3d12Runtime {
         flags: u32,
         backing_memory: Option<(u64, u64)>,
     ) -> AppResult<()> {
+        self.set_work_graph_program_with_local_roots(list, identifier, flags, backing_memory, None)
+    }
+
+    /// `SetProgram` including the node-local root arguments table.
+    pub fn set_work_graph_program_with_local_roots(
+        &mut self,
+        list: CommandListId,
+        identifier: [u8; 32],
+        flags: u32,
+        backing_memory: Option<(u64, u64)>,
+        node_local_root_arguments_table: Option<D3d12GpuRangeAndStride>,
+    ) -> AppResult<()> {
         if flags & !work_graphs::WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES != 0 {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
@@ -5677,6 +5694,10 @@ impl D3d12Runtime {
         if let Some((offset, size)) = backing_memory {
             graph.validate_backing_memory(offset, size)?;
         }
+        if let Some(table) = &node_local_root_arguments_table {
+            table.validate()?;
+            graph.validate_local_root_arguments(table)?;
+        }
         self.work_graph_programs.insert(
             list,
             D3d12WorkGraphProgram {
@@ -5684,6 +5705,7 @@ impl D3d12Runtime {
                 program_name,
                 flags,
                 backing_memory,
+                node_local_root_arguments_table,
             },
         );
         Ok(())
@@ -5729,8 +5751,11 @@ impl D3d12Runtime {
     }
 
     /// Execute a work graph by linearising its nodes into real Metal compute
-    /// dispatches. GPU-record modes fail closed because the Metal backend does
-    /// not expose a GPU virtual-address mapping for guest buffers.
+    /// and mesh dispatches.
+    ///
+    /// Single-node graphs keep the historical record-slot linearisation.
+    /// Multi-node graphs follow the declared node/output edges and execute
+    /// each reached node once per dispatch plan.
     pub fn dispatch_work_graph(
         &mut self,
         list: CommandListId,
@@ -5748,7 +5773,7 @@ impl D3d12Runtime {
             work_graphs::DISPATCH_MODE_NODE_GPU_INPUT
                 | work_graphs::DISPATCH_MODE_MULTI_NODE_GPU_INPUT
         ) {
-            return self.dispatch_work_graph_gpu(desc);
+            return self.dispatch_work_graph_gpu(list, &graph, desc);
         }
         graph.validate_cpu_records(
             desc.entrypoint_index,
@@ -5756,28 +5781,52 @@ impl D3d12Runtime {
             desc.record_stride,
             desc.records.len(),
         )?;
-        let plan =
-            graph.dispatch_plan(desc.entrypoint_index, desc.record_count, desc.record_stride)?;
+        let plan = if graph.uses_record_semantics() {
+            let records =
+                graph.parse_records(&desc.records, desc.record_count, desc.record_stride)?;
+            graph.record_plan(desc.entrypoint_index, &records)?
+        } else {
+            graph.dispatch_plan(desc.entrypoint_index, desc.record_count, desc.record_stride)?
+        };
         for dispatch in &plan {
-            self.backend.record_dispatch(
-                list,
-                dispatch.grid[0],
-                dispatch.grid[1],
-                dispatch.grid[2],
-            )?;
+            if dispatch.mesh {
+                let recorded = self.backend.record_dispatch_mesh(
+                    list,
+                    dispatch.grid[0],
+                    dispatch.grid[1],
+                    dispatch.grid[2],
+                );
+                recorded?;
+            } else {
+                let recorded = self.backend.record_dispatch(
+                    list,
+                    dispatch.grid[0],
+                    dispatch.grid[1],
+                    dispatch.grid[2],
+                );
+                recorded?;
+            }
         }
         Ok(plan.len() as u32)
     }
 
     /// Execute GPU-record work-graph fan-out on the GPU.
     ///
-    /// The producer kernel materialises record indices and the consumer's
-    /// indirect dispatch grid; the consumer then runs from that GPU-written
-    /// grid. The CPU issues only those two dispatches, never one per record.
+    /// Legacy single-node graphs use the original producer/consumer pair.
+    /// Multi-node graphs run one GPU fan-out stage per graph depth, with the
+    /// record count and compacted indices produced on the GPU.
 #[rustfmt::skip]
-    fn dispatch_work_graph_gpu(&mut self, desc: &D3d12DispatchGraphDesc) -> AppResult<u32> {
+    fn dispatch_work_graph_gpu(
+        &mut self,
+        list: CommandListId,
+        graph: &D3d12WorkGraph,
+        desc: &D3d12DispatchGraphDesc,
+    ) -> AppResult<u32> {
         if desc.record_count == 0 {
             return Ok(0);
+        }
+        if graph.uses_record_semantics() {
+            return self.dispatch_work_graph_gpu_staged(list, graph, desc);
         }
         if desc.record_stride < 8 {
             return Err(AppError::new(
@@ -5852,6 +5901,129 @@ impl D3d12Runtime {
                 None,)?;
         inner.last_work_graph_records = fanout_results;
         Ok(desc.record_count)
+    }
+
+    #[rustfmt::skip]
+    fn dispatch_work_graph_gpu_staged(
+        &mut self,
+        list: CommandListId,
+        graph: &D3d12WorkGraph,
+        desc: &D3d12DispatchGraphDesc,
+    ) -> AppResult<u32> {
+        let entrypoint_index = desc.entrypoint_index;
+        graph.validate_entrypoint(entrypoint_index)?;
+        let records = graph.parse_records(&desc.records, desc.record_count, desc.record_stride)?;
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let _validated_plan = graph.record_plan(entrypoint_index, &records)?;
+        let mut nodes = Vec::with_capacity(graph.nodes.len());
+        let mut targets = Vec::new();
+        let mut limits = Vec::new();
+        let mut usage_slots = Vec::new();
+        for node in &graph.nodes {
+            let output_count = node.output_count();
+            let output_offset = targets.len() as u32;
+            nodes.push(crate::metal_backend::MetalWorkGraphNodeSpec {
+                output_offset,
+                output_count,
+                mesh: u32::from(node.is_mesh()),
+            });
+            for output_index in 0..output_count {
+                targets.push(
+                    graph
+                        .edge_target(nodes.len() as u32 - 1, output_index)
+                        .unwrap_or(u32::MAX),
+                );
+                limits.push(node.output_limit(output_index).unwrap_or(0));
+                usage_slots.push(output_offset + node.output_limit_slot(output_index));
+            }
+        }
+        let mut metal_records = Vec::with_capacity(records.len());
+        for record in &records {
+            metal_records.push(crate::metal_backend::MetalWorkGraphRecord {
+                node_index: record.node_index,
+                output_index: record.output_index,
+            });
+        }
+        let bridge = self.metal_raytracing()?;
+        let mut inner = bridge
+            .inner
+            .lock()
+            .expect("Metal raytracing bridge lock poisoned");
+        if inner.work_graph.is_none() {
+            inner.work_graph = Some(crate::metal_backend::MetalWorkGraphFanout::new(
+                &inner.device,)?); }
+        let record_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                metal_records.as_ptr() as *const u8,
+                std::mem::size_of_val(metal_records.as_slice()),
+            )
+        };
+        let buffer = inner.device.new_buffer_with_data(
+            record_bytes.as_ptr() as *const std::ffi::c_void,
+            record_bytes.len() as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let spec = crate::metal_backend::MetalWorkGraphGraphSpec {
+            nodes: &nodes,
+            targets: &targets,
+            limits: &limits,
+            usage_slots: &usage_slots,
+            max_depth: work_graphs::WORK_GRAPH_MAX_NODE_DEPTH,
+        };
+        let run = inner
+            .work_graph
+            .as_ref()
+            .expect("work-graph fan-out initialised")
+            .execute_graph(
+                &inner.device,
+                &buffer,
+                records.len() as u32,
+                None,
+                &spec,
+            );
+        let run = run?;
+        let crate::metal_backend::MetalWorkGraphRun {
+            final_records,
+            node_counts,
+            ..
+        } = run;
+        inner.last_work_graph_records = final_records;
+        drop(inner);
+        let mut plan = Vec::new();
+        for (node_index, count) in node_counts.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            if let Some(dispatch) =
+                graph.dispatch_for_node(entrypoint_index, node_index as u32, *count)?
+            {
+                plan.push(dispatch);
+            }
+        }
+        let mut executed = 0u32;
+        for dispatch in &plan {
+            if dispatch.mesh {
+                let recorded = self.backend.record_dispatch_mesh(
+                    list,
+                    dispatch.grid[0],
+                    dispatch.grid[1],
+                    dispatch.grid[2],
+                );
+                recorded?;
+            } else {
+                let recorded = self.backend.record_dispatch(
+                    list,
+                    dispatch.grid[0],
+                    dispatch.grid[1],
+                    dispatch.grid[2],
+                );
+                recorded?;
+            }
+            executed = executed.saturating_add(1);
+        }
+        Ok(executed)
     }
 
     /// Output produced by the most recent GPU work-graph fan-out.
@@ -9661,6 +9833,7 @@ mod tests {
             flags: 0,
             entrypoints: vec![work_graphs::D3d12NodeId::new("node0", 0)],
             nodes: vec![work_graphs::D3d12WorkGraphNode {
+                node_type: work_graphs::D3D12_NODE_TYPE_SHADER,
                 shader: "node0".into(),
                 overrides: work_graphs::D3d12NodeOverrides::None,
             }],
@@ -10187,6 +10360,7 @@ mod tests {
             flags: 0,
             entrypoints: vec![work_graphs::D3d12NodeId::new("entry", 0)],
             nodes: vec![work_graphs::D3d12WorkGraphNode {
+                node_type: work_graphs::D3D12_NODE_TYPE_SHADER,
                 shader: "node0".to_string(),
                 overrides: work_graphs::D3d12NodeOverrides::Broadcasting(
                     work_graphs::D3d12BroadcastingLaunchOverrides {
@@ -10249,6 +10423,7 @@ mod tests {
             flags: 0,
             entrypoints: vec![work_graphs::D3d12NodeId::new("entry", 0)],
             nodes: vec![work_graphs::D3d12WorkGraphNode {
+                node_type: work_graphs::D3D12_NODE_TYPE_SHADER,
                 shader: "node0".to_string(),
                 overrides: work_graphs::D3d12NodeOverrides::None,
             }],
@@ -10494,6 +10669,7 @@ mod tests {
             flags: 0,
             entrypoints: vec![work_graphs::D3d12NodeId::new("node0", 0)],
             nodes: vec![work_graphs::D3d12WorkGraphNode {
+                node_type: work_graphs::D3D12_NODE_TYPE_SHADER,
                 shader: "node0".to_string(),
                 overrides: work_graphs::D3d12NodeOverrides::None,
             }],
@@ -11171,6 +11347,7 @@ mod tests {
             flags: 0,
             entrypoints: vec![work_graphs::D3d12NodeId::new("node0", 0)],
             nodes: vec![work_graphs::D3d12WorkGraphNode {
+                node_type: work_graphs::D3D12_NODE_TYPE_SHADER,
                 shader: "node0".into(),
                 overrides: work_graphs::D3d12NodeOverrides::None,
             }],
@@ -11245,6 +11422,256 @@ mod tests {
             .dispatch_work_graph(list, executable, Some("gpu"), &overflow, None)
             .expect_err("overflowing record range");
         assert_eq!(error.message, "work graph record range overflows");
+    }
+
+    #[test]
+    fn d3d12_work_graph_multi_node_mesh_dispatch_and_malformed_records_are_pinned() {
+        use crate::gfx::Command;
+        use work_graphs::{
+            D3D12_NODE_TYPE_PROGRAM, D3D12_NODE_TYPE_SHADER, D3d12BroadcastingLaunchOverrides,
+            D3d12CoalescingLaunchOverrides, D3d12MeshLaunchOverrides, D3d12NodeId,
+            D3d12NodeOutputOverrides, D3d12NodeOverrides, D3d12WorkGraphNode,
+        };
+        let node_id = |name: &str| D3d12NodeId::new(name, 0);
+        let output = |target: &str| D3d12NodeOutputOverrides {
+            output_index: 0,
+            new_name: Some(node_id(target)),
+            ..Default::default()
+        };
+        let mut runtime = D3d12Runtime::new();
+        let graph = D3d12WorkGraph {
+            program_name: "chain".to_string(),
+            flags: 0,
+            entrypoints: vec![node_id("root")],
+            nodes: vec![
+                D3d12WorkGraphNode {
+                    node_type: D3D12_NODE_TYPE_SHADER,
+                    shader: "root".to_string(),
+                    overrides: D3d12NodeOverrides::Broadcasting(D3d12BroadcastingLaunchOverrides {
+                        new_name: Some(node_id("root")),
+                        dispatch_grid: Some([1, 2, 1]),
+                        output_overrides: vec![output("stage1")],
+                        ..Default::default()
+                    }),
+                },
+                D3d12WorkGraphNode {
+                    node_type: D3D12_NODE_TYPE_SHADER,
+                    shader: "stage1".to_string(),
+                    overrides: D3d12NodeOverrides::Coalescing(D3d12CoalescingLaunchOverrides {
+                        new_name: Some(node_id("stage1")),
+                        output_overrides: vec![output("mesh")],
+                        ..Default::default()
+                    }),
+                },
+                D3d12WorkGraphNode {
+                    node_type: D3D12_NODE_TYPE_PROGRAM,
+                    shader: "mesh".to_string(),
+                    overrides: D3d12NodeOverrides::Mesh(D3d12MeshLaunchOverrides {
+                        program_entry: Some(true),
+                        new_name: Some(node_id("mesh")),
+                        dispatch_grid: Some([2, 1, 1]),
+                        ..Default::default()
+                    }),
+                },
+                D3d12WorkGraphNode {
+                    node_type: D3D12_NODE_TYPE_SHADER,
+                    shader: "override".to_string(),
+                    overrides: D3d12NodeOverrides::Broadcasting(D3d12BroadcastingLaunchOverrides {
+                        new_name: Some(node_id("override")),
+                        program_entry: Some(true),
+                        ..Default::default()
+                    }),
+                },
+            ],
+        };
+        let requirements = graph.memory_requirements();
+        let executable = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(graph)],
+            })
+            .expect("executable chain");
+        let mut records = Vec::new();
+        for _ in 0..2 {
+            records.extend_from_slice(&0u32.to_le_bytes());
+            records.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let cpu_desc = D3d12DispatchGraphDesc {
+            mode: work_graphs::DISPATCH_MODE_NODE_CPU_INPUT,
+            entrypoint_index: 0,
+            record_count: 2,
+            record_stride: 8,
+            records: records.clone(),
+        };
+        assert_eq!(
+            runtime
+                .dispatch_work_graph(
+                    list,
+                    executable,
+                    Some("chain"),
+                    &cpu_desc,
+                    Some((0, requirements.min_size_in_bytes)),
+                )
+                .expect("CPU multi-node dispatch"),
+            3
+        );
+        let stream = runtime.close_command_list(list).expect("close CPU chain");
+        assert_eq!(stream.commands.len(), 3);
+        assert!(matches!(
+            stream.commands[0],
+            Command::Dispatch { x: 1, y: 2, z: 1 }
+        ));
+        assert!(matches!(
+            stream.commands[1],
+            Command::Dispatch { x: 1, y: 1, z: 1 }
+        ));
+        assert!(matches!(
+            stream.commands[2],
+            Command::DispatchMesh { x: 2, y: 1, z: 1 }
+        ));
+
+        // The same chain runs through GPU-produced counts and records.
+        let gpu_list = runtime.create_graphics_command_list(0, 0, false);
+        let gpu_desc = D3d12DispatchGraphDesc {
+            mode: work_graphs::DISPATCH_MODE_NODE_GPU_INPUT,
+            ..cpu_desc.clone()
+        };
+        assert_eq!(
+            runtime
+                .dispatch_work_graph(gpu_list, executable, Some("chain"), &gpu_desc, None)
+                .expect("GPU multi-node dispatch"),
+            3
+        );
+        assert_eq!(runtime.last_work_graph_records(), vec![2, 2]);
+        let empty_record = [
+            work_graphs::WORK_GRAPH_EMPTY_RECORD.to_le_bytes(),
+            work_graphs::WORK_GRAPH_EMPTY_RECORD.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(
+            runtime
+                .dispatch_work_graph(
+                    gpu_list,
+                    executable,
+                    Some("chain"),
+                    &D3d12DispatchGraphDesc {
+                        record_count: 1,
+                        records: empty_record,
+                        ..gpu_desc.clone()
+                    },
+                    None,
+                )
+                .expect("empty GPU record"),
+            0
+        );
+
+        // Malformed record content is rejected before any Metal work.
+        let mut bad_output = records.clone();
+        bad_output[4..8].copy_from_slice(&9u32.to_le_bytes());
+        let error = runtime
+            .dispatch_work_graph(
+                gpu_list,
+                executable,
+                Some("chain"),
+                &D3d12DispatchGraphDesc {
+                    record_count: 1,
+                    records: bad_output,
+                    ..gpu_desc.clone()
+                },
+                None,
+            )
+            .expect_err("bad output index");
+        assert_eq!(
+            error.message,
+            "work graph record 0 output index 9 is out of range for node \"root\"[0] output count 1"
+        );
+        let mut bad_node = records.clone();
+        bad_node[0..4].copy_from_slice(&9u32.to_le_bytes());
+        let error = runtime
+            .dispatch_work_graph(
+                gpu_list,
+                executable,
+                Some("chain"),
+                &D3d12DispatchGraphDesc {
+                    record_count: 1,
+                    records: bad_node,
+                    ..gpu_desc
+                },
+                None,
+            )
+            .expect_err("bad node index");
+        assert_eq!(
+            error.message,
+            "work graph record 0 node index 9 is out of range for 4 nodes"
+        );
+
+        // Node-local root arguments are validated against the graph.
+        let rooted = D3d12WorkGraph {
+            program_name: "rooted".to_string(),
+            flags: 0,
+            entrypoints: vec![node_id("rooted")],
+            nodes: vec![D3d12WorkGraphNode {
+                node_type: D3D12_NODE_TYPE_SHADER,
+                shader: "rooted".to_string(),
+                overrides: D3d12NodeOverrides::Broadcasting(D3d12BroadcastingLaunchOverrides {
+                    new_name: Some(node_id("rooted")),
+                    local_root_arguments_table_index: Some(2),
+                    ..Default::default()
+                }),
+            }],
+        };
+        let rooted_object = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_EXECUTABLE,
+                subobjects: vec![D3d12StateSubobject::WorkGraph(rooted)],
+            })
+            .expect("rooted executable");
+        let identifier = runtime
+            .work_graph_program_identifier(rooted_object, "rooted")
+            .expect("rooted identifier");
+        let rooted_list = runtime.create_graphics_command_list(0, 0, false);
+        let error = runtime
+            .set_work_graph_program_with_local_roots(
+                rooted_list,
+                identifier,
+                0,
+                None,
+                Some(work_graphs::D3d12GpuRangeAndStride {
+                    start: 0,
+                    size: 16,
+                    stride: 8,
+                }),
+            )
+            .expect_err("short local root table");
+        assert_eq!(
+            error.message,
+            "node local root arguments table size 16 is smaller than the 20 bytes required \
+             by table index 2"
+        );
+        runtime
+            .set_work_graph_program_with_local_roots(
+                rooted_list,
+                identifier,
+                0,
+                None,
+                Some(work_graphs::D3d12GpuRangeAndStride {
+                    start: 0,
+                    size: 24,
+                    stride: 8,
+                }),
+            )
+            .expect("valid local root table");
+        assert_eq!(
+            runtime
+                .bound_work_graph_program(rooted_list)
+                .and_then(|program| program.node_local_root_arguments_table),
+            Some(work_graphs::D3d12GpuRangeAndStride {
+                start: 0,
+                size: 24,
+                stride: 8,
+            })
+        );
     }
 
     #[test]

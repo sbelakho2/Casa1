@@ -2331,6 +2331,14 @@
   "( error.message, \"work graph record range (32 bytes) exceeds the supplied 16 bytes\" )",
   "(error.message, \"work graph record range overflows\")"
  ],
+ "d3d12_work_graph_multi_node_mesh_dispatch_and_malformed_records_are_pinned": [
+  "( runtime .dispatch_work_graph( list, executable, Some(\"chain\"), &cpu_desc, Some((0, requirements.min_size_in_bytes)), ) .expect(\"CPU multi-node dispatch\"), 3 )",
+  "(stream.commands.len(), 3)",
+  "( runtime .dispatch_work_graph(gpu_list, executable, Some(\"chain\"), &gpu_desc, None) .expect(\"GPU multi-node dispatch\"), 3 )",
+  "(runtime.last_work_graph_records(), vec![2, 2])",
+  "( runtime .dispatch_work_graph( gpu_list, executable, Some(\"chain\"), &D3d12DispatchGraphDesc { record_count: 1, records: empty_record, ..gpu_desc.clone() }, None, ) .expect(\"empty GPU record\"), 0 )",
+  "( error.message, \"work graph record 0 output index 9 is out of range for node \\\"root\\\"[0] output count 1\" )"
+ ],
  "d3d8thk_allocation_residency_rejects_budget_overrun_and_double_destroy": [
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTQueryAdapterInfo, &[query] ), 0 )",
   "( call_status( &mut runtime, &mut memory, HostThunk::D3DKMTMakeResident, &[resident] ), STATUS_GRAPHICS_NO_VIDEO_MEMORY )",
@@ -3206,6 +3214,14 @@
   "( call_slot( &mut fixture, type_info, 13, &[ type_info as u32, 1, 0, OUT as u32, (OUT + 4) as u32, (OUT + 8) as u32, ] ), S_OK, \"guest-path module discovery\" )",
   "(fixture.memory.read_u16(OUT + 8).unwrap(), 5)"
  ],
+ "dml_cross_node_fusion_edge_matches_wired_and_preserves_nan": [
+  "(chains, vec![vec![0, 1, 2]])",
+  "(read_f32(&cpu), vec![-8.0, -24.0])",
+  "(read_f32(&metal), vec![-8.0, -24.0])",
+  "(cpu_nan[0], -2.0)",
+  "(cpu_nan[1].is_nan(), true)",
+  "(metal_nan[0], -2.0)"
+ ],
  "dml_device_rejects_feature_level_above_implemented_level": [
   "(error.hresult, DXGI_ERROR_UNSUPPORTED)",
   "( error.message, \"requested DML_FEATURE_LEVEL 0x6400 exceeds the supported 0x6300\" )"
@@ -3240,6 +3256,10 @@
   "( unsupported_plan.validate().unwrap_err().message, \"DML_TENSOR_DATA_TYPE 5 is not supported for DML_OPERATOR_TYPE 44\" )",
   "( convolution.validate().unwrap_err().message, \"DML_TENSOR_DATA_TYPE 2 is not supported for DML_OPERATOR_TYPE 53\" )",
   "( zero_stride_plan.validate().unwrap_err().message, \"output tensor strides must be non-zero\" )"
+ ],
+ "dml_feature_level_6_3_rejects_6_4_resample3_exactly": [
+  "(error.hresult, DXGI_ERROR_UNSUPPORTED)",
+  "( error.message, \"DML_OPERATOR_TYPE 175 requires DML_FEATURE_LEVEL 0x6400, device supports 0x6300\" )"
  ],
  "dml_feature_level_boundary_negotiation_and_operator_minimums": [
   "(SUPPORTED_DML_FEATURE_LEVEL, DML_FEATURE_LEVEL_6_3)",
@@ -3280,6 +3300,11 @@
   "( plan.kind, dml_ops::DmlOpKind::ArgMax { axes: vec![1], direction: dml_ops::DmlAxisDirection::Increasing, } )",
   "( error.message, \"argmin/argmax axis 4 is out of range for rank 4\" )"
  ],
+ "dml_guest_parses_new_operator_families_and_rejects_bad_scalar_values": [
+  "( plan.kind, dml_ops::DmlOpKind::Fill { value: 1.0, step: 2.0, sequence: true } )",
+  "(plan.kind, dml_ops::DmlOpKind::Cast)",
+  "( DmlRuntime::new() .parse_operation_from_guest(&bad, desc) .unwrap_err() .message, \"DML_OPERATOR_TYPE 103 ValueDataType 5 is not supported (FLOAT32 only)\" )"
+ ],
  "dml_guest_quantized_per_channel_scale_is_rejected_exactly": [
   "( error.message, \"DML_OPERATOR_TYPE 33 scale tensor is not broadcastable: quantization tensor dimension 0 size 3 does not match the output size 4\" )"
  ],
@@ -3297,6 +3322,31 @@
  "dml_mismatched_binary_sizes_return_invalidarg": [
   "(error.hresult, E_INVALIDARG)",
   "(error.message, \"input tensors must have identical Sizes\")"
+ ],
+ "dml_new_operator_families_numeric_and_malformed_edges": [
+  "(run_cpu(&fill, &[]), vec![1.0, 3.0, 5.0, 7.0])",
+  "( bad_fill.validate().unwrap_err().message, \"fill sequence step must be finite\" )",
+  "( run_cpu(&one_hot, &[&index_values, &on_off]), vec![5.0, -1.0, -1.0, -1.0] )",
+  "( bad_one_hot.validate().unwrap_err().message, \"one-hot axis 2 is out of range for output rank 2\" )",
+  "( run_cpu(&cumulative, &[&f32_bytes(&[1.0, 2.0, 3.0, 4.0])]), vec![2.0, 0.0, 4.0, 0.0] )",
+  "( bad_cumulative.validate().unwrap_err().message, \"cumulative axis 2 is out of range for rank 2\" )"
+ ],
+ "dml_operator_registry_enumerates_6_3_and_rejects_unimplemented_exactly": [
+  "(DML_OPERATOR_TYPES_6_3.len(), 174)",
+  "(DML_OPERATOR_TYPES_6_3[0].0, 1)",
+  "(DML_OPERATOR_TYPES_6_3[173].0, 174)",
+  "(operator_type_name(95), Some(\"ONE_HOT\"))",
+  "(operator_type_name(175), None)",
+  "( operator_support(dml_ops::DML_OPERATOR_ONE_HOT), OperatorSupport::Implemented )"
+ ],
+ "dml_packed_int4_malformed_weight_size_is_rejected_exactly": [
+  "( convolution.validate().unwrap_err().message, \"tensor TotalTensorSizeInBytes 1 is smaller than the implied 2 bytes\" )"
+ ],
+ "dml_packed_int4_weight_layout_edge_values_are_exact": [
+  "(read_f32(&cpu), vec![-5.0, 6.0])",
+  "(read_f32(&accelerated), vec![-5.0, 6.0])",
+  "(read_f32(&cpu), vec![50.0])",
+  "(read_f32(&accelerated), vec![50.0])"
  ],
  "dml_pooling_activation_batchnorm_metal_numeric_readback_edge_values": [
   "(max_pool.operator_type(), DML_OPERATOR_MAX_POOLING)"
@@ -13845,6 +13895,14 @@
   "(manager.cancel_wmi_subscription(subscription), Ok(()))",
   "( manager.cancel_wmi_subscription(subscription), Err(STATUS_INVALID_HANDLE) )"
  ],
+ "work_graph_chain_selects_launch_modes_arrays_and_mesh_nodes": [
+  "(graph.node_array_size(\"root\"), 1)",
+  "(graph.resolve_node(&node_id(\"stage1\")), Some(1))",
+  "(graph.resolve_node(&node_id(\"missing\")), None)",
+  "(graph.edge_target(0, 0), Some(1))",
+  "(graph.edge_target(1, 0), Some(2))",
+  "(graph.edge_target(2, 0), None)"
+ ],
  "work_graph_dispatch_grid_above_grid_limit_is_rejected": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
   "( error.message, \"work graph dispatch grid [16777216, 1, 1] exceeds the per-dimension limit 16777215\" )"
@@ -13853,6 +13911,21 @@
   "(parsed.mode, DISPATCH_MODE_NODE_GPU_INPUT)",
   "(parsed.record_count, 1)",
   "(parsed.records, vec![3, 0, 0, 0, 7, 0, 0, 0])"
+ ],
+ "work_graph_gpu_staged_fanout_chains_fans_out_and_rejects_malformed_records": [
+  "(run.final_records, vec![2])",
+  "(run.node_counts, vec![1, 1, 1])",
+  "(run.stages, 3)",
+  "(run.final_records, vec![2, 2])",
+  "(run.node_counts, vec![2, 2, 2])"
+ ],
+ "work_graph_mesh_program_nodes_parse_with_overrides": [
+  "(node.shader, \"meshprog\")",
+  "(node.output_count(), 0)",
+  "(node.overrides.local_root_arguments_table_index(), Some(1))",
+  "(node.overrides.share_input_of(), None)",
+  "(overrides.local_root_arguments_table_index, Some(1))",
+  "(overrides.program_entry, Some(true))"
  ],
  "work_graph_null_shader_is_rejected": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
@@ -13866,9 +13939,33 @@
   "( graph.entrypoint_index(&D3d12NodeId::new(\"missing\", 0)), None )",
   "(requirements.size_granularity_in_bytes, 8)"
  ],
+ "work_graph_plan_edge_cases_and_override_accessors_are_pinned": [
+  "(none.local_root_arguments_table_index(), None)",
+  "(none.share_input_of(), None)",
+  "(overrides.local_root_arguments_table_index(), Some(1))",
+  "(overrides.share_input_of(), Some(&shared))",
+  "(limits.nodes[0].output_limit(0), Some(3))",
+  "(limits.nodes[0].output_limit(1), Some(3))"
+ ],
+ "work_graph_record_layout_entrypoints_and_root_tables_are_pinned": [
+  "( graph.validate_entrypoint(9).unwrap_err().message, \"work graph entrypoint index 9 is out of range (1 entries)\" )",
+  "( missing.validate_entrypoint(0).unwrap_err().message, \"work graph entrypoint \\\"missing\\\"[0] does not name a node\" )",
+  "( graph.parse_records(&bytes, 2, 4).unwrap_err().message, \"work graph record stride 4 is smaller than the 8-byte node/output record\" )",
+  "( graph.parse_records(&bytes, 2, 9).unwrap_err().message, \"work graph record stride 9 is not a multiple of 4\" )",
+  "( graph.parse_records(&bytes, 2, 32_772).unwrap_err().message, \"work graph record stride 32772 exceeds the 32 KiB node record limit\" )",
+  "( graph.parse_records(&bytes[..8], 2, 8).unwrap_err().message, \"work graph record range (16 bytes) exceeds the supplied 8 bytes\" )"
+ ],
  "work_graph_undefined_flags_are_rejected": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
   "(error.message, \"work graph flags 0x2 contain undefined bits\")"
+ ],
+ "work_graph_validation_rejects_limits_cycles_and_excess_depth": [
+  "( duplicate.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] is defined more than once\" )",
+  "( too_many_outputs.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] output index 1024 exceeds the 1024 output limit\" )",
+  "( duplicated_output.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] defines output 0 more than once\" )",
+  "( both_limits.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] output 0 sets both MaxRecords and \\ MaxRecordsSharedWithOutputIndex\" )",
+  "( zero_limit.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] output 0 MaxRecords is zero\" )",
+  "( self_share.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] output 0 shares records with itself\" )"
  ],
  "worker_chained_code_safepoint_and_smc_stop_before_the_next_block": [
   "(report.stop, SliceStop::Budget)",

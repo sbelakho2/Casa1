@@ -18,6 +18,21 @@ use super::{
 };
 use crate::metal_backend::MetalDevice;
 
+pub const DML_OPERATOR_ELEMENT_WISE_ACOS: u32 = 3;
+pub const DML_OPERATOR_ELEMENT_WISE_ASIN: u32 = 5;
+pub const DML_OPERATOR_ELEMENT_WISE_ATAN: u32 = 6;
+pub const DML_OPERATOR_ELEMENT_WISE_CLIP: u32 = 8;
+pub const DML_OPERATOR_ELEMENT_WISE_LOGICAL_AND: u32 = 14;
+pub const DML_OPERATOR_ELEMENT_WISE_LOGICAL_EQUALS: u32 = 15;
+pub const DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN: u32 = 16;
+pub const DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN: u32 = 17;
+pub const DML_OPERATOR_ELEMENT_WISE_LOGICAL_NOT: u32 = 18;
+pub const DML_OPERATOR_ELEMENT_WISE_LOGICAL_OR: u32 = 19;
+pub const DML_OPERATOR_ELEMENT_WISE_LOGICAL_XOR: u32 = 20;
+pub const DML_OPERATOR_ELEMENT_WISE_MEAN: u32 = 22;
+pub const DML_OPERATOR_ELEMENT_WISE_CONSTANT_POW: u32 = 26;
+pub const DML_OPERATOR_ELEMENT_WISE_RECIP: u32 = 27;
+pub const DML_OPERATOR_ELEMENT_WISE_THRESHOLD: u32 = 32;
 pub const DML_OPERATOR_ELEMENT_WISE_QUANTIZE_LINEAR: u32 = 33;
 pub const DML_OPERATOR_ELEMENT_WISE_DEQUANTIZE_LINEAR: u32 = 34;
 pub const DML_OPERATOR_ACTIVATION_ELU: u32 = 35;
@@ -53,10 +68,35 @@ pub const DML_OPERATOR_LOCAL_RESPONSE_NORMALIZATION: u32 = 74;
 pub const DML_OPERATOR_RNN: u32 = 76;
 pub const DML_OPERATOR_LSTM: u32 = 77;
 pub const DML_OPERATOR_GRU: u32 = 78;
+pub const DML_OPERATOR_ELEMENT_WISE_SIGN: u32 = 79;
+pub const DML_OPERATOR_ELEMENT_WISE_IS_NAN: u32 = 80;
+pub const DML_OPERATOR_ELEMENT_WISE_ERF: u32 = 81;
+pub const DML_OPERATOR_ELEMENT_WISE_SINH: u32 = 82;
+pub const DML_OPERATOR_ELEMENT_WISE_COSH: u32 = 83;
+pub const DML_OPERATOR_ELEMENT_WISE_TANH: u32 = 84;
+pub const DML_OPERATOR_ELEMENT_WISE_ASINH: u32 = 85;
+pub const DML_OPERATOR_ELEMENT_WISE_ACOSH: u32 = 86;
+pub const DML_OPERATOR_ELEMENT_WISE_ATANH: u32 = 87;
+pub const DML_OPERATOR_ELEMENT_WISE_IF: u32 = 88;
 pub const DML_OPERATOR_ELEMENT_WISE_ADD1: u32 = 89;
+pub const DML_OPERATOR_ACTIVATION_SHRINK: u32 = 90;
+pub const DML_OPERATOR_MAX_POOLING1: u32 = 91;
+pub const DML_OPERATOR_MAX_UNPOOLING: u32 = 92;
+pub const DML_OPERATOR_DIAGONAL_MATRIX: u32 = 93;
 pub const DML_OPERATOR_SCATTER: u32 = 94;
 pub const DML_OPERATOR_SCATTER_ELEMENTS: u32 = DML_OPERATOR_SCATTER;
+pub const DML_OPERATOR_ONE_HOT: u32 = 95;
 pub const DML_OPERATOR_RESAMPLE: u32 = 96;
+pub const DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_LEFT: u32 = 97;
+pub const DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_RIGHT: u32 = 98;
+pub const DML_OPERATOR_ELEMENT_WISE_ROUND: u32 = 99;
+pub const DML_OPERATOR_ELEMENT_WISE_IS_INFINITY: u32 = 100;
+pub const DML_OPERATOR_ELEMENT_WISE_MODULUS_TRUNCATE: u32 = 101;
+pub const DML_OPERATOR_ELEMENT_WISE_MODULUS_FLOOR: u32 = 102;
+pub const DML_OPERATOR_FILL_VALUE_CONSTANT: u32 = 103;
+pub const DML_OPERATOR_FILL_VALUE_SEQUENCE: u32 = 104;
+pub const DML_OPERATOR_CUMULATIVE_SUMMATION: u32 = 105;
+pub const DML_OPERATOR_REVERSE_SUBSEQUENCES: u32 = 106;
 pub const DML_OPERATOR_GATHER_ELEMENTS: u32 = 107;
 pub const DML_OPERATOR_GATHER_ND: u32 = 108;
 pub const DML_OPERATOR_SCATTER_ND: u32 = 109;
@@ -67,25 +107,64 @@ pub const DML_OPERATOR_MATRIX_MULTIPLY_INTEGER: u32 = 117;
 pub const DML_OPERATOR_QUANTIZED_LINEAR_MATRIX_MULTIPLY: u32 = 118;
 pub const DML_OPERATOR_CONVOLUTION_INTEGER: u32 = 119;
 pub const DML_OPERATOR_QUANTIZED_LINEAR_CONVOLUTION: u32 = 120;
+pub const DML_OPERATOR_ELEMENT_WISE_BIT_AND: u32 = 121;
+pub const DML_OPERATOR_ELEMENT_WISE_BIT_OR: u32 = 122;
+pub const DML_OPERATOR_ELEMENT_WISE_BIT_XOR: u32 = 123;
+pub const DML_OPERATOR_ELEMENT_WISE_BIT_NOT: u32 = 124;
+pub const DML_OPERATOR_ELEMENT_WISE_BIT_COUNT: u32 = 125;
+pub const DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN_OR_EQUAL: u32 = 126;
+pub const DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN_OR_EQUAL: u32 = 127;
+pub const DML_OPERATOR_ACTIVATION_CELU: u32 = 128;
+pub const DML_OPERATOR_ACTIVATION_RELU_GRAD: u32 = 129;
+pub const DML_OPERATOR_AVERAGE_POOLING_GRAD: u32 = 130;
+pub const DML_OPERATOR_MAX_POOLING_GRAD: u32 = 131;
+pub const DML_OPERATOR_RANDOM_GENERATOR: u32 = 132;
+pub const DML_OPERATOR_NONZERO_COORDINATES: u32 = 133;
+pub const DML_OPERATOR_RESAMPLE_GRAD: u32 = 134;
+pub const DML_OPERATOR_SLICE_GRAD: u32 = 135;
 pub const DML_OPERATOR_ADAM_OPTIMIZER: u32 = 136;
 pub const DML_OPERATOR_ARGMIN: u32 = 137;
 pub const DML_OPERATOR_ARGMAX: u32 = 138;
 pub const DML_OPERATOR_ROI_ALIGN: u32 = 139;
 pub const DML_OPERATOR_GATHER_ND1: u32 = 140;
+pub const DML_OPERATOR_ELEMENT_WISE_ATAN_YX: u32 = 141;
+pub const DML_OPERATOR_ELEMENT_WISE_CLIP_GRAD: u32 = 142;
+pub const DML_OPERATOR_ELEMENT_WISE_DIFFERENCE_SQUARE: u32 = 143;
+pub const DML_OPERATOR_LOCAL_RESPONSE_NORMALIZATION_GRAD: u32 = 144;
+pub const DML_OPERATOR_CUMULATIVE_PRODUCT: u32 = 145;
+pub const DML_OPERATOR_BATCH_NORMALIZATION_GRAD: u32 = 146;
 pub const DML_OPERATOR_ELEMENT_WISE_QUANTIZED_LINEAR_ADD: u32 = 147;
 pub const DML_OPERATOR_DYNAMIC_QUANTIZE_LINEAR: u32 = 148;
 pub const DML_OPERATOR_ROI_ALIGN1: u32 = 149;
+pub const DML_OPERATOR_ROI_ALIGN_GRAD: u32 = 150;
+pub const DML_OPERATOR_BATCH_NORMALIZATION_TRAINING: u32 = 151;
+pub const DML_OPERATOR_BATCH_NORMALIZATION_TRAINING_GRAD: u32 = 152;
+pub const DML_OPERATOR_ELEMENT_WISE_CLIP1: u32 = 153;
+pub const DML_OPERATOR_ELEMENT_WISE_CLIP_GRAD1: u32 = 154;
 pub const DML_OPERATOR_PADDING1: u32 = 155;
+pub const DML_OPERATOR_ELEMENT_WISE_NEGATE: u32 = 156;
 pub const DML_OPERATOR_ACTIVATION_GELU: u32 = 157;
+pub const DML_OPERATOR_ACTIVATION_SOFTMAX1: u32 = 158;
+pub const DML_OPERATOR_ACTIVATION_LOG_SOFTMAX1: u32 = 159;
+pub const DML_OPERATOR_ACTIVATION_HARDMAX1: u32 = 160;
 pub const DML_OPERATOR_RESAMPLE2: u32 = 161;
+pub const DML_OPERATOR_RESAMPLE_GRAD1: u32 = 162;
+pub const DML_OPERATOR_DIAGONAL_MATRIX1: u32 = 163;
+pub const DML_OPERATOR_MULTIHEAD_ATTENTION: u32 = 164;
+pub const DML_OPERATOR_LP_POOLING1: u32 = 165;
+pub const DML_OPERATOR_AVERAGE_POOLING1: u32 = 166;
 pub const DML_OPERATOR_ACTIVATION_SWISH: u32 = 167;
 pub const DML_OPERATOR_ACTIVATION_HARD_SWISH: u32 = 168;
 pub const DML_OPERATOR_QUANTIZED_LINEAR_AVERAGE_POOLING: u32 = 169;
 pub const DML_OPERATOR_MATRIX_MULTIPLY_INTEGER_TO_FLOAT: u32 = 170;
 pub const DML_OPERATOR_MEAN_VARIANCE_NORMALIZATION2: u32 = 171;
+pub const DML_OPERATOR_MULTIHEAD_ATTENTION1: u32 = 172;
 pub const DML_OPERATOR_QUANTIZE: u32 = 173;
 pub const DML_OPERATOR_DEQUANTIZE: u32 = 174;
 pub const DML_OPERATOR_RESAMPLE3: u32 = 175;
+pub const DML_OPERATOR_FOLD: u32 = 176;
+pub const DML_OPERATOR_UNFOLD: u32 = 177;
+pub const DML_OPERATOR_CAST: u32 = 61;
 
 pub const DML_CONVOLUTION_MODE_CONVOLUTION: u32 = 0;
 pub const DML_CONVOLUTION_MODE_CROSS_CORRELATION: u32 = 1;
@@ -174,6 +253,236 @@ pub enum DmlBinaryOp {
     Min,
     Max,
     Pow,
+    ModulusTruncate,
+    ModulusFloor,
+    DifferenceSquare,
+    AtanYx,
+    LogicalAnd,
+    LogicalOr,
+    LogicalXor,
+    LogicalEquals,
+    LogicalGreaterThan,
+    LogicalLessThan,
+    LogicalGreaterThanOrEqual,
+    LogicalLessThanOrEqual,
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitShiftLeft,
+    BitShiftRight,
+    Mean,
+}
+
+impl DmlBinaryOp {
+    /// The `DML_OPERATOR_TYPE` this binary op lowers to.
+    pub fn operator_type(self) -> u32 {
+        match self {
+            Self::Add => super::DML_OPERATOR_ELEMENT_WISE_ADD,
+            Self::Subtract => super::DML_OPERATOR_ELEMENT_WISE_SUBTRACT,
+            Self::Multiply => super::DML_OPERATOR_ELEMENT_WISE_MULTIPLY,
+            Self::Divide => super::DML_OPERATOR_ELEMENT_WISE_DIVIDE,
+            Self::Min => super::DML_OPERATOR_ELEMENT_WISE_MIN,
+            Self::Max => super::DML_OPERATOR_ELEMENT_WISE_MAX,
+            Self::Pow => super::DML_OPERATOR_ELEMENT_WISE_POW,
+            Self::ModulusTruncate => DML_OPERATOR_ELEMENT_WISE_MODULUS_TRUNCATE,
+            Self::ModulusFloor => DML_OPERATOR_ELEMENT_WISE_MODULUS_FLOOR,
+            Self::DifferenceSquare => DML_OPERATOR_ELEMENT_WISE_DIFFERENCE_SQUARE,
+            Self::AtanYx => DML_OPERATOR_ELEMENT_WISE_ATAN_YX,
+            Self::LogicalAnd => DML_OPERATOR_ELEMENT_WISE_LOGICAL_AND,
+            Self::LogicalOr => DML_OPERATOR_ELEMENT_WISE_LOGICAL_OR,
+            Self::LogicalXor => DML_OPERATOR_ELEMENT_WISE_LOGICAL_XOR,
+            Self::LogicalEquals => DML_OPERATOR_ELEMENT_WISE_LOGICAL_EQUALS,
+            Self::LogicalGreaterThan => DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN,
+            Self::LogicalLessThan => DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN,
+            Self::LogicalGreaterThanOrEqual => {
+                DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN_OR_EQUAL
+            }
+            Self::LogicalLessThanOrEqual => DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN_OR_EQUAL,
+            Self::BitAnd => DML_OPERATOR_ELEMENT_WISE_BIT_AND,
+            Self::BitOr => DML_OPERATOR_ELEMENT_WISE_BIT_OR,
+            Self::BitXor => DML_OPERATOR_ELEMENT_WISE_BIT_XOR,
+            Self::BitShiftLeft => DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_LEFT,
+            Self::BitShiftRight => DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_RIGHT,
+            Self::Mean => DML_OPERATOR_ELEMENT_WISE_MEAN,
+        }
+    }
+
+    pub fn from_operator_type(ty: u32) -> Option<Self> {
+        Some(match ty {
+            super::DML_OPERATOR_ELEMENT_WISE_ADD => Self::Add,
+            super::DML_OPERATOR_ELEMENT_WISE_SUBTRACT => Self::Subtract,
+            super::DML_OPERATOR_ELEMENT_WISE_MULTIPLY => Self::Multiply,
+            super::DML_OPERATOR_ELEMENT_WISE_DIVIDE => Self::Divide,
+            super::DML_OPERATOR_ELEMENT_WISE_MIN => Self::Min,
+            super::DML_OPERATOR_ELEMENT_WISE_MAX => Self::Max,
+            super::DML_OPERATOR_ELEMENT_WISE_POW => Self::Pow,
+            DML_OPERATOR_ELEMENT_WISE_MODULUS_TRUNCATE => Self::ModulusTruncate,
+            DML_OPERATOR_ELEMENT_WISE_MODULUS_FLOOR => Self::ModulusFloor,
+            DML_OPERATOR_ELEMENT_WISE_DIFFERENCE_SQUARE => Self::DifferenceSquare,
+            DML_OPERATOR_ELEMENT_WISE_ATAN_YX => Self::AtanYx,
+            DML_OPERATOR_ELEMENT_WISE_LOGICAL_AND => Self::LogicalAnd,
+            DML_OPERATOR_ELEMENT_WISE_LOGICAL_OR => Self::LogicalOr,
+            DML_OPERATOR_ELEMENT_WISE_LOGICAL_XOR => Self::LogicalXor,
+            DML_OPERATOR_ELEMENT_WISE_LOGICAL_EQUALS => Self::LogicalEquals,
+            DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN => Self::LogicalGreaterThan,
+            DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN => Self::LogicalLessThan,
+            DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN_OR_EQUAL => {
+                Self::LogicalGreaterThanOrEqual
+            }
+            DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN_OR_EQUAL => Self::LogicalLessThanOrEqual,
+            DML_OPERATOR_ELEMENT_WISE_BIT_AND => Self::BitAnd,
+            DML_OPERATOR_ELEMENT_WISE_BIT_OR => Self::BitOr,
+            DML_OPERATOR_ELEMENT_WISE_BIT_XOR => Self::BitXor,
+            DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_LEFT => Self::BitShiftLeft,
+            DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_RIGHT => Self::BitShiftRight,
+            DML_OPERATOR_ELEMENT_WISE_MEAN => Self::Mean,
+            _ => return None,
+        })
+    }
+
+    pub fn minimum_feature_level(self) -> u32 {
+        match self {
+            Self::ModulusTruncate
+            | Self::ModulusFloor
+            | Self::BitShiftLeft
+            | Self::BitShiftRight => super::DML_FEATURE_LEVEL_2_1,
+            Self::DifferenceSquare | Self::AtanYx => super::DML_FEATURE_LEVEL_3_1,
+            Self::LogicalGreaterThanOrEqual
+            | Self::LogicalLessThanOrEqual
+            | Self::BitAnd
+            | Self::BitOr
+            | Self::BitXor => super::DML_FEATURE_LEVEL_3_0,
+            _ => super::DML_FEATURE_LEVEL_1_0,
+        }
+    }
+}
+
+/// Element-wise unary operators that are not covered by [`DmlActivation`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DmlUnaryOp {
+    Acos,
+    Asin,
+    Atan,
+    Abs,
+    Ceil,
+    Cos,
+    Exp,
+    Floor,
+    Log,
+    Sin,
+    Sqrt,
+    Tan,
+    Identity,
+    Reciprocal,
+    Sign,
+    IsNan,
+    Erf,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Round,
+    IsInfinity,
+    Negate,
+    Clip { min: f32, max: f32 },
+    Threshold { min: f32 },
+    ConstantPow { exponent: f32 },
+    LogicalNot,
+}
+
+impl DmlUnaryOp {
+    pub fn operator_type(self) -> u32 {
+        match self {
+            Self::Acos => DML_OPERATOR_ELEMENT_WISE_ACOS,
+            Self::Asin => DML_OPERATOR_ELEMENT_WISE_ASIN,
+            Self::Atan => DML_OPERATOR_ELEMENT_WISE_ATAN,
+            Self::Abs => super::DML_OPERATOR_ELEMENT_WISE_ABS,
+            Self::Ceil => super::DML_OPERATOR_ELEMENT_WISE_CEIL,
+            Self::Cos => super::DML_OPERATOR_ELEMENT_WISE_COS,
+            Self::Exp => super::DML_OPERATOR_ELEMENT_WISE_EXP,
+            Self::Floor => super::DML_OPERATOR_ELEMENT_WISE_FLOOR,
+            Self::Log => super::DML_OPERATOR_ELEMENT_WISE_LOG,
+            Self::Sin => super::DML_OPERATOR_ELEMENT_WISE_SIN,
+            Self::Sqrt => super::DML_OPERATOR_ELEMENT_WISE_SQRT,
+            Self::Tan => super::DML_OPERATOR_ELEMENT_WISE_TAN,
+            Self::Identity => super::DML_OPERATOR_ELEMENT_WISE_IDENTITY,
+            Self::Reciprocal => DML_OPERATOR_ELEMENT_WISE_RECIP,
+            Self::Sign => DML_OPERATOR_ELEMENT_WISE_SIGN,
+            Self::IsNan => DML_OPERATOR_ELEMENT_WISE_IS_NAN,
+            Self::Erf => DML_OPERATOR_ELEMENT_WISE_ERF,
+            Self::Sinh => DML_OPERATOR_ELEMENT_WISE_SINH,
+            Self::Cosh => DML_OPERATOR_ELEMENT_WISE_COSH,
+            Self::Tanh => DML_OPERATOR_ELEMENT_WISE_TANH,
+            Self::Asinh => DML_OPERATOR_ELEMENT_WISE_ASINH,
+            Self::Acosh => DML_OPERATOR_ELEMENT_WISE_ACOSH,
+            Self::Atanh => DML_OPERATOR_ELEMENT_WISE_ATANH,
+            Self::Round => DML_OPERATOR_ELEMENT_WISE_ROUND,
+            Self::IsInfinity => DML_OPERATOR_ELEMENT_WISE_IS_INFINITY,
+            Self::Negate => DML_OPERATOR_ELEMENT_WISE_NEGATE,
+            Self::Clip { .. } => DML_OPERATOR_ELEMENT_WISE_CLIP,
+            Self::Threshold { .. } => DML_OPERATOR_ELEMENT_WISE_THRESHOLD,
+            Self::ConstantPow { .. } => DML_OPERATOR_ELEMENT_WISE_CONSTANT_POW,
+            Self::LogicalNot => DML_OPERATOR_ELEMENT_WISE_LOGICAL_NOT,
+        }
+    }
+
+    pub fn from_operator_type(
+        ty: u32,
+        mut parameter: impl FnMut(u64) -> DmlResult<f32>,
+    ) -> DmlResult<Self> {
+        Ok(match ty {
+            DML_OPERATOR_ELEMENT_WISE_ACOS => Self::Acos,
+            DML_OPERATOR_ELEMENT_WISE_ASIN => Self::Asin,
+            DML_OPERATOR_ELEMENT_WISE_ATAN => Self::Atan,
+            DML_OPERATOR_ELEMENT_WISE_RECIP => Self::Reciprocal,
+            DML_OPERATOR_ELEMENT_WISE_SIGN => Self::Sign,
+            DML_OPERATOR_ELEMENT_WISE_IS_NAN => Self::IsNan,
+            DML_OPERATOR_ELEMENT_WISE_ERF => Self::Erf,
+            DML_OPERATOR_ELEMENT_WISE_SINH => Self::Sinh,
+            DML_OPERATOR_ELEMENT_WISE_COSH => Self::Cosh,
+            DML_OPERATOR_ELEMENT_WISE_TANH => Self::Tanh,
+            DML_OPERATOR_ELEMENT_WISE_ASINH => Self::Asinh,
+            DML_OPERATOR_ELEMENT_WISE_ACOSH => Self::Acosh,
+            DML_OPERATOR_ELEMENT_WISE_ATANH => Self::Atanh,
+            DML_OPERATOR_ELEMENT_WISE_ROUND => Self::Round,
+            DML_OPERATOR_ELEMENT_WISE_IS_INFINITY => Self::IsInfinity,
+            DML_OPERATOR_ELEMENT_WISE_NEGATE => Self::Negate,
+            DML_OPERATOR_ELEMENT_WISE_CLIP => Self::Clip {
+                min: parameter(24)?,
+                max: parameter(28)?,
+            },
+            DML_OPERATOR_ELEMENT_WISE_THRESHOLD => Self::Threshold {
+                min: parameter(24)?,
+            },
+            DML_OPERATOR_ELEMENT_WISE_CONSTANT_POW => Self::ConstantPow {
+                exponent: parameter(24)?,
+            },
+            DML_OPERATOR_ELEMENT_WISE_LOGICAL_NOT => Self::LogicalNot,
+            other => return Err(DmlError::unsupported_operator(other)),
+        })
+    }
+
+    pub fn minimum_feature_level(self) -> u32 {
+        match self {
+            Self::Reciprocal
+            | Self::Sign
+            | Self::IsNan
+            | Self::Erf
+            | Self::Sinh
+            | Self::Cosh
+            | Self::Tanh
+            | Self::Asinh
+            | Self::Acosh
+            | Self::Atanh => super::DML_FEATURE_LEVEL_2_0,
+            Self::Round | Self::IsInfinity | Self::ConstantPow { .. } => {
+                super::DML_FEATURE_LEVEL_2_1
+            }
+            Self::Negate => super::DML_FEATURE_LEVEL_5_0,
+            _ => super::DML_FEATURE_LEVEL_1_0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,6 +884,31 @@ pub enum DmlOpKind {
         quantization_type: u32,
     },
     Add1,
+    Unary {
+        op: DmlUnaryOp,
+    },
+    Fill {
+        value: f32,
+        step: f32,
+        sequence: bool,
+    },
+    OneHot {
+        axis: u32,
+    },
+    Cumulative {
+        product: bool,
+        axis: u32,
+        reverse: bool,
+        exclusive: bool,
+    },
+    Reverse {
+        axis: u32,
+    },
+    DiagonalMatrix {
+        offset: i32,
+        value: f32,
+    },
+    Cast,
 }
 
 impl DmlOpKind {
@@ -589,15 +923,7 @@ impl DmlOpKind {
             Self::Activation { activation, .. } => activation.operator_type(),
             Self::BatchNormalization { .. } => DML_OPERATOR_BATCH_NORMALIZATION,
             Self::Softmax => DML_OPERATOR_ACTIVATION_SOFTMAX,
-            Self::Binary { op } => match op {
-                DmlBinaryOp::Add => super::DML_OPERATOR_ELEMENT_WISE_ADD,
-                DmlBinaryOp::Subtract => super::DML_OPERATOR_ELEMENT_WISE_SUBTRACT,
-                DmlBinaryOp::Multiply => super::DML_OPERATOR_ELEMENT_WISE_MULTIPLY,
-                DmlBinaryOp::Divide => super::DML_OPERATOR_ELEMENT_WISE_DIVIDE,
-                DmlBinaryOp::Min => super::DML_OPERATOR_ELEMENT_WISE_MIN,
-                DmlBinaryOp::Max => super::DML_OPERATOR_ELEMENT_WISE_MAX,
-                DmlBinaryOp::Pow => super::DML_OPERATOR_ELEMENT_WISE_POW,
-            },
+            Self::Binary { op } => op.operator_type(),
             Self::Reduce { .. } => DML_OPERATOR_REDUCE,
             Self::Reshape => DML_OPERATOR_RESHAPE,
             Self::Transpose { .. } => DML_OPERATOR_TRANSPOSE,
@@ -609,7 +935,13 @@ impl DmlOpKind {
             Self::ArgMin { .. } => DML_OPERATOR_ARGMIN,
             Self::ArgMax { .. } => DML_OPERATOR_ARGMAX,
             Self::Padding { .. } => DML_OPERATOR_PADDING,
-            Self::Resample { .. } => DML_OPERATOR_RESAMPLE1,
+            Self::Resample { antialiased, .. } => {
+                if *antialiased {
+                    DML_OPERATOR_RESAMPLE3
+                } else {
+                    DML_OPERATOR_RESAMPLE1
+                }
+            }
             Self::TopK { .. } => DML_OPERATOR_TOP_K1,
             Self::Tile { .. } => DML_OPERATOR_TILE,
             Self::Split { .. } => DML_OPERATOR_SPLIT,
@@ -654,6 +986,25 @@ impl DmlOpKind {
             Self::Quantize { .. } => DML_OPERATOR_QUANTIZE,
             Self::Dequantize { .. } => DML_OPERATOR_DEQUANTIZE,
             Self::Add1 => DML_OPERATOR_ELEMENT_WISE_ADD1,
+            Self::Unary { op } => op.operator_type(),
+            Self::Fill { sequence, .. } => {
+                if *sequence {
+                    DML_OPERATOR_FILL_VALUE_SEQUENCE
+                } else {
+                    DML_OPERATOR_FILL_VALUE_CONSTANT
+                }
+            }
+            Self::OneHot { .. } => DML_OPERATOR_ONE_HOT,
+            Self::Cumulative { product, .. } => {
+                if *product {
+                    DML_OPERATOR_CUMULATIVE_PRODUCT
+                } else {
+                    DML_OPERATOR_CUMULATIVE_SUMMATION
+                }
+            }
+            Self::Reverse { .. } => DML_OPERATOR_REVERSE_SUBSEQUENCES,
+            Self::DiagonalMatrix { .. } => DML_OPERATOR_DIAGONAL_MATRIX,
+            Self::Cast => DML_OPERATOR_CAST,
         }
     }
 
@@ -678,7 +1029,8 @@ impl DmlOpKind {
             | Self::MeanVarianceNormalization { .. } => super::DML_FEATURE_LEVEL_2_1,
             Self::Resample { antialiased, .. } => {
                 if *antialiased {
-                    super::DML_FEATURE_LEVEL_6_3
+                    // DML_OPERATOR_RESAMPLE3 is a feature level 6.4 operator.
+                    super::DML_FEATURE_LEVEL_6_4
                 } else {
                     super::DML_FEATURE_LEVEL_2_1
                 }
@@ -700,6 +1052,12 @@ impl DmlOpKind {
                 }
                 _ => super::DML_FEATURE_LEVEL_1_0,
             },
+            Self::Unary { op } => op.minimum_feature_level(),
+            Self::Fill { .. } | Self::Cumulative { .. } | Self::Reverse { .. } => {
+                super::DML_FEATURE_LEVEL_2_1
+            }
+            Self::OneHot { .. } | Self::DiagonalMatrix { .. } => super::DML_FEATURE_LEVEL_2_0,
+            Self::Cast => super::DML_FEATURE_LEVEL_1_0,
             _ => super::DML_FEATURE_LEVEL_1_0,
         }
     }
@@ -1014,9 +1372,106 @@ impl DmlOpPlan {
     fn validate_dtypes(&self) -> DmlResult<()> {
         let ty = self.operator_type();
         match &self.kind {
-            DmlOpKind::Gemm { .. }
-            | DmlOpKind::Convolution { .. }
-            | DmlOpKind::Pooling { .. }
+            DmlOpKind::Gemm { .. } | DmlOpKind::Convolution { .. } => {
+                let allow_f16 = self.kind.allows_float16();
+                validate_dtype(&self.inputs[0], ty, allow_f16)?;
+                validate_dtype(&self.output, ty, allow_f16)?;
+                if self.inputs[0].data_type != self.output.data_type {
+                    return Err(DmlError::invalid(
+                        "input and output tensors must have the same DataType",
+                    ));
+                }
+                // A packed 4-bit weight/filter tensor is a real DirectML
+                // layout: the activation stays float while the weights read
+                // two signed/unsigned nibbles per byte.
+                let weight = &self.inputs[1];
+                expect_dtype(
+                    weight,
+                    &[
+                        self.output.data_type,
+                        DML_TENSOR_DATA_TYPE_UINT4,
+                        DML_TENSOR_DATA_TYPE_INT4,
+                    ],
+                    ty,
+                    "weight",
+                )?;
+                for tensor in self.inputs.iter().skip(2).chain(&self.extra_outputs) {
+                    validate_dtype(tensor, ty, allow_f16)?;
+                    if tensor.data_type != self.output.data_type {
+                        return Err(DmlError::invalid(
+                            "additional input and output tensors must have the output DataType",
+                        ));
+                    }
+                }
+            }
+            DmlOpKind::Unary { .. }
+            | DmlOpKind::Fill { .. }
+            | DmlOpKind::Cumulative { .. }
+            | DmlOpKind::DiagonalMatrix { .. } => {
+                let allow_f16 = self.kind.allows_float16();
+                for desc in self.inputs.iter().chain(self.outputs()) {
+                    validate_dtype(desc, ty, allow_f16)?;
+                    if desc.data_type != self.output.data_type {
+                        return Err(DmlError::invalid(
+                            "input and output tensors must have the same DataType",
+                        ));
+                    }
+                }
+            }
+            DmlOpKind::Reverse { .. } => {
+                let allow_f16 = self.kind.allows_float16();
+                validate_dtype(&self.inputs[0], ty, allow_f16)?;
+                validate_dtype(&self.output, ty, allow_f16)?;
+                if self.inputs[0].data_type != self.output.data_type {
+                    return Err(DmlError::invalid(
+                        "reverse input and output tensors must have the same DataType",
+                    ));
+                }
+                expect_dtype(
+                    &self.inputs[1],
+                    &[
+                        DML_TENSOR_DATA_TYPE_UINT32,
+                        DML_TENSOR_DATA_TYPE_INT32,
+                        DML_TENSOR_DATA_TYPE_UINT8,
+                        DML_TENSOR_DATA_TYPE_INT8,
+                    ],
+                    ty,
+                    "reverse sequence lengths",
+                )?;
+            }
+            DmlOpKind::OneHot { .. } => {
+                expect_dtype(
+                    &self.inputs[0],
+                    &[
+                        DML_TENSOR_DATA_TYPE_UINT8,
+                        DML_TENSOR_DATA_TYPE_INT8,
+                        DML_TENSOR_DATA_TYPE_UINT32,
+                        DML_TENSOR_DATA_TYPE_INT32,
+                    ],
+                    ty,
+                    "one-hot indices",
+                )?;
+                validate_dtype(&self.inputs[1], ty, true)?;
+                validate_dtype(&self.output, ty, true)?;
+                if self.inputs[1].data_type != self.output.data_type {
+                    return Err(DmlError::invalid(
+                        "one-hot values and output must have the same DataType",
+                    ));
+                }
+            }
+            DmlOpKind::Cast => {
+                let allowed = [
+                    DML_TENSOR_DATA_TYPE_FLOAT32,
+                    DML_TENSOR_DATA_TYPE_FLOAT16,
+                    DML_TENSOR_DATA_TYPE_INT32,
+                    DML_TENSOR_DATA_TYPE_UINT32,
+                    DML_TENSOR_DATA_TYPE_INT8,
+                    DML_TENSOR_DATA_TYPE_UINT8,
+                ];
+                expect_dtype(&self.inputs[0], &allowed, ty, "cast input")?;
+                expect_dtype(&self.output, &allowed, ty, "cast output")?;
+            }
+            DmlOpKind::Pooling { .. }
             | DmlOpKind::Activation { .. }
             | DmlOpKind::BatchNormalization { .. }
             | DmlOpKind::Softmax
@@ -1598,7 +2053,12 @@ impl DmlOpPlan {
 
     pub fn validate(&self) -> DmlResult<()> {
         let ty = self.operator_type();
-        if self.inputs.is_empty() {
+        if self.inputs.is_empty()
+            && !matches!(
+                self.kind,
+                DmlOpKind::Fill { .. } | DmlOpKind::DiagonalMatrix { .. }
+            )
+        {
             return Err(DmlError::invalid(format!(
                 "DML_OPERATOR_TYPE {ty} requires at least one input tensor"
             )));
@@ -1885,7 +2345,160 @@ impl DmlOpPlan {
             | DmlOpKind::Dequantize { quantization_type } => {
                 self.validate_quantize(*quantization_type)
             }
+            DmlOpKind::Unary { op } => self.validate_unary(*op),
+            DmlOpKind::Fill { value, step, .. } => {
+                if self.inputs.is_empty() && !value.is_finite() {
+                    return Err(DmlError::invalid("fill value must be finite"));
+                }
+                if !step.is_finite() {
+                    return Err(DmlError::invalid("fill sequence step must be finite"));
+                }
+                Ok(())
+            }
+            DmlOpKind::OneHot { axis } => self.validate_one_hot(*axis),
+            DmlOpKind::Cumulative { axis, .. } => self.validate_cumulative(*axis),
+            DmlOpKind::Reverse { axis } => self.validate_reverse(*axis),
+            DmlOpKind::DiagonalMatrix { offset, value } => {
+                if !value.is_finite() {
+                    return Err(DmlError::invalid("diagonal matrix value must be finite"));
+                }
+                if self.output.sizes.len() != 2 {
+                    return Err(DmlError::invalid("diagonal matrix output must be rank-2"));
+                }
+                let (rows, columns) = (self.output.sizes[0] as i64, self.output.sizes[1] as i64);
+                if i64::from(*offset) >= columns || i64::from(*offset) <= -rows {
+                    return Err(DmlError::invalid(format!(
+                        "diagonal matrix offset {offset} lies outside the {rows}x{columns} output"
+                    )));
+                }
+                Ok(())
+            }
+            DmlOpKind::Cast => {
+                self.require_input_count(1)?;
+                let input = &self.inputs[0];
+                if checked_product(&input.sizes)? != checked_product(&self.output.sizes)? {
+                    return Err(DmlError::invalid(
+                        "cast input and output element counts must match",
+                    ));
+                }
+                Ok(())
+            }
         }
+    }
+
+    fn validate_unary(&self, op: DmlUnaryOp) -> DmlResult<()> {
+        self.require_input_count(1)?;
+        if self.inputs[0].sizes != self.output.sizes {
+            return Err(DmlError::invalid(format!(
+                "DML_OPERATOR_TYPE {} input and output sizes must match",
+                op.operator_type()
+            )));
+        }
+        match op {
+            DmlUnaryOp::Clip { min, max } => {
+                if !min.is_finite() || !max.is_finite() || min > max {
+                    return Err(DmlError::invalid(format!(
+                        "clip bounds must be finite and min <= max, got {min} and {max}"
+                    )));
+                }
+            }
+            DmlUnaryOp::Threshold { min } | DmlUnaryOp::ConstantPow { exponent: min } => {
+                if !min.is_finite() {
+                    return Err(DmlError::invalid(
+                        "element-wise scalar parameter must be finite",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_one_hot(&self, axis: u32) -> DmlResult<()> {
+        self.require_input_count(2)?;
+        let indices = &self.inputs[0];
+        let values = &self.inputs[1];
+        let expected_rank = indices.sizes.len() + 1;
+        if self.output.sizes.len() != expected_rank {
+            return Err(DmlError::invalid(format!(
+                "one-hot output rank {} must be indices rank {} plus one",
+                self.output.sizes.len(),
+                indices.sizes.len()
+            )));
+        }
+        if axis as usize >= expected_rank {
+            return Err(DmlError::invalid(format!(
+                "one-hot axis {axis} is out of range for output rank {expected_rank}"
+            )));
+        }
+        let depth = values.element_count();
+        if depth != 2 {
+            return Err(DmlError::invalid(format!(
+                "one-hot values tensor must contain exactly 2 elements, got {depth}"
+            )));
+        }
+        if self.output.sizes[axis as usize] != depth as u32 {
+            return Err(DmlError::invalid(format!(
+                "one-hot output axis {axis} size {} must equal the values count {depth}",
+                self.output.sizes[axis as usize]
+            )));
+        }
+        let mut source = 0;
+        for (dimension, size) in self.output.sizes.iter().enumerate() {
+            if dimension == axis as usize {
+                continue;
+            }
+            if *size != indices.sizes[source] {
+                return Err(DmlError::invalid(format!(
+                    "one-hot output dimension {dimension} size {size} must match indices dimension {source} size {}",
+                    indices.sizes[source]
+                )));
+            }
+            source += 1;
+        }
+        Ok(())
+    }
+
+    fn validate_cumulative(&self, axis: u32) -> DmlResult<()> {
+        self.require_input_count(1)?;
+        let input = &self.inputs[0];
+        if input.sizes != self.output.sizes {
+            return Err(DmlError::invalid(
+                "cumulative input and output sizes must match",
+            ));
+        }
+        if axis as usize >= input.sizes.len() {
+            return Err(DmlError::invalid(format!(
+                "cumulative axis {axis} is out of range for rank {}",
+                input.sizes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_reverse(&self, axis: u32) -> DmlResult<()> {
+        self.require_input_count(2)?;
+        let input = &self.inputs[0];
+        if input.sizes != self.output.sizes {
+            return Err(DmlError::invalid(
+                "reverse input and output sizes must match",
+            ));
+        }
+        if axis as usize >= input.sizes.len() {
+            return Err(DmlError::invalid(format!(
+                "reverse axis {axis} is out of range for rank {}",
+                input.sizes.len()
+            )));
+        }
+        let sequence_count = input.sizes.iter().take(axis as usize).product::<u32>();
+        if self.inputs[1].element_count() != sequence_count.max(1) as u64 {
+            return Err(DmlError::invalid(format!(
+                "reverse sequence lengths must contain {} elements, got {}",
+                sequence_count.max(1),
+                self.inputs[1].element_count()
+            )));
+        }
+        Ok(())
     }
 
     fn require_input_count(&self, expected: usize) -> DmlResult<()> {
@@ -3988,7 +4601,7 @@ fn msl_scalar(data_type: u32, ty: u32) -> DmlResult<&'static str> {
 
 fn packed_read_4bit(pointer: &str, index: &str, signed: bool) -> String {
     let byte = format!("({index}) / 2u");
-    let shift = "(((index) % 2u) * 4u)".to_string();
+    let shift = format!("((({index}) % 2u) * 4u)");
     let raw = format!("(({pointer}[{byte}] >> {shift}) & 0x0fu)");
     if signed {
         format!("((int({raw}) & 8) != 0 ? int({raw}) - 16 : int({raw}))")
@@ -4011,7 +4624,29 @@ fn msl_type_unchecked(data_type: u32) -> &'static str {
         DML_TENSOR_DATA_TYPE_INT32 => "int",
         DML_TENSOR_DATA_TYPE_UINT8 => "uchar",
         DML_TENSOR_DATA_TYPE_INT8 => "char",
+        DML_TENSOR_DATA_TYPE_UINT4 | DML_TENSOR_DATA_TYPE_INT4 => "uchar",
         _ => "float",
+    }
+}
+
+/// MSL expression that reads one logical element as `float`.
+fn msl_load_float(desc: &DmlTensorDesc, pointer: &str, index: &str) -> String {
+    if desc.is_4bit() {
+        format!(
+            "float({})",
+            packed_read_4bit(pointer, index, desc.data_type == DML_TENSOR_DATA_TYPE_INT4)
+        )
+    } else {
+        format!("float({pointer}[{index}])")
+    }
+}
+
+/// MSL expression that reads one logical element in its native scalar type.
+fn msl_load_native(desc: &DmlTensorDesc, pointer: &str, index: &str) -> String {
+    if desc.is_4bit() {
+        packed_read_4bit(pointer, index, desc.data_type == DML_TENSOR_DATA_TYPE_INT4)
+    } else {
+        format!("{pointer}[{index}]")
     }
 }
 
@@ -4228,6 +4863,60 @@ fn emit_scalar_binary(op: DmlBinaryOp) -> &'static str {
         DmlBinaryOp::Min => "fmin(a, b)",
         DmlBinaryOp::Max => "fmax(a, b)",
         DmlBinaryOp::Pow => "pow(a, b)",
+        DmlBinaryOp::ModulusTruncate => "fmod(a, b)",
+        DmlBinaryOp::ModulusFloor => "a - b * floor(a / b)",
+        DmlBinaryOp::DifferenceSquare => "(a - b) * (a - b)",
+        DmlBinaryOp::AtanYx => "atan2(a, b)",
+        DmlBinaryOp::LogicalAnd => "(a != 0.0f && b != 0.0f) ? 1.0f : 0.0f",
+        DmlBinaryOp::LogicalOr => "(a != 0.0f || b != 0.0f) ? 1.0f : 0.0f",
+        DmlBinaryOp::LogicalXor => "((a != 0.0f) != (b != 0.0f)) ? 1.0f : 0.0f",
+        DmlBinaryOp::LogicalEquals => "a == b ? 1.0f : 0.0f",
+        DmlBinaryOp::LogicalGreaterThan => "a > b ? 1.0f : 0.0f",
+        DmlBinaryOp::LogicalLessThan => "a < b ? 1.0f : 0.0f",
+        DmlBinaryOp::LogicalGreaterThanOrEqual => "a >= b ? 1.0f : 0.0f",
+        DmlBinaryOp::LogicalLessThanOrEqual => "a <= b ? 1.0f : 0.0f",
+        DmlBinaryOp::BitAnd => "float(as_type<uint>(int(a)) & as_type<uint>(int(b)))",
+        DmlBinaryOp::BitOr => "float(as_type<uint>(int(a)) | as_type<uint>(int(b)))",
+        DmlBinaryOp::BitXor => "float(as_type<uint>(int(a)) ^ as_type<uint>(int(b)))",
+        DmlBinaryOp::BitShiftLeft => {
+            "float(as_type<uint>(int(a)) << (as_type<uint>(int(b)) & 31u))"
+        }
+        DmlBinaryOp::BitShiftRight => {
+            "float(as_type<uint>(int(a)) >> (as_type<uint>(int(b)) & 31u))"
+        }
+        DmlBinaryOp::Mean => "(a + b) * 0.5f",
+    }
+}
+
+fn apply_binary(op: DmlBinaryOp, left: f32, right: f32) -> f32 {
+    match op {
+        DmlBinaryOp::Add => left + right,
+        DmlBinaryOp::Subtract => left - right,
+        DmlBinaryOp::Multiply => left * right,
+        DmlBinaryOp::Divide => left / right,
+        DmlBinaryOp::Min => left.min(right),
+        DmlBinaryOp::Max => left.max(right),
+        DmlBinaryOp::Pow => left.powf(right),
+        DmlBinaryOp::ModulusTruncate => left % right,
+        DmlBinaryOp::ModulusFloor => left - right * (left / right).floor(),
+        DmlBinaryOp::DifferenceSquare => (left - right) * (left - right),
+        DmlBinaryOp::AtanYx => left.atan2(right),
+        DmlBinaryOp::LogicalAnd => ((left != 0.0) && (right != 0.0)) as u8 as f32,
+        DmlBinaryOp::LogicalOr => ((left != 0.0) || (right != 0.0)) as u8 as f32,
+        DmlBinaryOp::LogicalXor => ((left != 0.0) != (right != 0.0)) as u8 as f32,
+        DmlBinaryOp::LogicalEquals => (left == right) as u8 as f32,
+        DmlBinaryOp::LogicalGreaterThan => (left > right) as u8 as f32,
+        DmlBinaryOp::LogicalLessThan => (left < right) as u8 as f32,
+        DmlBinaryOp::LogicalGreaterThanOrEqual => (left >= right) as u8 as f32,
+        DmlBinaryOp::LogicalLessThanOrEqual => (left <= right) as u8 as f32,
+        DmlBinaryOp::BitAnd => ((left as i64 as u32) & (right as i64 as u32)) as f32,
+        DmlBinaryOp::BitOr => ((left as i64 as u32) | (right as i64 as u32)) as f32,
+        DmlBinaryOp::BitXor => ((left as i64 as u32) ^ (right as i64 as u32)) as f32,
+        DmlBinaryOp::BitShiftLeft => {
+            (left as i64 as u32).wrapping_shl((right as i64 as u32) & 31) as f32
+        }
+        DmlBinaryOp::BitShiftRight => ((left as i64 as u32) >> ((right as i64 as u32) & 31)) as f32,
+        DmlBinaryOp::Mean => (left + right) * 0.5,
     }
 }
 
@@ -4317,6 +5006,345 @@ fn activation_cpu(activation: DmlActivation, x: f32) -> f32 {
             }
         }
     }
+}
+
+fn unary_msl(op: DmlUnaryOp, x: &str) -> String {
+    let inner = format!("({x})");
+    match op {
+        DmlUnaryOp::Acos => format!("acos({inner})"),
+        DmlUnaryOp::Asin => format!("asin({inner})"),
+        DmlUnaryOp::Atan => format!("atan({inner})"),
+        DmlUnaryOp::Abs => format!("abs({inner})"),
+        DmlUnaryOp::Ceil => format!("ceil({inner})"),
+        DmlUnaryOp::Cos => format!("cos({inner})"),
+        DmlUnaryOp::Exp => format!("exp({inner})"),
+        DmlUnaryOp::Floor => format!("floor({inner})"),
+        DmlUnaryOp::Log => format!("log({inner})"),
+        DmlUnaryOp::Sin => format!("sin({inner})"),
+        DmlUnaryOp::Sqrt => format!("sqrt({inner})"),
+        DmlUnaryOp::Tan => format!("tan({inner})"),
+        DmlUnaryOp::Identity => inner,
+        DmlUnaryOp::Reciprocal => format!("1.0f / {inner}"),
+        DmlUnaryOp::Sign => {
+            format!("({inner}) > 0.0f ? 1.0f : (({inner}) < 0.0f ? -1.0f : ({inner}))")
+        }
+        DmlUnaryOp::IsNan => {
+            format!("((as_type<uint>(float({inner})) & 0x7fffffffu) > 0x7f800000u) ? 1.0f : 0.0f")
+        }
+        DmlUnaryOp::Erf => format!("erf({inner})"),
+        DmlUnaryOp::Sinh => format!("sinh({inner})"),
+        DmlUnaryOp::Cosh => format!("cosh({inner})"),
+        DmlUnaryOp::Tanh => format!("tanh({inner})"),
+        DmlUnaryOp::Asinh => format!("asinh({inner})"),
+        DmlUnaryOp::Acosh => format!("acosh({inner})"),
+        DmlUnaryOp::Atanh => format!("atanh({inner})"),
+        DmlUnaryOp::Round => format!("rint({inner})"),
+        DmlUnaryOp::IsInfinity => {
+            format!("abs(float({inner})) == INFINITY ? 1.0f : 0.0f")
+        }
+        DmlUnaryOp::Negate => format!("-{inner}"),
+        DmlUnaryOp::Clip { min, max } => {
+            format!("clamp({inner}, {}, {})", msl_float(min), msl_float(max))
+        }
+        DmlUnaryOp::Threshold { min } => format!("{inner} > {} ? {inner} : 0.0f", msl_float(min)),
+        DmlUnaryOp::ConstantPow { exponent } => {
+            format!("pow({inner}, {})", msl_float(exponent))
+        }
+        DmlUnaryOp::LogicalNot => format!("({inner}) == 0.0f ? 1.0f : 0.0f"),
+    }
+}
+
+fn unary_cpu(op: DmlUnaryOp, x: f32) -> f32 {
+    match op {
+        DmlUnaryOp::Acos => x.acos(),
+        DmlUnaryOp::Asin => x.asin(),
+        DmlUnaryOp::Atan => x.atan(),
+        DmlUnaryOp::Abs => x.abs(),
+        DmlUnaryOp::Ceil => x.ceil(),
+        DmlUnaryOp::Cos => x.cos(),
+        DmlUnaryOp::Exp => x.exp(),
+        DmlUnaryOp::Floor => x.floor(),
+        DmlUnaryOp::Log => x.ln(),
+        DmlUnaryOp::Sin => x.sin(),
+        DmlUnaryOp::Sqrt => x.sqrt(),
+        DmlUnaryOp::Tan => x.tan(),
+        DmlUnaryOp::Identity => x,
+        DmlUnaryOp::Reciprocal => 1.0 / x,
+        DmlUnaryOp::Sign => {
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                x
+            }
+        }
+        DmlUnaryOp::IsNan => {
+            if x.is_nan() {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        DmlUnaryOp::Erf => erf_approx(x),
+        DmlUnaryOp::Sinh => x.sinh(),
+        DmlUnaryOp::Cosh => x.cosh(),
+        DmlUnaryOp::Tanh => x.tanh(),
+        DmlUnaryOp::Asinh => x.asinh(),
+        DmlUnaryOp::Acosh => x.acosh(),
+        DmlUnaryOp::Atanh => x.atanh(),
+        DmlUnaryOp::Round => x.round_ties_even(),
+        DmlUnaryOp::IsInfinity => {
+            if x.is_infinite() {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        DmlUnaryOp::Negate => -x,
+        DmlUnaryOp::Clip { min, max } => x.clamp(min, max),
+        DmlUnaryOp::Threshold { min } => {
+            if x > min {
+                x
+            } else {
+                0.0
+            }
+        }
+        DmlUnaryOp::ConstantPow { exponent } => x.powf(exponent),
+        DmlUnaryOp::LogicalNot => {
+            if x == 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
+/// Deterministic erf approximation used by the CPU reference path. The Metal
+/// path uses the system `erf`; the tolerance used by numeric tests covers the
+/// difference.
+fn erf_approx(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_7) * t - 0.284_496_72) * t
+            + 0.254_829_6)
+            * t)
+            * (-x * x).exp();
+    sign * y
+}
+
+fn emit_unary_msl(plan: &DmlOpPlan, op: DmlUnaryOp) -> DmlResult<String> {
+    let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
+    let mut source = msl_header(plan, scalar);
+    push_guard(&mut source, &plan.output);
+    push_output_coords(&mut source, &plan.output);
+    source.push_str(&format!(
+        "    float x = {};\n",
+        msl_load_float(&plan.inputs[0], "in0", &broadcast_index(&plan.inputs[0]))
+    ));
+    source.push_str(&format!(
+        "    out[{}] = ({scalar})({});\n",
+        output_index_expr(&plan.output),
+        unary_msl(op, "x")
+    ));
+    source.push_str("}\n");
+    Ok(source)
+}
+
+fn emit_fill_msl(plan: &DmlOpPlan, value: f32, step: f32, sequence: bool) -> DmlResult<String> {
+    let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
+    let mut source = msl_header(plan, scalar);
+    push_guard(&mut source, &plan.output);
+    let expression = if sequence {
+        format!("{} + gid * {}", msl_float(value), msl_float(step))
+    } else {
+        msl_float(value)
+    };
+    source.push_str(&format!(
+        "    out[{}] = ({scalar})({expression});\n",
+        output_index_expr(&plan.output)
+    ));
+    source.push_str("}\n");
+    Ok(source)
+}
+
+fn emit_one_hot_msl(plan: &DmlOpPlan, axis: u32) -> DmlResult<String> {
+    let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
+    let indices = &plan.inputs[0];
+    let mut source = msl_header(plan, scalar);
+    push_guard(&mut source, &plan.output);
+    push_output_coords(&mut source, &plan.output);
+    let mut coords = Vec::new();
+    for dimension in 0..plan.output.sizes.len() {
+        if dimension != axis as usize {
+            coords.push(format!("o{dimension}"));
+        }
+    }
+    source.push_str(&format!(
+        "    int index = int({});\n",
+        msl_load_native(indices, "in0", &linear_index(indices, &coords))
+    ));
+    source.push_str(&format!(
+        "    uint depth = {}u;\n",
+        plan.output.sizes[axis as usize]
+    ));
+    source.push_str("    float on_value = float(in1[0]);\n");
+    source.push_str("    float off_value = float(in1[1]);\n");
+    source.push_str("    bool valid = index >= 0 && uint(index) < depth;\n");
+    source.push_str(&format!(
+        "    out[{}] = ({scalar})(valid && uint(index) == o{axis} ? on_value : off_value);\n",
+        output_index_expr(&plan.output)
+    ));
+    source.push_str("}\n");
+    Ok(source)
+}
+
+fn emit_cumulative_msl(
+    plan: &DmlOpPlan,
+    product: bool,
+    axis: u32,
+    reverse: bool,
+    exclusive: bool,
+) -> DmlResult<String> {
+    let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
+    let input = &plan.inputs[0];
+    let mut source = msl_header(plan, scalar);
+    push_guard(&mut source, &plan.output);
+    push_output_coords(&mut source, &plan.output);
+    let mut base = Vec::new();
+    for dimension in 0..input.sizes.len() {
+        if dimension != axis as usize {
+            base.push(format!("o{dimension} * {}u", input.strides[dimension]));
+        }
+    }
+    let base = if base.is_empty() {
+        "0u".to_string()
+    } else {
+        base.join(" + ")
+    };
+    let axis_size = input.sizes[axis as usize];
+    let axis_stride = input.strides[axis as usize];
+    source.push_str(&format!("    uint base = {base};\n"));
+    source.push_str(&format!("    uint axis = o{axis};\n"));
+    source.push_str(&format!(
+        "    float acc = {};\n",
+        if product { "1.0f" } else { "0.0f" }
+    ));
+    if reverse {
+        source.push_str(&format!(
+            "    for (uint j = axis; j < {axis_size}u; ++j) {{\n"
+        ));
+        if exclusive {
+            source.push_str("        if (j == axis) continue;\n");
+        }
+    } else {
+        source.push_str("    for (uint j = 0u; j <= axis; ++j) {\n");
+        if exclusive {
+            source.push_str("        if (j == axis) continue;\n");
+        }
+    }
+    source.push_str(&format!(
+        "        float v = {};\n",
+        msl_load_float(input, "in0", &format!("base + j * {axis_stride}u"))
+    ));
+    source.push_str(if product {
+        "        acc *= v;\n"
+    } else {
+        "        acc += v;\n"
+    });
+    source.push_str("    }\n");
+    source.push_str(&format!(
+        "    out[{}] = ({scalar})acc;\n",
+        output_index_expr(&plan.output)
+    ));
+    source.push_str("}\n");
+    Ok(source)
+}
+
+fn emit_reverse_msl(plan: &DmlOpPlan, axis: u32) -> DmlResult<String> {
+    let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
+    let input = &plan.inputs[0];
+    let lengths = &plan.inputs[1];
+    let mut source = msl_header(plan, scalar);
+    push_guard(&mut source, &plan.output);
+    push_output_coords(&mut source, &plan.output);
+    let mut sequence = Vec::new();
+    for dimension in 0..axis as usize {
+        sequence.push(format!("o{dimension} * {}u", lengths.strides[dimension]));
+    }
+    let sequence_index = if sequence.is_empty() {
+        "0u".to_string()
+    } else {
+        sequence.join(" + ")
+    };
+    source.push_str(&format!(
+        "    uint length = uint({});\n",
+        msl_load_native(lengths, "in1", &sequence_index)
+    ));
+    source.push_str(&format!("    uint reversed = o{axis};\n"));
+    source.push_str(&format!(
+        "    if (o{axis} < length) reversed = length - 1u - o{axis};\n"
+    ));
+    let mut coords = Vec::new();
+    for dimension in 0..input.sizes.len() {
+        if dimension == axis as usize {
+            coords.push("reversed".to_string());
+        } else {
+            coords.push(format!("o{dimension}"));
+        }
+    }
+    source.push_str(&format!(
+        "    out[{}] = ({scalar})({});\n",
+        output_index_expr(&plan.output),
+        msl_load_float(input, "in0", &linear_index(input, &coords))
+    ));
+    source.push_str("}\n");
+    Ok(source)
+}
+
+fn emit_diagonal_matrix_msl(plan: &DmlOpPlan, offset: i32, value: f32) -> DmlResult<String> {
+    let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
+    let mut source = msl_header(plan, scalar);
+    push_guard(&mut source, &plan.output);
+    push_output_coords(&mut source, &plan.output);
+    source.push_str(&format!(
+        "    bool selected = (int(o1) - int(o0)) == {offset};\n"
+    ));
+    source.push_str(&format!(
+        "    out[{}] = ({scalar})(selected ? {} : 0.0f);\n",
+        output_index_expr(&plan.output),
+        msl_float(value)
+    ));
+    source.push_str("}\n");
+    Ok(source)
+}
+
+fn emit_cast_msl(plan: &DmlOpPlan) -> DmlResult<String> {
+    let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
+    let input = &plan.inputs[0];
+    let mut source = msl_header(plan, scalar);
+    push_guard(&mut source, &plan.output);
+    let mut input_coords = Vec::new();
+    for (index, size) in input.sizes.iter().enumerate() {
+        let divisor: u64 = input.sizes[index + 1..]
+            .iter()
+            .map(|value| *value as u64)
+            .product();
+        source.push_str(&format!(
+            "    uint i{index} = (gid / {divisor}u) % {size}u;\n"
+        ));
+        input_coords.push(format!("i{index}"));
+    }
+    source.push_str(&format!(
+        "    out[{}] = ({scalar})({});\n",
+        output_index_expr(&plan.output),
+        msl_load_float(input, "in0", &linear_index(input, &input_coords))
+    ));
+    source.push_str("}\n");
+    Ok(source)
 }
 
 fn emit_elementwise_msl(plan: &DmlOpPlan, op: DmlBinaryOp) -> DmlResult<String> {
@@ -4433,7 +5461,11 @@ fn emit_gemm_msl(
     source.push_str(&format!(
         "        uint b_idx = {b_batch_expr} + {b_terms};\n"
     ));
-    source.push_str("        acc += float(in0[a_idx]) * float(in1[b_idx]);\n");
+    source.push_str(&format!(
+        "        acc += {} * {};\n",
+        msl_load_float(&plan.inputs[0], "in0", "a_idx"),
+        msl_load_float(&plan.inputs[1], "in1", "b_idx")
+    ));
     source.push_str("    }\n");
     source.push_str(&format!("    float value = {} * acc;\n", msl_float(alpha)));
     if plan.inputs.len() == 3 {
@@ -4523,7 +5555,9 @@ fn emit_convolution_msl(
         filter.strides[0], filter.strides[1], filter.strides[2], filter.strides[3]
     );
     source.push_str(&format!(
-        "                acc += float(in0[{input_index}]) * float(in1[{filter_index}]);\n"
+        "                acc += {} * {};\n",
+        msl_load_float(input, "in0", &input_index),
+        msl_load_float(filter, "in1", &filter_index)
     ));
     source.push_str("            }\n");
     source.push_str("        }\n");
@@ -7397,6 +8431,24 @@ pub fn emit_msl(plan: &DmlOpPlan) -> DmlResult<String> {
         DmlOpKind::Dequantize { quantization_type } => {
             emit_generic_quantize_msl(plan, *quantization_type, true)
         }
+        DmlOpKind::Unary { op } => emit_unary_msl(plan, *op),
+        DmlOpKind::Fill {
+            value,
+            step,
+            sequence,
+        } => emit_fill_msl(plan, *value, *step, *sequence),
+        DmlOpKind::OneHot { axis } => emit_one_hot_msl(plan, *axis),
+        DmlOpKind::Cumulative {
+            product,
+            axis,
+            reverse,
+            exclusive,
+        } => emit_cumulative_msl(plan, *product, *axis, *reverse, *exclusive),
+        DmlOpKind::Reverse { axis } => emit_reverse_msl(plan, *axis),
+        DmlOpKind::DiagonalMatrix { offset, value } => {
+            emit_diagonal_matrix_msl(plan, *offset, *value)
+        }
+        DmlOpKind::Cast => emit_cast_msl(plan),
     }?;
     if let Some(activation) = plan.fused_activation {
         let scalar = msl_scalar(plan.output.data_type, plan.operator_type())?;
@@ -7753,6 +8805,247 @@ fn execute_graph_cpu(
     Ok(())
 }
 
+/// Whether a node can participate in a cross-node elementwise fusion.
+///
+/// Fusion is deliberately limited to FLOAT32 single-output element-wise nodes
+/// with identical output shapes. That guarantees the fused kernel performs the
+/// exact same float arithmetic as the wired per-node kernels (no intermediate
+/// half rounding), while the wired path remains the fallback for everything
+/// else.
+fn fusion_candidate(node: &DmlOpPlan, sizes: &[u32]) -> bool {
+    if node.output.data_type != DML_TENSOR_DATA_TYPE_FLOAT32
+        || !node.extra_outputs.is_empty()
+        || node.output.sizes != sizes
+        || node.fused_activation.is_some()
+    {
+        return false;
+    }
+    if node.inputs.iter().any(|desc| {
+        desc.data_type != DML_TENSOR_DATA_TYPE_FLOAT32
+            || desc.sizes.len() != sizes.len()
+            || desc
+                .sizes
+                .iter()
+                .zip(sizes)
+                .any(|(input, output)| *input != *output && *input != 1)
+    }) {
+        return false;
+    }
+    matches!(
+        node.kind,
+        DmlOpKind::Activation { .. }
+            | DmlOpKind::Unary { .. }
+            | DmlOpKind::Binary { .. }
+            | DmlOpKind::Add1
+    )
+}
+
+/// Build the graph input slot list and emit one MSL kernel for a fused chain.
+fn emit_fused_chain_msl(
+    name: &str,
+    graph: &super::DmlGraphPlan,
+    wiring: &[Vec<Option<GraphSource>>],
+    nodes: &[usize],
+) -> DmlResult<(String, Vec<usize>)> {
+    let root = &graph.nodes[nodes[0]];
+    let sizes = root.output.sizes.clone();
+    let mut used_inputs: Vec<usize> = Vec::new();
+    let mut source = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+    source.push_str(&format!("kernel void {name}("));
+    // The input list is discovered while emitting, so emit the body first into
+    // a temporary buffer and prepend the signature afterwards.
+    let mut body = String::new();
+    let count = root.output.element_count();
+    body.push_str(&format!("    if (gid >= {count}u) return;\n"));
+    for (index, size) in sizes.iter().enumerate() {
+        let divisor: u64 = sizes[index + 1..]
+            .iter()
+            .map(|value| *value as u64)
+            .product();
+        body.push_str(&format!(
+            "    uint o{index} = (gid / {divisor}u) % {size}u;\n"
+        ));
+    }
+    let register_input = |graph_input: usize, used_inputs: &mut Vec<usize>| -> usize {
+        if let Some(slot) = used_inputs.iter().position(|value| *value == graph_input) {
+            slot
+        } else {
+            used_inputs.push(graph_input);
+            used_inputs.len() - 1
+        }
+    };
+    let mut value_name: Option<String> = None;
+    for (step, node_index) in nodes.iter().enumerate() {
+        let node = &graph.nodes[*node_index];
+        let previous = value_name.clone();
+        let load = |input_index: usize, used_inputs: &mut Vec<usize>| -> DmlResult<String> {
+            match wiring[*node_index][input_index].expect("graph wiring validated") {
+                GraphSource::Input(graph_input) => {
+                    let slot = register_input(graph_input, used_inputs);
+                    Ok(msl_load_float(
+                        &node.inputs[input_index],
+                        &format!("in{slot}"),
+                        &broadcast_index(&node.inputs[input_index]),
+                    ))
+                }
+                GraphSource::Node(node_id, _) => {
+                    if step > 0 && node_id as usize == nodes[step - 1] {
+                        Ok(previous.clone().expect("previous value"))
+                    } else {
+                        Err(DmlError::invalid(format!(
+                            "fused graph node {node_index} has a non-fusable input"
+                        )))
+                    }
+                }
+            }
+        };
+        let value = match &node.kind {
+            DmlOpKind::Activation { activation, alpha } => {
+                let input = load(0, &mut used_inputs)?;
+                format!(
+                    "    float v{step} = {};\n",
+                    activation_msl(*activation, *alpha, &format!("({input})"))
+                )
+            }
+            DmlOpKind::Unary { op } => {
+                let input = load(0, &mut used_inputs)?;
+                format!(
+                    "    float v{step} = {};\n",
+                    unary_msl(*op, &format!("({input})"))
+                )
+            }
+            DmlOpKind::Binary { op } => {
+                let left = load(0, &mut used_inputs)?;
+                let right = load(1, &mut used_inputs)?;
+                format!(
+                    "    float v{step};\n    {{\n        float fa{step} = {left};\n        float fb{step} = {right};\n        float a = fa{step};\n        float b = fb{step};\n        v{step} = ({});\n    }}\n",
+                    emit_scalar_binary(*op)
+                )
+            }
+            DmlOpKind::Add1 => {
+                let left = load(0, &mut used_inputs)?;
+                let right = load(1, &mut used_inputs)?;
+                format!(
+                    "    float v{step};\n    {{\n        float fa{step} = {left};\n        float fb{step} = {right};\n        float a = fa{step};\n        float b = fb{step};\n        v{step} = (a + b);\n    }}\n"
+                )
+            }
+            _ => {
+                return Err(DmlError::invalid(
+                    "node is not a fusable element-wise operator",
+                ));
+            }
+        };
+        body.push_str(&value);
+        value_name = Some(format!("v{step}"));
+    }
+    for (slot, _) in used_inputs.iter().enumerate() {
+        source.push_str(&format!(
+            "device const float* in{slot} [[buffer({slot})]], "
+        ));
+    }
+    source.push_str(&format!(
+        "device float* out [[buffer({})]], uint gid [[thread_position_in_grid]]) {{\n",
+        used_inputs.len()
+    ));
+    source.push_str(&body);
+    let last = value_name.expect("fused chain non-empty");
+    source.push_str(&format!(
+        "    out[{}] = {last};\n",
+        output_index_expr(&root.output)
+    ));
+    source.push_str("}\n");
+    Ok((source, used_inputs))
+}
+
+/// Select maximal single-consumer element-wise chains.
+fn find_fusion_chains(
+    graph: &super::DmlGraphPlan,
+    wiring: &[Vec<Option<GraphSource>>],
+    output_sources: &[Option<GraphSource>],
+) -> Vec<Vec<usize>> {
+    let mut consumers: std::collections::BTreeMap<(usize, usize), Vec<(usize, usize)>> =
+        std::collections::BTreeMap::new();
+    let mut graph_outputs = std::collections::BTreeSet::new();
+    for (node_index, inputs) in wiring.iter().enumerate() {
+        for (input_index, source) in inputs.iter().enumerate() {
+            if let Some(GraphSource::Node(node, output)) = source {
+                consumers
+                    .entry((*node as usize, *output))
+                    .or_default()
+                    .push((node_index, input_index));
+            }
+        }
+    }
+    for source in output_sources.iter().flatten() {
+        if let GraphSource::Node(node, output) = source {
+            graph_outputs.insert((*node as usize, *output));
+        }
+    }
+    let mut fused = std::collections::BTreeSet::new();
+    let mut chains = Vec::new();
+    for node_index in &graph.execution_order {
+        let index = *node_index as usize;
+        if fused.contains(&index) {
+            continue;
+        }
+        let sizes = graph.nodes[index].output.sizes.clone();
+        if !fusion_candidate(&graph.nodes[index], &sizes)
+            || wiring[index]
+                .iter()
+                .any(|source| !matches!(source, Some(GraphSource::Input(_))))
+        {
+            continue;
+        }
+        let mut chain = vec![index];
+        loop {
+            let last = *chain.last().expect("chain");
+            if graph_outputs.contains(&(last, 0)) {
+                break;
+            }
+            let Some(next) = consumers.get(&(last, 0)) else {
+                break;
+            };
+            if next.len() != 1 {
+                break;
+            }
+            let (next_node, _next_input) = next[0];
+            if fused.contains(&next_node)
+                || chain.contains(&next_node)
+                || !fusion_candidate(&graph.nodes[next_node], &sizes)
+            {
+                break;
+            }
+            // Every other input must be a graph input; the chain link must be
+            // wired into the candidate node.
+            let mut saw_link = false;
+            let mut ok = true;
+            for source in &wiring[next_node] {
+                match source.expect("graph wiring validated") {
+                    GraphSource::Input(_) => {}
+                    GraphSource::Node(node, output) => {
+                        if node as usize == last && output == 0 {
+                            saw_link = true;
+                        } else {
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            if !ok || !saw_link {
+                break;
+            }
+            chain.push(next_node);
+        }
+        if chain.len() >= 2 {
+            for node in &chain {
+                fused.insert(*node);
+            }
+            chains.push(chain);
+        }
+    }
+    chains
+}
+
 fn execute_graph_metal(
     graph: &super::DmlGraphPlan,
     wiring: &[Vec<Option<GraphSource>>],
@@ -7763,7 +9056,21 @@ fn execute_graph_metal(
     let device = MetalDevice::system_default().map_err(|error| {
         DmlError::unsupported_feature(format!("no Metal device available: {error}"))
     })?;
+    let chains = find_fusion_chains(graph, wiring, output_sources);
+    let mut chain_of = vec![None; graph.nodes.len()];
+    let mut fused_sources = Vec::with_capacity(chains.len());
+    for (chain_index, chain) in chains.iter().enumerate() {
+        for node in chain {
+            chain_of[*node] = Some(chain_index);
+        }
+        let (source, used_inputs) =
+            emit_fused_chain_msl(&format!("dml_fused{chain_index}"), graph, wiring, chain)?;
+        fused_sources.push((source, used_inputs));
+    }
     let mut combined = String::new();
+    for (source, _) in &fused_sources {
+        combined.push_str(source);
+    }
     for (index, node) in graph.nodes.iter().enumerate() {
         let source = emit_msl(node)?;
         combined.push_str(&source.replace(
@@ -7826,6 +9133,39 @@ fn execute_graph_metal(
         let encoder = command_buffer.new_compute_command_encoder();
         for node_index in &graph.execution_order {
             let index = *node_index as usize;
+            if let Some(chain_index) = chain_of[index] {
+                let chain = &chains[chain_index];
+                if chain.last() == Some(&index) {
+                    let (_, used_inputs) = &fused_sources[chain_index];
+                    let function = library
+                        .get_function(&format!("dml_fused{chain_index}"), None)
+                        .map_err(|error| {
+                            DmlError::new(
+                                E_FAIL,
+                                format!("dml_fused{chain_index} not found: {error}"),
+                            )
+                        })?;
+                    let pipeline = device
+                        .metal_device()
+                        .new_compute_pipeline_state_with_function(&function)
+                        .map_err(|error| {
+                            DmlError::new(E_FAIL, format!("pipeline creation failed: {error}"))
+                        })?;
+                    encoder.set_compute_pipeline_state(&pipeline);
+                    for (slot, graph_input) in used_inputs.iter().enumerate() {
+                        encoder.set_buffer(slot as u64, Some(&input_buffers[*graph_input]), 0);
+                    }
+                    encoder.set_buffer(used_inputs.len() as u64, Some(&node_buffers[index][0]), 0);
+                    let count = graph.nodes[index].output.element_count();
+                    let max_threads = pipeline.max_total_threads_per_threadgroup();
+                    let threadgroup = max_threads.clamp(1, 256);
+                    encoder.dispatch_threads(
+                        metal::MTLSize::new(count.max(1), 1, 1),
+                        metal::MTLSize::new(threadgroup, 1, 1),
+                    );
+                }
+                continue;
+            }
             let node = &graph.nodes[index];
             let function = library
                 .get_function(&format!("dml_node{index}"), None)
@@ -8160,6 +9500,26 @@ fn store_quantized(bytes: &mut [u8], index: u64, data_type: u32, value: f32) {
     }
 }
 
+fn store_cast(bytes: &mut [u8], index: u64, data_type: u32, value: f32) {
+    match data_type {
+        DML_TENSOR_DATA_TYPE_INT32 => {
+            let index = index as usize;
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&(value as i32).to_le_bytes());
+        }
+        DML_TENSOR_DATA_TYPE_UINT32 => {
+            let index = index as usize;
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&(value as u32).to_le_bytes());
+        }
+        DML_TENSOR_DATA_TYPE_INT8 => {
+            bytes[index as usize] = value as i8 as u8;
+        }
+        DML_TENSOR_DATA_TYPE_UINT8 => {
+            bytes[index as usize] = value as u8;
+        }
+        _ => store_scalar(bytes, index, data_type, value),
+    }
+}
+
 fn store_scalar(bytes: &mut [u8], index: u64, data_type: u32, value: f32) {
     let index = index as usize;
     match data_type {
@@ -8282,14 +9642,19 @@ fn execute_cpu(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) ->
                         b_coords.push(kk);
                         b_coords.push(n_index);
                     }
-                    acc += load_scalar(inputs[0], index_of(&a_coords, &a.strides), dtype) as f64
-                        * load_scalar(inputs[1], index_of(&b_coords, &b.strides), dtype) as f64;
+                    acc += load_scalar(inputs[0], index_of(&a_coords, &a.strides), a.data_type)
+                        as f64
+                        * load_scalar(inputs[1], index_of(&b_coords, &b.strides), b.data_type)
+                            as f64;
                 }
                 let mut value = *alpha as f64 * acc;
                 if plan.inputs.len() == 3 {
                     value += *beta as f64
-                        * load_scalar(inputs[2], index_of(&coords, &plan.inputs[2].strides), dtype)
-                            as f64;
+                        * load_scalar(
+                            inputs[2],
+                            index_of(&coords, &plan.inputs[2].strides),
+                            plan.inputs[2].data_type,
+                        ) as f64;
                 }
                 store_scalar(output, output_index(&plan.output, gid), dtype, value as f32);
             }
@@ -8343,18 +9708,18 @@ fn execute_cpu(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) ->
                             acc += load_scalar(
                                 inputs[0],
                                 index_of(&input_coords, &input.strides),
-                                dtype,
+                                input.data_type,
                             ) as f64
                                 * load_scalar(
                                     inputs[1],
                                     index_of(&filter_coords, &filter.strides),
-                                    dtype,
+                                    filter.data_type,
                                 ) as f64;
                         }
                     }
                 }
                 if plan.inputs.len() == 3 {
-                    acc += load_scalar(inputs[2], out_channel, dtype) as f64;
+                    acc += load_scalar(inputs[2], out_channel, plan.inputs[2].data_type) as f64;
                 }
                 store_scalar(output, output_index(&plan.output, gid), dtype, acc as f32);
             }
@@ -8523,18 +9888,14 @@ fn execute_cpu(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) ->
                     }
                     let _ = coord;
                 }
-                let left = load_scalar(inputs[0], index_of(&a_coords, &a.strides), dtype);
-                let right = load_scalar(inputs[1], index_of(&b_coords, &b.strides), dtype);
-                let value = match op {
-                    DmlBinaryOp::Add => left + right,
-                    DmlBinaryOp::Subtract => left - right,
-                    DmlBinaryOp::Multiply => left * right,
-                    DmlBinaryOp::Divide => left / right,
-                    DmlBinaryOp::Min => left.min(right),
-                    DmlBinaryOp::Max => left.max(right),
-                    DmlBinaryOp::Pow => left.powf(right),
-                };
-                store_scalar(output, output_index(&plan.output, gid), dtype, value);
+                let left = load_scalar(inputs[0], index_of(&a_coords, &a.strides), a.data_type);
+                let right = load_scalar(inputs[1], index_of(&b_coords, &b.strides), b.data_type);
+                store_scalar(
+                    output,
+                    output_index(&plan.output, gid),
+                    dtype,
+                    apply_binary(*op, left, right),
+                );
             }
         }
         DmlOpKind::Reduce { reduce, axes } => {
@@ -8986,6 +10347,143 @@ fn execute_cpu(plan: &DmlOpPlan, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) ->
         DmlOpKind::Dequantize { quantization_type } => {
             execute_generic_quantize_cpu(plan, inputs, output, *quantization_type, true)?
         }
+        DmlOpKind::Unary { op } => {
+            let input = &plan.inputs[0];
+            for gid in 0..count {
+                let coords = coords_of(gid, &plan.output.sizes);
+                let mut input_coords = coords.clone();
+                for (dimension, coord) in coords.iter().enumerate() {
+                    if input.sizes[dimension] == 1 {
+                        input_coords[dimension] = 0;
+                    }
+                    let _ = coord;
+                }
+                let value = load_scalar(inputs[0], index_of(&input_coords, &input.strides), dtype);
+                store_scalar(
+                    output,
+                    output_index(&plan.output, gid),
+                    dtype,
+                    unary_cpu(*op, value),
+                );
+            }
+        }
+        DmlOpKind::Fill {
+            value,
+            step,
+            sequence,
+        } => {
+            for gid in 0..count {
+                let element = if *sequence {
+                    *value + *step * gid as f32
+                } else {
+                    *value
+                };
+                store_scalar(output, output_index(&plan.output, gid), dtype, element);
+            }
+        }
+        DmlOpKind::OneHot { axis } => {
+            let indices = &plan.inputs[0];
+            let on_value = load_scalar(inputs[1], 0, plan.inputs[1].data_type);
+            let off_value = load_scalar(inputs[1], 1, plan.inputs[1].data_type);
+            let depth = plan.output.sizes[*axis as usize] as i64;
+            for gid in 0..count {
+                let coords = coords_of(gid, &plan.output.sizes);
+                let mut index_coords = Vec::with_capacity(coords.len() - 1);
+                for (dimension, coord) in coords.iter().enumerate() {
+                    if dimension != *axis as usize {
+                        index_coords.push(*coord);
+                    }
+                }
+                let index = load_scalar(
+                    inputs[0],
+                    index_of(&index_coords, &indices.strides),
+                    indices.data_type,
+                ) as i64;
+                let on = index >= 0 && index < depth && index == coords[*axis as usize] as i64;
+                store_scalar(
+                    output,
+                    output_index(&plan.output, gid),
+                    dtype,
+                    if on { on_value } else { off_value },
+                );
+            }
+        }
+        DmlOpKind::Cumulative {
+            product,
+            axis,
+            reverse,
+            exclusive,
+        } => {
+            let input = &plan.inputs[0];
+            let axis = *axis as usize;
+            for gid in 0..count {
+                let mut coords = coords_of(gid, &plan.output.sizes);
+                let position = coords[axis];
+                let size = input.sizes[axis];
+                let (start, end) = if *reverse {
+                    (position, size as u64)
+                } else {
+                    (0, position + 1)
+                };
+                let mut acc = if *product { 1.0f32 } else { 0.0f32 };
+                for j in start..end {
+                    if *exclusive && j == position {
+                        continue;
+                    }
+                    coords[axis] = j;
+                    let value = load_scalar(inputs[0], index_of(&coords, &input.strides), dtype);
+                    if *product {
+                        acc *= value;
+                    } else {
+                        acc += value;
+                    }
+                }
+                store_scalar(output, output_index(&plan.output, gid), dtype, acc);
+            }
+        }
+        DmlOpKind::Reverse { axis } => {
+            let input = &plan.inputs[0];
+            let lengths = &plan.inputs[1];
+            let axis = *axis as usize;
+            for gid in 0..count {
+                let mut coords = coords_of(gid, &plan.output.sizes);
+                let sequence_coords = &coords[..axis];
+                let length = load_scalar(
+                    inputs[1],
+                    index_of(sequence_coords, &lengths.strides),
+                    lengths.data_type,
+                ) as u64;
+                if coords[axis] < length {
+                    coords[axis] = length - 1 - coords[axis];
+                }
+                let value = load_scalar(inputs[0], index_of(&coords, &input.strides), dtype);
+                store_scalar(output, output_index(&plan.output, gid), dtype, value);
+            }
+        }
+        DmlOpKind::DiagonalMatrix { offset, value } => {
+            for gid in 0..count {
+                let coords = coords_of(gid, &plan.output.sizes);
+                let selected = coords[1] as i64 - coords[0] as i64 == *offset as i64;
+                store_scalar(
+                    output,
+                    output_index(&plan.output, gid),
+                    dtype,
+                    if selected { *value } else { 0.0 },
+                );
+            }
+        }
+        DmlOpKind::Cast => {
+            let input = &plan.inputs[0];
+            for gid in 0..count {
+                let coords = coords_of(gid, &input.sizes);
+                let value = load_scalar(
+                    inputs[0],
+                    index_of(&coords, &input.strides),
+                    input.data_type,
+                );
+                store_cast(output, output_index(&plan.output, gid), dtype, value);
+            }
+        }
     }
     if let Some(activation) = plan.fused_activation {
         for gid in 0..count {
@@ -9022,16 +10520,12 @@ fn execute_binary_cpu(
         }
         let left = load_scalar(inputs[0], index_of(&a_coords, &a.strides), a.data_type);
         let right = load_scalar(inputs[1], index_of(&b_coords, &b.strides), b.data_type);
-        let value = match op {
-            DmlBinaryOp::Add => left + right,
-            DmlBinaryOp::Subtract => left - right,
-            DmlBinaryOp::Multiply => left * right,
-            DmlBinaryOp::Divide => left / right,
-            DmlBinaryOp::Min => left.min(right),
-            DmlBinaryOp::Max => left.max(right),
-            DmlBinaryOp::Pow => left.powf(right),
-        };
-        store_scalar(output, output_index(&plan.output, gid), dtype, value);
+        store_scalar(
+            output,
+            output_index(&plan.output, gid),
+            dtype,
+            apply_binary(op, left, right),
+        );
     }
     Ok(())
 }
@@ -11307,7 +12801,53 @@ fn execute_generic_quantize_cpu(
 pub fn is_extended_operator(ty: u32) -> bool {
     matches!(
         ty,
-        DML_OPERATOR_ELEMENT_WISE_QUANTIZE_LINEAR
+        DML_OPERATOR_ELEMENT_WISE_ACOS
+            | DML_OPERATOR_ELEMENT_WISE_ASIN
+            | DML_OPERATOR_ELEMENT_WISE_ATAN
+            | DML_OPERATOR_ELEMENT_WISE_CLIP
+            | DML_OPERATOR_ELEMENT_WISE_CONSTANT_POW
+            | DML_OPERATOR_ELEMENT_WISE_RECIP
+            | DML_OPERATOR_ELEMENT_WISE_THRESHOLD
+            | DML_OPERATOR_ELEMENT_WISE_SIGN
+            | DML_OPERATOR_ELEMENT_WISE_IS_NAN
+            | DML_OPERATOR_ELEMENT_WISE_ERF
+            | DML_OPERATOR_ELEMENT_WISE_SINH
+            | DML_OPERATOR_ELEMENT_WISE_COSH
+            | DML_OPERATOR_ELEMENT_WISE_TANH
+            | DML_OPERATOR_ELEMENT_WISE_ASINH
+            | DML_OPERATOR_ELEMENT_WISE_ACOSH
+            | DML_OPERATOR_ELEMENT_WISE_ATANH
+            | DML_OPERATOR_ELEMENT_WISE_LOGICAL_NOT
+            | DML_OPERATOR_ELEMENT_WISE_ROUND
+            | DML_OPERATOR_ELEMENT_WISE_IS_INFINITY
+            | DML_OPERATOR_ELEMENT_WISE_NEGATE
+            | DML_OPERATOR_ELEMENT_WISE_MODULUS_TRUNCATE
+            | DML_OPERATOR_ELEMENT_WISE_MODULUS_FLOOR
+            | DML_OPERATOR_ELEMENT_WISE_DIFFERENCE_SQUARE
+            | DML_OPERATOR_ELEMENT_WISE_ATAN_YX
+            | DML_OPERATOR_ELEMENT_WISE_MEAN
+            | DML_OPERATOR_ELEMENT_WISE_LOGICAL_AND
+            | DML_OPERATOR_ELEMENT_WISE_LOGICAL_OR
+            | DML_OPERATOR_ELEMENT_WISE_LOGICAL_XOR
+            | DML_OPERATOR_ELEMENT_WISE_LOGICAL_EQUALS
+            | DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN
+            | DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN
+            | DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN_OR_EQUAL
+            | DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN_OR_EQUAL
+            | DML_OPERATOR_ELEMENT_WISE_BIT_AND
+            | DML_OPERATOR_ELEMENT_WISE_BIT_OR
+            | DML_OPERATOR_ELEMENT_WISE_BIT_XOR
+            | DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_LEFT
+            | DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_RIGHT
+            | DML_OPERATOR_CAST
+            | DML_OPERATOR_FILL_VALUE_CONSTANT
+            | DML_OPERATOR_FILL_VALUE_SEQUENCE
+            | DML_OPERATOR_ONE_HOT
+            | DML_OPERATOR_CUMULATIVE_SUMMATION
+            | DML_OPERATOR_CUMULATIVE_PRODUCT
+            | DML_OPERATOR_REVERSE_SUBSEQUENCES
+            | DML_OPERATOR_DIAGONAL_MATRIX
+            | DML_OPERATOR_ELEMENT_WISE_QUANTIZE_LINEAR
             | DML_OPERATOR_ELEMENT_WISE_DEQUANTIZE_LINEAR
             | DML_OPERATOR_ACTIVATION_ELU
             | DML_OPERATOR_ACTIVATION_HARD_SIGMOID
@@ -11373,7 +12913,6 @@ pub fn is_extended_operator(ty: u32) -> bool {
             | DML_OPERATOR_MEAN_VARIANCE_NORMALIZATION2
             | DML_OPERATOR_QUANTIZE
             | DML_OPERATOR_DEQUANTIZE
-            | DML_OPERATOR_RESAMPLE3
     )
 }
 
@@ -13866,6 +15405,385 @@ mod tests {
         assert_eq!(
             invalid_antialiased.validate().unwrap_err().message,
             "antialiased resample requires linear interpolation"
+        );
+    }
+    fn packed_int4(values: &[i8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; values.len().div_ceil(2)];
+        for (index, value) in values.iter().enumerate() {
+            let nibble = (*value as i32 & 0x0f) as u8;
+            bytes[index / 2] |= nibble << ((index % 2) * 4);
+        }
+        bytes
+    }
+
+    #[test]
+    fn dml_packed_int4_weight_layout_edge_values_are_exact() {
+        let a = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 2], None);
+        let b = tensor(DML_TENSOR_DATA_TYPE_INT4, &[2, 2], None);
+        let out = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 2], None);
+        let gemm = plan(
+            DmlOpKind::Gemm {
+                trans_a: false,
+                trans_b: false,
+                alpha: 1.0,
+                beta: 0.0,
+            },
+            vec![a.clone(), b.clone()],
+            out.clone(),
+        );
+        let a_values = f32_bytes(&[1.0, 2.0]);
+        let b_values = packed_int4(&[1, -2, -3, 4]);
+        let mut cpu = vec![0u8; out.total_size_in_bytes as usize];
+        execute_plan(
+            &gemm,
+            DmlExecutionDevice::Cpu,
+            &[&a_values, &b_values],
+            &mut cpu,
+        )
+        .expect("cpu int4 gemm");
+        assert_eq!(read_f32(&cpu), vec![-5.0, 6.0]);
+        if metal_available() {
+            let mut accelerated = vec![0u8; out.total_size_in_bytes as usize];
+            execute_plan(
+                &gemm,
+                DmlExecutionDevice::Metal,
+                &[&a_values, &b_values],
+                &mut accelerated,
+            )
+            .expect("metal int4 gemm");
+            assert_eq!(read_f32(&accelerated), vec![-5.0, 6.0]);
+        }
+
+        let input = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 1, 3], None);
+        let filter = tensor(DML_TENSOR_DATA_TYPE_UINT4, &[1, 1, 1, 3], None);
+        let conv_out = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 1, 1], None);
+        let convolution = plan(
+            DmlOpKind::Convolution {
+                mode: DML_CONVOLUTION_MODE_CROSS_CORRELATION,
+                strides: vec![1, 1],
+                dilations: vec![1, 1],
+                start_padding: vec![0, 0],
+                end_padding: vec![0, 0],
+                output_padding: vec![0, 0],
+                group_count: 1,
+            },
+            vec![input.clone(), filter.clone()],
+            conv_out.clone(),
+        );
+        let input_values = f32_bytes(&[1.0, 2.0, 3.0]);
+        let filter_values = packed_int4(&[1, 2, 15, 0])[..2].to_vec();
+        let mut cpu = vec![0u8; conv_out.total_size_in_bytes as usize];
+        execute_plan(
+            &convolution,
+            DmlExecutionDevice::Cpu,
+            &[&input_values, &filter_values],
+            &mut cpu,
+        )
+        .expect("cpu uint4 convolution");
+        assert_eq!(read_f32(&cpu), vec![50.0]);
+        if metal_available() {
+            let mut accelerated = vec![0u8; conv_out.total_size_in_bytes as usize];
+            execute_plan(
+                &convolution,
+                DmlExecutionDevice::Metal,
+                &[&input_values, &filter_values],
+                &mut accelerated,
+            )
+            .expect("metal uint4 convolution");
+            assert_eq!(read_f32(&accelerated), vec![50.0]);
+        }
+    }
+
+    #[test]
+    fn dml_packed_int4_malformed_weight_size_is_rejected_exactly() {
+        let mut filter = tensor(DML_TENSOR_DATA_TYPE_INT4, &[1, 1, 1, 3], None);
+        filter.total_size_in_bytes = 1;
+        let convolution = plan(
+            DmlOpKind::Convolution {
+                mode: DML_CONVOLUTION_MODE_CROSS_CORRELATION,
+                strides: vec![1, 1],
+                dilations: vec![1, 1],
+                start_padding: vec![0, 0],
+                end_padding: vec![0, 0],
+                output_padding: vec![0, 0],
+                group_count: 1,
+            },
+            vec![
+                tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 1, 3], None),
+                filter,
+            ],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 1, 1], None),
+        );
+        assert_eq!(
+            convolution.validate().unwrap_err().message,
+            "tensor TotalTensorSizeInBytes 1 is smaller than the implied 2 bytes"
+        );
+    }
+
+    #[test]
+    fn dml_cross_node_fusion_edge_matches_wired_and_preserves_nan() {
+        let input = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2], None);
+        let add = plan(
+            DmlOpKind::Binary {
+                op: DmlBinaryOp::Add,
+            },
+            vec![input.clone(), input.clone()],
+            input.clone(),
+        );
+        let negate = plan(
+            DmlOpKind::Unary {
+                op: DmlUnaryOp::Negate,
+            },
+            vec![input.clone()],
+            input.clone(),
+        );
+        let graph = super::super::DmlGraphPlan {
+            input_count: 2,
+            output_count: 1,
+            nodes: vec![add.clone(), add, negate],
+            input_edges: vec![
+                super::super::DmlGraphInputEdge {
+                    graph_input: 0,
+                    to_node: 0,
+                    to_node_input: 0,
+                },
+                super::super::DmlGraphInputEdge {
+                    graph_input: 1,
+                    to_node: 0,
+                    to_node_input: 1,
+                },
+                super::super::DmlGraphInputEdge {
+                    graph_input: 0,
+                    to_node: 1,
+                    to_node_input: 1,
+                },
+            ],
+            output_edges: vec![super::super::DmlGraphOutputEdge {
+                from_node: 2,
+                from_node_output: 0,
+                graph_output: 0,
+            }],
+            intermediate_edges: vec![
+                super::super::DmlGraphIntermediateEdge {
+                    from_node: 0,
+                    from_node_output: 0,
+                    to_node: 1,
+                    to_node_input: 0,
+                },
+                super::super::DmlGraphIntermediateEdge {
+                    from_node: 1,
+                    from_node_output: 0,
+                    to_node: 2,
+                    to_node_input: 0,
+                },
+            ],
+            execution_order: vec![0, 1, 2],
+        };
+        let (wiring, output_sources, _) = graph_wiring(&graph).expect("graph wiring");
+        let chains = find_fusion_chains(&graph, &wiring, &output_sources);
+        assert_eq!(chains, vec![vec![0, 1, 2]]);
+        let first = f32_bytes(&[-1.0, 2.0]);
+        let second = f32_bytes(&[10.0, 20.0]);
+        let mut cpu = vec![0u8; 8];
+        execute_graph_plan(
+            &graph,
+            DmlExecutionDevice::Cpu,
+            &[&first, &second],
+            &mut [&mut cpu],
+        )
+        .expect("cpu graph");
+        assert_eq!(read_f32(&cpu), vec![-8.0, -24.0]);
+        if metal_available() {
+            let mut metal = vec![0u8; 8];
+            execute_graph_plan(
+                &graph,
+                DmlExecutionDevice::Metal,
+                &[&first, &second],
+                &mut [&mut metal],
+            )
+            .expect("fused metal graph");
+            assert_eq!(read_f32(&metal), vec![-8.0, -24.0]);
+        }
+
+        let nan_values = f32_bytes(&[1.0, f32::NAN]);
+        let zeros = f32_bytes(&[0.0, 0.0]);
+        let mut cpu_nan = vec![0u8; 8];
+        execute_graph_plan(
+            &graph,
+            DmlExecutionDevice::Cpu,
+            &[&nan_values, &zeros],
+            &mut [&mut cpu_nan],
+        )
+        .expect("cpu nan graph");
+        let cpu_nan = read_f32(&cpu_nan);
+        assert_eq!(cpu_nan[0], -2.0);
+        assert_eq!(cpu_nan[1].is_nan(), true);
+        if metal_available() {
+            let mut metal_nan = vec![0u8; 8];
+            execute_graph_plan(
+                &graph,
+                DmlExecutionDevice::Metal,
+                &[&nan_values, &zeros],
+                &mut [&mut metal_nan],
+            )
+            .expect("fused metal nan graph");
+            let metal_nan = read_f32(&metal_nan);
+            assert_eq!(metal_nan[0], -2.0);
+            assert_eq!(metal_nan[1].is_nan(), true);
+        }
+    }
+
+    #[test]
+    fn dml_new_operator_families_numeric_and_malformed_edges() {
+        let output = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 2], None);
+        let fill = plan(
+            DmlOpKind::Fill {
+                value: 1.0,
+                step: 2.0,
+                sequence: true,
+            },
+            Vec::new(),
+            output.clone(),
+        );
+        assert_eq!(run_cpu(&fill, &[]), vec![1.0, 3.0, 5.0, 7.0]);
+        let bad_fill = plan(
+            DmlOpKind::Fill {
+                value: 0.0,
+                step: f32::INFINITY,
+                sequence: true,
+            },
+            Vec::new(),
+            output.clone(),
+        );
+        assert_eq!(
+            bad_fill.validate().unwrap_err().message,
+            "fill sequence step must be finite"
+        );
+
+        let indices = tensor(DML_TENSOR_DATA_TYPE_UINT32, &[2], None);
+        let values = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2], None);
+        let one_hot_out = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 2], None);
+        let one_hot = plan(
+            DmlOpKind::OneHot { axis: 1 },
+            vec![indices.clone(), values.clone()],
+            one_hot_out.clone(),
+        );
+        let index_values: Vec<u8> = [0u32, 2]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let on_off = f32_bytes(&[5.0, -1.0]);
+        assert_eq!(
+            run_cpu(&one_hot, &[&index_values, &on_off]),
+            vec![5.0, -1.0, -1.0, -1.0]
+        );
+        let bad_one_hot = plan(
+            DmlOpKind::OneHot { axis: 2 },
+            vec![indices, values],
+            one_hot_out,
+        );
+        assert_eq!(
+            bad_one_hot.validate().unwrap_err().message,
+            "one-hot axis 2 is out of range for output rank 2"
+        );
+
+        let cumulative_out = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 2], None);
+        let cumulative = plan(
+            DmlOpKind::Cumulative {
+                product: false,
+                axis: 1,
+                reverse: true,
+                exclusive: true,
+            },
+            vec![cumulative_out.clone()],
+            cumulative_out.clone(),
+        );
+        assert_eq!(
+            run_cpu(&cumulative, &[&f32_bytes(&[1.0, 2.0, 3.0, 4.0])]),
+            vec![2.0, 0.0, 4.0, 0.0]
+        );
+        let bad_cumulative = plan(
+            DmlOpKind::Cumulative {
+                product: true,
+                axis: 2,
+                reverse: false,
+                exclusive: false,
+            },
+            vec![cumulative_out.clone()],
+            cumulative_out,
+        );
+        assert_eq!(
+            bad_cumulative.validate().unwrap_err().message,
+            "cumulative axis 2 is out of range for rank 2"
+        );
+
+        let sequence_values = tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 3], None);
+        let lengths = tensor(DML_TENSOR_DATA_TYPE_UINT32, &[1], None);
+        let reverse = plan(
+            DmlOpKind::Reverse { axis: 1 },
+            vec![sequence_values.clone(), lengths.clone()],
+            sequence_values.clone(),
+        );
+        assert_eq!(
+            run_cpu(
+                &reverse,
+                &[&f32_bytes(&[1.0, 2.0, 3.0]), &2u32.to_le_bytes()]
+            ),
+            vec![2.0, 1.0, 3.0]
+        );
+        let bad_reverse = plan(
+            DmlOpKind::Reverse { axis: 1 },
+            vec![
+                sequence_values,
+                tensor(DML_TENSOR_DATA_TYPE_UINT32, &[2], None),
+            ],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 3], None),
+        );
+        assert_eq!(
+            bad_reverse.validate().unwrap_err().message,
+            "reverse sequence lengths must contain 1 elements, got 2"
+        );
+
+        let diagonal = plan(
+            DmlOpKind::DiagonalMatrix {
+                offset: 1,
+                value: 3.0,
+            },
+            Vec::new(),
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 3], None),
+        );
+        assert_eq!(run_cpu(&diagonal, &[]), vec![0.0, 3.0, 0.0, 0.0, 0.0, 3.0]);
+        let bad_diagonal = plan(
+            DmlOpKind::DiagonalMatrix {
+                offset: 3,
+                value: 3.0,
+            },
+            Vec::new(),
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2, 3], None),
+        );
+        assert_eq!(
+            bad_diagonal.validate().unwrap_err().message,
+            "diagonal matrix offset 3 lies outside the 2x3 output"
+        );
+
+        let cast = plan(
+            DmlOpKind::Cast,
+            vec![tensor(DML_TENSOR_DATA_TYPE_INT32, &[2], None)],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2], None),
+        );
+        let int_values: Vec<u8> = [-7i32, 9]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert_eq!(run_cpu(&cast, &[&int_values]), vec![-7.0, 9.0]);
+        let bad_cast = plan(
+            DmlOpKind::Cast,
+            vec![tensor(DML_TENSOR_DATA_TYPE_INT32, &[2], None)],
+            tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[3], None),
+        );
+        assert_eq!(
+            bad_cast.validate().unwrap_err().message,
+            "cast input and output element counts must match"
         );
     }
 }

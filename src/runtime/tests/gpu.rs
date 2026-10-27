@@ -4252,7 +4252,10 @@ fn d3d12_dml_dispatch_error_paths_and_object_methods_are_pinned() {
             .dispatch_import(check_feature, &mut state, &mut memory)
             .expect("CheckFeatureSupport levels");
         assert_eq!(state.get(Register::Rax), 0);
-        assert_eq!(runtime_read_u32(&memory, feature_out), 0x1000);
+        assert_eq!(
+            runtime_read_u32(&memory, feature_out),
+            crate::d3d12::directml::DML_FEATURE_LEVEL_6_3
+        );
 
         // Compile and create the rest of the object graph.
         let iid_compiled = base + 0x8600;

@@ -4375,11 +4375,20 @@ impl PeHostRuntime {
         } else {
             Some((backing_start, backing_size))
         };
-        match self.d3d12_runtime.set_work_graph_program(
+        let table_start = memory.read_u64(desc_ptr + 64)?;
+        let table_size = memory.read_u64(desc_ptr + 72)?;
+        let table_stride = memory.read_u64(desc_ptr + 80)?;
+        let node_local_root_arguments_table = crate::d3d12::work_graphs::D3d12GpuRangeAndStride {
+            start: table_start,
+            size: table_size,
+            stride: table_stride,
+        };
+        match self.d3d12_runtime.set_work_graph_program_with_local_roots(
             command_list_id,
             identifier,
             flags,
             backing_memory,
+            Some(node_local_root_arguments_table),
         ) {
             Ok(()) => {
                 state.set(Register::Rax, 0);

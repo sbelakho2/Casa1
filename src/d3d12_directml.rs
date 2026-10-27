@@ -118,6 +118,243 @@ pub fn negotiate_feature_levels(levels: &[u32]) -> u32 {
         .unwrap_or(0)
 }
 
+/// The complete DirectML 6.3 operator-type registry (ids 1..=174).
+///
+/// This is the authoritative list from `DirectML.h` (Microsoft.AI.DirectML
+/// 1.15.4). Feature level 6.4 introduces 175..=177 (`RESAMPLE3`, `FOLD`,
+/// `UNFOLD`), which this bridge does not claim.
+pub const DML_OPERATOR_TYPES_6_3: &[(u32, &str)] = &[
+    (1, "ELEMENT_WISE_IDENTITY"),
+    (2, "ELEMENT_WISE_ABS"),
+    (3, "ELEMENT_WISE_ACOS"),
+    (4, "ELEMENT_WISE_ADD"),
+    (5, "ELEMENT_WISE_ASIN"),
+    (6, "ELEMENT_WISE_ATAN"),
+    (7, "ELEMENT_WISE_CEIL"),
+    (8, "ELEMENT_WISE_CLIP"),
+    (9, "ELEMENT_WISE_COS"),
+    (10, "ELEMENT_WISE_DIVIDE"),
+    (11, "ELEMENT_WISE_EXP"),
+    (12, "ELEMENT_WISE_FLOOR"),
+    (13, "ELEMENT_WISE_LOG"),
+    (14, "ELEMENT_WISE_LOGICAL_AND"),
+    (15, "ELEMENT_WISE_LOGICAL_EQUALS"),
+    (16, "ELEMENT_WISE_LOGICAL_GREATER_THAN"),
+    (17, "ELEMENT_WISE_LOGICAL_LESS_THAN"),
+    (18, "ELEMENT_WISE_LOGICAL_NOT"),
+    (19, "ELEMENT_WISE_LOGICAL_OR"),
+    (20, "ELEMENT_WISE_LOGICAL_XOR"),
+    (21, "ELEMENT_WISE_MAX"),
+    (22, "ELEMENT_WISE_MEAN"),
+    (23, "ELEMENT_WISE_MIN"),
+    (24, "ELEMENT_WISE_MULTIPLY"),
+    (25, "ELEMENT_WISE_POW"),
+    (26, "ELEMENT_WISE_CONSTANT_POW"),
+    (27, "ELEMENT_WISE_RECIP"),
+    (28, "ELEMENT_WISE_SIN"),
+    (29, "ELEMENT_WISE_SQRT"),
+    (30, "ELEMENT_WISE_SUBTRACT"),
+    (31, "ELEMENT_WISE_TAN"),
+    (32, "ELEMENT_WISE_THRESHOLD"),
+    (33, "ELEMENT_WISE_QUANTIZE_LINEAR"),
+    (34, "ELEMENT_WISE_DEQUANTIZE_LINEAR"),
+    (35, "ACTIVATION_ELU"),
+    (36, "ACTIVATION_HARDMAX"),
+    (37, "ACTIVATION_HARD_SIGMOID"),
+    (38, "ACTIVATION_IDENTITY"),
+    (39, "ACTIVATION_LEAKY_RELU"),
+    (40, "ACTIVATION_LINEAR"),
+    (41, "ACTIVATION_LOG_SOFTMAX"),
+    (42, "ACTIVATION_PARAMETERIZED_RELU"),
+    (43, "ACTIVATION_PARAMETRIC_SOFTPLUS"),
+    (44, "ACTIVATION_RELU"),
+    (45, "ACTIVATION_SCALED_ELU"),
+    (46, "ACTIVATION_SCALED_TANH"),
+    (47, "ACTIVATION_SIGMOID"),
+    (48, "ACTIVATION_SOFTMAX"),
+    (49, "ACTIVATION_SOFTPLUS"),
+    (50, "ACTIVATION_SOFTSIGN"),
+    (51, "ACTIVATION_TANH"),
+    (52, "ACTIVATION_THRESHOLDED_RELU"),
+    (53, "CONVOLUTION"),
+    (54, "GEMM"),
+    (55, "REDUCE"),
+    (56, "AVERAGE_POOLING"),
+    (57, "LP_POOLING"),
+    (58, "MAX_POOLING"),
+    (59, "ROI_POOLING"),
+    (60, "SLICE"),
+    (61, "CAST"),
+    (62, "SPLIT"),
+    (63, "JOIN"),
+    (64, "PADDING"),
+    (65, "VALUE_SCALE_2D"),
+    (66, "UPSAMPLE_2D"),
+    (67, "GATHER"),
+    (68, "SPACE_TO_DEPTH"),
+    (69, "DEPTH_TO_SPACE"),
+    (70, "TILE"),
+    (71, "TOP_K"),
+    (72, "BATCH_NORMALIZATION"),
+    (73, "MEAN_VARIANCE_NORMALIZATION"),
+    (74, "LOCAL_RESPONSE_NORMALIZATION"),
+    (75, "LP_NORMALIZATION"),
+    (76, "RNN"),
+    (77, "LSTM"),
+    (78, "GRU"),
+    (79, "ELEMENT_WISE_SIGN"),
+    (80, "ELEMENT_WISE_IS_NAN"),
+    (81, "ELEMENT_WISE_ERF"),
+    (82, "ELEMENT_WISE_SINH"),
+    (83, "ELEMENT_WISE_COSH"),
+    (84, "ELEMENT_WISE_TANH"),
+    (85, "ELEMENT_WISE_ASINH"),
+    (86, "ELEMENT_WISE_ACOSH"),
+    (87, "ELEMENT_WISE_ATANH"),
+    (88, "ELEMENT_WISE_IF"),
+    (89, "ELEMENT_WISE_ADD1"),
+    (90, "ACTIVATION_SHRINK"),
+    (91, "MAX_POOLING1"),
+    (92, "MAX_UNPOOLING"),
+    (93, "DIAGONAL_MATRIX"),
+    (94, "SCATTER_ELEMENTS"),
+    (95, "ONE_HOT"),
+    (96, "RESAMPLE"),
+    (97, "ELEMENT_WISE_BIT_SHIFT_LEFT"),
+    (98, "ELEMENT_WISE_BIT_SHIFT_RIGHT"),
+    (99, "ELEMENT_WISE_ROUND"),
+    (100, "ELEMENT_WISE_IS_INFINITY"),
+    (101, "ELEMENT_WISE_MODULUS_TRUNCATE"),
+    (102, "ELEMENT_WISE_MODULUS_FLOOR"),
+    (103, "FILL_VALUE_CONSTANT"),
+    (104, "FILL_VALUE_SEQUENCE"),
+    (105, "CUMULATIVE_SUMMATION"),
+    (106, "REVERSE_SUBSEQUENCES"),
+    (107, "GATHER_ELEMENTS"),
+    (108, "GATHER_ND"),
+    (109, "SCATTER_ND"),
+    (110, "MAX_POOLING2"),
+    (111, "SLICE1"),
+    (112, "TOP_K1"),
+    (113, "DEPTH_TO_SPACE1"),
+    (114, "SPACE_TO_DEPTH1"),
+    (115, "MEAN_VARIANCE_NORMALIZATION1"),
+    (116, "RESAMPLE1"),
+    (117, "MATRIX_MULTIPLY_INTEGER"),
+    (118, "QUANTIZED_LINEAR_MATRIX_MULTIPLY"),
+    (119, "CONVOLUTION_INTEGER"),
+    (120, "QUANTIZED_LINEAR_CONVOLUTION"),
+    (121, "ELEMENT_WISE_BIT_AND"),
+    (122, "ELEMENT_WISE_BIT_OR"),
+    (123, "ELEMENT_WISE_BIT_XOR"),
+    (124, "ELEMENT_WISE_BIT_NOT"),
+    (125, "ELEMENT_WISE_BIT_COUNT"),
+    (126, "ELEMENT_WISE_LOGICAL_GREATER_THAN_OR_EQUAL"),
+    (127, "ELEMENT_WISE_LOGICAL_LESS_THAN_OR_EQUAL"),
+    (128, "ACTIVATION_CELU"),
+    (129, "ACTIVATION_RELU_GRAD"),
+    (130, "AVERAGE_POOLING_GRAD"),
+    (131, "MAX_POOLING_GRAD"),
+    (132, "RANDOM_GENERATOR"),
+    (133, "NONZERO_COORDINATES"),
+    (134, "RESAMPLE_GRAD"),
+    (135, "SLICE_GRAD"),
+    (136, "ADAM_OPTIMIZER"),
+    (137, "ARGMIN"),
+    (138, "ARGMAX"),
+    (139, "ROI_ALIGN"),
+    (140, "GATHER_ND1"),
+    (141, "ELEMENT_WISE_ATAN_YX"),
+    (142, "ELEMENT_WISE_CLIP_GRAD"),
+    (143, "ELEMENT_WISE_DIFFERENCE_SQUARE"),
+    (144, "LOCAL_RESPONSE_NORMALIZATION_GRAD"),
+    (145, "CUMULATIVE_PRODUCT"),
+    (146, "BATCH_NORMALIZATION_GRAD"),
+    (147, "ELEMENT_WISE_QUANTIZED_LINEAR_ADD"),
+    (148, "DYNAMIC_QUANTIZE_LINEAR"),
+    (149, "ROI_ALIGN1"),
+    (150, "ROI_ALIGN_GRAD"),
+    (151, "BATCH_NORMALIZATION_TRAINING"),
+    (152, "BATCH_NORMALIZATION_TRAINING_GRAD"),
+    (153, "ELEMENT_WISE_CLIP1"),
+    (154, "ELEMENT_WISE_CLIP_GRAD1"),
+    (155, "PADDING1"),
+    (156, "ELEMENT_WISE_NEGATE"),
+    (157, "ACTIVATION_GELU"),
+    (158, "ACTIVATION_SOFTMAX1"),
+    (159, "ACTIVATION_LOG_SOFTMAX1"),
+    (160, "ACTIVATION_HARDMAX1"),
+    (161, "RESAMPLE2"),
+    (162, "RESAMPLE_GRAD1"),
+    (163, "DIAGONAL_MATRIX1"),
+    (164, "MULTIHEAD_ATTENTION"),
+    (165, "LP_POOLING1"),
+    (166, "AVERAGE_POOLING1"),
+    (167, "ACTIVATION_SWISH"),
+    (168, "ACTIVATION_HARD_SWISH"),
+    (169, "QUANTIZED_LINEAR_AVERAGE_POOLING"),
+    (170, "MATRIX_MULTIPLY_INTEGER_TO_FLOAT"),
+    (171, "MEAN_VARIANCE_NORMALIZATION2"),
+    (172, "MULTIHEAD_ATTENTION1"),
+    (173, "QUANTIZE"),
+    (174, "DEQUANTIZE"),
+];
+
+/// The exact support decision for one operator type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorSupport {
+    /// A real Metal/CPU lowering exists (or a dedicated descriptor parser).
+    Implemented,
+    /// The type is part of DML 6.3 but this bridge returns the exact
+    /// `DML_OPERATOR_TYPE <n> is not supported` error.
+    Unsupported,
+    /// The id is outside the DML 6.3 range.
+    Unknown,
+}
+
+/// Whether a DML operator type has a real implementation in this bridge.
+pub fn operator_support(ty: u32) -> OperatorSupport {
+    if !DML_OPERATOR_TYPES_6_3.iter().any(|(id, _)| *id == ty) {
+        return OperatorSupport::Unknown;
+    }
+    if dml_ops::is_extended_operator(ty) || is_unary_operator(ty) || is_binary_operator(ty) {
+        OperatorSupport::Implemented
+    } else {
+        OperatorSupport::Unsupported
+    }
+}
+
+/// Operator types with a real lowering.
+pub fn implemented_operator_types() -> Vec<u32> {
+    DML_OPERATOR_TYPES_6_3
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|ty| operator_support(*ty) == OperatorSupport::Implemented)
+        .collect()
+}
+
+/// Operator types that fail closed with the exact unsupported error.
+pub fn unsupported_operator_types() -> Vec<u32> {
+    DML_OPERATOR_TYPES_6_3
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|ty| operator_support(*ty) == OperatorSupport::Unsupported)
+        .collect()
+}
+
+/// Human-readable name for a DML operator type.
+pub fn operator_type_name(ty: u32) -> Option<&'static str> {
+    DML_OPERATOR_TYPES_6_3
+        .iter()
+        .find(|(id, _)| *id == ty)
+        .map(|(_, name)| *name)
+}
+
+/// The exact error a guest receives for an unimplemented DML 6.3 operator.
+pub fn unsupported_operator_error(ty: u32) -> DmlError {
+    DmlError::unsupported_operator(ty)
+}
+
 pub const DML_CREATE_DEVICE_FLAG_DEBUG: u32 = 0x1;
 pub const DML_EXECUTION_FLAGS_VALID: u32 = 0x1 | 0x2 | 0x4;
 
@@ -1562,6 +1799,172 @@ impl DmlRuntime {
                     DmlOpKind::Dequantize { quantization_type }
                 };
                 plan(kind, inputs, output, Vec::new(), None)
+            }
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_LOGICAL_AND
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_LOGICAL_OR
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_LOGICAL_XOR
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_LOGICAL_EQUALS
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_LOGICAL_GREATER_THAN_OR_EQUAL
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_LOGICAL_LESS_THAN_OR_EQUAL
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_BIT_AND
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_BIT_OR
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_BIT_XOR
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_LEFT
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_BIT_SHIFT_RIGHT
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_MODULUS_TRUNCATE
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_MODULUS_FLOOR
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_DIFFERENCE_SQUARE
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_ATAN_YX
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_MEAN => {
+                let a = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let b = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let op = dml_ops::DmlBinaryOp::from_operator_type(ty)
+                    .ok_or_else(|| DmlError::unsupported_operator(ty))?;
+                plan(
+                    DmlOpKind::Binary { op },
+                    vec![a, b],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_ACOS
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_ASIN
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_ATAN
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_RECIP
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_SIGN
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_IS_NAN
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_ERF
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_SINH
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_COSH
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_TANH
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_ASINH
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_ACOSH
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_ATANH
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_LOGICAL_NOT
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_ROUND
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_IS_INFINITY
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_NEGATE
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_CLIP
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_THRESHOLD
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_CONSTANT_POW => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let scale_bias = read_ptr(memory, payload + 16)?;
+                if scale_bias != 0 {
+                    return Err(DmlError::invalid(format!(
+                        "DML_OPERATOR_TYPE {ty} ScaleBias is not supported"
+                    )));
+                }
+                let op = dml_ops::DmlUnaryOp::from_operator_type(ty, |offset| {
+                    read_f32(memory, payload + offset)
+                })?;
+                plan(
+                    DmlOpKind::Unary { op },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_FILL_VALUE_CONSTANT
+            | dml_ops::DML_OPERATOR_FILL_VALUE_SEQUENCE => {
+                let output = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let value_type = read_u32(memory, payload + 8)?;
+                if value_type != DML_TENSOR_DATA_TYPE_FLOAT32 {
+                    return Err(DmlError::invalid(format!(
+                        "DML_OPERATOR_TYPE {ty} ValueDataType {value_type} is not supported (FLOAT32 only)"
+                    )));
+                }
+                let value = read_f32(memory, payload + 16)?;
+                let sequence = ty == dml_ops::DML_OPERATOR_FILL_VALUE_SEQUENCE;
+                let step = if sequence {
+                    read_f32(memory, payload + 24)?
+                } else {
+                    0.0
+                };
+                plan(
+                    DmlOpKind::Fill {
+                        value,
+                        step,
+                        sequence,
+                    },
+                    Vec::new(),
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ONE_HOT => {
+                let indices = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let values = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let axis = read_u32(memory, payload + 24)?;
+                plan(
+                    DmlOpKind::OneHot { axis },
+                    vec![indices, values],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_CUMULATIVE_SUMMATION
+            | dml_ops::DML_OPERATOR_CUMULATIVE_PRODUCT => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let axis = read_u32(memory, payload + 16)?;
+                let direction = read_u32(memory, payload + 20)?;
+                if direction > 1 {
+                    return Err(DmlError::invalid(format!(
+                        "DML_OPERATOR_TYPE {ty} AxisDirection {direction} is invalid"
+                    )));
+                }
+                let exclusive = read_u32(memory, payload + 24)? != 0;
+                plan(
+                    DmlOpKind::Cumulative {
+                        product: ty == dml_ops::DML_OPERATOR_CUMULATIVE_PRODUCT,
+                        axis,
+                        reverse: direction == 1,
+                        exclusive,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_REVERSE_SUBSEQUENCES => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let lengths = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let axis = read_u32(memory, payload + 24)?;
+                plan(
+                    DmlOpKind::Reverse { axis },
+                    vec![input, lengths],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_DIAGONAL_MATRIX => {
+                let output = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let offset = i32::from_le_bytes(read_u32(memory, payload + 8)?.to_le_bytes());
+                let value = read_f32(memory, payload + 12)?;
+                plan(
+                    DmlOpKind::DiagonalMatrix { offset, value },
+                    Vec::new(),
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_CAST => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                plan(DmlOpKind::Cast, vec![input], output, Vec::new(), None)
             }
             other => Err(DmlError::unsupported_operator(other)),
         }
@@ -3169,6 +3572,7 @@ fn is_binary_operator(ty: u32) -> bool {
             | DML_OPERATOR_ELEMENT_WISE_MAX
             | DML_OPERATOR_ELEMENT_WISE_MIN
             | DML_OPERATOR_ELEMENT_WISE_MULTIPLY
+            | DML_OPERATOR_ELEMENT_WISE_POW
             | DML_OPERATOR_ELEMENT_WISE_SUBTRACT
     )
 }
@@ -3304,6 +3708,7 @@ fn emit_elementwise_msl(desc: &DmlOperatorDesc) -> DmlResult<String> {
         DML_OPERATOR_ELEMENT_WISE_MIN => "metal::min(a[a_idx], b[b_idx])".to_string(),
         DML_OPERATOR_ELEMENT_WISE_MULTIPLY => "a[a_idx] * b[b_idx]".to_string(),
         DML_OPERATOR_ELEMENT_WISE_SUBTRACT => "a[a_idx] - b[b_idx]".to_string(),
+        DML_OPERATOR_ELEMENT_WISE_POW => "metal::pow(a[a_idx], b[b_idx])".to_string(),
         other => return Err(DmlError::unsupported_operator(other)),
     };
     source.push_str(&format!("    out[gid] = {rhs};\n"));
@@ -5055,6 +5460,163 @@ mod tests {
         assert_eq!(
             supports_tensor_data_type(DML_TENSOR_DATA_TYPE_FLOAT64),
             false
+        );
+    }
+    #[test]
+    fn dml_operator_registry_enumerates_6_3_and_rejects_unimplemented_exactly() {
+        assert_eq!(DML_OPERATOR_TYPES_6_3.len(), 174);
+        assert_eq!(DML_OPERATOR_TYPES_6_3[0].0, 1);
+        assert_eq!(DML_OPERATOR_TYPES_6_3[173].0, 174);
+        assert_eq!(operator_type_name(95), Some("ONE_HOT"));
+        assert_eq!(operator_type_name(175), None);
+        assert_eq!(
+            operator_support(dml_ops::DML_OPERATOR_ONE_HOT),
+            OperatorSupport::Implemented
+        );
+        assert_eq!(
+            operator_support(dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION),
+            OperatorSupport::Unsupported
+        );
+        assert_eq!(
+            operator_support(dml_ops::DML_OPERATOR_RESAMPLE3),
+            OperatorSupport::Unknown
+        );
+        assert_eq!(
+            unsupported_operator_error(dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION).message,
+            "DML_OPERATOR_TYPE 164 is not supported by this DirectML implementation"
+        );
+        let implemented = implemented_operator_types();
+        let remaining = unsupported_operator_types();
+        assert_eq!(implemented.len(), 129);
+        assert_eq!(remaining.len(), 45);
+        assert_eq!(implemented.len() + remaining.len(), 174);
+        assert_eq!(implemented.is_empty(), false);
+        assert_eq!(remaining.is_empty(), false);
+        assert_eq!(
+            implemented.contains(&dml_ops::DML_OPERATOR_FILL_VALUE_CONSTANT),
+            true
+        );
+        assert_eq!(
+            remaining.contains(&dml_ops::DML_OPERATOR_MULTIHEAD_ATTENTION),
+            true
+        );
+    }
+
+    #[test]
+    fn dml_guest_parses_new_operator_families_and_rejects_bad_scalar_values() {
+        let mut memory = base_memory();
+        let output = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[2, 2],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_FILL_VALUE_SEQUENCE,
+            &[output],
+        );
+        put_u32(&mut memory.data, 0x6020 + 8, DML_TENSOR_DATA_TYPE_FLOAT32);
+        put_u32(&mut memory.data, 0x6020 + 16, 1.0f32.to_bits());
+        put_u32(&mut memory.data, 0x6020 + 24, 2.0f32.to_bits());
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&memory, desc)
+            .expect("fill plan");
+        assert_eq!(
+            plan.kind,
+            dml_ops::DmlOpKind::Fill {
+                value: 1.0,
+                step: 2.0,
+                sequence: true
+            }
+        );
+
+        let mut cast_memory = base_memory();
+        let input = write_tensor(
+            &mut cast_memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_INT32,
+            &[2],
+            None,
+        );
+        let output = write_tensor(
+            &mut cast_memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[2],
+            None,
+        );
+        let cast = write_operator(
+            &mut cast_memory.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_CAST,
+            &[input, output],
+        );
+        let plan = DmlRuntime::new()
+            .parse_operation_from_guest(&cast_memory, cast)
+            .expect("cast plan");
+        assert_eq!(plan.kind, dml_ops::DmlOpKind::Cast);
+
+        let mut bad = base_memory();
+        let output = write_tensor(
+            &mut bad.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[2],
+            None,
+        );
+        let desc = write_operator(
+            &mut bad.data,
+            0x6000,
+            dml_ops::DML_OPERATOR_FILL_VALUE_CONSTANT,
+            &[output],
+        );
+        put_u32(&mut bad.data, 0x6020 + 8, DML_TENSOR_DATA_TYPE_UINT8);
+        assert_eq!(
+            DmlRuntime::new()
+                .parse_operation_from_guest(&bad, desc)
+                .unwrap_err()
+                .message,
+            "DML_OPERATOR_TYPE 103 ValueDataType 5 is not supported (FLOAT32 only)"
+        );
+    }
+    #[test]
+    fn dml_feature_level_6_3_rejects_6_4_resample3_exactly() {
+        let mut runtime = DmlRuntime::new();
+        let device = runtime
+            .create_device_on(
+                0x100,
+                0,
+                DML_FEATURE_LEVEL_6_3,
+                IID_IDMLDEVICE,
+                dml_ops::DmlExecutionDevice::Cpu,
+            )
+            .expect("cpu device");
+        let plan = dml_ops::DmlOpPlan {
+            kind: dml_ops::DmlOpKind::Resample {
+                mode: dml_ops::DmlInterpolationMode::Linear,
+                scales: vec![1.0, 1.0, 0.5, 0.5],
+                input_offsets: vec![0.0; 4],
+                output_offsets: vec![0.0; 4],
+                rounding: dml_ops::DmlAxisDirection::Increasing,
+                antialiased: true,
+            },
+            inputs: vec![desc_tensor(
+                DML_TENSOR_DATA_TYPE_FLOAT32,
+                &[1, 1, 4, 4],
+                None,
+            )],
+            output: desc_tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[1, 1, 2, 2], None),
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        };
+        let error = runtime.create_operation(device, plan).unwrap_err();
+        assert_eq!(error.hresult, DXGI_ERROR_UNSUPPORTED);
+        assert_eq!(
+            error.message,
+            "DML_OPERATOR_TYPE 175 requires DML_FEATURE_LEVEL 0x6400, device supports 0x6300"
         );
     }
 }

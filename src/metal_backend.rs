@@ -12345,6 +12345,68 @@ kernel void d3d12_wg_consumer(device const uint* indices [[buffer(0)]],
     uint record_index = indices[gid];
     WorkGraphRecord record = records[record_index];
     output[record.output_index] = record.node_index + 1;
+}
+
+struct WorkGraphNodeSpec {
+    uint output_offset;
+    uint output_count;
+    uint mesh;
+};
+
+kernel void d3d12_wg_fanout_stage(device const WorkGraphRecord* input [[buffer(0)]],
+                                  device WorkGraphRecord* output [[buffer(1)]],
+                                  device atomic_uint* output_count [[buffer(2)]],
+                                  device atomic_uint* output_usage [[buffer(3)]],
+                                  device atomic_uint* flags [[buffer(4)]],
+                                  device const WorkGraphNodeSpec* nodes [[buffer(5)]],
+                                  device const uint* targets [[buffer(6)]],
+                                  device const uint* limits [[buffer(7)]],
+                                  device atomic_uint* node_counts [[buffer(8)]],
+                                  constant uint& input_count [[buffer(9)]],
+                                  constant uint& node_count [[buffer(10)]],
+                                  constant uint& depth [[buffer(11)]],
+                                  constant uint& max_depth [[buffer(12)]],
+                                  device const uint* usage_slots [[buffer(13)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    if (gid >= input_count) {
+        return;
+    }
+    WorkGraphRecord record = input[gid];
+    if (record.node_index == 0xFFFFFFFFu && record.output_index == 0xFFFFFFFFu) {
+        return;
+    }
+    if (record.node_index >= node_count) {
+        atomic_fetch_or_explicit(flags, 1u, memory_order_relaxed);
+        return;
+    }
+    WorkGraphNodeSpec node = nodes[record.node_index];
+    if (node.mesh != 0u) {
+        atomic_fetch_add_explicit(node_counts + record.node_index, 1u, memory_order_relaxed);
+        return;
+    }
+    if (record.output_index >= node.output_count) {
+        atomic_fetch_or_explicit(flags, 2u, memory_order_relaxed);
+        return;
+    }
+    atomic_fetch_add_explicit(node_counts + record.node_index, 1u, memory_order_relaxed);
+    uint slot = node.output_offset + record.output_index;
+    uint target = targets[slot];
+    if (target == 0xFFFFFFFFu) {
+        return;
+    }
+    if (depth >= max_depth) {
+        atomic_fetch_or_explicit(flags, 4u, memory_order_relaxed);
+        return;
+    }
+    uint limit = limits[slot];
+    uint usage_slot = usage_slots[slot];
+    if (limit != 0u &&
+        atomic_fetch_add_explicit(output_usage + usage_slot, 1u, memory_order_relaxed) >= limit) {
+        atomic_fetch_or_explicit(flags, 8u, memory_order_relaxed);
+        return;
+    }
+    uint index = atomic_fetch_add_explicit(output_count, 1u, memory_order_relaxed);
+    output[index] = WorkGraphRecord{target, 0u};
 }"#;
 
 /// Real GPU-side work-graph fan-out pipelines.
@@ -12355,6 +12417,8 @@ pub struct MetalWorkGraphFanout {
     pub producer_pipeline: metal::ComputePipelineState,
     /// Consumer pipeline dispatched from the GPU-produced grid.
     pub consumer_pipeline: metal::ComputePipelineState,
+    /// One work-graph depth stage, driven entirely from GPU-written records.
+    pub stage_pipeline: metal::ComputePipelineState,
 }
 
 impl MetalWorkGraphFanout {
@@ -12371,10 +12435,16 @@ impl MetalWorkGraphFanout {
             WORK_GRAPH_FANOUT_MSL,
             "d3d12_wg_consumer",
             "work-graph consumer",)?;
+        let stage_pipeline = compile_compute_pipeline(
+            device,
+            WORK_GRAPH_FANOUT_MSL,
+            "d3d12_wg_fanout_stage",
+            "work-graph stage",)?;
         Ok(Self {
             handle: alloc_gpu_id(),
             producer_pipeline,
             consumer_pipeline,
+            stage_pipeline,
         })
     }
 
@@ -12490,6 +12560,286 @@ impl MetalWorkGraphFanout {
         }
         Ok(results)
     }
+
+    /// Execute a complete multi-node work-graph fan-out on the GPU.
+    ///
+    /// Every depth of the graph is one real Metal dispatch. The record count,
+    /// compacted record indices and per-node record counts are produced by GPU
+    /// atomics; the CPU only reads back the final records and counters. Output
+    /// limits are enforced with an atomic use counter per node output, which
+    /// provides back-pressure instead of overrunning a bounded output.
+    pub fn execute_graph(
+        &self,
+        device: &metal::DeviceRef,
+        records: &metal::BufferRef,
+        record_capacity: u32,
+        gpu_count: Option<&metal::BufferRef>,
+        spec: &MetalWorkGraphGraphSpec<'_>,
+    ) -> AppResult<MetalWorkGraphRun> {
+        if spec.nodes.is_empty() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work graph fan-out requires at least one node",
+            ));
+        }
+        let expected_outputs: u64 = spec
+            .nodes
+            .iter()
+            .map(|node| u64::from(node.output_count))
+            .sum();
+        if expected_outputs != spec.targets.len() as u64 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work graph fan-out node table does not match the target table",
+            ));
+        }
+        if spec.limits.len() != spec.targets.len() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work graph fan-out limit table does not match the target table",
+            ));
+        }
+        if spec.usage_slots.len() != spec.targets.len() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work graph fan-out usage table does not match the target table",
+            ));
+        }
+        if spec.max_depth == 0 {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "work graph maximum depth must be non-zero",
+            ));
+        }
+        let mut input_count = match gpu_count {
+            Some(buffer) => {
+                let count = unsafe { *(buffer.contents() as *const u32) };
+                if count > record_capacity {
+                    return Err(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        "work graph GPU record count exceeds the record capacity",
+                    ));
+                }
+                count
+            }
+            None => record_capacity,
+        };
+
+        let node_count = spec.nodes.len() as u32;
+        let total_outputs = spec.targets.len() as u64;
+        let nodes_buffer = device.new_buffer_with_data(
+            spec.nodes.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(spec.nodes) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let targets_buffer = if spec.targets.is_empty() {
+            device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared)
+        } else {
+            device.new_buffer_with_data(
+                spec.targets.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of_val(spec.targets) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let limits_buffer = if spec.limits.is_empty() {
+            device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared)
+        } else {
+            device.new_buffer_with_data(
+                spec.limits.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of_val(spec.limits) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let usage_slots_buffer = if spec.usage_slots.is_empty() {
+            device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared)
+        } else {
+            device.new_buffer_with_data(
+                spec.usage_slots.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of_val(spec.usage_slots) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let zero_bytes = |len: u64| -> metal::Buffer {
+            let zeros = vec![0u8; len as usize];
+            device.new_buffer_with_data(
+                zeros.as_ptr() as *const std::ffi::c_void,
+                len,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let node_counts_buffer = zero_bytes(node_count as u64 * 4);
+        let mut node_counts = vec![0u32; node_count as usize];
+        let mut stages = 0u32;
+        let mut back_pressure = false;
+        let empty_terminated;
+        let mut owned_input: Option<metal::Buffer> = None;
+        let mut final_records = Vec::new();
+
+        if input_count == 0 {
+            return Ok(MetalWorkGraphRun {
+                final_records,
+                node_counts,
+                stages,
+                empty_terminated: true,
+                back_pressure,
+            });
+        }
+
+        loop {
+            let input_buffer = owned_input
+                .as_ref()
+                .map(|buffer| buffer.as_ref())
+                .unwrap_or(records);
+            let output = device.new_buffer(
+                u64::from(input_count) * std::mem::size_of::<MetalWorkGraphRecord>() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let output_count_buffer = zero_bytes(4);
+            let output_usage_buffer = zero_bytes(total_outputs.max(1) * 4);
+            let flags_buffer = zero_bytes(4);
+            let input_count_buffer = device.new_buffer_with_data(
+                &input_count as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let node_count_buffer = device.new_buffer_with_data(
+                &node_count as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let depth_buffer = device.new_buffer_with_data(
+                &stages as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let max_depth_buffer = device.new_buffer_with_data(
+                &spec.max_depth as *const u32 as *const std::ffi::c_void,
+                4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let queue = device.new_command_queue();
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.stage_pipeline);
+            encoder.set_buffer(0, Some(input_buffer), 0);
+            encoder.set_buffer(1, Some(&output), 0);
+            encoder.set_buffer(2, Some(&output_count_buffer), 0);
+            encoder.set_buffer(3, Some(&output_usage_buffer), 0);
+            encoder.set_buffer(4, Some(&flags_buffer), 0);
+            encoder.set_buffer(5, Some(&nodes_buffer), 0);
+            encoder.set_buffer(6, Some(&targets_buffer), 0);
+            encoder.set_buffer(7, Some(&limits_buffer), 0);
+            encoder.set_buffer(8, Some(&node_counts_buffer), 0);
+            encoder.set_buffer(9, Some(&input_count_buffer), 0);
+            encoder.set_buffer(10, Some(&node_count_buffer), 0);
+            encoder.set_buffer(11, Some(&depth_buffer), 0);
+            encoder.set_buffer(12, Some(&max_depth_buffer), 0);
+            encoder.set_buffer(13, Some(&usage_slots_buffer), 0);
+            encoder.dispatch_threads(
+                metal::MTLSize {
+                    width: u64::from(input_count),
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 64,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            stages = stages.saturating_add(1);
+            let produced = unsafe { *(output_count_buffer.contents() as *const u32) };
+            let flags = unsafe { *(flags_buffer.contents() as *const u32) };
+            if flags & 1 != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "work graph fan-out record references an invalid node index",
+                ));
+            }
+            if flags & 2 != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "work graph fan-out record references an output index beyond the node output count",
+                ));
+            }
+            if flags & 4 != 0 {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!(
+                        "work graph recursion depth exceeds the configured maximum {}",
+                        spec.max_depth
+                    ),
+                ));
+            }
+            back_pressure = flags & 8 != 0;
+            if produced == 0 || back_pressure {
+                let pointer = input_buffer.contents() as *const MetalWorkGraphRecord;
+                final_records = (0..input_count as usize)
+                    .map(|index| unsafe { (*pointer.add(index)).node_index })
+                    .filter(|node| *node != u32::MAX)
+                    .collect();
+                empty_terminated = produced == 0 && !back_pressure;
+                break;
+            }
+            owned_input = Some(output);
+            input_count = produced;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                node_counts_buffer.contents() as *const u32,
+                node_counts.as_mut_ptr(),
+                node_count as usize,
+            );
+        }
+        Ok(MetalWorkGraphRun {
+            final_records,
+            node_counts,
+            stages,
+            empty_terminated,
+            back_pressure,
+        })
+    }
+}
+
+/// One node in a GPU work-graph fan-out specification.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetalWorkGraphNodeSpec {
+    pub output_offset: u32,
+    pub output_count: u32,
+    pub mesh: u32,
+}
+
+/// Flattened graph topology consumed by [`MetalWorkGraphFanout::execute_graph`].
+#[derive(Debug, Clone, Copy)]
+pub struct MetalWorkGraphGraphSpec<'a> {
+    pub nodes: &'a [MetalWorkGraphNodeSpec],
+    /// Target node per output, or `u32::MAX` for a leaf output.
+    pub targets: &'a [u32],
+    /// Maximum records per output, or `0` for unbounded.
+    pub limits: &'a [u32],
+    /// Output that owns each output's record budget (shared limits point at
+    /// the owning output).
+    pub usage_slots: &'a [u32],
+    pub max_depth: u32,
+}
+
+/// GPU readback of one complete work-graph run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetalWorkGraphRun {
+    /// Node indices of the records that reached leaf nodes.
+    pub final_records: Vec<u32>,
+    /// Total records consumed by each node.
+    pub node_counts: Vec<u32>,
+    pub stages: u32,
+    /// True when the graph drained with no further records.
+    pub empty_terminated: bool,
+    /// True when an output limit stopped further fan-out.
+    pub back_pressure: bool,
 }
 
 // ===========================================================================
@@ -26257,6 +26607,364 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
             )
             .expect("GPU-record fan-out");
         assert_eq!(gpu, vec![0, 4]);
+    }
+
+    #[test]
+    fn work_graph_gpu_staged_fanout_chains_fans_out_and_rejects_malformed_records() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let fanout = MetalWorkGraphFanout::new(device.metal_device()).expect("fan-out pipelines");
+        let record_buffer = |records: &[(u32, u32)]| {
+            let mut values = Vec::with_capacity(records.len() * 2);
+            for (node, output) in records {
+                values.push(*node);
+                values.push(*output);
+            }
+            shared_u32_buffer(&device, &values)
+        };
+        let chain_nodes = [
+            MetalWorkGraphNodeSpec {
+                output_offset: 0,
+                output_count: 1,
+                mesh: 0,
+            },
+            MetalWorkGraphNodeSpec {
+                output_offset: 1,
+                output_count: 1,
+                mesh: 0,
+            },
+            MetalWorkGraphNodeSpec {
+                output_offset: 2,
+                output_count: 1,
+                mesh: 0,
+            },
+        ];
+        let chain_targets = [1u32, 2u32, u32::MAX];
+        let chain_limits = [0u32, 0u32, 0u32];
+        let chain_usage = [0u32, 1u32, 2u32];
+        let chain = MetalWorkGraphGraphSpec {
+            nodes: &chain_nodes,
+            targets: &chain_targets,
+            limits: &chain_limits,
+            usage_slots: &chain_usage,
+            max_depth: 32,
+        };
+        let records = record_buffer(&[(0, 0)]);
+        let run = fanout
+            .execute_graph(device.metal_device(), records.as_ref(), 1, None, &chain)
+            .expect("three-node GPU chain");
+        assert_eq!(run.final_records, vec![2]);
+        assert_eq!(run.node_counts, vec![1, 1, 1]);
+        assert_eq!(run.stages, 3);
+        assert!(run.empty_terminated);
+        assert!(!run.back_pressure);
+
+        // GPU-produced count limits the number of entries consumed.
+        let records = record_buffer(&[(0, 0), (0, 0), (0, 0)]);
+        let gpu_count = shared_u32_buffer(&device, &[2]);
+        let run = fanout
+            .execute_graph(
+                device.metal_device(),
+                records.as_ref(),
+                3,
+                Some(gpu_count.as_ref()),
+                &chain,
+            )
+            .expect("GPU-count chain");
+        assert_eq!(run.final_records, vec![2, 2]);
+        assert_eq!(run.node_counts, vec![2, 2, 2]);
+        assert_eq!(run.stages, 3);
+
+        // Empty records terminate without launching downstream work.
+        let empty = shared_u32_buffer(&device, &[u32::MAX, u32::MAX]);
+        let run = fanout
+            .execute_graph(device.metal_device(), empty.as_ref(), 1, None, &chain)
+            .expect("empty record");
+        assert_eq!(run.final_records, Vec::<u32>::new());
+        assert_eq!(run.node_counts, vec![0, 0, 0]);
+        assert_eq!(run.stages, 1);
+        assert!(run.empty_terminated);
+
+        // A mesh node is a leaf: it consumes records and produces no output.
+        let mesh_nodes = [
+            MetalWorkGraphNodeSpec {
+                output_offset: 0,
+                output_count: 1,
+                mesh: 0,
+            },
+            MetalWorkGraphNodeSpec {
+                output_offset: 1,
+                output_count: 0,
+                mesh: 1,
+            },
+        ];
+        let mesh_targets = [1u32];
+        let mesh_limits = [0u32];
+        let mesh_usage = [0u32];
+        let mesh_spec = MetalWorkGraphGraphSpec {
+            nodes: &mesh_nodes,
+            targets: &mesh_targets,
+            limits: &mesh_limits,
+            usage_slots: &mesh_usage,
+            max_depth: 32,
+        };
+        let records = record_buffer(&[(0, 0)]);
+        let run = fanout
+            .execute_graph(device.metal_device(), records.as_ref(), 1, None, &mesh_spec)
+            .expect("mesh node output");
+        assert_eq!(run.final_records, vec![1]);
+        assert_eq!(run.node_counts, vec![1, 1]);
+        assert_eq!(run.stages, 2);
+        assert!(run.empty_terminated);
+
+        // A mesh entrypoint has no outputs and is counted as a leaf.
+        let mesh_entry_nodes = [MetalWorkGraphNodeSpec {
+            output_offset: 0,
+            output_count: 0,
+            mesh: 1,
+        }];
+        let mesh_entry = MetalWorkGraphGraphSpec {
+            nodes: &mesh_entry_nodes,
+            targets: &[],
+            limits: &[],
+            usage_slots: &[],
+            max_depth: 32,
+        };
+        let run = fanout
+            .execute_graph(
+                device.metal_device(),
+                records.as_ref(),
+                1,
+                None,
+                &mesh_entry,
+            )
+            .expect("mesh entrypoint");
+        assert_eq!(run.final_records, vec![0]);
+        assert_eq!(run.node_counts, vec![1]);
+        assert_eq!(run.stages, 1);
+
+        // Back-pressure stops at a bounded output instead of overrunning it.
+        let limited_nodes = [
+            MetalWorkGraphNodeSpec {
+                output_offset: 0,
+                output_count: 1,
+                mesh: 0,
+            },
+            MetalWorkGraphNodeSpec {
+                output_offset: 1,
+                output_count: 1,
+                mesh: 0,
+            },
+        ];
+        let limited_targets = [1u32, u32::MAX];
+        let limited_limits = [1u32, 0u32];
+        let limited_usage = [0u32, 1u32];
+        let limited = MetalWorkGraphGraphSpec {
+            nodes: &limited_nodes,
+            targets: &limited_targets,
+            limits: &limited_limits,
+            usage_slots: &limited_usage,
+            max_depth: 32,
+        };
+        let records = record_buffer(&[(0, 0), (0, 0)]);
+        let run = fanout
+            .execute_graph(device.metal_device(), records.as_ref(), 2, None, &limited)
+            .expect("bounded fan-out");
+        assert!(run.back_pressure);
+        assert_eq!(run.node_counts, vec![2, 0]);
+
+        // Two outputs sharing one budget draw from the same GPU counter.
+        let shared_nodes = [
+            MetalWorkGraphNodeSpec {
+                output_offset: 0,
+                output_count: 2,
+                mesh: 0,
+            },
+            MetalWorkGraphNodeSpec {
+                output_offset: 2,
+                output_count: 1,
+                mesh: 0,
+            },
+        ];
+        let shared_targets = [1u32, 1u32, u32::MAX];
+        let shared_limits = [1u32, 1u32, 0u32];
+        let shared_usage = [0u32, 0u32, 2u32];
+        let shared = MetalWorkGraphGraphSpec {
+            nodes: &shared_nodes,
+            targets: &shared_targets,
+            limits: &shared_limits,
+            usage_slots: &shared_usage,
+            max_depth: 32,
+        };
+        let records = record_buffer(&[(0, 0), (0, 1)]);
+        let run = fanout
+            .execute_graph(device.metal_device(), records.as_ref(), 2, None, &shared)
+            .expect("shared output budget");
+        assert!(run.back_pressure);
+        assert_eq!(run.node_counts, vec![2, 0]);
+
+        // Recursion is bounded by the configured maximum depth.
+        let recursive_nodes = [MetalWorkGraphNodeSpec {
+            output_offset: 0,
+            output_count: 1,
+            mesh: 0,
+        }];
+        let recursive_targets = [0u32];
+        let recursive_limits = [0u32];
+        let recursive_usage = [0u32];
+        let recursive = MetalWorkGraphGraphSpec {
+            nodes: &recursive_nodes,
+            targets: &recursive_targets,
+            limits: &recursive_limits,
+            usage_slots: &recursive_usage,
+            max_depth: 2,
+        };
+        let error = fanout
+            .execute_graph(device.metal_device(), records.as_ref(), 1, None, &recursive)
+            .expect_err("recursion limit");
+        assert_eq!(
+            error.message,
+            "work graph recursion depth exceeds the configured maximum 2"
+        );
+
+        // Malformed node/output indices fail closed.
+        let malformed = record_buffer(&[(9, 0)]);
+        let error = fanout
+            .execute_graph(device.metal_device(), malformed.as_ref(), 1, None, &chain)
+            .expect_err("invalid node index");
+        assert_eq!(
+            error.message,
+            "work graph fan-out record references an invalid node index"
+        );
+        let malformed = record_buffer(&[(0, 5)]);
+        let error = fanout
+            .execute_graph(device.metal_device(), malformed.as_ref(), 1, None, &chain)
+            .expect_err("invalid output index");
+        assert_eq!(
+            error.message,
+            "work graph fan-out record references an output index beyond the node output count"
+        );
+
+        // Specification validation and GPU count bounds.
+        let empty_nodes: [MetalWorkGraphNodeSpec; 0] = [];
+        let error = fanout
+            .execute_graph(
+                device.metal_device(),
+                records.as_ref(),
+                1,
+                None,
+                &MetalWorkGraphGraphSpec {
+                    nodes: &empty_nodes,
+                    targets: &[],
+                    limits: &[],
+                    usage_slots: &[],
+                    max_depth: 32,
+                },
+            )
+            .expect_err("empty graph");
+        assert_eq!(
+            error.message,
+            "work graph fan-out requires at least one node"
+        );
+        let error = fanout
+            .execute_graph(
+                device.metal_device(),
+                records.as_ref(),
+                1,
+                None,
+                &MetalWorkGraphGraphSpec {
+                    nodes: &recursive_nodes,
+                    targets: &[],
+                    limits: &[],
+                    usage_slots: &[],
+                    max_depth: 32,
+                },
+            )
+            .expect_err("target table mismatch");
+        assert_eq!(
+            error.message,
+            "work graph fan-out node table does not match the target table"
+        );
+        let error = fanout
+            .execute_graph(
+                device.metal_device(),
+                records.as_ref(),
+                1,
+                None,
+                &MetalWorkGraphGraphSpec {
+                    nodes: &recursive_nodes,
+                    targets: &recursive_targets,
+                    limits: &[],
+                    usage_slots: &[],
+                    max_depth: 32,
+                },
+            )
+            .expect_err("limit table mismatch");
+        assert_eq!(
+            error.message,
+            "work graph fan-out limit table does not match the target table"
+        );
+        let error = fanout
+            .execute_graph(
+                device.metal_device(),
+                records.as_ref(),
+                1,
+                None,
+                &MetalWorkGraphGraphSpec {
+                    nodes: &recursive_nodes,
+                    targets: &recursive_targets,
+                    limits: &recursive_limits,
+                    usage_slots: &[],
+                    max_depth: 32,
+                },
+            )
+            .expect_err("usage table mismatch");
+        assert_eq!(
+            error.message,
+            "work graph fan-out usage table does not match the target table"
+        );
+        let error = fanout
+            .execute_graph(
+                device.metal_device(),
+                records.as_ref(),
+                1,
+                None,
+                &MetalWorkGraphGraphSpec {
+                    nodes: &recursive_nodes,
+                    targets: &recursive_targets,
+                    limits: &recursive_limits,
+                    usage_slots: &recursive_usage,
+                    max_depth: 0,
+                },
+            )
+            .expect_err("zero depth");
+        assert_eq!(error.message, "work graph maximum depth must be non-zero");
+        let too_large = shared_u32_buffer(&device, &[2]);
+        let error = fanout
+            .execute_graph(
+                device.metal_device(),
+                records.as_ref(),
+                1,
+                Some(too_large.as_ref()),
+                &recursive,
+            )
+            .expect_err("GPU count beyond capacity");
+        assert_eq!(
+            error.message,
+            "work graph GPU record count exceeds the record capacity"
+        );
+        let zero_count = shared_u32_buffer(&device, &[0]);
+        let run = fanout
+            .execute_graph(
+                device.metal_device(),
+                records.as_ref(),
+                1,
+                Some(zero_count.as_ref()),
+                &recursive,
+            )
+            .expect("zero GPU count");
+        assert_eq!(run.stages, 0);
+        assert_eq!(run.final_records, Vec::<u32>::new());
+        assert!(run.empty_terminated);
     }
 
     #[test]
