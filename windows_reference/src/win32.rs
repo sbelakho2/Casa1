@@ -290,7 +290,6 @@ unsafe extern "C" {
     fn lstrlenW(string: LPCWSTR) -> c_int;
     fn lstrcmpW(left: LPCWSTR, right: LPCWSTR) -> c_int;
     fn lstrcpyW(destination: LPWSTR, source: LPCWSTR) -> LPWSTR;
-    fn CharUpperW(string: LPWSTR) -> LPWSTR;
     fn CreateFileMappingW(
         file: HANDLE,
         attributes: *mut c_void,
@@ -379,6 +378,11 @@ unsafe extern "C" {
     fn VirtualQuery(address: LPVOID, info: *mut MemoryBasicInformation, length: SIZE_T) -> SIZE_T;
 }
 
+#[link(name = "user32")]
+unsafe extern "C" {
+    fn CharUpperW(string: LPWSTR) -> LPWSTR;
+}
+
 #[link(name = "ntdll")]
 unsafe extern "C" {
     fn RtlGetVersion(info: *mut RtlOsVersionInfoW) -> i32;
@@ -431,6 +435,7 @@ type InvalidParameterHandler = unsafe extern "C" fn(
 );
 
 #[link(name = "ucrt")]
+#[link(name = "legacy_stdio_definitions")]
 unsafe extern "C" {
     fn _set_invalid_parameter_handler(
         handler: Option<InvalidParameterHandler>,
@@ -2546,7 +2551,11 @@ fn exec_file_metadata(input: &Value) -> Value {
             close_handle(handle);
             output["pointer_begin"] = json!(if begin_ok != 0 { begin } else { 0 });
             output["pointer_end"] = json!(if end_ok != 0 { end } else { 0 });
-            output["error"] = json!(if begin_ok != 0 && end_ok != 0 { 0 } else { last_error() });
+            output["error"] = json!(if begin_ok != 0 && end_ok != 0 {
+                0
+            } else {
+                last_error()
+            });
             output
         }
         "directory" => {
@@ -2580,7 +2589,10 @@ fn exec_file_metadata(input: &Value) -> Value {
             }
             let wide = to_wide(&spec.path);
             let set_succeeded = unsafe {
-                SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE)
+                SetFileAttributesW(
+                    wide.as_ptr(),
+                    FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE,
+                )
             };
             output["set_succeeded"] = json!(set_succeeded != 0);
             output["is_readonly"] = json!(file_attr_projection(&spec.path).2);
@@ -2737,14 +2749,7 @@ fn exec_version(input: &Value) -> Value {
         json!({ "major": 0, "minor": 0, "build": 0, "platform_id": 0, "service_pack_major": 0, "service_pack_minor": 0 })
     };
     let rtl_fields = if rtl_ok == 0 {
-        fields(
-            rtl.major,
-            rtl.minor,
-            rtl.build,
-            rtl.platform_id,
-            0,
-            0,
-        )
+        fields(rtl.major, rtl.minor, rtl.build, rtl.platform_id, 0, 0)
     } else {
         json!({ "major": 0, "minor": 0, "build": 0, "platform_id": 0, "service_pack_major": 0, "service_pack_minor": 0 })
     };
@@ -2784,7 +2789,10 @@ fn exec_error_domain(input: &Value) -> Value {
     };
     let (get_last_error, status) = match spec.op.as_str() {
         "missing_file" => {
-            let path = format!("{}\\err\\missing-000.bin", "C:\\Windows\\Temp\\casa1-oracle");
+            let path = format!(
+                "{}\\err\\missing-000.bin",
+                "C:\\Windows\\Temp\\casa1-oracle"
+            );
             let handle = open_file(&path, GENERIC_READ | GENERIC_WRITE, 0, OPEN_EXISTING);
             let error = if handle == INVALID_HANDLE_VALUE {
                 last_error()
@@ -3142,8 +3150,7 @@ fn exec_heap(input: &Value) -> Value {
     }
     match spec.op.as_str() {
         "alloc_zero" => {
-            let pointer =
-                unsafe { HeapAlloc(heap, HEAP_ZERO_MEMORY, spec.size as SIZE_T) };
+            let pointer = unsafe { HeapAlloc(heap, HEAP_ZERO_MEMORY, spec.size as SIZE_T) };
             if pointer.is_null() {
                 return json!({
                     "op": "alloc_zero",

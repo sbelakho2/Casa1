@@ -1798,6 +1798,14 @@ const fn interface_skeleton(
 }
 
 fn skeleton_entry(dll: &str, skeleton: &SkeletonEntry) -> ApiEntry {
+    // Aggregate COM/D3D interface rows must never inherit Exact/Full when
+    // their own description admits an implemented subset, unsupported methods,
+    // or telemetry-only fallthrough.  Until method-level rows are the
+    // accounting unit, seed the aggregate with the worst child status.
+    let partial_surface = skeleton.detail.contains("subset")
+        || skeleton.detail.contains("remaining methods")
+        || skeleton.detail.contains("unsupported_method")
+        || skeleton.detail.contains("surface as unsupported");
     ApiEntry {
         dll: dll.to_string(),
         export: skeleton.export.to_string(),
@@ -1809,8 +1817,16 @@ fn skeleton_entry(dll: &str, skeleton: &SkeletonEntry) -> ApiEntry {
         transitional: skeleton.transitional,
         detail: (!skeleton.detail.is_empty()).then(|| skeleton.detail.to_string()),
         support_policy: skeleton.support_policy,
-        semantic_fidelity: default_fidelity_for(skeleton.implementation),
-        subsystem_capability: default_capability_for(skeleton.implementation),
+        semantic_fidelity: if partial_surface {
+            SemanticFidelity::Restricted
+        } else {
+            default_fidelity_for(skeleton.implementation)
+        },
+        subsystem_capability: if partial_surface {
+            SubsystemCapability::Partial
+        } else {
+            default_capability_for(skeleton.implementation)
+        },
     }
 }
 

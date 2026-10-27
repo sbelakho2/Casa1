@@ -2505,9 +2505,10 @@
  "database_seeds_interface_tables_at_runtime_levels": [
   "(dispatch.implementation, ImplementationLevel::Implemented)",
   "(device.implementation, ImplementationLevel::Implemented)",
+  "( device.semantic_fidelity, SemanticFidelity::Restricted, \"an aggregate interface admitting unsupported methods is never exact\" )",
+  "( device.subsystem_capability, SubsystemCapability::Partial, \"the D3D11 device surface is partial until every method is proven\" )",
   "( dxgi_factory.implementation, ImplementationLevel::Implemented )",
-  "(heap.implementation, ImplementationLevel::Implemented)",
-  "(session.implementation, ImplementationLevel::Implemented)"
+  "(heap.implementation, ImplementationLevel::Implemented)"
  ],
  "dbg_print_format_rejects_malformed_conversions": [
   "( format_dbg_print(\"tail %\", &[], &memory, GuestArch::X64), \"tail %\" )",

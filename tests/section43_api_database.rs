@@ -144,6 +144,16 @@ fn database_seeds_interface_tables_at_runtime_levels() {
         .expect("ID3D11Device entry");
     assert_eq!(device.implementation, ImplementationLevel::Implemented);
     assert!(!device.transitional);
+    assert_eq!(
+        device.semantic_fidelity,
+        SemanticFidelity::Restricted,
+        "an aggregate interface admitting unsupported methods is never exact"
+    );
+    assert_eq!(
+        device.subsystem_capability,
+        SubsystemCapability::Partial,
+        "the D3D11 device surface is partial until every method is proven"
+    );
     let dxgi_factory = database
         .lookup("dxgi.dll", "IDXGIFactory")
         .expect("IDXGIFactory entry");
