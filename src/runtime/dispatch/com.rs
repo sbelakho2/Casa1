@@ -57,6 +57,87 @@ const DISP_E_MEMBERNOTFOUND: u32 = 0x8002_0003;
 const DISP_E_UNKNOWNNAME: u32 = 0x8002_0006;
 #[allow(dead_code)] // reserved for the COM surface
 const DISP_E_BADPARAMCOUNT: u32 = 0x8002_0001;
+const E_ACCESSDENIED: u32 = 0x8007_0005;
+const REGDB_E_READREGDB: u32 = 0x8004_0150;
+const REGDB_E_INVALIDVALUE: u32 = 0x8004_0151;
+/// `HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND)` — the library named by a class's
+/// `InprocServer32` path does not exist.
+const HRESULT_MOD_NOT_FOUND: u32 = 0x8007_007E;
+
+// ── actxprxy registry-backed in-process class table ────────────────────────
+
+/// The in-process proxy/stub module actxprxy's registration entry points
+/// publish.  The runtime resolves guest module paths through the GE filesystem,
+/// so this path must exist (the registration fails with
+/// `HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND)` otherwise).
+const ACTXPRXY_MODULE_PATH: &str = "C:\\Windows\\System32\\actxprxy.dll";
+
+/// One class registration owned by the actxprxy in-process class table.
+struct ActxprxyClassEntry {
+    clsid: &'static str,
+    /// The class's `HKCR\<ProgID>\CLSID` mapping.  `None` for classes that do
+    /// not publish a ProgID.
+    progid: Option<&'static str>,
+    /// The documented `InprocServer32\ThreadingModel` value.
+    threading_model: &'static str,
+}
+
+/// The runtime's in-process classes that actxprxy's `DllRegisterServer`
+/// publishes.  Registration is registry-backed: the CLSID keys are written to
+/// both `HKCR` (backed by `HKCU\Software\Classes`) and `HKLM\Software\Classes`,
+/// and the class-object table is updated so class resolution follows the
+/// registration state.
+const ACTXPRXY_CLASSES: &[ActxprxyClassEntry] = &[
+    ActxprxyClassEntry {
+        clsid: "{C1A50010-0000-4000-8000-000000000010}",
+        progid: Some("Casa1.AtxProxy"),
+        threading_model: "Both",
+    },
+    ActxprxyClassEntry {
+        clsid: "{C1A50011-0000-4000-8000-000000000011}",
+        progid: None,
+        threading_model: "Apartment",
+    },
+];
+
+/// One live entry in the runtime's registry-backed in-process class table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ComClassRegistration {
+    pub(crate) clsid: String,
+    pub(crate) progid: Option<String>,
+    pub(crate) module_path: String,
+    pub(crate) threading_model: String,
+}
+
+/// Normalize a CLSID string to the canonical upper-case registry spelling.
+fn normalize_clsid(clsid: &str) -> String {
+    clsid.trim().to_ascii_uppercase()
+}
+
+/// The runtime's built-in class objects (the CLSIDs `try_create_com_object`
+/// recognizes without a registration).  They remain resolvable through
+/// `DllGetClassObject`/`CoGetClassObject` without being registered, matching
+/// the runtime's pre-existing in-process server surface.
+fn is_builtin_com_class(clsid: &str) -> bool {
+    [
+        COM_AUTOMATION_SERVER_CLSID,
+        "{00021401-0000-0000-C000-000000000046}",
+        "{E436EBB3-524F-11CE-9F53-0020AF0BA770}",
+        "{3901CC3F-84B5-4FA4-BA35-AA8172B8A6B2}",
+        "{934A9523-A3CA-4BC5-ADA0-D6D95D979421}",
+        "{609ED052-35B5-4F10-9BE6-39650F9781D4}",
+        "{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}",
+        "{C0B4E2F3-BA21-4773-8DBA-335EC946EB8B}",
+        "{4590F811-1D3A-11D0-891F-00AA004B2E24}",
+        "{00021400-0000-0000-C000-000000000046}",
+        "{000214E4-0000-0000-C000-000000000046}",
+        "{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}",
+        "{2933BF90-7B36-11D2-B20E-00C04F983E60}",
+        "{79EAC9E0-BAF9-11CE-8C82-00AA004BA90B}",
+    ]
+    .iter()
+    .any(|builtin| clsid.eq_ignore_ascii_case(builtin))
+}
 
 /// The BSTR user-marshal block layout: [4-byte length][wchar data][2-byte
 /// null] — the standard BSTR_User* wire format.
@@ -762,31 +843,293 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `DllRegisterServer()` / `DllUnregisterServer()` — the runtime's
-    /// in-process registration model keeps the class-object table; both
-    /// succeed for the stateless shim.
+    /// Read a `REG_SZ` value from the guest registry (the runtime registry is
+    /// the single source for the registration keys).
+    fn com_registry_string(&self, hive: &str, key: &str, value_name: &str) -> Option<String> {
+        self.win32
+            .ge()
+            .registry_get_value(hive, key, value_name, RegistryView::Native)
+            .ok()
+            .flatten()
+            .and_then(|value| value.data.as_str().map(str::to_string))
+    }
+
+    fn com_registry_set_string(
+        &self,
+        hive: &str,
+        key: &str,
+        value_name: &str,
+        value: &str,
+    ) -> AppResult<()> {
+        self.win32.ge().registry_set_value(
+            hive,
+            key,
+            value_name,
+            "REG_SZ",
+            json!(value),
+            RegistryView::Native,
+        )
+    }
+
+    /// The registry view of one actxprxy class: `(any_key_present,
+    /// complete)`.  Both backing hives (`HKCU\Software\Classes` for `HKCR`
+    /// writes and `HKLM\Software\Classes`) must carry the full registration.
+    fn actxprxy_registration_state(&self, entry: &ActxprxyClassEntry) -> (bool, bool) {
+        let mut any = false;
+        let mut complete = true;
+        for hive in ["HKCU", "HKLM"] {
+            let class_root = format!("Software\\Classes\\CLSID\\{}", entry.clsid);
+            let inproc_key = format!("{class_root}\\InprocServer32");
+            for value_name in ["", "ThreadingModel"] {
+                if self
+                    .com_registry_string(hive, &inproc_key, value_name)
+                    .is_some()
+                {
+                    any = true;
+                } else {
+                    complete = false;
+                }
+            }
+            if let Some(progid) = entry.progid {
+                for key in [
+                    format!("{class_root}\\ProgID"),
+                    format!("Software\\Classes\\{progid}\\CLSID"),
+                ] {
+                    if self.com_registry_string(hive, &key, "").is_some() {
+                        any = true;
+                    } else {
+                        complete = false;
+                    }
+                }
+            }
+            if !any
+                && (self
+                    .win32
+                    .ge()
+                    .registry_key_exists(hive, &class_root, RegistryView::Native)
+                    .unwrap_or(false)
+                    || entry.progid.is_some_and(|progid| {
+                        self.win32
+                            .ge()
+                            .registry_key_exists(
+                                hive,
+                                &format!("Software\\Classes\\{progid}"),
+                                RegistryView::Native,
+                            )
+                            .unwrap_or(false)
+                    }))
+            {
+                any = true;
+            }
+        }
+        (any, complete)
+    }
+
+    /// The live registration for a class, but only when the registry still
+    /// carries the exact `InprocServer32` path and `ThreadingModel` the class
+    /// table published.  Class activation uses this table (plus the registered
+    /// library path), not just the built-in class objects.
+    pub(crate) fn registered_com_class(&self, clsid: &str) -> Option<&ComClassRegistration> {
+        let registration = self.com_class_table.get(&normalize_clsid(clsid))?;
+        let inproc_key = format!("CLSID\\{}\\InprocServer32", registration.clsid);
+        let module_path = self.com_registry_string("HKCR", &inproc_key, "")?;
+        if !module_path.eq_ignore_ascii_case(&registration.module_path) {
+            return None;
+        }
+        let threading_model = self.com_registry_string("HKCR", &inproc_key, "ThreadingModel")?;
+        if !threading_model.eq_ignore_ascii_case(&registration.threading_model) {
+            return None;
+        }
+        Some(registration)
+    }
+
+    /// Whether class resolution can serve a CLSID: a live registry-backed
+    /// registration or a built-in class object.
+    pub(crate) fn com_class_available(&self, clsid: &str) -> bool {
+        self.registered_com_class(clsid).is_some() || is_builtin_com_class(clsid)
+    }
+
+    /// Resolve a registered class to a real guest IDispatch server.  The
+    /// object is created only while the registration is live, so an
+    /// unregistered class is not activatable through the table.
+    pub(crate) fn try_create_registered_com_class(
+        &mut self,
+        memory: &mut MemoryImage,
+        clsid: &str,
+    ) -> AppResult<Option<u64>> {
+        let Some(registration) = self.registered_com_class(clsid).cloned() else {
+            return Ok(None);
+        };
+        let table = registration
+            .progid
+            .clone()
+            .unwrap_or_else(|| registration.clsid.clone());
+        let object = self.alloc_com_automation_server(memory, &table)?;
+        Ok(Some(object))
+    }
+
+    /// `DllRegisterServer()` — writes the real HKCR/HKLM `CLSID` keys
+    /// (`InprocServer32`, `ThreadingModel`, and the `ProgID` mapping where the
+    /// class has one) through the runtime registry and publishes the classes
+    /// in the in-process class table.  Idempotent: re-registering rewrites the
+    /// same values and keeps the existing table entries.
+    ///
+    /// Failure HRESULTs: `HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND)` when the
+    /// registered library path does not exist, `REGDB_E_INVALIDVALUE` when a
+    /// ProgID is already owned by a different CLSID, and `E_ACCESSDENIED` when
+    /// the guest registry refuses a write.
     pub(crate) fn dispatch_com_dll_register_server(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        state.set(Register::Rax, u64::from(S_OK));
         let _ = memory;
+        if self
+            .win32
+            .ge()
+            .get_file_metadata(ACTXPRXY_MODULE_PATH)
+            .is_err()
+        {
+            state.set(Register::Rax, u64::from(HRESULT_MOD_NOT_FOUND));
+            return Ok(());
+        }
+        // Validate the ProgID namespace before writing anything: a ProgID may
+        // map to exactly one CLSID.
+        for entry in ACTXPRXY_CLASSES {
+            let Some(progid) = entry.progid else {
+                continue;
+            };
+            if let Some(existing) =
+                self.com_registry_string("HKCR", &format!("{progid}\\CLSID"), "")
+                && !existing.eq_ignore_ascii_case(entry.clsid)
+            {
+                state.set(Register::Rax, u64::from(REGDB_E_INVALIDVALUE));
+                return Ok(());
+            }
+        }
+        for entry in ACTXPRXY_CLASSES {
+            for hive in ["HKCU", "HKLM"] {
+                let class_root = format!("Software\\Classes\\CLSID\\{}", entry.clsid);
+                let inproc_key = format!("{class_root}\\InprocServer32");
+                let write = self
+                    .com_registry_set_string(hive, &inproc_key, "", ACTXPRXY_MODULE_PATH)
+                    .and_then(|_| {
+                        self.com_registry_set_string(
+                            hive,
+                            &inproc_key,
+                            "ThreadingModel",
+                            entry.threading_model,
+                        )
+                    })
+                    .and_then(|_| match entry.progid {
+                        Some(progid) => self
+                            .com_registry_set_string(
+                                hive,
+                                &format!("{class_root}\\ProgID"),
+                                "",
+                                progid,
+                            )
+                            .and_then(|_| {
+                                self.com_registry_set_string(
+                                    hive,
+                                    &format!("Software\\Classes\\{progid}\\CLSID"),
+                                    "",
+                                    entry.clsid,
+                                )
+                            }),
+                        None => Ok(()),
+                    });
+                if write.is_err() {
+                    state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+                    return Ok(());
+                }
+            }
+            self.com_class_table.insert(
+                normalize_clsid(entry.clsid),
+                ComClassRegistration {
+                    clsid: normalize_clsid(entry.clsid),
+                    progid: entry.progid.map(str::to_string),
+                    module_path: ACTXPRXY_MODULE_PATH.to_string(),
+                    threading_model: entry.threading_model.to_string(),
+                },
+            );
+        }
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
+    /// `DllUnregisterServer()` — removes the class registration from both
+    /// registry hives and from the in-process class table.  A completely
+    /// absent registration answers `REGDB_E_CLASSNOTREG` (the repeated
+    /// unregister semantics); a partial registration answers
+    /// `REGDB_E_READREGDB` and is left untouched; a registry delete failure
+    /// answers `E_ACCESSDENIED`.
     pub(crate) fn dispatch_com_dll_unregister_server(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        state.set(Register::Rax, u64::from(S_OK));
         let _ = memory;
+        let mut any_present = false;
+        let mut all_complete = true;
+        for entry in ACTXPRXY_CLASSES {
+            let (any, complete) = self.actxprxy_registration_state(entry);
+            any_present |= any;
+            all_complete &= complete;
+        }
+        if !all_complete {
+            state.set(
+                Register::Rax,
+                u64::from(if any_present {
+                    REGDB_E_READREGDB
+                } else {
+                    REGDB_E_CLASSNOTREG
+                }),
+            );
+            return Ok(());
+        }
+        for entry in ACTXPRXY_CLASSES {
+            for hive in ["HKCU", "HKLM"] {
+                // Delete one class fully before touching the next hive: a
+                // refused delete must not leave the other hive half-removed.
+                if self
+                    .win32
+                    .ge()
+                    .registry_delete_key(
+                        hive,
+                        &format!("Software\\Classes\\CLSID\\{}", entry.clsid),
+                        RegistryView::Native,
+                    )
+                    .is_err()
+                {
+                    state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+                    return Ok(());
+                }
+                if let Some(progid) = entry.progid
+                    && self
+                        .win32
+                        .ge()
+                        .registry_delete_key(
+                            hive,
+                            &format!("Software\\Classes\\{progid}"),
+                            RegistryView::Native,
+                        )
+                        .is_err()
+                {
+                    state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+                    return Ok(());
+                }
+            }
+            self.com_class_table.remove(&normalize_clsid(entry.clsid));
+        }
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
     /// `DllGetClassObject(rclsid, riid, ppv)` — the in-process class-object
-    /// resolution routes through the runtime's class-object table.
+    /// resolution routes through the registry-backed class table: a class is
+    /// served only while it is registered (or is a runtime built-in), and an
+    /// unregistered class answers `REGDB_E_CLASSNOTREG`.
     pub(crate) fn dispatch_com_dll_get_class_object(
         &mut self,
         state: &mut CpuState,
@@ -801,6 +1144,11 @@ impl PeHostRuntime {
         let clsid =
             std::array::from_fn(|index| memory.read_u8(clsid_ptr + index as u64).unwrap_or(0));
         let clsid_text = Self::guid_bytes_to_string(&clsid);
+        if !self.com_class_available(&clsid_text) {
+            write_guest_pointer(memory, out, 0, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(REGDB_E_CLASSNOTREG));
+            return Ok(());
+        }
         match self.alloc_com_factory_object(memory, &clsid_text) {
             Ok(object) => {
                 write_guest_pointer(memory, out, object, self.guest_arch).ok();
@@ -19866,6 +20214,505 @@ mod tests {
                 S_FALSE
             );
             assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 0);
+        })
+    }
+
+    // ── registry-backed class registration (actxprxy) ───────────────────────
+
+    const ATX_CLSID_WITH_PROGID: &str = "{C1A50010-0000-4000-8000-000000000010}";
+    const ATX_CLSID_NO_PROGID: &str = "{C1A50011-0000-4000-8000-000000000011}";
+    const ATX_PROGID: &str = "Casa1.AtxProxy";
+    const ATX_MODULE_PATH: &str = "C:\\Windows\\System32\\actxprxy.dll";
+    const REG_CLSID: u64 = 0x43_000;
+    const REG_CLSID_OUT: u64 = 0x43_100;
+    const REG_IID: u64 = 0x43_200;
+    const REG_REG_OUT: u64 = 0x43_300;
+    const REG_TEXT: u64 = 0x43_400;
+
+    fn install_actxprxy_module(fixture: &Fixture) {
+        let path = fixture
+            .runtime
+            .win32
+            .ge()
+            .drive_c()
+            .join("Windows/System32/actxprxy.dll");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"MZ").unwrap();
+    }
+
+    fn registry_value(fixture: &Fixture, hive: &str, key: &str, name: &str) -> Option<String> {
+        fixture
+            .runtime
+            .win32
+            .ge()
+            .registry_get_value(hive, key, name, RegistryView::Native)
+            .unwrap()
+            .and_then(|value| value.data.as_str().map(str::to_string))
+    }
+
+    fn clsid_key(clsid: &str) -> String {
+        format!("Software\\Classes\\CLSID\\{clsid}")
+    }
+
+    fn map_clsid(fixture: &mut Fixture, ptr: u64, clsid: &str) {
+        let bytes = PeHostRuntime::parse_guid_string(clsid).unwrap();
+        fixture.memory.map_bytes(ptr, &bytes);
+    }
+
+    fn dispatch_register(fixture: &mut Fixture) -> u64 {
+        dispatch_x86(fixture, HostThunk::DllRegisterServer, &[])
+    }
+
+    fn dispatch_unregister(fixture: &mut Fixture) -> u64 {
+        dispatch_x86(fixture, HostThunk::DllUnregisterServer, &[])
+    }
+
+    fn dispatch_get_class_object(fixture: &mut Fixture, clsid: &str) -> u64 {
+        map_clsid(fixture, REG_CLSID, clsid);
+        fixture.memory.map_bytes(REG_REG_OUT, &[0_u8; 8]);
+        dispatch_x86(
+            fixture,
+            HostThunk::DllGetClassObject,
+            &[REG_CLSID as u32, 0, REG_REG_OUT as u32],
+        )
+    }
+
+    fn dispatch_co_get_class_object(fixture: &mut Fixture, clsid: &str) -> u64 {
+        map_clsid(fixture, REG_CLSID, clsid);
+        fixture.memory.map_bytes(REG_IID, &[0_u8; 16]);
+        fixture.memory.map_bytes(REG_REG_OUT, &[0_u8; 8]);
+        dispatch_x86(
+            fixture,
+            HostThunk::CoGetClassObject,
+            &[REG_CLSID as u32, 0, 1, REG_IID as u32, REG_REG_OUT as u32],
+        )
+    }
+
+    fn dispatch_create_instance(fixture: &mut Fixture, clsid: &str) -> u64 {
+        map_clsid(fixture, REG_CLSID, clsid);
+        map_clsid(fixture, REG_IID, IID_IUNKNOWN);
+        fixture.memory.map_bytes(REG_REG_OUT, &[0_u8; 8]);
+        dispatch_x86(
+            fixture,
+            HostThunk::CoCreateInstance,
+            &[REG_CLSID as u32, 0, 1, REG_IID as u32, REG_REG_OUT as u32],
+        )
+    }
+
+    #[test]
+    fn com_register_unregister_re_register_is_registry_backed_and_idempotent() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-registry-backed");
+            fixture.memory.map_bytes(REG_REG_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(REGDB_E_CLASSNOTREG),
+                "an unregistered class is not resolvable"
+            );
+
+            install_actxprxy_module(&fixture);
+            assert_eq!(dispatch_register(&mut fixture), u64::from(S_OK));
+
+            for hive in ["HKCU", "HKLM"] {
+                let inproc = format!("{}\\InprocServer32", clsid_key(ATX_CLSID_WITH_PROGID));
+                assert_eq!(
+                    registry_value(&fixture, hive, &inproc, "").as_deref(),
+                    Some(ATX_MODULE_PATH),
+                    "{hive} InprocServer32"
+                );
+                assert_eq!(
+                    registry_value(&fixture, hive, &inproc, "ThreadingModel").as_deref(),
+                    Some("Both"),
+                    "{hive} ThreadingModel"
+                );
+                assert_eq!(
+                    registry_value(
+                        &fixture,
+                        hive,
+                        &format!("{}\\ProgID", clsid_key(ATX_CLSID_WITH_PROGID)),
+                        "",
+                    )
+                    .as_deref(),
+                    Some(ATX_PROGID),
+                    "{hive} ProgID"
+                );
+                assert_eq!(
+                    registry_value(
+                        &fixture,
+                        hive,
+                        &format!("Software\\Classes\\{ATX_PROGID}\\CLSID"),
+                        "",
+                    )
+                    .as_deref(),
+                    Some(ATX_CLSID_WITH_PROGID),
+                    "{hive} ProgID -> CLSID"
+                );
+                assert_eq!(
+                    registry_value(
+                        &fixture,
+                        hive,
+                        &format!("{}\\ProgID", clsid_key(ATX_CLSID_NO_PROGID)),
+                        "",
+                    ),
+                    None,
+                    "a class without a ProgID publishes no ProgID mapping"
+                );
+                assert_eq!(
+                    registry_value(
+                        &fixture,
+                        hive,
+                        &format!("{}\\InprocServer32", clsid_key(ATX_CLSID_NO_PROGID)),
+                        "ThreadingModel",
+                    )
+                    .as_deref(),
+                    Some("Apartment")
+                );
+            }
+            assert_eq!(fixture.runtime.com_class_table.len(), 2);
+
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(S_OK),
+                "a registered class resolves through the class table"
+            );
+            assert_ne!(guest_ptr(&fixture, REG_REG_OUT), 0);
+            assert_eq!(
+                dispatch_create_instance(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(S_OK),
+                "a registered class activates through the registered table"
+            );
+            assert_ne!(guest_ptr(&fixture, REG_REG_OUT), 0);
+            assert_eq!(
+                dispatch_co_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(S_OK)
+            );
+
+            // Idempotent re-registration rewrites the same registration.
+            assert_eq!(dispatch_register(&mut fixture), u64::from(S_OK));
+            assert_eq!(fixture.runtime.com_class_table.len(), 2);
+
+            // The ProgID mappings are real registry lookups.
+            map_clsid(&mut fixture, REG_CLSID, ATX_CLSID_WITH_PROGID);
+            fixture.memory.map_bytes(REG_REG_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ProgidFromClsid,
+                    &[REG_CLSID as u32, REG_REG_OUT as u32],
+                ),
+                u64::from(S_OK)
+            );
+            assert_eq!(
+                read_utf16_string(&fixture.memory, guest_ptr(&fixture, REG_REG_OUT)).unwrap(),
+                ATX_PROGID
+            );
+            write_utf16(&mut fixture, REG_TEXT, ATX_PROGID);
+            fixture.memory.map_bytes(REG_CLSID_OUT, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ClsidFromProgid,
+                    &[REG_TEXT as u32, REG_CLSID_OUT as u32],
+                ),
+                u64::from(S_OK)
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(REG_CLSID_OUT, 16).unwrap(),
+                PeHostRuntime::parse_guid_string(ATX_CLSID_WITH_PROGID).unwrap()
+            );
+
+            assert_eq!(dispatch_unregister(&mut fixture), u64::from(S_OK));
+            assert!(fixture.runtime.com_class_table.is_empty());
+            for hive in ["HKCU", "HKLM"] {
+                assert!(
+                    !fixture
+                        .runtime
+                        .win32
+                        .ge()
+                        .registry_key_exists(
+                            hive,
+                            &clsid_key(ATX_CLSID_WITH_PROGID),
+                            RegistryView::Native,
+                        )
+                        .unwrap(),
+                    "{hive} CLSID key removed"
+                );
+                assert!(
+                    !fixture
+                        .runtime
+                        .win32
+                        .ge()
+                        .registry_key_exists(
+                            hive,
+                            &format!("Software\\Classes\\{ATX_PROGID}"),
+                            RegistryView::Native,
+                        )
+                        .unwrap(),
+                    "{hive} ProgID key removed"
+                );
+            }
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(REGDB_E_CLASSNOTREG),
+                "resolution fails after unregister"
+            );
+            assert_eq!(
+                dispatch_create_instance(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(CLASS_E_CLASSNOTAVAILABLE),
+                "activation fails after unregister"
+            );
+            assert_eq!(
+                dispatch_co_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(CLASS_E_CLASSNOTAVAILABLE),
+                "CoGetClassObject fails after unregister"
+            );
+
+            // Repeated unregister is not a success: the class is gone.
+            assert_eq!(
+                dispatch_unregister(&mut fixture),
+                u64::from(REGDB_E_CLASSNOTREG)
+            );
+
+            // Re-registration restores the registry and table registration.
+            assert_eq!(dispatch_register(&mut fixture), u64::from(S_OK));
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(S_OK)
+            );
+        })
+    }
+
+    #[test]
+    fn com_register_missing_library_path_fails_with_mod_not_found() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-registry-missing-library");
+            assert_eq!(
+                dispatch_register(&mut fixture),
+                u64::from(HRESULT_MOD_NOT_FOUND)
+            );
+            assert!(fixture.runtime.com_class_table.is_empty());
+            assert_eq!(
+                registry_value(
+                    &fixture,
+                    "HKCU",
+                    &format!("{}\\InprocServer32", clsid_key(ATX_CLSID_WITH_PROGID)),
+                    "",
+                ),
+                None,
+                "a missing library path writes no registry keys"
+            );
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn com_register_access_denied_surfaces_e_access_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-registry-access-denied");
+            install_actxprxy_module(&fixture);
+            assert_eq!(dispatch_register(&mut fixture), u64::from(S_OK));
+
+            let hive_path = fixture.runtime.win32.ge().registry_file("HKCU");
+            let original = std::fs::metadata(&hive_path).unwrap().permissions();
+            std::fs::set_permissions(&hive_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            assert_eq!(
+                dispatch_register(&mut fixture),
+                u64::from(E_ACCESSDENIED),
+                "a refused registry write is E_ACCESSDENIED"
+            );
+            assert_eq!(
+                dispatch_unregister(&mut fixture),
+                u64::from(E_ACCESSDENIED),
+                "a refused registry delete is E_ACCESSDENIED"
+            );
+            assert_eq!(fixture.runtime.com_class_table.len(), 2);
+            std::fs::set_permissions(&hive_path, original).unwrap();
+            assert_eq!(dispatch_unregister(&mut fixture), u64::from(S_OK));
+        })
+    }
+
+    #[test]
+    fn com_register_duplicate_progid_is_rejected() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-registry-duplicate-progid");
+            install_actxprxy_module(&fixture);
+            fixture
+                .runtime
+                .win32
+                .ge()
+                .registry_set_value(
+                    "HKCR",
+                    &format!("{ATX_PROGID}\\CLSID"),
+                    "",
+                    "REG_SZ",
+                    json!("{DEADBEEF-0000-4000-8000-000000000000}"),
+                    RegistryView::Native,
+                )
+                .unwrap();
+            assert_eq!(
+                dispatch_register(&mut fixture),
+                u64::from(REGDB_E_INVALIDVALUE)
+            );
+            assert!(fixture.runtime.com_class_table.is_empty());
+            assert_eq!(
+                registry_value(
+                    &fixture,
+                    "HKCU",
+                    &format!("{}\\InprocServer32", clsid_key(ATX_CLSID_WITH_PROGID)),
+                    "",
+                ),
+                None,
+                "a ProgID collision writes no class registration"
+            );
+        })
+    }
+
+    #[test]
+    fn com_unregister_missing_and_partial_keys_report_exact_errors() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-registry-partial-unregister");
+            assert_eq!(
+                dispatch_unregister(&mut fixture),
+                u64::from(REGDB_E_CLASSNOTREG),
+                "no registration at all"
+            );
+
+            fixture
+                .runtime
+                .win32
+                .ge()
+                .registry_create_key(
+                    "HKCU",
+                    &format!("{}\\InprocServer32", clsid_key(ATX_CLSID_WITH_PROGID)),
+                    RegistryView::Native,
+                )
+                .unwrap();
+            assert_eq!(
+                dispatch_unregister(&mut fixture),
+                u64::from(REGDB_E_READREGDB),
+                "an empty partial key is a partial registration"
+            );
+
+            install_actxprxy_module(&fixture);
+            assert_eq!(dispatch_register(&mut fixture), u64::from(S_OK));
+            fixture
+                .runtime
+                .win32
+                .ge()
+                .registry_delete_value(
+                    "HKLM",
+                    &format!("{}\\InprocServer32", clsid_key(ATX_CLSID_WITH_PROGID)),
+                    "ThreadingModel",
+                    RegistryView::Native,
+                )
+                .unwrap();
+            assert_eq!(
+                dispatch_unregister(&mut fixture),
+                u64::from(REGDB_E_READREGDB),
+                "a missing ThreadingModel is a partial registration"
+            );
+            assert_eq!(fixture.runtime.com_class_table.len(), 2);
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(S_OK),
+                "a partial registration is left untouched"
+            );
+
+            // Re-registration repairs the missing value; unregister then works.
+            assert_eq!(dispatch_register(&mut fixture), u64::from(S_OK));
+            assert_eq!(dispatch_unregister(&mut fixture), u64::from(S_OK));
+        })
+    }
+
+    #[test]
+    fn com_registered_class_resolution_requires_live_inproc_server_values() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-registry-resolution");
+            install_actxprxy_module(&fixture);
+            assert_eq!(dispatch_register(&mut fixture), u64::from(S_OK));
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(S_OK)
+            );
+
+            let inproc = format!("{}\\InprocServer32", clsid_key(ATX_CLSID_WITH_PROGID));
+            fixture
+                .runtime
+                .win32
+                .ge()
+                .registry_set_value(
+                    "HKCU",
+                    &inproc,
+                    "",
+                    "REG_SZ",
+                    json!("C:\\Windows\\System32\\not-actxprxy.dll"),
+                    RegistryView::Native,
+                )
+                .unwrap();
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(REGDB_E_CLASSNOTREG),
+                "a mismatched InprocServer32 path does not resolve"
+            );
+
+            assert_eq!(dispatch_register(&mut fixture), u64::from(S_OK));
+            fixture
+                .runtime
+                .win32
+                .ge()
+                .registry_set_value(
+                    "HKCU",
+                    &inproc,
+                    "ThreadingModel",
+                    "REG_SZ",
+                    json!("Free"),
+                    RegistryView::Native,
+                )
+                .unwrap();
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(REGDB_E_CLASSNOTREG),
+                "a mismatched ThreadingModel does not resolve"
+            );
+        })
+    }
+
+    #[test]
+    fn com_dll_get_class_object_rejects_invalid_arguments_and_unknown_classes() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-registry-invalid-args");
+            fixture.memory.map_bytes(REG_REG_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::DllGetClassObject,
+                    &[0, 0, REG_REG_OUT as u32],
+                ),
+                u64::from(E_INVALIDARG),
+                "a null CLSID pointer is invalid"
+            );
+            map_clsid(&mut fixture, REG_CLSID, ATX_CLSID_WITH_PROGID);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::DllGetClassObject,
+                    &[REG_CLSID as u32, 0, 0],
+                ),
+                u64::from(E_INVALIDARG),
+                "a null output pointer is invalid"
+            );
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID),
+                u64::from(REGDB_E_CLASSNOTREG),
+                "an unregistered class is REGDB_E_CLASSNOTREG"
+            );
+            // Built-in class objects stay resolvable without registration.
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, "{E436EBB3-524F-11CE-9F53-0020AF0BA770}"),
+                u64::from(S_OK)
+            );
+            assert_ne!(guest_ptr(&fixture, REG_REG_OUT), 0);
         })
     }
 }

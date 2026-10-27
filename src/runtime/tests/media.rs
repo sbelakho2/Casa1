@@ -825,8 +825,8 @@ fn evidence_codec_components_surfaces() {
         let text = memory.read_bytes(text_out, written as usize).unwrap();
         assert!(String::from_utf8_lossy(&text).contains("No filters"));
 
-        // ── a codec module's DllGetClassObject (the shared server
-        //    contract: no codec classes are registered) ──
+        // ── a codec module's DllGetClassObject for an unregistered CLSID:
+        //    class resolution follows the registry-backed class table ──
         let dll_class: u64 = runtime.alloc_host_thunk(HostThunk::DllGetClassObject);
         let clsid_out = 0x41_600_u64;
         let hr = dispatch_x86_thunk(
@@ -836,8 +836,8 @@ fn evidence_codec_components_surfaces() {
             &[0x41_610, 0x41_620, clsid_out as u32],
         );
         assert_eq!(
-            hr, 0,
-            "the shared class-object contract answers every CLSID"
+            hr, 0x8004_0154,
+            "an unregistered class is REGDB_E_CLASSNOTREG"
         );
     })
 }

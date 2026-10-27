@@ -1403,6 +1403,13 @@
   "( call_slot( &mut fixture, type_info, 13, &[ type_info as u32, 1, 0, OUT as u32, (OUT + 4) as u32, (OUT + 8) as u32, ] ), 0, \"non-UTF-8 module names are skipped, not matched\" )",
   "(fixture.memory.read_u16(OUT + 8).unwrap(), 1)"
  ],
+ "com_dll_get_class_object_rejects_invalid_arguments_and_unknown_classes": [
+  "( dispatch_x86( &mut fixture, HostThunk::DllGetClassObject, &[0, 0, REG_REG_OUT as u32], ), u64::from(E_INVALIDARG), \"a null CLSID pointer is invalid\" )",
+  "( dispatch_x86( &mut fixture, HostThunk::DllGetClassObject, &[REG_CLSID as u32, 0, 0], ), u64::from(E_INVALIDARG), \"a null output pointer is invalid\" )",
+  "( dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID), u64::from(REGDB_E_CLASSNOTREG), \"an unregistered class is REGDB_E_CLASSNOTREG\" )",
+  "( dispatch_get_class_object(&mut fixture, \"{E436EBB3-524F-11CE-9F53-0020AF0BA770}\"), u64::from(S_OK) )",
+  "(guest_ptr(&fixture, REG_REG_OUT), 0)"
+ ],
  "com_item_bind_allocation_exhaustion_pins_errors": [
   "(error.message, \"PE runtime data allocation overflow\")"
  ],
@@ -1455,6 +1462,35 @@
   "( read_utf16_string(&fixture.memory, guest_ptr(&fixture, OUT + 12)).unwrap(), \"casa1.hlp\" )",
   "( call_slot( &mut fixture, type_info, 10, &[type_info as u32, NAMES as u32, 1, IDS as u32] ), 0 )"
  ],
+ "com_register_access_denied_surfaces_e_access_denied": [
+  "(dispatch_register(&mut fixture), u64::from(S_OK))",
+  "( dispatch_register(&mut fixture), u64::from(E_ACCESSDENIED), \"a refused registry write is E_ACCESSDENIED\" )",
+  "( dispatch_unregister(&mut fixture), u64::from(E_ACCESSDENIED), \"a refused registry delete is E_ACCESSDENIED\" )",
+  "(fixture.runtime.com_class_table.len(), 2)",
+  "(dispatch_unregister(&mut fixture), u64::from(S_OK))"
+ ],
+ "com_register_duplicate_progid_is_rejected": [
+  "( dispatch_register(&mut fixture), u64::from(REGDB_E_INVALIDVALUE) )",
+  "( registry_value( &fixture, \"HKCU\", &format!(\"{}\\\\InprocServer32\", clsid_key(ATX_CLSID_WITH_PROGID)), \"\", ), None, \"a ProgID collision writes no class registration\" )"
+ ],
+ "com_register_missing_library_path_fails_with_mod_not_found": [
+  "( dispatch_register(&mut fixture), u64::from(HRESULT_MOD_NOT_FOUND) )",
+  "( registry_value( &fixture, \"HKCU\", &format!(\"{}\\\\InprocServer32\", clsid_key(ATX_CLSID_WITH_PROGID)), \"\", ), None, \"a missing library path writes no registry keys\" )"
+ ],
+ "com_register_unregister_re_register_is_registry_backed_and_idempotent": [
+  "( dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID), u64::from(REGDB_E_CLASSNOTREG), \"an unregistered class is not resolvable\" )",
+  "(dispatch_register(&mut fixture), u64::from(S_OK))",
+  "( registry_value(&fixture, hive, &inproc, \"\").as_deref(), Some(ATX_MODULE_PATH), \"{hive} InprocServer32\" )",
+  "( registry_value(&fixture, hive, &inproc, \"ThreadingModel\").as_deref(), Some(\"Both\"), \"{hive} ThreadingModel\" )",
+  "( registry_value( &fixture, hive, &format!(\"{}\\\\ProgID\", clsid_key(ATX_CLSID_WITH_PROGID)), \"\", ) .as_deref(), Some(ATX_PROGID), \"{hive} ProgID\" )",
+  "( registry_value( &fixture, hive, &format!(\"Software\\\\Classes\\\\{ATX_PROGID}\\\\CLSID\"), \"\", ) .as_deref(), Some(ATX_CLSID_WITH_PROGID), \"{hive} ProgID -> CLSID\" )"
+ ],
+ "com_registered_class_resolution_requires_live_inproc_server_values": [
+  "(dispatch_register(&mut fixture), u64::from(S_OK))",
+  "( dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID), u64::from(S_OK) )",
+  "( dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID), u64::from(REGDB_E_CLASSNOTREG), \"a mismatched InprocServer32 path does not resolve\" )",
+  "( dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID), u64::from(REGDB_E_CLASSNOTREG), \"a mismatched ThreadingModel does not resolve\" )"
+ ],
  "com_running_enum_allocation_exhaustion_is_an_error": [
   "(error.message, \"PE runtime data allocation overflow\")"
  ],
@@ -1479,6 +1515,14 @@
   "( call_slot( &mut fixture, type_lib, 9, &[type_lib as u32, 0, 0, 0, OUT as u32, 0] ), 0 )",
   "(fixture.memory.read_u32(OUT).unwrap(), 7)",
   "( call_slot( &mut fixture, descriptor_lib, 9, &[descriptor_lib as u32, 0, 0, 0, 0, 0] ), S_OK )"
+ ],
+ "com_unregister_missing_and_partial_keys_report_exact_errors": [
+  "( dispatch_unregister(&mut fixture), u64::from(REGDB_E_CLASSNOTREG), \"no registration at all\" )",
+  "( dispatch_unregister(&mut fixture), u64::from(REGDB_E_READREGDB), \"an empty partial key is a partial registration\" )",
+  "(dispatch_register(&mut fixture), u64::from(S_OK))",
+  "( dispatch_unregister(&mut fixture), u64::from(REGDB_E_READREGDB), \"a missing ThreadingModel is a partial registration\" )",
+  "(fixture.runtime.com_class_table.len(), 2)",
+  "( dispatch_get_class_object(&mut fixture, ATX_CLSID_WITH_PROGID), u64::from(S_OK), \"a partial registration is left untouched\" )"
  ],
  "com_value_conversion_and_x64_connect_data_boundary_encoding_is_pinned": [
   "( invoke_add( &mut fixture, server, &[ComValue::Bool(true), ComValue::Double(2.9)] ), 3 )",
@@ -3518,6 +3562,12 @@
   "(dos_error_to_nt_status(122), STATUS_BUFFER_TOO_SMALL)",
   "(dos_error_to_nt_status(1460), STATUS_TIMEOUT)"
  ],
+ "double_initialize_and_shutdown_reject_with_exact_invalid_state": [
+  "( host.initialize().expect_err(\"double initialize\"), UmdfError::InvalidState )",
+  "( host.initialize().expect_err(\"double initialize\").hresult(), STATUS_INVALID_DEVICE_STATE )",
+  "( host.shutdown().expect_err(\"double shutdown\"), UmdfError::HostStopped )",
+  "(host.lifetime(), HostLifetime::Stopped)"
+ ],
  "double_load_and_unload_lifecycle": [
   "(first.device_count(), 1)",
   "(second.device_count(), 1)",
@@ -4080,6 +4130,14 @@
   "(short.required, full.required, \"class {class}\")",
   "(exact.status, STATUS_SUCCESS, \"class {class}\")",
   "(exact.bytes, full.bytes, \"class {class}\")"
+ ],
+ "evidence_codec_components_surfaces": [
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create_decoder, &[0, decoder_out as u32] ), 0 )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create_reader, &[0, 0, reader_out as u32] ), 0 )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create_writer, &[0, writer_out as u32] ), 0 )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, is_protected, &[0x41_130, protected_out as u32] ), 0 )",
+  "( read_guest_u32(&memory, protected_out).unwrap(), 0, \"not protected\" )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, dmo_enum, &[0, 0, count_out as u32, 0, 0] ), 0 )"
  ],
  "evidence_com_guid_string_conversions_and_task_allocator": [
   "(memory.read_u8(out_ptr).unwrap(), 0x78)",
@@ -5468,6 +5526,18 @@
  ],
  "host_busy_port_reports_addressing": [
   "( peer.host(&DplayAppDesc::new(\"Busy\", 4), addr), DPNERR_ADDRESSING, \"a busy port is a real addressing failure\" )"
+ ],
+ "host_callback_panic_is_isolated_to_the_owning_host": [
+  "( host.pump(1).expect_err(\"panic crashes host\"), UmdfError::HostCrashed )",
+  "(host.crash_reason(), Some(&CrashReason::CallbackPanic))"
+ ],
+ "host_crash_isolation_rejects_messages_without_affecting_other_hosts": [
+  "( crashed.pump(1).expect_err(\"callback failure crashes host\"), UmdfError::HostCrashed )",
+  "(crashed.lifetime(), HostLifetime::Crashed)",
+  "( crashed .submit_message(device, HostMessageKind::Cleanup) .expect_err(\"crashed host rejects work\"), UmdfError::HostCrashed )",
+  "( UmdfError::HostCrashed.hresult(), STATUS_PROCESS_IS_TERMINATING )",
+  "(healthy.pump(1).expect(\"healthy pump\").len(), 1)",
+  "(healthy.lifetime(), HostLifetime::Running)"
  ],
  "host_limited_kernel_services_fail_closed_with_exact_statuses": [
   "(DriverShim::EtwUnregister.x86_arg_bytes(), 4)",
@@ -6885,6 +6955,22 @@
   "( memory .read_u32(u64::from(image_base as u32 + X86K_ADD_MARKER)) .unwrap(), 0xCA5A_0031 )",
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtUnloadDriver, &[service_path], ), STATUS_SUCCESS )"
  ],
+ "kmdf_power_managed_queue_defers_until_device_exits_idle": [
+  "( island .dispatch_pnp( &mut runtime, &mut memory, device_object, IRP_MN_START_DEVICE, ) .expect(\"start\") .0, STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[device, config, 0, queue_out], ) .expect(\"power-managed queue\"), STATUS_SUCCESS )",
+  "( island.kmdf_queue_state(queue), Some((0, 0, false, false, true)) )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceStopIdle, &[device, 1], ) .expect(\"stop idle\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceResumeIdle, &[device], ) .expect(\"resume idle\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceResumeIdle, &[device], ) .expect(\"unbalanced resume\"), STATUS_INVALID_DEVICE_STATE )"
+ ],
+ "kmdf_power_transition_failure_rolls_back_to_previous_state": [
+  "( island .dispatch_pnp(&mut runtime, &mut memory, device, IRP_MN_START_DEVICE) .expect(\"start\") .0, STATUS_SUCCESS )",
+  "( island .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3) .expect(\"failing D3\") .0, STATUS_UNSUCCESSFUL )",
+  "( island.kmdf_device_runtime_state(handle).expect(\"state\").4, WDF_POWER_DEVICE_D0 )",
+  "(pnp_u32(&memory, base, P_D0EXIT_COUNT), 1)",
+  "(pnp_u32(&memory, base, P_D0ENTRY_COUNT), 2)",
+  "( island .set_device_power(&mut runtime, &mut memory, device, WDF_POWER_DEVICE_D3) .expect(\"D3\") .0, STATUS_SUCCESS )"
+ ],
  "kmdf_queue_callback_absence_and_stale_completion_edges_reject": [
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueStop, &[queue], ) .expect(\"stop without callback\"), STATUS_SUCCESS )",
   "( island .inner .borrow() .kmdf .queues .get(&queue) .expect(\"queue\") .stopped, true )",
@@ -6923,6 +7009,22 @@
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtReadFile, &[u64::from(handle), 0, 0, 0, iosb, buffer, 8, 0, 0], ), STATUS_SUCCESS )",
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtWriteFile, &[u64::from(handle), 0, 0, 0, iosb, buffer, 4, 0, 0], ), STATUS_SUCCESS )"
  ],
+ "kmdf_request_format_cancel_and_status_reject_stale_transitions": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device, out], ) .expect(\"request create\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestFormatRequestForRead, &[request, device, descriptor, 4, 0], ) .expect(\"format read\"), STATUS_SUCCESS )",
+  "(record.major, IrpMajorFunction::Read)",
+  "(record.input_len, 0)",
+  "(record.output_len, 0x0C)",
+  "(record.output_guest, buffer + 4)"
+ ],
+ "kmdf_request_forward_to_io_queue_rejects_cross_device_and_completed": [
+  "(devices.len(), 2)",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[second, config, 0, queue_out], ) .expect(\"cross-device queue\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[first, config, 0, queue_out], ) .expect(\"same-device queue\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueStopSynchronously, &[local_queue], ) .expect(\"stop local queue\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, first, request_out], ) .expect(\"request create\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestForwardToIoQueue, &[request, cross_queue], ) .expect(\"cross-device forward\"), STATUS_INVALID_DEVICE_REQUEST )"
+ ],
  "kmdf_requests_and_iotargets_reject_bad_handles_and_buffers": [
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device_a, out], ) .expect(\"request a\"), STATUS_SUCCESS )",
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestFormatRequestForIoctl, &[0xDEAD, device_a, 1, 0, 0, 0, 0, 0], ) .expect(\"format missing request\"), STATUS_INVALID_PARAMETER )",
@@ -6938,6 +7040,22 @@
   "(parsed.parent, None)",
   "(parsed.context_size_override, 0)",
   "(parsed.context_type_info, 0)"
+ ],
+ "kmdf_spinlock_timer_workitem_lifecycles_reject_invalid_states": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfSpinLockCreate, &[0, out], ) .expect(\"spin lock create\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfSpinLockAcquire, &[lock], ) .expect(\"acquire\"), STATUS_SUCCESS )",
+  "(island.kmdf_spinlock_held(lock), Some(true))",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfSpinLockAcquire, &[lock], ) .expect(\"double acquire\"), STATUS_INVALID_DEVICE_STATE )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfSpinLockRelease, &[lock], ) .expect(\"release\"), STATUS_SUCCESS )",
+  "(island.kmdf_spinlock_held(lock), Some(false))"
+ ],
+ "kmdf_surprise_removal_cancels_inflight_irp_and_rejects_repeat": [
+  "( island .dispatch_pnp( &mut runtime, &mut memory, device_object, IRP_MN_START_DEVICE, ) .expect(\"start\") .0, STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[device, config, 0, queue_out], ) .expect(\"queue create\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device, request_out], ) .expect(\"request create\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceEnqueueRequest, &[device, request], ) .expect(\"enqueue in flight\"), STATUS_PENDING )",
+  "( island.kmdf_queue_state(queue), Some((0, 1, false, false, false)) )",
+  "( island .dispatch_pnp( &mut runtime, &mut memory, device_object, IRP_MN_SURPRISE_REMOVAL, ) .expect(\"surprise removal\") .0, STATUS_SUCCESS )"
  ],
  "kmdf_wait_lock_blocks_with_timeout_and_wakes_waiters": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS )",
@@ -7414,6 +7532,11 @@
   "(message.wparam, 11)",
   "(message.lparam, 22)",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, peek, &[msg_ptr as u32, 0, 0, 0, 0] ), 0, \"PeekMessageW with an empty queue returns 0\" )"
+ ],
+ "message_queue_and_device_limits_reject_with_exact_errors": [
+  "( host.add_device(\"root\\\\c\", Vec::new()) .expect_err(\"device limit\"), UmdfError::OutOfMemory )",
+  "( host.submit_message(first, HostMessageKind::Cleanup) .expect_err(\"queue limit\"), UmdfError::MessageQueueFull )",
+  "(UmdfError::MessageQueueFull.hresult(), E_OUTOFMEMORY)"
  ],
  "metadata_dispatch_rejects_png_and_exif_edge_payloads": [
   "( wic_image_metadata_entries(&png, 1), vec![(\"Author\".to_string(), \"Casa\".to_string())] )",
@@ -8507,6 +8630,14 @@
   "( win32 .describe_handle(event) .expect(\"descriptor\") .object_type, casa1::win32::ObjectType::Event )",
   "( win32 .describe_handle(mutex) .expect(\"descriptor\") .object_type, casa1::win32::ObjectType::Mutex )",
   "( win32 .wait_for_single_object(opened_event, 0, false, None) .expect(\"wait via opened handle\"), casa1::win32::WaitStatus::Object0, \"the event opened through the namespace is the SAME object\" )"
+ ],
+ "object_pool_exhaustion_and_stale_release_are_exact": [
+  "( pool.allocate().expect_err(\"pool exhausted\"), UmdfError::PoolExhausted )",
+  "(UmdfError::PoolExhausted.hresult(), E_OUTOFMEMORY)",
+  "( pool.release(slot).expect_err(\"stale release\"), UmdfError::InvalidHandle )",
+  "(reused, slot)",
+  "(UmdfError::InvalidHandle.hresult(), STATUS_INVALID_HANDLE)",
+  "( HostObjectPool::new(0).expect_err(\"zero capacity\"), UmdfError::InvalidArgument )"
  ],
  "object_type_index_mismatch_for_the_file_family_is_intentional_and_distinct_elsewhere": [
   "(object_type_index(crate::win32::ObjectType::File), 3)",
@@ -9971,6 +10102,12 @@
   "(manager.resolve(\"RefCountedEvent\"), Some(id))",
   "(manager.resolve(\"RefCountedEvent\"), None, \"name forgotten\")"
  ],
+ "reflection_registry_rejects_duplicate_iid_and_unknown_proxy": [
+  "( pool.register(duplicate).expect_err(\"duplicate iid\"), UmdfError::InvalidState )",
+  "( pool.proxy(Iid(1)).expect_err(\"unknown proxy\"), UmdfError::NoInterface )",
+  "(pool.proxy_count(), 0)",
+  "(pool.len(), 5)"
+ ],
  "reg_close_key_on_non_key_handle_is_invalid_handle": [
   "(result, ERROR_INVALID_HANDLE as u64)",
   "(runtime.last_error, ERROR_INVALID_HANDLE)",
@@ -11089,6 +11226,14 @@
   "(island.status(), STATUS_UNSUCCESSFUL)",
   "(island.device_count(), 0)",
   "( memory .read_u32(island.image_base() + ENTRY_MARKER_RVA as u64) .unwrap(), 0xCA5A_0001, \"the failing entry still ran\" )"
+ ],
+ "surprise_removal_cancels_queued_messages_and_rejects_late_submits": [
+  "(host.device_state(device), Ok(DeviceState::SurpriseRemoved))",
+  "(completions.len(), 2)",
+  "(completions[0].status, STATUS_CANCELLED)",
+  "(completions[1].status, STATUS_CANCELLED)",
+  "( host.submit_message(device, HostMessageKind::Cleanup) .expect_err(\"late submit\"), UmdfError::DeviceRemoved )",
+  "(UmdfError::DeviceRemoved.hresult(), STATUS_DEVICE_NOT_READY)"
  ],
  "suspend_resume_and_priority_surfaces_share_one_thread_state": [
   "(session.call_x86(suspend_thread, &[handle]), 0)",
@@ -13372,6 +13517,12 @@
   "( device.swapchain_state_for(swapchain).unwrap().desc.format, DxgiFormat::R8G8B8A8Unorm )",
   "(runtime.swapchain_format_fallback_count(), 1)",
   "( runtime.swapchain_state(swapchain).unwrap().desc.format, DxgiFormat::R8G8B8A8Unorm, \"fallback uses the caller's typed format\" )"
+ ],
+ "unsupported_umdf_interface_returns_exact_e_nointerface": [
+  "( host.query_interface(Iid(0xDEAD_BEEF_0000_0000_0000_0000_0000_0001)) .expect_err(\"unknown interface\"), UmdfError::NoInterface )",
+  "(UmdfError::NoInterface.hresult(), E_NOINTERFACE)",
+  "( host.unsupported_feature(\"host-reflector-kernel-mode\") .expect_err(\"unsupported feature\"), UmdfError::NotSupported )",
+  "(E_NOTIMPL, 0x8000_4001u32 as HResult)"
  ],
  "unsupported_xop_instruction_returns_precise_error": [
   "( e.code, ReasonCode::RcUnimplInsn, \"XOP decode error should have precise code\" )",

@@ -1921,6 +1921,11 @@ pub(crate) struct PeHostRuntime {
     pub(crate) com_ps_clsids: HashMap<String, [u8; 16]>,
     /// Type-library registrations (RegisterTypeLib): guid string -> path.
     pub(crate) com_type_libraries: HashMap<String, String>,
+    /// The registry-backed in-process COM class table published by the
+    /// module-class registration entry points (actxprxy's `DllRegisterServer`
+    /// and `DllUnregisterServer`).  Keyed by the canonical upper-case CLSID.
+    pub(crate) com_class_table:
+        BTreeMap<String, crate::runtime::dispatch::com::ComClassRegistration>,
     /// Next connection-point cookie.
     pub(crate) com_next_conn_cookie: u32,
     /// The runtime's in-process IDispatch automation servers.
@@ -2638,6 +2643,7 @@ impl PeHostRuntime {
             com_next_context_token: 1,
             com_ps_clsids: HashMap::new(),
             com_type_libraries: HashMap::new(),
+            com_class_table: BTreeMap::new(),
             com_next_conn_cookie: 1,
             com_servers: HashMap::new(),
             com_monikers: HashMap::new(),

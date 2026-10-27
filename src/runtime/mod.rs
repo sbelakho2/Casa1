@@ -30613,22 +30613,27 @@ impl PeHostRuntime {
                 } else {
                     let clsid_str = read_guid_string(memory, clsid_ptr)?;
                     write_guest_pointer(memory, out_factory, 0, self.guest_arch)?;
-                    // Build a proper IClassFactory vtable:
-                    // [0] QueryInterface, [1] AddRef, [2] Release,
-                    // [3] CreateInstance, [4] LockServer
-                    let factory_object = self.alloc_com_factory_object(memory, &clsid_str)?;
-                    write_guest_pointer(memory, out_factory, factory_object, self.guest_arch)?;
-                    state.set(Register::Rax, 0);
-                    self.last_error = 0;
-                    self.push_trace(
-                        "ole32",
-                        "CoGetClassObject",
-                        BTreeMap::from([
-                            ("clsid".to_string(), json!(clsid_str)),
-                            ("factory".to_string(), json!(format!("{factory_object:#x}"))),
-                        ]),
-                        json!(0),
-                    );
+                    if !self.com_class_available(&clsid_str) {
+                        state.set(Register::Rax, CLASS_E_CLASSNOTAVAILABLE);
+                        self.last_error = ERROR_INVALID_PARAMETER;
+                    } else {
+                        // Build a proper IClassFactory vtable:
+                        // [0] QueryInterface, [1] AddRef, [2] Release,
+                        // [3] CreateInstance, [4] LockServer
+                        let factory_object = self.alloc_com_factory_object(memory, &clsid_str)?;
+                        write_guest_pointer(memory, out_factory, factory_object, self.guest_arch)?;
+                        state.set(Register::Rax, 0);
+                        self.last_error = 0;
+                        self.push_trace(
+                            "ole32",
+                            "CoGetClassObject",
+                            BTreeMap::from([
+                                ("clsid".to_string(), json!(clsid_str)),
+                                ("factory".to_string(), json!(format!("{factory_object:#x}"))),
+                            ]),
+                            json!(0),
+                        );
+                    }
                 }
             }
             HostThunk::CoRegisterClassObject => {
@@ -68317,6 +68322,12 @@ impl PeHostRuntime {
         iid: &str,
         _flags: u32,
     ) -> AppResult<Option<u64>> {
+        // A registry-backed class runs through its live registration first:
+        // the in-process class table carries the registered InprocServer32
+        // path/threading model, so activation follows registration state.
+        if let Some(object) = self.try_create_registered_com_class(memory, clsid)? {
+            return Ok(Some(object));
+        }
         // The runtime's in-process automation/event-source class: a real
         // IDispatch property/method server with an IConnectionPointContainer
         // for sink advice (the runtime's synthetic in-process class table).

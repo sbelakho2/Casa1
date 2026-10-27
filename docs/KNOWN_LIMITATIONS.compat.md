@@ -6,13 +6,13 @@
 
 Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).
 
-**Counts**: 85 entries deviate from exact/full — fidelity Exact 7, Restricted 64, SyntheticEnvironment 14, capability Full 1, Partial 76, Absent 8.  Method-level accounting: 810 method rows, 810 deviate from exact/full — fidelity Restricted 810, capability Partial 810.
+**Counts**: 85 entries deviate from exact/full — fidelity Exact 9, Restricted 64, SyntheticEnvironment 12, capability Full 1, Partial 76, Absent 8.  Method-level accounting: 810 method rows, 810 deviate from exact/full — fidelity Restricted 810, capability Partial 810.
 
 
 ### actxprxy.dll
 
-- `DllRegisterServer` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — Registry-less COM environment model: classes resolve through the in-process class-object table, so DllRegisterServer succeeds without writing the Windows registry.  Registration never changes class availability (it is already satisfied); unregistration never removes one.
-- `DllUnregisterServer` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Partial` — Registry-less COM environment model: classes resolve through the in-process class-object table, so DllUnregisterServer succeeds without writing the Windows registry.
+- `DllRegisterServer` — level `Implemented`, fidelity `Exact`, capability `Partial` — Writes the real guest registry CLSID keys (InprocServer32, ThreadingModel, and the ProgID mapping where applicable) to HKCR's backing hive and HKLM\Software\Classes, updates the in-process class table, is idempotent on re-register, and reports exact failure HRESULTs (ERROR_MOD_NOT_FOUND for a missing library path, REGDB_E_INVALIDVALUE for a ProgID collision, E_ACCESSDENIED for a refused registry write).  The COM subsystem remains partial: only the runtime's modeled class set is registered and activation stays in-process.
+- `DllUnregisterServer` — level `Implemented`, fidelity `Exact`, capability `Partial` — Removes the real guest registry CLSID keys (InprocServer32, ThreadingModel, ProgID) from HKCR's backing hive and HKLM\Software\Classes and removes the class from the in-process class table; exact HRESULTs distinguish an absent registration (REGDB_E_CLASSNOTREG), a partial registration (REGDB_E_READREGDB) and a refused delete (E_ACCESSDENIED).  The COM subsystem remains partial.
 
 ### browser.dll
 

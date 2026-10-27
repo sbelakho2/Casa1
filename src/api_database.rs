@@ -2160,32 +2160,40 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
     ),
     // ── the shared module-class registration contract ──────────────────────
     // Every module-class-object DLL routes DllRegisterServer/DllUnregisterServer
-    // through the same in-process COM contract.  Casa1's COM environment is
-    // registry-less: classes are available through the in-process class-object
-    // table, so registration is satisfied trivially — an environment model
-    // (the registry write is a no-op that never changes class availability),
-    // not a canned claim of Windows registry work.
+    // through the same registry-backed COM contract.  Registration writes the
+    // real guest registry CLSID keys (InprocServer32, ThreadingModel, ProgID
+    // where applicable) to both HKCR's backing hive and HKLM\Software\Classes,
+    // and updates the in-process class table; activation follows the published
+    // registration.  The COM subsystem remains partial: only the runtime's
+    // modeled class set is registered, and activation is in-process.
     semantic_override(
         "*",
         "DllRegisterServer",
         None,
-        SemanticFidelity::SyntheticEnvironment,
+        SemanticFidelity::Exact,
         SubsystemCapability::Partial,
-        "Registry-less COM environment model: classes resolve through the \
-         in-process class-object table, so DllRegisterServer succeeds without \
-         writing the Windows registry.  Registration never changes class \
-         availability (it is already satisfied); unregistration never removes \
-         one.",
+        "Writes the real guest registry CLSID keys (InprocServer32, \
+         ThreadingModel, and the ProgID mapping where applicable) to HKCR's \
+         backing hive and HKLM\\Software\\Classes, updates the in-process class \
+         table, is idempotent on re-register, and reports exact failure HRESULTs \
+         (ERROR_MOD_NOT_FOUND for a missing library path, \
+         REGDB_E_INVALIDVALUE for a ProgID collision, E_ACCESSDENIED for a \
+         refused registry write).  The COM subsystem remains partial: only the \
+         runtime's modeled class set is registered and activation stays \
+         in-process.",
     ),
     semantic_override(
         "*",
         "DllUnregisterServer",
         None,
-        SemanticFidelity::SyntheticEnvironment,
+        SemanticFidelity::Exact,
         SubsystemCapability::Partial,
-        "Registry-less COM environment model: classes resolve through the \
-         in-process class-object table, so DllUnregisterServer succeeds without \
-         writing the Windows registry.",
+        "Removes the real guest registry CLSID keys (InprocServer32, \
+         ThreadingModel, ProgID) from HKCR's backing hive and \
+         HKLM\\Software\\Classes and removes the class from the in-process class \
+         table; exact HRESULTs distinguish an absent registration \
+         (REGDB_E_CLASSNOTREG), a partial registration (REGDB_E_READREGDB) and \
+         a refused delete (E_ACCESSDENIED).  The COM subsystem remains partial.",
     ),
 ];
 
