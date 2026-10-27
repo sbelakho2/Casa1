@@ -42,6 +42,11 @@ pub const DML_TENSOR_DATA_TYPE_UINT8: u32 = 5;
 pub const DML_TENSOR_DATA_TYPE_INT32: u32 = 6;
 pub const DML_TENSOR_DATA_TYPE_INT16: u32 = 7;
 pub const DML_TENSOR_DATA_TYPE_INT8: u32 = 8;
+pub const DML_TENSOR_DATA_TYPE_FLOAT64: u32 = 9;
+pub const DML_TENSOR_DATA_TYPE_UINT64: u32 = 10;
+pub const DML_TENSOR_DATA_TYPE_INT64: u32 = 11;
+pub const DML_TENSOR_DATA_TYPE_UINT4: u32 = 12;
+pub const DML_TENSOR_DATA_TYPE_INT4: u32 = 13;
 
 pub const DML_TENSOR_TYPE_BUFFER: u32 = 1;
 
@@ -80,10 +85,39 @@ pub const DML_FEATURE_LEVEL_6_3: u32 = 0x6300;
 pub const DML_FEATURE_LEVEL_6_4: u32 = 0x6400;
 
 /// The highest DirectML feature level this bridge truthfully implements.
-pub const SUPPORTED_DML_FEATURE_LEVEL: u32 = DML_FEATURE_LEVEL_1_0;
+pub const SUPPORTED_DML_FEATURE_LEVEL: u32 = DML_FEATURE_LEVEL_4_0;
+/// Whether the bridge can realize this tensor data type in at least one
+/// implemented operator.
+pub fn supports_tensor_data_type(data_type: u32) -> bool {
+    matches!(
+        data_type,
+        DML_TENSOR_DATA_TYPE_FLOAT32
+            | DML_TENSOR_DATA_TYPE_FLOAT16
+            | DML_TENSOR_DATA_TYPE_UINT32
+            | DML_TENSOR_DATA_TYPE_INT32
+            | DML_TENSOR_DATA_TYPE_UINT8
+            | DML_TENSOR_DATA_TYPE_INT8
+    )
+}
+
+/// DirectML feature-level negotiation: the highest requested level at or below
+/// [`SUPPORTED_DML_FEATURE_LEVEL`], or 0 when none is supported.
+pub fn negotiate_feature_levels(levels: &[u32]) -> u32 {
+    levels
+        .iter()
+        .copied()
+        .filter(|level| *level <= SUPPORTED_DML_FEATURE_LEVEL)
+        .max()
+        .unwrap_or(0)
+}
 
 pub const DML_CREATE_DEVICE_FLAG_DEBUG: u32 = 0x1;
 pub const DML_EXECUTION_FLAGS_VALID: u32 = 0x1 | 0x2 | 0x4;
+
+pub const DML_GRAPH_NODE_TYPE_OPERATOR: u32 = 1;
+pub const DML_GRAPH_EDGE_TYPE_INPUT: u32 = 1;
+pub const DML_GRAPH_EDGE_TYPE_OUTPUT: u32 = 2;
+pub const DML_GRAPH_EDGE_TYPE_INTERMEDIATE: u32 = 3;
 
 pub const DML_TENSOR_MAX_DIMENSIONS: u32 = 4;
 pub const DML_TENSOR_MIN_ALIGNMENT: u64 = 16;
@@ -353,6 +387,48 @@ pub struct DmlBindingProperties {
     pub persistent_resource_size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmlGraphInputEdge {
+    pub graph_input: u32,
+    pub to_node: u32,
+    pub to_node_input: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmlGraphOutputEdge {
+    pub from_node: u32,
+    pub from_node_output: u32,
+    pub graph_output: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmlGraphIntermediateEdge {
+    pub from_node: u32,
+    pub from_node_output: u32,
+    pub to_node: u32,
+    pub to_node_input: u32,
+}
+
+/// A validated DirectML graph: node operators in topological order plus the
+/// graph input/output edges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DmlGraphPlan {
+    pub input_count: u32,
+    pub output_count: u32,
+    pub nodes: Vec<dml_ops::DmlOpPlan>,
+    pub input_edges: Vec<DmlGraphInputEdge>,
+    pub output_edges: Vec<DmlGraphOutputEdge>,
+    pub intermediate_edges: Vec<DmlGraphIntermediateEdge>,
+    pub execution_order: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DmlGraphRecord {
+    pub handle: u64,
+    pub device: u64,
+    pub plan: DmlGraphPlan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmlBindingTableRecord {
     pub handle: u64,
@@ -379,6 +455,7 @@ pub struct DmlRuntime {
     binding_tables: BTreeMap<u64, DmlBindingTableRecord>,
     operations: BTreeMap<u64, DmlOperationRecord>,
     operations_compiled: BTreeMap<u64, DmlOperationCompiledRecord>,
+    graphs: BTreeMap<u64, DmlGraphRecord>,
     dispatches: Vec<DmlDispatchRecord>,
 }
 
@@ -472,6 +549,7 @@ impl DmlRuntime {
             .retain(|_, table| table.device != device);
         self.operations.retain(|_, op| op.device != device);
         self.operations_compiled.retain(|_, op| op.device != device);
+        self.graphs.retain(|_, graph| graph.device != device);
         Ok(())
     }
 
@@ -528,6 +606,938 @@ impl DmlRuntime {
         Ok(DmlOperatorDesc { ty, a, b, output })
     }
 
+    /// Parse a guest `DML_OPERATOR_DESC` for the extended operator set.
+    ///
+    /// This is the guest-facing counterpart of [`Self::create_operation`]: the
+    /// descriptor chain is read from guest memory, every tensor descriptor is
+    /// validated, and the result is a real [`dml_ops::DmlOpPlan`].
+    pub fn parse_operation_from_guest(
+        &self,
+        memory: &dyn StateObjectMemory,
+        desc: u64,
+    ) -> DmlResult<dml_ops::DmlOpPlan> {
+        use dml_ops::{DmlAxisDirection, DmlOpKind, DmlOpPlan};
+
+        if desc == 0 {
+            return Err(DmlError::new(
+                E_POINTER,
+                "DML_OPERATOR_DESC pointer is null",
+            ));
+        }
+        let ty = memory
+            .read_u32(desc)
+            .map_err(|error| DmlError::invalid(error.to_string()))?;
+        let payload = memory
+            .read_u64(desc + 8)
+            .map_err(|error| DmlError::invalid(error.to_string()))?;
+        if payload == 0 {
+            return Err(DmlError::new(
+                E_POINTER,
+                "DML_OPERATOR_DESC.Desc pointer is null",
+            ));
+        }
+        let plan = |kind, inputs, output, extra_outputs, fused_activation| {
+            Ok::<DmlOpPlan, DmlError>(DmlOpPlan {
+                kind,
+                inputs,
+                output,
+                extra_outputs,
+                fused_activation,
+            })
+        };
+        match ty {
+            dml_ops::DML_OPERATOR_GEMM => {
+                let a = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let b = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let c = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let trans_a = read_u32(memory, payload + 32)? == 1;
+                let trans_b = read_u32(memory, payload + 36)? == 1;
+                let alpha = read_f32(memory, payload + 40)?;
+                let beta = read_f32(memory, payload + 44)?;
+                let mut inputs = vec![a, b];
+                if let Some(c) = c {
+                    inputs.push(c);
+                }
+                plan(
+                    DmlOpKind::Gemm {
+                        trans_a,
+                        trans_b,
+                        alpha,
+                        beta,
+                    },
+                    inputs,
+                    output,
+                    Vec::new(),
+                    parse_fused_activation(memory, read_ptr(memory, payload + 48)?)?,
+                )
+            }
+            dml_ops::DML_OPERATOR_CONVOLUTION => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let filter = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let bias = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let mode = read_u32(memory, payload + 32)?;
+                let direction = read_u32(memory, payload + 36)?;
+                if mode != dml_ops::DML_CONVOLUTION_MODE_CROSS_CORRELATION {
+                    return Err(DmlError::invalid(format!(
+                        "convolution mode {mode} is not supported (only cross-correlation)"
+                    )));
+                }
+                if direction != dml_ops::DML_CONVOLUTION_DIRECTION_FORWARD {
+                    return Err(DmlError::invalid(format!(
+                        "convolution direction {direction} is not supported (only forward)"
+                    )));
+                }
+                let dimension_count = read_u32(memory, payload + 40)?;
+                if dimension_count != 2 {
+                    return Err(DmlError::invalid(format!(
+                        "convolution DimensionCount must be 2, got {dimension_count}"
+                    )));
+                }
+                let strides = read_u32_list(memory, read_ptr(memory, payload + 48)?, 2)?;
+                let dilations = read_u32_list(memory, read_ptr(memory, payload + 56)?, 2)?;
+                let start_padding = read_u32_list(memory, read_ptr(memory, payload + 64)?, 2)?;
+                let end_padding = read_u32_list(memory, read_ptr(memory, payload + 72)?, 2)?;
+                let output_padding = read_u32_list(memory, read_ptr(memory, payload + 80)?, 2)?;
+                let group_count = read_u32(memory, payload + 88)?;
+                let mut inputs = vec![input, filter];
+                if let Some(bias) = bias {
+                    inputs.push(bias);
+                }
+                plan(
+                    DmlOpKind::Convolution {
+                        strides,
+                        dilations,
+                        start_padding,
+                        end_padding,
+                        output_padding,
+                        group_count,
+                    },
+                    inputs,
+                    output,
+                    Vec::new(),
+                    parse_fused_activation(memory, read_ptr(memory, payload + 96)?)?,
+                )
+            }
+            dml_ops::DML_OPERATOR_AVERAGE_POOLING | dml_ops::DML_OPERATOR_MAX_POOLING => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let dimension_count = read_u32(memory, payload + 16)?;
+                if dimension_count != 2 {
+                    return Err(DmlError::invalid(format!(
+                        "pooling DimensionCount must be 2, got {dimension_count}"
+                    )));
+                }
+                let strides = read_u32_list(memory, read_ptr(memory, payload + 24)?, 2)?;
+                let window = read_u32_list(memory, read_ptr(memory, payload + 32)?, 2)?;
+                let start_padding = read_u32_list(memory, read_ptr(memory, payload + 40)?, 2)?;
+                let end_padding = read_u32_list(memory, read_ptr(memory, payload + 48)?, 2)?;
+                let include_padding = if ty == dml_ops::DML_OPERATOR_AVERAGE_POOLING {
+                    read_u32(memory, payload + 56)? != 0
+                } else {
+                    false
+                };
+                plan(
+                    DmlOpKind::Pooling {
+                        kind: if ty == dml_ops::DML_OPERATOR_MAX_POOLING {
+                            dml_ops::DmlPoolingKind::Max
+                        } else {
+                            dml_ops::DmlPoolingKind::Average
+                        },
+                        strides,
+                        window,
+                        start_padding,
+                        end_padding,
+                        include_padding,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ACTIVATION_RELU
+            | dml_ops::DML_OPERATOR_ACTIVATION_LEAKY_RELU
+            | dml_ops::DML_OPERATOR_ACTIVATION_SIGMOID
+            | dml_ops::DML_OPERATOR_ACTIVATION_TANH
+            | dml_ops::DML_OPERATOR_ACTIVATION_IDENTITY
+            | dml_ops::DML_OPERATOR_ACTIVATION_ELU
+            | dml_ops::DML_OPERATOR_ACTIVATION_LINEAR
+            | dml_ops::DML_OPERATOR_ACTIVATION_SOFTPLUS
+            | dml_ops::DML_OPERATOR_ACTIVATION_SOFTSIGN
+            | dml_ops::DML_OPERATOR_ACTIVATION_GELU
+            | dml_ops::DML_OPERATOR_ACTIVATION_SWISH
+            | dml_ops::DML_OPERATOR_ACTIVATION_HARD_SWISH
+            | dml_ops::DML_OPERATOR_ACTIVATION_HARD_SIGMOID
+            | dml_ops::DML_OPERATOR_ACTIVATION_SCALED_TANH
+            | dml_ops::DML_OPERATOR_ACTIVATION_THRESHOLDED_RELU => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let activation = parse_activation_payload(memory, ty, payload)?;
+                plan(
+                    DmlOpKind::Activation {
+                        activation,
+                        alpha: 0.0,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ACTIVATION_SOFTMAX => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                plan(DmlOpKind::Softmax, vec![input], output, Vec::new(), None)
+            }
+            dml_ops::DML_OPERATOR_BATCH_NORMALIZATION => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let mean = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let variance = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let scale = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let bias = tensor_at(memory, read_ptr(memory, payload + 32)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 40)?)?;
+                let spatial = read_u32(memory, payload + 48)? != 0;
+                let epsilon = read_f32(memory, payload + 52)?;
+                plan(
+                    DmlOpKind::BatchNormalization { spatial, epsilon },
+                    vec![input, mean, variance, scale, bias],
+                    output,
+                    Vec::new(),
+                    parse_fused_activation(memory, read_ptr(memory, payload + 56)?)?,
+                )
+            }
+            dml_ops::DML_OPERATOR_REDUCE => {
+                let function = read_u32(memory, payload)?;
+                let input = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let axis_count = read_u32(memory, payload + 24)?;
+                let axes = read_u32_list(memory, read_ptr(memory, payload + 32)?, axis_count)?;
+                let reduce =
+                    dml_ops::DmlReduceKind::from_reduce_function(function).ok_or_else(|| {
+                        DmlError::invalid(format!(
+                            "DML_REDUCE_FUNCTION {function} is not supported"
+                        ))
+                    })?;
+                if reduce.is_index_reduction() {
+                    let kind = if function == 0 {
+                        DmlOpKind::ArgMax {
+                            axes,
+                            direction: DmlAxisDirection::Increasing,
+                        }
+                    } else {
+                        DmlOpKind::ArgMin {
+                            axes,
+                            direction: DmlAxisDirection::Increasing,
+                        }
+                    };
+                    plan(kind, vec![input], output, Vec::new(), None)
+                } else {
+                    plan(
+                        DmlOpKind::Reduce { reduce, axes },
+                        vec![input],
+                        output,
+                        Vec::new(),
+                        None,
+                    )
+                }
+            }
+            dml_ops::DML_OPERATOR_SLICE => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let dimension_count = read_u32(memory, payload + 16)?;
+                if dimension_count as usize != input.sizes.len() {
+                    return Err(DmlError::invalid(format!(
+                        "slice DimensionCount {dimension_count} must match the input rank {}",
+                        input.sizes.len()
+                    )));
+                }
+                let offsets =
+                    read_u32_list(memory, read_ptr(memory, payload + 24)?, dimension_count)?;
+                let sizes =
+                    read_u32_list(memory, read_ptr(memory, payload + 32)?, dimension_count)?;
+                let strides =
+                    read_u32_list(memory, read_ptr(memory, payload + 40)?, dimension_count)?;
+                plan(
+                    DmlOpKind::Slice {
+                        offsets,
+                        sizes,
+                        strides,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_JOIN => {
+                let count = read_u32(memory, payload)?;
+                if count == 0 || count > 1024 {
+                    return Err(DmlError::invalid(format!(
+                        "join InputCount {count} is outside the supported 1..=1024 range"
+                    )));
+                }
+                let ptr = read_ptr(memory, payload + 8)?;
+                let mut inputs = Vec::with_capacity(count as usize);
+                for index in 0..count as u64 {
+                    inputs.push(tensor_at(memory, read_ptr(memory, ptr + index * 8)?)?);
+                }
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let axis = read_u32(memory, payload + 24)?;
+                plan(DmlOpKind::Concat { axis }, inputs, output, Vec::new(), None)
+            }
+            dml_ops::DML_OPERATOR_SPLIT => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let count = read_u32(memory, payload + 8)?;
+                if count == 0 || count > 1024 {
+                    return Err(DmlError::invalid(format!(
+                        "split OutputCount {count} is outside the supported 1..=1024 range"
+                    )));
+                }
+                let ptr = read_ptr(memory, payload + 16)?;
+                let mut outputs = Vec::with_capacity(count as usize);
+                for index in 0..count as u64 {
+                    outputs.push(tensor_at(memory, read_ptr(memory, ptr + index * 8)?)?);
+                }
+                let axis = read_u32(memory, payload + 24)?;
+                let primary = outputs.remove(0);
+                plan(
+                    DmlOpKind::Split { axis },
+                    vec![input],
+                    primary,
+                    outputs,
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_PADDING | dml_ops::DML_OPERATOR_PADDING1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let mode = read_u32(memory, payload + 16)?;
+                let padding_mode = dml_ops::DmlPaddingMode::from_u32(mode).ok_or_else(|| {
+                    DmlError::invalid(format!("DML_PADDING_MODE {mode} is not supported"))
+                })?;
+                let (value, dimension_count, start_offset) = if ty == dml_ops::DML_OPERATOR_PADDING1
+                {
+                    let data_type = read_u32(memory, payload + 20)?;
+                    let value = read_scalar_union(memory, payload + 24, data_type)?;
+                    (value, read_u32(memory, payload + 32)?, 40)
+                } else {
+                    (
+                        read_f32(memory, payload + 20)?,
+                        read_u32(memory, payload + 24)?,
+                        32,
+                    )
+                };
+                let rank = input.sizes.len();
+                if dimension_count as usize != rank {
+                    return Err(DmlError::invalid(format!(
+                        "padding DimensionCount {dimension_count} must match the input rank {rank}"
+                    )));
+                }
+                let start_padding = read_u32_list(
+                    memory,
+                    read_ptr(memory, payload + start_offset)?,
+                    dimension_count,
+                )?;
+                let end_padding = read_u32_list(
+                    memory,
+                    read_ptr(memory, payload + start_offset + 8)?,
+                    dimension_count,
+                )?;
+                plan(
+                    DmlOpKind::Padding {
+                        mode: padding_mode,
+                        start_padding,
+                        end_padding,
+                        value,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_RESAMPLE
+            | dml_ops::DML_OPERATOR_RESAMPLE1
+            | dml_ops::DML_OPERATOR_RESAMPLE2
+            | dml_ops::DML_OPERATOR_RESAMPLE3 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let mode = read_u32(memory, payload + 16)?;
+                let interpolation =
+                    dml_ops::DmlInterpolationMode::from_u32(mode).ok_or_else(|| {
+                        DmlError::invalid(format!("DML_INTERPOLATION_MODE {mode} is not supported"))
+                    })?;
+                let rank = input.sizes.len();
+                let mut rounding = DmlAxisDirection::Increasing;
+                let mut antialiased = false;
+                let (dimension_count, scales_ptr, input_offset_ptr, output_offset_ptr) = match ty {
+                    dml_ops::DML_OPERATOR_RESAMPLE => {
+                        (rank as u32, read_ptr(memory, payload + 24)?, 0, 0)
+                    }
+                    dml_ops::DML_OPERATOR_RESAMPLE1 => (
+                        read_u32(memory, payload + 20)?,
+                        read_ptr(memory, payload + 24)?,
+                        read_ptr(memory, payload + 32)?,
+                        read_ptr(memory, payload + 40)?,
+                    ),
+                    _ => {
+                        rounding = DmlAxisDirection::from_u32(read_u32(memory, payload + 20)?)
+                            .ok_or_else(|| {
+                                DmlError::invalid("resample rounding direction is invalid")
+                            })?;
+                        antialiased = ty == dml_ops::DML_OPERATOR_RESAMPLE3
+                            && read_u32(memory, payload + 56)? != 0;
+                        (
+                            read_u32(memory, payload + 24)?,
+                            read_ptr(memory, payload + 32)?,
+                            read_ptr(memory, payload + 40)?,
+                            read_ptr(memory, payload + 48)?,
+                        )
+                    }
+                };
+                let scales = read_f32_list(memory, scales_ptr, dimension_count)?;
+                let input_offsets = if input_offset_ptr == 0 {
+                    vec![0.0; dimension_count as usize]
+                } else {
+                    read_f32_list(memory, input_offset_ptr, dimension_count)?
+                };
+                let output_offsets = if output_offset_ptr == 0 {
+                    vec![0.0; dimension_count as usize]
+                } else {
+                    read_f32_list(memory, output_offset_ptr, dimension_count)?
+                };
+                plan(
+                    DmlOpKind::Resample {
+                        mode: interpolation,
+                        scales,
+                        input_offsets,
+                        output_offsets,
+                        rounding,
+                        antialiased,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_UPSAMPLE_2D => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let width = read_u32(memory, payload + 16)?;
+                let height = read_u32(memory, payload + 20)?;
+                let mode = read_u32(memory, payload + 24)?;
+                let interpolation =
+                    dml_ops::DmlInterpolationMode::from_u32(mode).ok_or_else(|| {
+                        DmlError::invalid(format!("DML_INTERPOLATION_MODE {mode} is not supported"))
+                    })?;
+                let rank = input.sizes.len();
+                let mut scales = vec![1.0f32; rank];
+                if rank >= 2 {
+                    scales[rank - 2] = height as f32;
+                    scales[rank - 1] = width as f32;
+                }
+                plan(
+                    DmlOpKind::Resample {
+                        mode: interpolation,
+                        scales,
+                        input_offsets: vec![0.0; rank],
+                        output_offsets: vec![0.0; rank],
+                        rounding: DmlAxisDirection::Increasing,
+                        antialiased: false,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_GATHER => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let indices = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let axis = read_u32(memory, payload + 24)?;
+                let index_dimensions = read_u32(memory, payload + 28)?;
+                plan(
+                    DmlOpKind::Gather {
+                        axis,
+                        index_dimensions,
+                    },
+                    vec![input, indices],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_GATHER_ELEMENTS => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let indices = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let axis = read_u32(memory, payload + 24)?;
+                plan(
+                    DmlOpKind::GatherElements { axis },
+                    vec![input, indices],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_GATHER_ND | dml_ops::DML_OPERATOR_GATHER_ND1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let indices = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let input_dimension_count = read_u32(memory, payload + 24)?;
+                let indices_dimension_count = read_u32(memory, payload + 28)?;
+                let batch_dimension_count = if ty == dml_ops::DML_OPERATOR_GATHER_ND1 {
+                    read_u32(memory, payload + 32)?
+                } else {
+                    0
+                };
+                plan(
+                    DmlOpKind::GatherNd {
+                        input_dimension_count,
+                        indices_dimension_count,
+                        batch_dimension_count,
+                    },
+                    vec![input, indices],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_SCATTER => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let indices = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let updates = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let axis = read_u32(memory, payload + 32)?;
+                plan(
+                    DmlOpKind::Scatter { axis },
+                    vec![input, indices, updates],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_SCATTER_ND => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let indices = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let updates = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let input_dimension_count = read_u32(memory, payload + 32)?;
+                let indices_dimension_count = read_u32(memory, payload + 36)?;
+                plan(
+                    DmlOpKind::ScatterNd {
+                        input_dimension_count,
+                        indices_dimension_count,
+                    },
+                    vec![input, indices, updates],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_TILE => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let count = read_u32(memory, payload + 16)?;
+                let repeats = read_u32_list(memory, read_ptr(memory, payload + 24)?, count)?;
+                plan(
+                    DmlOpKind::Tile { repeats },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_TOP_K | dml_ops::DML_OPERATOR_TOP_K1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let values = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let indices = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let axis = read_u32(memory, payload + 24)?;
+                let k = read_u32(memory, payload + 28)?;
+                let direction = if ty == dml_ops::DML_OPERATOR_TOP_K1 {
+                    DmlAxisDirection::from_u32(read_u32(memory, payload + 32)?)
+                        .ok_or_else(|| DmlError::invalid("top-k axis direction is invalid"))?
+                } else {
+                    DmlAxisDirection::Decreasing
+                };
+                plan(
+                    DmlOpKind::TopK { axis, k, direction },
+                    vec![input],
+                    values,
+                    vec![indices],
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ROI_POOLING => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let roi = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let spatial_scale = read_f32(memory, payload + 24)?;
+                let width = read_u32(memory, payload + 28)?;
+                let height = read_u32(memory, payload + 32)?;
+                plan(
+                    DmlOpKind::RoiPooling {
+                        spatial_scale,
+                        pooled: vec![height, width],
+                    },
+                    vec![input, roi],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ROI_ALIGN | dml_ops::DML_OPERATOR_ROI_ALIGN1 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let roi = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let batch_indices = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let reduction = dml_ops::DmlReduceKind::from_reduce_function(read_u32(
+                    memory,
+                    payload + 32,
+                )?)
+                .ok_or_else(|| DmlError::invalid("ROI align reduction function is invalid"))?;
+                let mode = dml_ops::DmlInterpolationMode::from_u32(read_u32(memory, payload + 36)?)
+                    .ok_or_else(|| DmlError::invalid("ROI align interpolation mode is invalid"))?;
+                let (
+                    spatial_scale_x,
+                    spatial_scale_y,
+                    input_pixel_offset,
+                    output_pixel_offset,
+                    out_of_bounds_value,
+                    minimum_samples_per_output,
+                    maximum_samples_per_output,
+                    align_regions_to_corners,
+                ) = if ty == dml_ops::DML_OPERATOR_ROI_ALIGN1 {
+                    (
+                        read_f32(memory, payload + 40)?,
+                        read_f32(memory, payload + 44)?,
+                        read_f32(memory, payload + 48)?,
+                        read_f32(memory, payload + 52)?,
+                        read_f32(memory, payload + 56)?,
+                        read_u32(memory, payload + 60)?,
+                        read_u32(memory, payload + 64)?,
+                        read_u32(memory, payload + 68)? != 0,
+                    )
+                } else {
+                    (
+                        read_f32(memory, payload + 40)?,
+                        read_f32(memory, payload + 44)?,
+                        0.0,
+                        0.0,
+                        read_f32(memory, payload + 48)?,
+                        read_u32(memory, payload + 52)?,
+                        read_u32(memory, payload + 56)?,
+                        false,
+                    )
+                };
+                plan(
+                    DmlOpKind::RoiAlign {
+                        reduction,
+                        mode,
+                        spatial_scale_x,
+                        spatial_scale_y,
+                        input_pixel_offset,
+                        output_pixel_offset,
+                        out_of_bounds_value,
+                        minimum_samples_per_output,
+                        maximum_samples_per_output,
+                        align_regions_to_corners,
+                    },
+                    vec![input, roi, batch_indices],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_LOCAL_RESPONSE_NORMALIZATION => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let cross_channel = read_u32(memory, payload + 16)? != 0;
+                let local_size = read_u32(memory, payload + 20)?;
+                let alpha = read_f32(memory, payload + 24)?;
+                let beta = read_f32(memory, payload + 28)?;
+                let bias = read_f32(memory, payload + 32)?;
+                plan(
+                    DmlOpKind::LocalResponseNormalization {
+                        cross_channel,
+                        local_size,
+                        alpha,
+                        beta,
+                        bias,
+                    },
+                    vec![input],
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_MEAN_VARIANCE_NORMALIZATION
+            | dml_ops::DML_OPERATOR_MEAN_VARIANCE_NORMALIZATION1
+            | dml_ops::DML_OPERATOR_MEAN_VARIANCE_NORMALIZATION2 => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let scale = optional_tensor(memory, read_ptr(memory, payload + 8)?)?;
+                let bias = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let rank = input.sizes.len();
+                let (axes, normalize_variance, epsilon, fused_ptr) = match ty {
+                    dml_ops::DML_OPERATOR_MEAN_VARIANCE_NORMALIZATION => {
+                        let cross_channel = read_u32(memory, payload + 32)? != 0;
+                        let axes = if cross_channel {
+                            (1..rank as u32).collect()
+                        } else if rank > 2 {
+                            (2..rank as u32).collect()
+                        } else {
+                            (1..rank as u32).collect()
+                        };
+                        (
+                            axes,
+                            read_u32(memory, payload + 36)? != 0,
+                            read_f32(memory, payload + 40)?,
+                            48,
+                        )
+                    }
+                    dml_ops::DML_OPERATOR_MEAN_VARIANCE_NORMALIZATION1 => {
+                        let count = read_u32(memory, payload + 32)?;
+                        (
+                            read_u32_list(memory, read_ptr(memory, payload + 40)?, count)?,
+                            read_u32(memory, payload + 48)? != 0,
+                            read_f32(memory, payload + 52)?,
+                            56,
+                        )
+                    }
+                    _ => {
+                        let count = read_u32(memory, payload + 32)?;
+                        if read_u32(memory, payload + 48)? == 0 {
+                            return Err(DmlError::invalid(
+                                "mean variance normalization with UseMean disabled is not supported",
+                            ));
+                        }
+                        (
+                            read_u32_list(memory, read_ptr(memory, payload + 40)?, count)?,
+                            read_u32(memory, payload + 52)? != 0,
+                            read_f32(memory, payload + 56)?,
+                            64,
+                        )
+                    }
+                };
+                let mut inputs = vec![input];
+                if let Some(scale) = scale {
+                    inputs.push(scale);
+                }
+                if let Some(bias) = bias {
+                    inputs.push(bias);
+                }
+                plan(
+                    DmlOpKind::MeanVarianceNormalization {
+                        axes,
+                        normalize_variance,
+                        epsilon,
+                    },
+                    inputs,
+                    output,
+                    Vec::new(),
+                    parse_fused_activation(memory, read_ptr(memory, payload + fused_ptr)?)?,
+                )
+            }
+            dml_ops::DML_OPERATOR_ADAM_OPTIMIZER => {
+                let parameters = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let first = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let second = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let gradient = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let step = tensor_at(memory, read_ptr(memory, payload + 32)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 40)?)?;
+                let output_first = tensor_at(memory, read_ptr(memory, payload + 48)?)?;
+                let output_second = tensor_at(memory, read_ptr(memory, payload + 56)?)?;
+                plan(
+                    DmlOpKind::Adam {
+                        learning_rate: read_f32(memory, payload + 64)?,
+                        beta1: read_f32(memory, payload + 68)?,
+                        beta2: read_f32(memory, payload + 72)?,
+                        epsilon: read_f32(memory, payload + 76)?,
+                    },
+                    vec![parameters, first, second, gradient, step],
+                    output,
+                    vec![output_first, output_second],
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_ARGMIN | dml_ops::DML_OPERATOR_ARGMAX => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let count = read_u32(memory, payload + 16)?;
+                let axes = read_u32_list(memory, read_ptr(memory, payload + 24)?, count)?;
+                let direction = DmlAxisDirection::from_u32(read_u32(memory, payload + 32)?)
+                    .ok_or_else(|| DmlError::invalid("argmin/argmax axis direction is invalid"))?;
+                let kind = if ty == dml_ops::DML_OPERATOR_ARGMIN {
+                    DmlOpKind::ArgMin { axes, direction }
+                } else {
+                    DmlOpKind::ArgMax { axes, direction }
+                };
+                plan(kind, vec![input], output, Vec::new(), None)
+            }
+            dml_ops::DML_OPERATOR_RNN | dml_ops::DML_OPERATOR_GRU | dml_ops::DML_OPERATOR_LSTM => {
+                parse_recurrent(memory, ty, payload)
+            }
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_ADD1 => {
+                let a = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let b = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                plan(
+                    DmlOpKind::Add1,
+                    vec![a, b],
+                    output,
+                    Vec::new(),
+                    parse_fused_activation(memory, read_ptr(memory, payload + 24)?)?,
+                )
+            }
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_QUANTIZE_LINEAR
+            | dml_ops::DML_OPERATOR_ELEMENT_WISE_DEQUANTIZE_LINEAR => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let scale = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let zero = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let mut inputs = vec![input, scale];
+                if let Some(zero) = zero {
+                    inputs.push(zero);
+                }
+                let kind = if ty == dml_ops::DML_OPERATOR_ELEMENT_WISE_QUANTIZE_LINEAR {
+                    DmlOpKind::QuantizeLinear
+                } else {
+                    DmlOpKind::DequantizeLinear
+                };
+                plan(kind, inputs, output, Vec::new(), None)
+            }
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_QUANTIZED_LINEAR_ADD => {
+                let a = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let a_scale = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let a_zero = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
+                let b = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let b_scale = tensor_at(memory, read_ptr(memory, payload + 32)?)?;
+                let b_zero = optional_tensor(memory, read_ptr(memory, payload + 40)?)?;
+                let out_scale = tensor_at(memory, read_ptr(memory, payload + 48)?)?;
+                let out_zero = optional_tensor(memory, read_ptr(memory, payload + 56)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 64)?)?;
+                let mut inputs = vec![a, a_scale];
+                if let Some(zero) = &a_zero {
+                    inputs.push(zero.clone());
+                }
+                inputs.push(b);
+                inputs.push(b_scale);
+                if let Some(zero) = &b_zero {
+                    inputs.push(zero.clone());
+                }
+                inputs.push(out_scale);
+                if let Some(zero) = &out_zero {
+                    inputs.push(zero.clone());
+                }
+                plan(
+                    DmlOpKind::QuantizedLinearAdd {
+                        a_zero_point: a_zero.is_some(),
+                        b_zero_point: b_zero.is_some(),
+                        output_zero_point: out_zero.is_some(),
+                    },
+                    inputs,
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_DYNAMIC_QUANTIZE_LINEAR => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let scale = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+                let zero = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                plan(
+                    DmlOpKind::DynamicQuantizeLinear,
+                    vec![input],
+                    output,
+                    vec![scale, zero],
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_MATRIX_MULTIPLY_INTEGER
+            | dml_ops::DML_OPERATOR_QUANTIZED_LINEAR_MATRIX_MULTIPLY
+            | dml_ops::DML_OPERATOR_MATRIX_MULTIPLY_INTEGER_TO_FLOAT => {
+                parse_integer_matmul(memory, ty, payload)
+            }
+            dml_ops::DML_OPERATOR_CONVOLUTION_INTEGER
+            | dml_ops::DML_OPERATOR_QUANTIZED_LINEAR_CONVOLUTION => {
+                parse_integer_convolution(memory, ty, payload)
+            }
+            dml_ops::DML_OPERATOR_QUANTIZED_LINEAR_AVERAGE_POOLING => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let input_scale = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+                let input_zero = optional_tensor(memory, read_ptr(memory, payload + 16)?)?;
+                let out_scale = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let out_zero = optional_tensor(memory, read_ptr(memory, payload + 32)?)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 40)?)?;
+                let dimension_count = read_u32(memory, payload + 48)?;
+                if dimension_count != 2 {
+                    return Err(DmlError::invalid(format!(
+                        "quantized average pooling DimensionCount must be 2, got {dimension_count}"
+                    )));
+                }
+                let strides = read_u32_list(memory, read_ptr(memory, payload + 56)?, 2)?;
+                let window = read_u32_list(memory, read_ptr(memory, payload + 64)?, 2)?;
+                let start_padding = read_u32_list(memory, read_ptr(memory, payload + 72)?, 2)?;
+                let end_padding = read_u32_list(memory, read_ptr(memory, payload + 80)?, 2)?;
+                let dilations = read_u32_list(memory, read_ptr(memory, payload + 88)?, 2)?;
+                let include_padding = read_u32(memory, payload + 96)? != 0;
+                let mut inputs = vec![input, input_scale];
+                if let Some(zero) = &input_zero {
+                    inputs.push(zero.clone());
+                }
+                inputs.push(out_scale);
+                if let Some(zero) = &out_zero {
+                    inputs.push(zero.clone());
+                }
+                plan(
+                    DmlOpKind::QuantizedLinearAveragePooling {
+                        strides,
+                        window,
+                        start_padding,
+                        end_padding,
+                        dilations,
+                        include_padding,
+                        input_zero_point: input_zero.is_some(),
+                        output_zero_point: out_zero.is_some(),
+                    },
+                    inputs,
+                    output,
+                    Vec::new(),
+                    None,
+                )
+            }
+            dml_ops::DML_OPERATOR_QUANTIZE | dml_ops::DML_OPERATOR_DEQUANTIZE => {
+                let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+                let quantization_type = read_u32(memory, payload + 8)?;
+                let count = read_u32(memory, payload + 12)?;
+                if count > 8 {
+                    return Err(DmlError::invalid(format!(
+                        "quantize QuantizationTensorCount {count} exceeds the supported 8 tensors"
+                    )));
+                }
+                let ptr = read_ptr(memory, payload + 16)?;
+                let output = tensor_at(memory, read_ptr(memory, payload + 24)?)?;
+                let mut inputs = vec![input];
+                for index in 0..count as u64 {
+                    inputs.push(tensor_at(memory, read_ptr(memory, ptr + index * 8)?)?);
+                }
+                let kind = if ty == dml_ops::DML_OPERATOR_QUANTIZE {
+                    DmlOpKind::Quantize { quantization_type }
+                } else {
+                    DmlOpKind::Dequantize { quantization_type }
+                };
+                plan(kind, inputs, output, Vec::new(), None)
+            }
+            other => Err(DmlError::unsupported_operator(other)),
+        }
+    }
+
     pub fn create_operator(&mut self, device: u64, desc: DmlOperatorDesc) -> DmlResult<u64> {
         self.device(device)?;
         let handle = self.alloc_handle();
@@ -548,8 +1558,22 @@ impl DmlRuntime {
         memory: &dyn StateObjectMemory,
         desc: u64,
     ) -> DmlResult<u64> {
-        let parsed = self.parse_operator(memory, desc)?;
-        self.create_operator(device, parsed)
+        if desc == 0 {
+            return Err(DmlError::new(
+                E_POINTER,
+                "DML_OPERATOR_DESC pointer is null",
+            ));
+        }
+        let ty = memory
+            .read_u32(desc)
+            .map_err(|error| DmlError::invalid(error.to_string()))?;
+        if dml_ops::is_extended_operator(ty) {
+            let plan = self.parse_operation_from_guest(memory, desc)?;
+            self.create_operation(device, plan)
+        } else {
+            let parsed = self.parse_operator(memory, desc)?;
+            self.create_operator(device, parsed)
+        }
     }
 
     pub fn operator(&self, operator: u64) -> DmlResult<&DmlOperatorRecord> {
@@ -563,6 +1587,14 @@ impl DmlRuntime {
         if flags & !DML_EXECUTION_FLAGS_VALID != 0 {
             return Err(DmlError::invalid(format!(
                 "DML_EXECUTION_FLAGS {flags:#x} contain undefined bits"
+            )));
+        }
+        if !self.operators.contains_key(&operator) {
+            if self.operations.contains_key(&operator) {
+                return self.compile_operation(device, operator, flags);
+            }
+            return Err(DmlError::invalid(format!(
+                "unknown DML operator {operator:#x}"
             )));
         }
         let record = self.operator(operator)?.clone();
@@ -696,6 +1728,350 @@ impl DmlRuntime {
             })
     }
 
+    /// The plan for a created operator, including the extended operator set.
+    pub fn operation_plan(&self, handle: u64) -> DmlResult<dml_ops::DmlOpPlan> {
+        if let Some(record) = self.operations.get(&handle) {
+            return Ok(record.plan.clone());
+        }
+        let record = self
+            .operators
+            .get(&handle)
+            .ok_or_else(|| DmlError::invalid(format!("unknown DML operator {handle:#x}")))?;
+        let desc = &record.desc;
+        let kind = if desc.is_binary() {
+            dml_ops::DmlOpKind::Binary {
+                op: match desc.ty {
+                    DML_OPERATOR_ELEMENT_WISE_ADD => dml_ops::DmlBinaryOp::Add,
+                    DML_OPERATOR_ELEMENT_WISE_SUBTRACT => dml_ops::DmlBinaryOp::Subtract,
+                    DML_OPERATOR_ELEMENT_WISE_MULTIPLY => dml_ops::DmlBinaryOp::Multiply,
+                    DML_OPERATOR_ELEMENT_WISE_DIVIDE => dml_ops::DmlBinaryOp::Divide,
+                    DML_OPERATOR_ELEMENT_WISE_MIN => dml_ops::DmlBinaryOp::Min,
+                    DML_OPERATOR_ELEMENT_WISE_MAX => dml_ops::DmlBinaryOp::Max,
+                    DML_OPERATOR_ELEMENT_WISE_POW => dml_ops::DmlBinaryOp::Pow,
+                    other => return Err(DmlError::unsupported_operator(other)),
+                },
+            }
+        } else if desc.ty == DML_OPERATOR_ELEMENT_WISE_IDENTITY {
+            dml_ops::DmlOpKind::Activation {
+                activation: dml_ops::DmlActivation::Identity,
+                alpha: 0.0,
+            }
+        } else {
+            return Err(DmlError::invalid(format!(
+                "DML_OPERATOR_TYPE {} cannot be used as a graph node",
+                desc.ty
+            )));
+        };
+        let mut inputs = vec![desc.a.clone()];
+        if let Some(b) = &desc.b {
+            inputs.push(b.clone());
+        }
+        Ok(dml_ops::DmlOpPlan {
+            kind,
+            inputs,
+            output: desc.output.clone(),
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        })
+    }
+
+    /// Parse, validate, and topologically order a guest `DML_GRAPH_DESC`.
+    ///
+    /// `operator_handles` maps the guest `IDMLOperator*` stored in each graph
+    /// node to the runtime handle created by `CreateOperator`.
+    pub fn compile_graph_from_guest(
+        &mut self,
+        device: u64,
+        memory: &dyn StateObjectMemory,
+        desc: u64,
+        operator_handles: &BTreeMap<u64, u64>,
+        flags: u32,
+    ) -> DmlResult<u64> {
+        self.device(device)?;
+        if flags & !DML_EXECUTION_FLAGS_VALID != 0 {
+            return Err(DmlError::invalid(format!(
+                "DML_EXECUTION_FLAGS {flags:#x} contain undefined bits"
+            )));
+        }
+        if desc == 0 {
+            return Err(DmlError::new(E_POINTER, "DML_GRAPH_DESC pointer is null"));
+        }
+        let input_count = read_u32(memory, desc)?;
+        let output_count = read_u32(memory, desc + 4)?;
+        let node_count = read_u32(memory, desc + 8)?;
+        let nodes_ptr = read_ptr(memory, desc + 16)?;
+        let input_edge_count = read_u32(memory, desc + 24)?;
+        let input_edges_ptr = read_ptr(memory, desc + 32)?;
+        let output_edge_count = read_u32(memory, desc + 40)?;
+        let output_edges_ptr = read_ptr(memory, desc + 48)?;
+        let intermediate_edge_count = read_u32(memory, desc + 56)?;
+        let intermediate_edges_ptr = read_ptr(memory, desc + 64)?;
+        if output_count == 0 || node_count == 0 {
+            return Err(DmlError::invalid(
+                "DML_GRAPH_DESC OutputCount and NodeCount must be non-zero",
+            ));
+        }
+        if input_count > 65536
+            || output_count > 65536
+            || node_count > 65536
+            || input_edge_count > 65536
+            || output_edge_count > 65536
+            || intermediate_edge_count > 65536
+        {
+            return Err(DmlError::invalid(
+                "DML_GRAPH_DESC counts exceed the supported 65536 limit",
+            ));
+        }
+        if nodes_ptr == 0 {
+            return Err(DmlError::new(E_POINTER, "DML_GRAPH_DESC.Nodes is null"));
+        }
+        let mut nodes = Vec::with_capacity(node_count as usize);
+        for index in 0..node_count as u64 {
+            let node_desc = nodes_ptr + index * 16;
+            let node_type = read_u32(memory, node_desc)?;
+            if node_type != DML_GRAPH_NODE_TYPE_OPERATOR {
+                return Err(DmlError::invalid(format!(
+                    "DML_GRAPH_NODE_TYPE {node_type} is not supported"
+                )));
+            }
+            let operator_desc = read_ptr(memory, node_desc + 8)?;
+            if operator_desc == 0 {
+                return Err(DmlError::new(
+                    E_POINTER,
+                    "DML_GRAPH_NODE_DESC.Desc pointer is null",
+                ));
+            }
+            let operator_guest = read_ptr(memory, operator_desc)?;
+            let handle = operator_handles
+                .get(&operator_guest)
+                .copied()
+                .ok_or_else(|| {
+                    DmlError::invalid(format!(
+                        "graph node {index} references an unknown IDMLOperator {operator_guest:#x}"
+                    ))
+                })?;
+            let plan = self.operation_plan(handle)?;
+            plan.validate()?;
+            nodes.push(plan);
+        }
+        let mut input_edges = Vec::with_capacity(input_edge_count as usize);
+        for index in 0..input_edge_count as u64 {
+            let edge = input_edges_ptr + index * 16;
+            let edge_type = read_u32(memory, edge)?;
+            if edge_type != DML_GRAPH_EDGE_TYPE_INPUT {
+                return Err(DmlError::invalid(format!(
+                    "input edge {index} has DML_GRAPH_EDGE_TYPE {edge_type}"
+                )));
+            }
+            let edge_desc = read_ptr(memory, edge + 8)?;
+            input_edges.push(DmlGraphInputEdge {
+                graph_input: read_u32(memory, edge_desc)?,
+                to_node: read_u32(memory, edge_desc + 4)?,
+                to_node_input: read_u32(memory, edge_desc + 8)?,
+            });
+        }
+        let mut output_edges = Vec::with_capacity(output_edge_count as usize);
+        for index in 0..output_edge_count as u64 {
+            let edge = output_edges_ptr + index * 16;
+            let edge_type = read_u32(memory, edge)?;
+            if edge_type != DML_GRAPH_EDGE_TYPE_OUTPUT {
+                return Err(DmlError::invalid(format!(
+                    "output edge {index} has DML_GRAPH_EDGE_TYPE {edge_type}"
+                )));
+            }
+            let edge_desc = read_ptr(memory, edge + 8)?;
+            output_edges.push(DmlGraphOutputEdge {
+                from_node: read_u32(memory, edge_desc)?,
+                from_node_output: read_u32(memory, edge_desc + 4)?,
+                graph_output: read_u32(memory, edge_desc + 8)?,
+            });
+        }
+        let mut intermediate_edges = Vec::with_capacity(intermediate_edge_count as usize);
+        for index in 0..intermediate_edge_count as u64 {
+            let edge = intermediate_edges_ptr + index * 16;
+            let edge_type = read_u32(memory, edge)?;
+            if edge_type != DML_GRAPH_EDGE_TYPE_INTERMEDIATE {
+                return Err(DmlError::invalid(format!(
+                    "intermediate edge {index} has DML_GRAPH_EDGE_TYPE {edge_type}"
+                )));
+            }
+            let edge_desc = read_ptr(memory, edge + 8)?;
+            intermediate_edges.push(DmlGraphIntermediateEdge {
+                from_node: read_u32(memory, edge_desc)?,
+                from_node_output: read_u32(memory, edge_desc + 4)?,
+                to_node: read_u32(memory, edge_desc + 8)?,
+                to_node_input: read_u32(memory, edge_desc + 12)?,
+            });
+        }
+
+        let mut connected = Vec::with_capacity(node_count as usize);
+        for node in &nodes {
+            connected.push(vec![false; node.inputs.len()]);
+        }
+        let mut graph_inputs_used = vec![false; input_count as usize];
+        for (index, edge) in input_edges.iter().enumerate() {
+            if edge.graph_input >= input_count {
+                return Err(DmlError::invalid(format!(
+                    "input edge {index} GraphInputIndex {} is out of range",
+                    edge.graph_input
+                )));
+            }
+            if edge.to_node >= node_count {
+                return Err(DmlError::invalid(format!(
+                    "input edge {index} ToNodeIndex {} is out of range",
+                    edge.to_node
+                )));
+            }
+            let node_inputs = nodes[edge.to_node as usize].inputs.len();
+            if edge.to_node_input as usize >= node_inputs {
+                return Err(DmlError::invalid(format!(
+                    "input edge {index} ToNodeInputIndex {} is out of range for node {} with {node_inputs} input(s)",
+                    edge.to_node_input, edge.to_node
+                )));
+            }
+            if connected[edge.to_node as usize][edge.to_node_input as usize] {
+                return Err(DmlError::invalid(format!(
+                    "graph node {} input {} is connected more than once",
+                    edge.to_node, edge.to_node_input
+                )));
+            }
+            connected[edge.to_node as usize][edge.to_node_input as usize] = true;
+            graph_inputs_used[edge.graph_input as usize] = true;
+        }
+        for (index, edge) in intermediate_edges.iter().enumerate() {
+            if edge.from_node >= node_count || edge.to_node >= node_count {
+                return Err(DmlError::invalid(format!(
+                    "intermediate edge {index} references a node outside 0..{node_count}"
+                )));
+            }
+            let from_outputs = nodes[edge.from_node as usize].output_count();
+            if edge.from_node_output as usize >= from_outputs {
+                return Err(DmlError::invalid(format!(
+                    "intermediate edge {index} FromNodeOutputIndex {} is out of range for node {} with {from_outputs} output(s)",
+                    edge.from_node_output, edge.from_node
+                )));
+            }
+            let node_inputs = nodes[edge.to_node as usize].inputs.len();
+            if edge.to_node_input as usize >= node_inputs {
+                return Err(DmlError::invalid(format!(
+                    "intermediate edge {index} ToNodeInputIndex {} is out of range for node {}",
+                    edge.to_node_input, edge.to_node
+                )));
+            }
+            if connected[edge.to_node as usize][edge.to_node_input as usize] {
+                return Err(DmlError::invalid(format!(
+                    "graph node {} input {} is connected more than once",
+                    edge.to_node, edge.to_node_input
+                )));
+            }
+            connected[edge.to_node as usize][edge.to_node_input as usize] = true;
+        }
+        for (node_index, inputs) in connected.iter().enumerate() {
+            for (input_index, is_connected) in inputs.iter().enumerate() {
+                if !is_connected {
+                    return Err(DmlError::invalid(format!(
+                        "graph node {node_index} input {input_index} is not connected"
+                    )));
+                }
+            }
+        }
+        if input_count != 0 {
+            if let Some(index) = graph_inputs_used.iter().position(|used| !used) {
+                return Err(DmlError::invalid(format!(
+                    "graph input {index} is not connected to any node"
+                )));
+            }
+        }
+        let mut graph_outputs_used = vec![false; output_count as usize];
+        for (index, edge) in output_edges.iter().enumerate() {
+            if edge.from_node >= node_count {
+                return Err(DmlError::invalid(format!(
+                    "output edge {index} FromNodeIndex {} is out of range",
+                    edge.from_node
+                )));
+            }
+            let outputs = nodes[edge.from_node as usize].output_count();
+            if edge.from_node_output as usize >= outputs {
+                return Err(DmlError::invalid(format!(
+                    "output edge {index} FromNodeOutputIndex {} is out of range for node {} with {outputs} output(s)",
+                    edge.from_node_output, edge.from_node
+                )));
+            }
+            if edge.graph_output >= output_count {
+                return Err(DmlError::invalid(format!(
+                    "output edge {index} GraphOutputIndex {} is out of range",
+                    edge.graph_output
+                )));
+            }
+            if graph_outputs_used[edge.graph_output as usize] {
+                return Err(DmlError::invalid(format!(
+                    "graph output {} is produced more than once",
+                    edge.graph_output
+                )));
+            }
+            graph_outputs_used[edge.graph_output as usize] = true;
+        }
+        if let Some(index) = graph_outputs_used.iter().position(|used| !used) {
+            return Err(DmlError::invalid(format!(
+                "graph output {index} is not connected"
+            )));
+        }
+        let mut indegree = vec![0u32; node_count as usize];
+        let mut adjacency = vec![Vec::new(); node_count as usize];
+        for edge in &intermediate_edges {
+            indegree[edge.to_node as usize] += 1;
+            adjacency[edge.from_node as usize].push(edge.to_node);
+        }
+        let mut ready: Vec<u32> = (0..node_count)
+            .filter(|node| indegree[*node as usize] == 0)
+            .collect();
+        let mut execution_order = Vec::with_capacity(node_count as usize);
+        while let Some(node) = ready.pop() {
+            execution_order.push(node);
+            for next in &adjacency[node as usize] {
+                indegree[*next as usize] -= 1;
+                if indegree[*next as usize] == 0 {
+                    ready.push(*next);
+                }
+            }
+        }
+        if execution_order.len() != node_count as usize {
+            return Err(DmlError::invalid("DML graph contains a cycle"));
+        }
+        let plan = DmlGraphPlan {
+            input_count,
+            output_count,
+            nodes,
+            input_edges,
+            output_edges,
+            intermediate_edges,
+            execution_order,
+        };
+        let handle = self.alloc_handle();
+        self.graphs.insert(
+            handle,
+            DmlGraphRecord {
+                handle,
+                device,
+                plan,
+            },
+        );
+        Ok(handle)
+    }
+
+    pub fn graph(&self, handle: u64) -> DmlResult<&DmlGraphRecord> {
+        self.graphs
+            .get(&handle)
+            .ok_or_else(|| DmlError::invalid(format!("unknown DML graph {handle:#x}")))
+    }
+
+    pub fn destroy_graph(&mut self, handle: u64) -> DmlResult<()> {
+        self.graphs
+            .remove(&handle)
+            .map(|_| ())
+            .ok_or_else(|| DmlError::invalid(format!("unknown DML graph {handle:#x}")))
+    }
+
     pub fn create_operator_initializer(
         &mut self,
         device: u64,
@@ -703,8 +2079,16 @@ impl DmlRuntime {
     ) -> DmlResult<u64> {
         self.device(device)?;
         for operator in operators {
-            let record = self.compiled(*operator)?;
-            if record.device != device {
+            let compiled_device = if let Some(record) = self.compiled.get(operator) {
+                record.device
+            } else if let Some(record) = self.operations_compiled.get(operator) {
+                record.device
+            } else {
+                return Err(DmlError::invalid(format!(
+                    "unknown compiled operator {operator:#x}"
+                )));
+            };
+            if compiled_device != device {
                 return Err(DmlError::invalid(
                     "compiled operator belongs to a different DirectML device",
                 ));
@@ -735,8 +2119,16 @@ impl DmlRuntime {
             })?
             .clone();
         for operator in &operators {
-            let compiled = self.compiled(*operator)?;
-            if compiled.device != record.device {
+            let compiled_device = if let Some(compiled) = self.compiled.get(operator) {
+                compiled.device
+            } else if let Some(compiled) = self.operations_compiled.get(operator) {
+                compiled.device
+            } else {
+                return Err(DmlError::invalid(format!(
+                    "unknown compiled operator {operator:#x}"
+                )));
+            };
+            if compiled_device != record.device {
                 return Err(DmlError::invalid(
                     "compiled operator belongs to a different DirectML device",
                 ));
@@ -776,6 +2168,11 @@ impl DmlRuntime {
         } else if let Some(record) = self.operations_compiled.get(&compiled) {
             let operation = self.operation(record.operation)?;
             (record.device, operation.plan.inputs.len() + 1)
+        } else if let Some(record) = self.graphs.get(&compiled) {
+            (
+                record.device,
+                (record.plan.input_count + record.plan.output_count) as usize,
+            )
         } else {
             return Err(DmlError::invalid(format!(
                 "unknown compiled operator {compiled:#x}"
@@ -823,6 +2220,9 @@ impl DmlRuntime {
 
     pub fn destroy_operator(&mut self, operator: u64) -> DmlResult<()> {
         if self.operators.remove(&operator).is_none() {
+            if self.operations.contains_key(&operator) {
+                return self.destroy_operation(operator);
+            }
             return Err(DmlError::invalid(format!(
                 "unknown DML operator {operator:#x}"
             )));
@@ -833,10 +2233,15 @@ impl DmlRuntime {
     }
 
     pub fn destroy_compiled(&mut self, compiled: u64) -> DmlResult<()> {
-        self.compiled
-            .remove(&compiled)
-            .map(|_| ())
-            .ok_or_else(|| DmlError::invalid(format!("unknown compiled operator {compiled:#x}")))
+        if self.compiled.remove(&compiled).is_some()
+            || self.operations_compiled.remove(&compiled).is_some()
+            || self.graphs.remove(&compiled).is_some()
+        {
+            return Ok(());
+        }
+        Err(DmlError::invalid(format!(
+            "unknown compiled operator {compiled:#x}"
+        )))
     }
 
     pub fn destroy_operator_initializer(&mut self, initializer: u64) -> DmlResult<()> {
@@ -983,6 +2388,13 @@ impl DmlRuntime {
             let operation = self.operation(record.operation)?;
             return Ok(DmlBindingProperties {
                 required_descriptor_count: operation.plan.inputs.len() as u32 + 1,
+                temporary_resource_size: 0,
+                persistent_resource_size: 0,
+            });
+        }
+        if let Some(record) = self.graphs.get(&dispatchable) {
+            return Ok(DmlBindingProperties {
+                required_descriptor_count: record.plan.input_count + record.plan.output_count,
                 temporary_resource_size: 0,
                 persistent_resource_size: 0,
             });
@@ -1190,6 +2602,497 @@ fn parse_tensor(memory: &dyn StateObjectMemory, tensor_desc: u64) -> DmlResult<D
         strides,
         total_size_in_bytes,
         guaranteed_base_offset_alignment,
+    })
+}
+
+fn read_ptr(memory: &dyn StateObjectMemory, address: u64) -> DmlResult<u64> {
+    memory.read_u64(address).map_err(app_to_dml)
+}
+
+fn read_u32(memory: &dyn StateObjectMemory, address: u64) -> DmlResult<u32> {
+    memory.read_u32(address).map_err(app_to_dml)
+}
+
+fn read_f32(memory: &dyn StateObjectMemory, address: u64) -> DmlResult<f32> {
+    Ok(f32::from_bits(read_u32(memory, address)?))
+}
+
+fn read_u32_list(memory: &dyn StateObjectMemory, address: u64, count: u32) -> DmlResult<Vec<u32>> {
+    if count != 0 && address == 0 {
+        return Err(DmlError::new(E_POINTER, "operator array pointer is null"));
+    }
+    let mut values = Vec::with_capacity(count as usize);
+    for index in 0..count as u64 {
+        values.push(read_u32(memory, address + index * 4)?);
+    }
+    Ok(values)
+}
+
+fn read_f32_list(memory: &dyn StateObjectMemory, address: u64, count: u32) -> DmlResult<Vec<f32>> {
+    if count != 0 && address == 0 {
+        return Err(DmlError::new(
+            E_POINTER,
+            "operator float array pointer is null",
+        ));
+    }
+    let mut values = Vec::with_capacity(count as usize);
+    for index in 0..count as u64 {
+        values.push(read_f32(memory, address + index * 4)?);
+    }
+    Ok(values)
+}
+
+fn tensor_at(memory: &dyn StateObjectMemory, pointer: u64) -> DmlResult<DmlTensorDesc> {
+    parse_tensor(memory, pointer)
+}
+
+fn optional_tensor(
+    memory: &dyn StateObjectMemory,
+    pointer: u64,
+) -> DmlResult<Option<DmlTensorDesc>> {
+    if pointer == 0 {
+        Ok(None)
+    } else {
+        parse_tensor(memory, pointer).map(Some)
+    }
+}
+
+fn read_scalar_union(
+    memory: &dyn StateObjectMemory,
+    address: u64,
+    data_type: u32,
+) -> DmlResult<f32> {
+    match data_type {
+        DML_TENSOR_DATA_TYPE_FLOAT32 => read_f32(memory, address),
+        DML_TENSOR_DATA_TYPE_UINT32 => Ok(read_u32(memory, address)? as f32),
+        DML_TENSOR_DATA_TYPE_INT32 => Ok(read_u32(memory, address)? as i32 as f32),
+        DML_TENSOR_DATA_TYPE_FLOAT16 => Ok(dml_ops::f16_bits_to_f32(
+            memory.read_u16(address).map_err(app_to_dml)?,
+        )),
+        DML_TENSOR_DATA_TYPE_UINT16 => Ok(memory.read_u16(address).map_err(app_to_dml)? as f32),
+        DML_TENSOR_DATA_TYPE_INT16 => {
+            Ok(memory.read_u16(address).map_err(app_to_dml)? as i16 as f32)
+        }
+        DML_TENSOR_DATA_TYPE_UINT8 => {
+            Ok(memory.read_bytes(address, 1).map_err(app_to_dml)?[0] as f32)
+        }
+        DML_TENSOR_DATA_TYPE_INT8 => {
+            Ok(memory.read_bytes(address, 1).map_err(app_to_dml)?[0] as i8 as f32)
+        }
+        other => Err(DmlError::invalid(format!(
+            "DML_TENSOR_DATA_TYPE {other} is not supported for a padding value"
+        ))),
+    }
+}
+
+fn parse_activation_payload(
+    memory: &dyn StateObjectMemory,
+    ty: u32,
+    payload: u64,
+) -> DmlResult<dml_ops::DmlActivation> {
+    use dml_ops::DmlActivation;
+    Ok(match ty {
+        dml_ops::DML_OPERATOR_ACTIVATION_RELU => DmlActivation::Relu,
+        dml_ops::DML_OPERATOR_ACTIVATION_LEAKY_RELU => DmlActivation::LeakyRelu {
+            alpha: read_f32(memory, payload + 16)?,
+        },
+        dml_ops::DML_OPERATOR_ACTIVATION_SIGMOID => DmlActivation::Sigmoid,
+        dml_ops::DML_OPERATOR_ACTIVATION_TANH => DmlActivation::Tanh,
+        dml_ops::DML_OPERATOR_ACTIVATION_IDENTITY => DmlActivation::Identity,
+        dml_ops::DML_OPERATOR_ACTIVATION_ELU => DmlActivation::Elu {
+            alpha: read_f32(memory, payload + 16)?,
+        },
+        dml_ops::DML_OPERATOR_ACTIVATION_LINEAR => DmlActivation::Linear {
+            alpha: read_f32(memory, payload + 16)?,
+            beta: read_f32(memory, payload + 20)?,
+        },
+        dml_ops::DML_OPERATOR_ACTIVATION_SOFTPLUS => DmlActivation::Softplus {
+            steepness: read_f32(memory, payload + 16)?,
+        },
+        dml_ops::DML_OPERATOR_ACTIVATION_SOFTSIGN => DmlActivation::Softsign,
+        dml_ops::DML_OPERATOR_ACTIVATION_GELU => DmlActivation::Gelu,
+        dml_ops::DML_OPERATOR_ACTIVATION_SWISH => DmlActivation::Swish {
+            scale: read_f32(memory, payload + 16)?,
+        },
+        dml_ops::DML_OPERATOR_ACTIVATION_HARD_SWISH => DmlActivation::HardSwish {
+            alpha: read_f32(memory, payload + 16)?,
+            beta: read_f32(memory, payload + 20)?,
+        },
+        dml_ops::DML_OPERATOR_ACTIVATION_HARD_SIGMOID => DmlActivation::HardSigmoid {
+            alpha: read_f32(memory, payload + 16)?,
+            beta: read_f32(memory, payload + 20)?,
+        },
+        dml_ops::DML_OPERATOR_ACTIVATION_SCALED_TANH => DmlActivation::ScaledTanh {
+            alpha: read_f32(memory, payload + 16)?,
+            beta: read_f32(memory, payload + 20)?,
+        },
+        dml_ops::DML_OPERATOR_ACTIVATION_THRESHOLDED_RELU => DmlActivation::ThresholdedRelu {
+            alpha: read_f32(memory, payload + 16)?,
+        },
+        other => return Err(DmlError::unsupported_operator(other)),
+    })
+}
+
+fn parse_fused_activation(
+    memory: &dyn StateObjectMemory,
+    pointer: u64,
+) -> DmlResult<Option<dml_ops::DmlActivation>> {
+    if pointer == 0 {
+        return Ok(None);
+    }
+    let ty = read_u32(memory, pointer)?;
+    let payload = read_ptr(memory, pointer + 8)?;
+    if payload == 0 {
+        return Err(DmlError::new(
+            E_POINTER,
+            "fused activation DML_OPERATOR_DESC.Desc pointer is null",
+        ));
+    }
+    parse_activation_payload(memory, ty, payload).map(Some)
+}
+
+fn parse_recurrent(
+    memory: &dyn StateObjectMemory,
+    ty: u32,
+    payload: u64,
+) -> DmlResult<dml_ops::DmlOpPlan> {
+    use dml_ops::{DmlOpKind, DmlOpPlan, DmlRecurrentOptions, DmlRecurrentOutput};
+    let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+    let weight = tensor_at(memory, read_ptr(memory, payload + 8)?)?;
+    let recurrence = tensor_at(memory, read_ptr(memory, payload + 16)?)?;
+    let bias = optional_tensor(memory, read_ptr(memory, payload + 24)?)?;
+    let hidden_init = optional_tensor(memory, read_ptr(memory, payload + 32)?)?;
+    let (cell_init, sequence_lengths, peephole, activation_count, activation_ptr, direction) =
+        if ty == dml_ops::DML_OPERATOR_LSTM {
+            (
+                optional_tensor(memory, read_ptr(memory, payload + 40)?)?,
+                optional_tensor(memory, read_ptr(memory, payload + 48)?)?,
+                optional_tensor(memory, read_ptr(memory, payload + 56)?)?,
+                read_u32(memory, payload + 88)?,
+                read_ptr(memory, payload + 96)?,
+                read_u32(memory, payload + 104)?,
+            )
+        } else {
+            (
+                None,
+                optional_tensor(memory, read_ptr(memory, payload + 40)?)?,
+                None,
+                read_u32(memory, payload + 64)?,
+                read_ptr(memory, payload + 72)?,
+                read_u32(memory, payload + 80)?,
+            )
+        };
+    let direction = dml_ops::DmlRecurrentDirection::from_u32(direction)
+        .ok_or_else(|| DmlError::invalid("recurrent network direction is invalid"))?;
+    if activation_count > 8 {
+        return Err(DmlError::invalid(format!(
+            "recurrent ActivationDescCount {activation_count} exceeds the supported 8 activations"
+        )));
+    }
+    let mut activations = Vec::with_capacity(activation_count as usize);
+    for index in 0..activation_count as u64 {
+        let descriptor = read_ptr(memory, activation_ptr + index * 8)?;
+        if descriptor == 0 {
+            return Err(DmlError::new(
+                E_POINTER,
+                "recurrent activation descriptor pointer is null",
+            ));
+        }
+        let activation_ty = read_u32(memory, descriptor)?;
+        let activation_payload = read_ptr(memory, descriptor + 8)?;
+        if activation_payload == 0 {
+            return Err(DmlError::new(
+                E_POINTER,
+                "recurrent activation DML_OPERATOR_DESC.Desc pointer is null",
+            ));
+        }
+        activations.push(parse_activation_payload(
+            memory,
+            activation_ty,
+            activation_payload,
+        )?);
+    }
+    let mut inputs = vec![input, weight, recurrence];
+    if let Some(bias) = &bias {
+        inputs.push(bias.clone());
+    }
+    if let Some(hidden) = &hidden_init {
+        inputs.push(hidden.clone());
+    }
+    if let Some(cell) = &cell_init {
+        inputs.push(cell.clone());
+    }
+    if let Some(lengths) = &sequence_lengths {
+        inputs.push(lengths.clone());
+    }
+    if let Some(peephole) = &peephole {
+        inputs.push(peephole.clone());
+    }
+    let sequence_output = optional_tensor(
+        memory,
+        read_ptr(
+            memory,
+            payload
+                + if ty == dml_ops::DML_OPERATOR_LSTM {
+                    64
+                } else {
+                    48
+                },
+        )?,
+    )?;
+    let single_output = optional_tensor(
+        memory,
+        read_ptr(
+            memory,
+            payload
+                + if ty == dml_ops::DML_OPERATOR_LSTM {
+                    72
+                } else {
+                    56
+                },
+        )?,
+    )?;
+    let cell_output = if ty == dml_ops::DML_OPERATOR_LSTM {
+        optional_tensor(memory, read_ptr(memory, payload + 80)?)?
+    } else {
+        None
+    };
+    let mut outputs = Vec::new();
+    let mut roles = Vec::new();
+    if let Some(output) = sequence_output {
+        outputs.push(output);
+        roles.push(DmlRecurrentOutput::Sequence);
+    }
+    if let Some(output) = single_output {
+        outputs.push(output);
+        roles.push(DmlRecurrentOutput::Single);
+    }
+    if let Some(output) = cell_output {
+        outputs.push(output);
+        roles.push(DmlRecurrentOutput::CellSingle);
+    }
+    let mut outputs = outputs.into_iter();
+    let output = outputs.next().ok_or_else(|| {
+        DmlError::invalid("recurrent network requires at least one output tensor")
+    })?;
+    let extra_outputs = outputs.collect();
+    let options = DmlRecurrentOptions {
+        bias: bias.is_some(),
+        hidden_init: hidden_init.is_some(),
+        cell_init: cell_init.is_some(),
+        sequence_lengths: sequence_lengths.is_some(),
+        peephole: peephole.is_some(),
+    };
+    let kind = match ty {
+        dml_ops::DML_OPERATOR_RNN => DmlOpKind::Rnn {
+            direction,
+            activations,
+            options,
+            outputs: roles,
+        },
+        dml_ops::DML_OPERATOR_GRU => DmlOpKind::Gru {
+            direction,
+            activations,
+            options,
+            outputs: roles,
+            linear_before_reset: read_u32(memory, payload + 84)? != 0,
+        },
+        _ => DmlOpKind::Lstm {
+            direction,
+            activations,
+            options,
+            outputs: roles,
+            clip_threshold: read_f32(memory, payload + 108)?,
+            use_clip_threshold: read_u32(memory, payload + 112)? != 0,
+            couple_input_forget: read_u32(memory, payload + 116)? != 0,
+        },
+    };
+    Ok(DmlOpPlan {
+        kind,
+        inputs,
+        output,
+        extra_outputs,
+        fused_activation: None,
+    })
+}
+
+fn parse_integer_matmul(
+    memory: &dyn StateObjectMemory,
+    ty: u32,
+    payload: u64,
+) -> DmlResult<dml_ops::DmlOpPlan> {
+    use dml_ops::{DmlOpKind, DmlOpPlan};
+    let mut inputs = Vec::new();
+    let mut quantized = false;
+    let mut a_zero = false;
+    let mut b_zero = false;
+    let mut output_scale = false;
+    let mut output_zero = false;
+    let mut bias_present = false;
+    let output = match ty {
+        dml_ops::DML_OPERATOR_MATRIX_MULTIPLY_INTEGER => {
+            inputs.push(tensor_at(memory, read_ptr(memory, payload)?)?);
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 8)?)? {
+                a_zero = true;
+                inputs.push(zero);
+            }
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 16)?)?);
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 24)?)? {
+                b_zero = true;
+                inputs.push(zero);
+            }
+            tensor_at(memory, read_ptr(memory, payload + 32)?)?
+        }
+        dml_ops::DML_OPERATOR_MATRIX_MULTIPLY_INTEGER_TO_FLOAT => {
+            quantized = true;
+            inputs.push(tensor_at(memory, read_ptr(memory, payload)?)?);
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 8)?)?);
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 16)?)? {
+                a_zero = true;
+                inputs.push(zero);
+            }
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 24)?)?);
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 32)?)?);
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 40)?)? {
+                b_zero = true;
+                inputs.push(zero);
+            }
+            if let Some(bias) = optional_tensor(memory, read_ptr(memory, payload + 48)?)? {
+                bias_present = true;
+                inputs.push(bias);
+            }
+            tensor_at(memory, read_ptr(memory, payload + 56)?)?
+        }
+        _ => {
+            quantized = true;
+            inputs.push(tensor_at(memory, read_ptr(memory, payload)?)?);
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 8)?)?);
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 16)?)? {
+                a_zero = true;
+                inputs.push(zero);
+            }
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 24)?)?);
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 32)?)?);
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 40)?)? {
+                b_zero = true;
+                inputs.push(zero);
+            }
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 48)?)?);
+            output_scale = true;
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 56)?)? {
+                output_zero = true;
+                inputs.push(zero);
+            }
+            tensor_at(memory, read_ptr(memory, payload + 64)?)?
+        }
+    };
+    let kind = if ty == dml_ops::DML_OPERATOR_MATRIX_MULTIPLY_INTEGER_TO_FLOAT {
+        DmlOpKind::MatrixMultiplyIntegerToFloat {
+            a_zero_point: a_zero,
+            b_zero_point: b_zero,
+            bias: bias_present,
+        }
+    } else {
+        DmlOpKind::MatrixMultiplyInteger {
+            quantized_output: quantized,
+            a_zero_point: a_zero,
+            b_zero_point: b_zero,
+            output_scale,
+            output_zero_point: output_zero,
+        }
+    };
+    Ok(DmlOpPlan {
+        kind,
+        inputs,
+        output,
+        extra_outputs: Vec::new(),
+        fused_activation: None,
+    })
+}
+
+fn parse_integer_convolution(
+    memory: &dyn StateObjectMemory,
+    ty: u32,
+    payload: u64,
+) -> DmlResult<dml_ops::DmlOpPlan> {
+    use dml_ops::{DmlOpKind, DmlOpPlan};
+    let quantized = ty == dml_ops::DML_OPERATOR_QUANTIZED_LINEAR_CONVOLUTION;
+    let input = tensor_at(memory, read_ptr(memory, payload)?)?;
+    let mut inputs = vec![input];
+    let mut input_zero = false;
+    let mut filter_zero = false;
+    let mut bias_present = false;
+    let mut output_scale = false;
+    let mut output_zero = false;
+    let (filter_pointer, output_pointer, dimension_offset, strides_offset, group_offset) =
+        if quantized {
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 8)?)?);
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 16)?)? {
+                input_zero = true;
+                inputs.push(zero);
+            }
+            let filter_pointer = payload + 24;
+            inputs.push(tensor_at(memory, read_ptr(memory, filter_pointer)?)?);
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 32)?)?);
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 40)?)? {
+                filter_zero = true;
+                inputs.push(zero);
+            }
+            if let Some(bias) = optional_tensor(memory, read_ptr(memory, payload + 48)?)? {
+                bias_present = true;
+                inputs.push(bias);
+            }
+            inputs.push(tensor_at(memory, read_ptr(memory, payload + 56)?)?);
+            output_scale = true;
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 64)?)? {
+                output_zero = true;
+                inputs.push(zero);
+            }
+            (filter_pointer, payload + 72, 80, 88, 120)
+        } else {
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 8)?)? {
+                input_zero = true;
+                inputs.push(zero);
+            }
+            let filter_pointer = payload + 16;
+            inputs.push(tensor_at(memory, read_ptr(memory, filter_pointer)?)?);
+            if let Some(zero) = optional_tensor(memory, read_ptr(memory, payload + 24)?)? {
+                filter_zero = true;
+                inputs.push(zero);
+            }
+            (filter_pointer, payload + 32, 40, 48, 80)
+        };
+    let _ = filter_pointer;
+    let output = tensor_at(memory, read_ptr(memory, output_pointer)?)?;
+    let dimension_count = read_u32(memory, payload + dimension_offset)?;
+    if dimension_count != 2 {
+        return Err(DmlError::invalid(format!(
+            "integer convolution DimensionCount must be 2, got {dimension_count}"
+        )));
+    }
+    let strides = read_u32_list(memory, read_ptr(memory, payload + strides_offset)?, 2)?;
+    let dilations = read_u32_list(memory, read_ptr(memory, payload + strides_offset + 8)?, 2)?;
+    let start_padding = read_u32_list(memory, read_ptr(memory, payload + strides_offset + 16)?, 2)?;
+    let end_padding = read_u32_list(memory, read_ptr(memory, payload + strides_offset + 24)?, 2)?;
+    let group_count = read_u32(memory, payload + group_offset)?;
+    Ok(DmlOpPlan {
+        kind: DmlOpKind::ConvolutionInteger {
+            strides,
+            dilations,
+            start_padding,
+            end_padding,
+            group_count,
+            quantized_output: quantized,
+            input_zero_point: input_zero,
+            filter_zero_point: filter_zero,
+            bias: bias_present,
+            output_scale,
+            output_zero_point: output_zero,
+        },
+        inputs,
+        output,
+        extra_outputs: Vec::new(),
+        fused_activation: None,
     })
 }
 
@@ -2582,7 +4485,7 @@ mod tests {
         assert_eq!(error.hresult, DXGI_ERROR_UNSUPPORTED);
         assert_eq!(
             error.message,
-            "requested DML_FEATURE_LEVEL 0x6400 exceeds the supported 0x1000"
+            "requested DML_FEATURE_LEVEL 0x6400 exceeds the supported 0x4000"
         );
     }
 
@@ -2655,5 +4558,295 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.hresult, E_INVALIDARG);
         assert_eq!(error.message, "output buffer is 4 bytes, tensor requires 8");
+    }
+
+    fn create_test_device(runtime: &mut DmlRuntime) -> u64 {
+        runtime
+            .create_device(0x100, 0, DML_FEATURE_LEVEL_4_0, IID_IDMLDEVICE)
+            .expect("feature level 4.0 device")
+    }
+
+    #[test]
+    fn dml_guest_extended_operator_parsing_reaches_argmax_and_rejects_axis_overflow() {
+        let (mut memory, a, _, out) = float32_image();
+        // Replace the float output with a UINT32 [2,1] output used by ArgMax.
+        let _ = out;
+        let uint_out = write_tensor(
+            &mut memory.data,
+            0x3800,
+            DML_TENSOR_DATA_TYPE_UINT32,
+            &[2, 1, 1, 1],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x5000,
+            dml_ops::DML_OPERATOR_ARGMAX,
+            &[a, uint_out],
+        );
+        let payload = 0x5020usize;
+        put_u32(&mut memory.data, payload + 16, 1);
+        put_u64(&mut memory.data, payload + 24, 0x6000);
+        put_u32(&mut memory.data, 0x6000, 1);
+        put_u32(&mut memory.data, payload + 32, 0);
+        let mut runtime = DmlRuntime::new();
+        let device = create_test_device(&mut runtime);
+        let handle = runtime
+            .create_operator_from_guest(device, &memory, desc)
+            .expect("guest ArgMax operator");
+        let plan = runtime.operation_plan(handle).expect("extended plan");
+        assert_eq!(plan.operator_type(), dml_ops::DML_OPERATOR_ARGMAX);
+        assert_eq!(
+            plan.kind,
+            dml_ops::DmlOpKind::ArgMax {
+                axes: vec![1],
+                direction: dml_ops::DmlAxisDirection::Increasing,
+            }
+        );
+
+        put_u32(&mut memory.data, 0x6000, 4);
+        let error = runtime
+            .create_operator_from_guest(device, &memory, desc)
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "argmin/argmax axis 4 is out of range for rank 4"
+        );
+    }
+
+    #[test]
+    fn dml_guest_quantized_per_channel_scale_is_rejected_exactly() {
+        let mut memory = base_memory();
+        let input = write_tensor(
+            &mut memory.data,
+            0x1000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[4],
+            None,
+        );
+        let scale = write_tensor(
+            &mut memory.data,
+            0x2000,
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            &[4],
+            None,
+        );
+        let output = write_tensor(
+            &mut memory.data,
+            0x3000,
+            DML_TENSOR_DATA_TYPE_UINT8,
+            &[4],
+            None,
+        );
+        let desc = write_operator(
+            &mut memory.data,
+            0x5000,
+            dml_ops::DML_OPERATOR_ELEMENT_WISE_QUANTIZE_LINEAR,
+            &[input, scale, 0, output],
+        );
+        let mut runtime = DmlRuntime::new();
+        let device = create_test_device(&mut runtime);
+        let error = runtime
+            .create_operator_from_guest(device, &memory, desc)
+            .unwrap_err();
+        assert_eq!(
+            error.message,
+            "DML_OPERATOR_TYPE 33 supports only a scalar scale tensor"
+        );
+    }
+
+    #[test]
+    fn dml_feature_level_boundary_negotiation_and_operator_minimums() {
+        assert_eq!(SUPPORTED_DML_FEATURE_LEVEL, DML_FEATURE_LEVEL_4_0);
+        let mut runtime = DmlRuntime::new();
+        let device = create_test_device(&mut runtime);
+        assert_eq!(
+            runtime.device(device).expect("device").feature_level,
+            DML_FEATURE_LEVEL_4_0
+        );
+        let error = runtime
+            .create_device(0x100, 0, DML_FEATURE_LEVEL_6_4, IID_IDMLDEVICE)
+            .unwrap_err();
+        assert_eq!(error.hresult, DXGI_ERROR_UNSUPPORTED);
+        for kind in [
+            dml_ops::DmlOpKind::Rnn {
+                direction: dml_ops::DmlRecurrentDirection::Forward,
+                activations: Vec::new(),
+                options: dml_ops::DmlRecurrentOptions::default(),
+                outputs: vec![dml_ops::DmlRecurrentOutput::Single],
+            },
+            dml_ops::DmlOpKind::Adam {
+                learning_rate: 0.1,
+                beta1: 0.9,
+                beta2: 0.999,
+                epsilon: 1e-8,
+            },
+            dml_ops::DmlOpKind::DynamicQuantizeLinear,
+        ] {
+            assert_eq!(
+                kind.minimum_feature_level() <= SUPPORTED_DML_FEATURE_LEVEL,
+                true
+            );
+        }
+        assert_eq!(
+            dml_ops::DmlOpKind::Dequantize {
+                quantization_type: 2
+            }
+            .minimum_feature_level()
+                > SUPPORTED_DML_FEATURE_LEVEL,
+            true
+        );
+    }
+
+    struct GraphFixture {
+        memory: TestMemory,
+        handle_map: BTreeMap<u64, u64>,
+        node0: u64,
+        node1: u64,
+    }
+
+    fn graph_fixture(runtime: &mut DmlRuntime, device: u64) -> GraphFixture {
+        let activation = dml_ops::DmlOpPlan {
+            kind: dml_ops::DmlOpKind::Activation {
+                activation: dml_ops::DmlActivation::Relu,
+                alpha: 0.0,
+            },
+            inputs: vec![desc_tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2], None)],
+            output: desc_tensor(DML_TENSOR_DATA_TYPE_FLOAT32, &[2], None),
+            extra_outputs: Vec::new(),
+            fused_activation: None,
+        };
+        let node0 = runtime
+            .create_operation(device, activation.clone())
+            .expect("first graph node");
+        let node1 = runtime
+            .create_operation(device, activation)
+            .expect("second graph node");
+        let mut memory = base_memory();
+        // DML_GRAPH_DESC
+        put_u32(&mut memory.data, 0x100, 1);
+        put_u32(&mut memory.data, 0x104, 1);
+        put_u32(&mut memory.data, 0x108, 2);
+        put_u64(&mut memory.data, 0x110, 0x200);
+        put_u32(&mut memory.data, 0x118, 1);
+        put_u64(&mut memory.data, 0x120, 0x300);
+        put_u32(&mut memory.data, 0x128, 1);
+        put_u64(&mut memory.data, 0x130, 0x400);
+        put_u32(&mut memory.data, 0x138, 1);
+        put_u64(&mut memory.data, 0x140, 0x500);
+        // Nodes.
+        put_u32(&mut memory.data, 0x200, DML_GRAPH_NODE_TYPE_OPERATOR);
+        put_u64(&mut memory.data, 0x208, 0x600);
+        put_u64(&mut memory.data, 0x600, 0x9000);
+        put_u32(&mut memory.data, 0x210, DML_GRAPH_NODE_TYPE_OPERATOR);
+        put_u64(&mut memory.data, 0x218, 0x608);
+        put_u64(&mut memory.data, 0x608, 0x9001);
+        // Input edge: graph input 0 -> node 0 input 0.
+        put_u32(&mut memory.data, 0x300, DML_GRAPH_EDGE_TYPE_INPUT);
+        put_u64(&mut memory.data, 0x308, 0x310);
+        put_u32(&mut memory.data, 0x310, 0);
+        put_u32(&mut memory.data, 0x314, 0);
+        put_u32(&mut memory.data, 0x318, 0);
+        // Output edge: node 1 output 0 -> graph output 0.
+        put_u32(&mut memory.data, 0x400, DML_GRAPH_EDGE_TYPE_OUTPUT);
+        put_u64(&mut memory.data, 0x408, 0x410);
+        put_u32(&mut memory.data, 0x410, 1);
+        put_u32(&mut memory.data, 0x414, 0);
+        put_u32(&mut memory.data, 0x418, 0);
+        // Intermediate edge: node 0 output 0 -> node 1 input 0.
+        put_u32(&mut memory.data, 0x500, DML_GRAPH_EDGE_TYPE_INTERMEDIATE);
+        put_u64(&mut memory.data, 0x508, 0x540);
+        put_u32(&mut memory.data, 0x540, 0);
+        put_u32(&mut memory.data, 0x544, 0);
+        put_u32(&mut memory.data, 0x548, 1);
+        put_u32(&mut memory.data, 0x54c, 0);
+        let mut handle_map = BTreeMap::new();
+        handle_map.insert(0x9000, node0);
+        handle_map.insert(0x9001, node1);
+        GraphFixture {
+            memory,
+            handle_map,
+            node0,
+            node1,
+        }
+    }
+
+    #[test]
+    fn dml_malformed_graph_missing_input_cycle_and_bad_index_rejected() {
+        let mut runtime = DmlRuntime::new();
+        let device = create_test_device(&mut runtime);
+        let mut fixture = graph_fixture(&mut runtime, device);
+        assert_eq!(
+            fixture.memory.read_u32(0x200).expect("node type"),
+            DML_GRAPH_NODE_TYPE_OPERATOR
+        );
+        assert_eq!(fixture.memory.read_u64(0x110).expect("nodes ptr"), 0x200);
+        let handle = runtime
+            .compile_graph_from_guest(device, &fixture.memory, 0x100, &fixture.handle_map, 0)
+            .expect("valid graph");
+        assert_eq!(
+            runtime.graph(handle).expect("graph").plan.execution_order,
+            vec![0, 1]
+        );
+
+        // Missing intermediate edge leaves node 1 input 0 unconnected.
+        put_u32(&mut fixture.memory.data, 0x138, 0);
+        let error = runtime
+            .compile_graph_from_guest(device, &fixture.memory, 0x100, &fixture.handle_map, 0)
+            .unwrap_err();
+        assert_eq!(error.message, "graph node 1 input 0 is not connected");
+
+        // A constant graph whose two nodes feed each other is a cycle.
+        put_u32(&mut fixture.memory.data, 0x100, 0);
+        put_u32(&mut fixture.memory.data, 0x118, 0);
+        put_u32(&mut fixture.memory.data, 0x138, 2);
+        put_u32(
+            &mut fixture.memory.data,
+            0x510,
+            DML_GRAPH_EDGE_TYPE_INTERMEDIATE,
+        );
+        put_u64(&mut fixture.memory.data, 0x518, 0x550);
+        put_u32(&mut fixture.memory.data, 0x550, 1);
+        put_u32(&mut fixture.memory.data, 0x554, 0);
+        put_u32(&mut fixture.memory.data, 0x558, 0);
+        put_u32(&mut fixture.memory.data, 0x55c, 0);
+        let error = runtime
+            .compile_graph_from_guest(device, &fixture.memory, 0x100, &fixture.handle_map, 0)
+            .unwrap_err();
+        assert_eq!(error.message, "DML graph contains a cycle");
+        let _ = (fixture.node0, fixture.node1);
+    }
+
+    #[test]
+    fn dml_feature_level_boundary_negotiation_helper_and_data_types() {
+        assert_eq!(
+            negotiate_feature_levels(&[
+                DML_FEATURE_LEVEL_1_0,
+                DML_FEATURE_LEVEL_2_0,
+                DML_FEATURE_LEVEL_4_0,
+                DML_FEATURE_LEVEL_6_4,
+            ]),
+            DML_FEATURE_LEVEL_4_0
+        );
+        assert_eq!(negotiate_feature_levels(&[DML_FEATURE_LEVEL_6_4]), 0);
+        assert_eq!(negotiate_feature_levels(&[]), 0);
+        for supported in [
+            DML_TENSOR_DATA_TYPE_FLOAT32,
+            DML_TENSOR_DATA_TYPE_FLOAT16,
+            DML_TENSOR_DATA_TYPE_UINT32,
+            DML_TENSOR_DATA_TYPE_INT32,
+            DML_TENSOR_DATA_TYPE_UINT8,
+            DML_TENSOR_DATA_TYPE_INT8,
+        ] {
+            assert_eq!(supports_tensor_data_type(supported), true);
+        }
+        assert_eq!(
+            supports_tensor_data_type(DML_TENSOR_DATA_TYPE_UINT16),
+            false
+        );
+        assert_eq!(
+            supports_tensor_data_type(DML_TENSOR_DATA_TYPE_FLOAT64),
+            false
+        );
     }
 }

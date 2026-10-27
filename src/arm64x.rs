@@ -63,6 +63,38 @@ pub enum ChpeCodeKind {
     Amd64,
 }
 
+/// How an ARM64EC/ARM64X image classifies one function body.
+///
+/// `Arm64` and `Arm64Ec` execute natively; `X64` must be translated to x64
+/// guest instructions before it runs.  This is the classification the call
+/// checker uses to decide whether an indirect call needs an exit thunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EcFunctionKind {
+    Arm64,
+    Arm64Ec,
+    X64,
+}
+
+impl EcFunctionKind {
+    pub const fn is_native(self) -> bool {
+        !matches!(self, Self::X64)
+    }
+
+    pub const fn is_x64(self) -> bool {
+        matches!(self, Self::X64)
+    }
+}
+
+impl From<ChpeCodeKind> for EcFunctionKind {
+    fn from(kind: ChpeCodeKind) -> Self {
+        match kind {
+            ChpeCodeKind::Arm64 => Self::Arm64,
+            ChpeCodeKind::Arm64Ec => Self::Arm64Ec,
+            ChpeCodeKind::Amd64 => Self::X64,
+        }
+    }
+}
+
 impl ChpeCodeKind {
     pub fn from_raw(value: u32) -> AppResult<Self> {
         match value {
@@ -120,7 +152,7 @@ pub struct HybridExportRoute {
     pub emulation_rva: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChpeMetadata {
     pub version: u32,
     pub code_map_rva: u32,
@@ -150,12 +182,56 @@ pub struct ChpeMetadata {
     pub redirections: Vec<ChpeRedirection>,
 }
 
+/// Distance from an ARM64EC function entry backwards to its entry-thunk
+/// metadata word.  ARM64EC reserves these four bytes before every callable
+/// function for the signature-specific entry thunk.
+pub const EC_ENTRY_THUNK_METADATA_SIZE: u32 = 4;
+pub const EC_ENTRY_THUNK_DELTA_MASK: u32 = !0x3;
+
+/// Registers that have no representation in the x64 `CONTEXT` and therefore
+/// must not carry state across an ARM64EC transition.
+pub const EC_BLOCKED_ARM64_REGISTERS: [usize; 5] = [13, 14, 23, 24, 28];
+
 impl ChpeMetadata {
     pub fn code_kind_at(&self, rva: u32) -> Option<ChpeCodeKind> {
         self.code_map
             .iter()
             .find(|range| range.contains(rva))
             .map(|range| range.kind)
+    }
+
+    /// Classify the code containing `rva` according to the CHPE code map.
+    pub fn function_kind_at(&self, rva: u32) -> Option<EcFunctionKind> {
+        self.code_kind_at(rva).map(EcFunctionKind::from)
+    }
+
+    /// Reject a code map that is unsorted or has overlapping ranges.
+    ///
+    /// Windows emits the map sorted by RVA; overlapping entries make the
+    /// architecture of a function address ambiguous, so the checker must fail
+    /// closed instead of picking one arbitrarily.
+    pub fn validate_code_map(&self, size_of_image: u32) -> AppResult<()> {
+        if self.code_map.is_empty() {
+            return Err(malformed("ARM64EC image is missing the CHPE code map"));
+        }
+        let mut previous_end = 0u32;
+        for range in &self.code_map {
+            if range.length == 0 {
+                return Err(malformed("CHPE code map entry has zero length"));
+            }
+            let end = range
+                .start_rva
+                .checked_add(range.length)
+                .ok_or_else(|| malformed("CHPE code map entry overflows the image"))?;
+            if end > size_of_image {
+                return Err(malformed("CHPE code map entry exceeds SizeOfImage"));
+            }
+            if range.start_rva < previous_end {
+                return Err(malformed("CHPE code map entries overlap or are unsorted"));
+            }
+            previous_end = end;
+        }
+        Ok(())
     }
 
     pub fn route_entry_point(&self, rva: u32) -> Option<u32> {
@@ -417,6 +493,7 @@ pub fn parse_chpe_metadata(
     }
 
     let mut code_map = Vec::with_capacity(code_map_count as usize);
+    let mut previous_code_map_end = 0u32;
     for index in 0..code_map_count {
         let entry_rva = code_map_rva
             .checked_add(
@@ -440,6 +517,10 @@ pub fn parse_chpe_metadata(
         if end > size_of_image {
             return Err(malformed("CHPE code map entry exceeds SizeOfImage"));
         }
+        if start_rva < previous_code_map_end {
+            return Err(malformed("CHPE code map entries overlap or are unsorted"));
+        }
+        previous_code_map_end = end;
         code_map.push(ChpeCodeRange {
             start_rva,
             length,
@@ -526,6 +607,42 @@ pub fn parse_chpe_metadata(
         entry_points,
         redirections,
     })
+}
+
+/// Read the entry-thunk delta stored in the four bytes immediately before an
+/// ARM64EC function.  The low two bits are tag bits and are masked off; the
+/// remaining signed delta is added to the function RVA.  `None` means the
+/// function has no entry thunk (delta zero).
+pub fn parse_ec_entry_thunk_rva(
+    bytes: &[u8],
+    sections: &[PeSection],
+    function_rva: u32,
+    size_of_image: u32,
+) -> AppResult<Option<u32>> {
+    if function_rva < EC_ENTRY_THUNK_METADATA_SIZE {
+        return Err(malformed(
+            "ARM64EC function is too close to the image base for entry-thunk metadata",
+        ));
+    }
+    let metadata_rva = function_rva - EC_ENTRY_THUNK_METADATA_SIZE;
+    let raw = read_u32_at(
+        bytes,
+        sections,
+        metadata_rva,
+        "ARM64EC entry thunk metadata",
+    )
+    .map_err(|_| malformed("ARM64EC entry thunk metadata is truncated"))?;
+    let delta = (raw & EC_ENTRY_THUNK_DELTA_MASK) as i32;
+    if delta == 0 {
+        return Ok(None);
+    }
+    let target = (i64::from(function_rva) + i64::from(delta))
+        .try_into()
+        .map_err(|_| malformed("ARM64EC entry thunk points outside the image"))?;
+    if target >= size_of_image {
+        return Err(malformed("ARM64EC entry thunk points outside the image"));
+    }
+    Ok(Some(target))
 }
 
 pub fn parse_hybrid_aux_iat(
@@ -1589,5 +1706,61 @@ mod tests {
             error.message,
             "ARM64X relocation target exceeds the mapped image"
         );
+    }
+    #[test]
+    fn arm64x_chpe_code_map_overlap_is_rejected_exactly() {
+        let mut bytes = vec![0u8; 0x2000];
+        put_u32(&mut bytes, 0x1000, 1);
+        put_u32(&mut bytes, 0x1004, 0x1100);
+        put_u32(&mut bytes, 0x1008, 2);
+        put_u32(&mut bytes, 0x1100, 0x1000 | 1);
+        put_u32(&mut bytes, 0x1104, 0x400);
+        put_u32(&mut bytes, 0x1108, 0x1200 | 2);
+        put_u32(&mut bytes, 0x110c, 0x400);
+        let error = parse_chpe_metadata(&bytes, &[section(0x1000, 0x1000)], 0, 0x2000, 0x1000)
+            .expect_err("overlapping code map must be rejected");
+        assert_eq!(error.code, ReasonCode::RcPeParseInvalid);
+        assert_eq!(
+            error.message,
+            "CHPE code map entries overlap or are unsorted"
+        );
+    }
+
+    #[test]
+    fn arm64x_ec_entry_thunk_metadata_masks_tags_and_rejects_oob_exactly() {
+        let mut bytes = vec![0u8; 0x2000];
+        put_u32(&mut bytes, 0x0ffc, 0x200 | 3);
+        let target = parse_ec_entry_thunk_rva(&bytes, &[section(0x0f00, 0x200)], 0x1000, 0x2000)
+            .expect("entry thunk")
+            .expect("tagged delta resolves");
+        assert_eq!(target, 0x1200);
+
+        put_u32(&mut bytes, 0x0ffc, 0x2000 | 1);
+        let error = parse_ec_entry_thunk_rva(&bytes, &[section(0x0f00, 0x200)], 0x1000, 0x2000)
+            .expect_err("out-of-image entry thunk must fail");
+        assert_eq!(error.code, ReasonCode::RcPeParseInvalid);
+        assert_eq!(
+            error.message,
+            "ARM64EC entry thunk points outside the image"
+        );
+    }
+
+    #[test]
+    fn arm64x_ec_function_classification_boundary_is_pinned() {
+        let mut bytes = vec![0u8; 0x2000];
+        put_u32(&mut bytes, 0x1000, 1);
+        put_u32(&mut bytes, 0x1004, 0x1100);
+        put_u32(&mut bytes, 0x1008, 2);
+        put_u32(&mut bytes, 0x1100, 0x1000 | 1);
+        put_u32(&mut bytes, 0x1104, 0x400);
+        put_u32(&mut bytes, 0x1108, 0x1400 | 2);
+        put_u32(&mut bytes, 0x110c, 0x400);
+        let chpe = parse_chpe_metadata(&bytes, &[section(0x1000, 0x1000)], 0, 0x2000, 0x1000)
+            .expect("parse code map");
+        assert_eq!(chpe.function_kind_at(0x1000), Some(EcFunctionKind::Arm64Ec));
+        assert_eq!(chpe.function_kind_at(0x13ff), Some(EcFunctionKind::Arm64Ec));
+        assert_eq!(chpe.function_kind_at(0x1400), Some(EcFunctionKind::X64));
+        assert_eq!(chpe.function_kind_at(0x17ff), Some(EcFunctionKind::X64));
+        assert_eq!(chpe.function_kind_at(0x1800), None);
     }
 }

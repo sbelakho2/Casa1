@@ -734,8 +734,9 @@ const MEM_IMAGE: u32 = 0x0100_0000;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 const STARTF_USESHOWWINDOW: u32 = 0x0001;
 const STARTF_USESTDHANDLES: u32 = 0x0100;
-const E_INVALIDARG: u64 = 0x8007_0057;
+#[allow(dead_code)]
 const E_NOTIMPL: u64 = 0x8000_4001;
+const E_INVALIDARG: u64 = 0x8007_0057;
 /// CLASS_E_CLASSNOTAVAILABLE — returned when CoCreateInstance cannot find a
 /// registered class factory for the requested CLSID.
 const CLASS_E_CLASSNOTAVAILABLE: u64 = 0x8004_0154;
@@ -6668,6 +6669,208 @@ thread_local! {
     static ARM64_GUEST_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
+impl PeHostRuntime {
+    /// Run an ARM64EC image whose entry point is x64 code.  The x64 machine is
+    /// started at `entry` and every branch into a natively-classified EC
+    /// function is routed through the entry-thunk conversion.
+    fn run_ec_x64_entry(
+        &mut self,
+        runner: &mut crate::arm64::Arm64NativeRunner,
+        checker: &crate::arm64::EcCallChecker,
+        memory: &mut MemoryImage,
+        entry: u64,
+    ) -> AppResult<i32> {
+        let config = CpuEngineConfig::from_profile(
+            GuestArch::X64,
+            &self.win32.ge().config.winver,
+            env!("CARGO_PKG_VERSION"),
+            None,
+        )?;
+        let mut engine = CpuExecutionEngine::new(config);
+        let mut state = CpuState::new(GuestArch::X64);
+        let stack_size = 0x10000usize;
+        let stack_base = self.alloc_zeroed(memory, stack_size, 0x1000)?;
+        let stack_top = stack_base + stack_size as u64;
+        // Leave room above rsp for the x64 shadow-home area and stack
+        // arguments; an entry thunk must not place rsp at the end of the
+        // allocation.
+        let rsp = ((stack_top.saturating_sub(0x400)) & !0xF) | 0x8;
+        state.set(Register::Rsp, rsp);
+        state.segment_bases.gs = self.teb_base;
+        state.rip = entry;
+        write_u64(memory, rsp, 0);
+        self.run_ec_x64_machine(
+            runner as *mut crate::arm64::Arm64NativeRunner,
+            memory,
+            &mut state,
+            &mut engine,
+            checker,
+            "arm64ec-x64-entry",
+        )?;
+        Ok(state.get(Register::Rax) as u32 as i32)
+    }
+
+    /// Execute one x64 call reached from an ARM64EC exit thunk.  The x64
+    /// return address is the synthetic zero at `[rsp]`, so `ret` terminates
+    /// the nested machine exactly at the transition boundary.
+    fn run_ec_x64_transition(
+        &mut self,
+        runner_ptr: *mut crate::arm64::Arm64NativeRunner,
+        memory: &mut MemoryImage,
+        request: &crate::arm64::EcExitRequest,
+        checker: &crate::arm64::EcCallChecker,
+    ) -> AppResult<crate::arm64::EcExitResponse> {
+        let config = CpuEngineConfig::from_profile(
+            GuestArch::X64,
+            &self.win32.ge().config.winver,
+            env!("CARGO_PKG_VERSION"),
+            None,
+        )?;
+        let mut engine = CpuExecutionEngine::new(config);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.gpr = request.args.gpr;
+        for (index, value) in request.args.vec.iter().copied().enumerate() {
+            state.xmm[index] = crate::cpu::XmmValue {
+                low: value as u64,
+                high: (value >> 64) as u64,
+            };
+        }
+        for (x64_index, _) in crate::arm64::EC_NONVOLATILE_GPR_PAIRS {
+            state.gpr[x64_index] = request.nonvolatile.gpr[x64_index];
+        }
+        for index in crate::arm64::EC_NONVOLATILE_VECTOR_INDICES {
+            state.xmm[index] = crate::cpu::XmmValue {
+                low: request.nonvolatile.xmm[index] as u64,
+                high: (request.nonvolatile.xmm[index] >> 64) as u64,
+            };
+        }
+        state.segment_bases.gs = if request.teb != 0 {
+            request.teb
+        } else {
+            self.teb_base
+        };
+        let stack_size = 0x1000usize + request.args.stack.len() * 8;
+        let stack_base = self.alloc_zeroed(memory, stack_size, 0x1000)?;
+        let stack_top = stack_base + stack_size as u64;
+        let headroom = 0x400 + request.args.stack.len() as u64 * 8;
+        let rsp = ((stack_top.saturating_sub(headroom)) & !0xF) | 0x8;
+        state.set(Register::Rsp, rsp);
+        write_u64(memory, rsp, 0);
+        for (index, value) in request.args.stack.iter().copied().enumerate() {
+            write_u64(memory, rsp + 0x28 + index as u64 * 8, value);
+        }
+        state.rip = request.target;
+        self.run_ec_x64_machine(
+            runner_ptr,
+            memory,
+            &mut state,
+            &mut engine,
+            checker,
+            "arm64ec-x64-exit",
+        )?;
+        Ok(crate::arm64::EcExitResponse {
+            rax: state.get(Register::Rax),
+            rdx: state.get(Register::Rdx),
+            xmm0: u128::from(state.xmm[0].low) | (u128::from(state.xmm[0].high) << 64),
+            xmm1: u128::from(state.xmm[1].low) | (u128::from(state.xmm[1].high) << 64),
+        })
+    }
+
+    fn run_ec_x64_machine(
+        &mut self,
+        runner_ptr: *mut crate::arm64::Arm64NativeRunner,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+        engine: &mut CpuExecutionEngine,
+        checker: &crate::arm64::EcCallChecker,
+        label: &str,
+    ) -> AppResult<()> {
+        let mut steps = 0u64;
+        let instruction_budget = self.current_instruction_budget()?;
+        loop {
+            if state.rip == 0 {
+                return Ok(());
+            }
+            if RUN_DEADLINE_EXPIRED.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(AppError::new(
+                    ReasonCode::RcUnimplInsn,
+                    format!(
+                        "ARM64EC hybrid x64 run exceeded the wall-clock deadline at {:#x}",
+                        state.rip
+                    ),
+                ));
+            }
+            if let Some(result) = self.dispatch_import_if_present(state.rip, state, memory)? {
+                if let Some(code) = result {
+                    ARM64_GUEST_EXIT.with(|slot| slot.set(Some(code)));
+                    state.rip = 0;
+                }
+                continue;
+            }
+            if let Some(kind) = checker.classify(state.rip)
+                && kind.is_native()
+            {
+                let rva = (state.rip - checker.image_base) as u32;
+                let x64 = crate::arm64::X64AbiState::from_cpu_state(state);
+                let outcome = crate::arm64::enter_ec_from_x64_native(
+                    // SAFETY: synchronous nested execution from the same
+                    // thread; the runner outlives the generated thunk call.
+                    unsafe { &mut *runner_ptr },
+                    &crate::arm64::EcSignature::class_parallel(),
+                    &x64,
+                    memory,
+                    rva,
+                )?;
+                let mut next = x64;
+                next.gpr[Register::Rax.index()] = outcome.result.rax;
+                next.gpr[Register::Rdx.index()] = outcome.result.rdx;
+                next.gpr[Register::Rsp.index()] = x64.gpr[Register::Rsp.index()] + 8;
+                next.xmm[0] = outcome.result.xmm0;
+                next.rip = outcome.return_address;
+                crate::arm64::copy_ec_nonvolatile_to_x64(&outcome.state, &mut next);
+                next.write_to_cpu_state(state);
+                continue;
+            }
+            let mut instructions = Vec::new();
+            let mut window = [0u8; 15];
+            let mut available = 0usize;
+            for offset in 0..window.len() {
+                match memory.read_u8(state.rip + offset as u64) {
+                    Ok(byte) => {
+                        window[offset] = byte;
+                        available = offset + 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if available == 0 {
+                return Err(MemoryImage::unmapped_memory_error(state.rip));
+            }
+            let decoded = engine.decode_block(&window[..available], state.rip)?;
+            for instruction in decoded {
+                let control = instruction_controls_rip(instruction.opcode)
+                    || instruction.opcode == DecodedOpcode::Ret;
+                instructions.push(instruction);
+                if control {
+                    break;
+                }
+            }
+            let executed = instructions.len() as u64;
+            let ir = crate::cpu::lower_to_ir(&instructions)?;
+            self.execute_ir_with_guest_exception_delivery(engine, state, memory, &ir, label)?;
+            advance_runtime_steps(
+                self,
+                &mut steps,
+                instruction_budget,
+                executed,
+                memory,
+                state,
+                label,
+            )?;
+        }
+    }
+}
+
 fn arm64_dispatch_runtime_thunk(
     runtime_ptr: *mut PeHostRuntime,
     memory_ptr: *mut MemoryImage,
@@ -6734,6 +6937,7 @@ fn execute_native_arm64_image(
     ARM64_IMPORT_ERROR.with(|slot| *slot.borrow_mut() = None);
     ARM64_GUEST_EXIT.with(|slot| slot.set(None));
     let mut runner = crate::arm64::Arm64NativeRunner::load(bytes, image)?;
+    let checker = crate::arm64::EcCallChecker::for_loaded_image(image, runner.image.base)?;
     let selected_base = runner.image.base;
     let mut runtime = PeHostRuntime::new(
         ge.clone(),
@@ -6785,6 +6989,25 @@ fn execute_native_arm64_image(
     let scratch = runtime.alloc_zeroed(&mut memory, 0x100, 16)?;
     let runtime_ptr = &mut runtime as *mut PeHostRuntime;
     let memory_ptr = &mut memory as *mut MemoryImage;
+    // Native ARM64EC call checkers and exit thunks are generated once and
+    // installed into the image's import slots / CHPE helper pointers.
+    let check_thunk = runner
+        .image
+        .alloc_thunk(&crate::arm64::build_ec_check_thunk())?;
+    let exit_dispatch_thunk = runner
+        .image
+        .alloc_thunk(&crate::arm64::build_ec_exit_thunk(None, 0))?;
+    crate::arm64::set_call_checker(checker.clone());
+    let runner_ptr = &mut runner as *mut crate::arm64::Arm64NativeRunner;
+    let hook_checker = checker.clone();
+    crate::arm64::set_exit_hook(move |request| {
+        // SAFETY: native ARM64EC execution is synchronous; the runtime,
+        // memory and runner outlive the exit thunk call and no other borrow
+        // of them is active while the hook runs.
+        let runtime = unsafe { &mut *runtime_ptr };
+        let memory = unsafe { &mut *memory_ptr };
+        runtime.run_ec_x64_transition(runner_ptr, memory, request, &hook_checker)
+    });
     for (import_index, import) in imports.iter().enumerate() {
         let thunk = HostThunk::from_import(import);
         let thunk_address = runtime.alloc_host_thunk(thunk);
@@ -6812,7 +7035,19 @@ fn execute_native_arm64_image(
                         [a0, a1, a2, a3, a4, a5, a6, a7],
                     )
                 })?;
-        runner.image.write_slot(import.iat_rva, arm64_thunk)?;
+        let lowered_key = key.to_ascii_lowercase();
+        let slot_thunk = if lowered_key.contains("__os_arm64x_check_icall") {
+            check_thunk
+        } else if lowered_key.contains("__os_arm64x_dispatch_call")
+            || lowered_key.contains("__os_arm64x_dispatch_icall")
+            || lowered_key.contains("__os_arm64x_x64_jump")
+            || lowered_key.contains("__os_arm64x_dispatch_ret")
+        {
+            exit_dispatch_thunk
+        } else {
+            arm64_thunk
+        };
+        runner.image.write_slot(import.iat_rva, slot_thunk)?;
         if let Some(chpe) = image.chpe_metadata() {
             for auxiliary in [
                 chpe.auxiliary_iat_rva,
@@ -6834,10 +7069,16 @@ fn execute_native_arm64_image(
                                 "ARM64EC auxiliary IAT RVA overflow",
                             )
                         })?;
-                    runner.image.write_slot(slot, arm64_thunk)?;
+                    runner.image.write_slot(slot, slot_thunk)?;
                 }
             }
         }
+    }
+    let direct_patches = runner.image.patch_cross_isa_direct_calls(image, &checker)?;
+    if direct_patches != 0 {
+        crate::live::live_trace(&format!(
+            "[arm64-runtime] patched {direct_patches} direct x64 call(s) to exit thunks"
+        ));
     }
     runner.image.protect()?;
     for callback in &tls_rvas {
@@ -6857,27 +7098,30 @@ fn execute_native_arm64_image(
         &runner.image.bytes()[0x2060..0x2068]
     );
     let entry_rva = crate::arm64x::route_entry_point(image, crate::arm64x::HybridView::Native)?;
-    if image
-        .chpe_metadata()
-        .and_then(|chpe| chpe.code_kind_at(entry_rva))
-        == Some(crate::arm64x::ChpeCodeKind::Amd64)
-    {
-        return Err(crate::arm64::CrossIsaError::new(
-            crate::arm64::Arm64Isa::Arm64,
-            crate::arm64::Arm64Isa::X64,
-        )
-        .to_app_error());
-    }
     let start_time = std::time::Instant::now();
     eprintln!(
         "[arm64-runtime] entry={entry_rva:#x} code={:02x?}",
         &runner.image.bytes()[0x1000..0x1020]
     );
-    let result = runner.call_entry(image, &[])?;
+    let entry_address = selected_base + u64::from(entry_rva);
+    let mut exit_code = match checker.classify(entry_address) {
+        Some(kind) if kind.is_x64() => {
+            runtime.run_ec_x64_entry(&mut runner, &checker, &mut memory, entry_address)?
+        }
+        _ => {
+            let result = runner.call_entry(image, &[])?;
+            result.return_value() as u32 as i32
+        }
+    };
+    if let Some(error) = crate::arm64::take_exit_error() {
+        return Err(error.to_app_error());
+    }
+    if let Some(error) = crate::arm64::take_call_checker_error() {
+        return Err(error.to_app_error());
+    }
     if let Some(error) = ARM64_IMPORT_ERROR.with(|slot| slot.borrow_mut().take()) {
         return Err(error);
     }
-    let mut exit_code = result.return_value() as u32 as i32;
     if let Some(code) = ARM64_GUEST_EXIT.with(|slot| slot.take()) {
         exit_code = code;
     }
@@ -7729,7 +7973,6 @@ pub fn execute_with_options(
                 }
             }
 
-            // Per-block diagnostic writes removed.
             let cached_block = decode_basic_block_cached(
                 engine,
                 memory,
@@ -15574,8 +15817,7 @@ impl PeHostRuntime {
                 self.dispatch_dml_device_get_parent_device(memory, state)?
             }
             HostThunk::DmlDevice1CompileGraph => {
-                state.set(Register::Rax, E_NOTIMPL);
-                self.last_error = 0;
+                self.dispatch_dml_device1_compile_graph(memory, state)?
             }
             HostThunk::DmlDispatchableGetBindingProperties => {
                 self.dispatch_dml_dispatchable_get_binding_properties(memory, state)?

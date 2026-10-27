@@ -4178,8 +4178,13 @@ pub(crate) fn decode_block_uncached(
                             precise_faulting_memory: false,
                             evex_info: EvexInfo::no_mask(),
                         }
-                    } else if opcode == 0xC7 && modrm.reg == 0 && modrm.mod_bits == 0b11 {
-                        // XBEGIN rel32: C7 /0 rel32 with mod=11, reg=0, rm=0 (ModRM = 0xF0)
+                    } else if opcode == 0xC7
+                        && modrm.reg == 7
+                        && modrm.rm == 0
+                        && modrm.mod_bits == 0b11
+                    {
+                        // XBEGIN rel32: C7 F8 rel32 (ModRM F8: mod=11, reg=7,
+                        // rm=0).  C7 /0 with mod=11 is ordinary MOV r/m,imm32.
                         // The fallthrough target is after the relocation offset
                         let rel_type = if prefixes.contains(&InstructionPrefix::OperandSize) {
                             2u32
@@ -4222,34 +4227,69 @@ pub(crate) fn decode_block_uncached(
                         } else {
                             4
                         };
-                        let imm = read_immediate(bytes, local, immediate_width)?;
+                        let raw_imm = read_immediate(bytes, local, immediate_width)?;
                         local += immediate_width;
-                        let Operand::Memory(address_operand) = modrm_operand(
+                        // C7 /0 with REX.W sign-extends imm32 to 64 bits.
+                        let imm = if width == 8 {
+                            (raw_imm as i32 as i64) as u64
+                        } else {
+                            raw_imm
+                        };
+                        let destination = modrm_operand(
                             &modrm,
                             arch,
                             &prefixes,
                             address + (local - cursor) as u64,
-                        ) else {
-                            return Err(AppError::new(
-                                ReasonCode::RcUnimplInsn,
-                                format!(
-                                    "opcode {opcode:#x} currently requires a memory destination"
-                                ),
-                            ));
-                        };
-                        DecodedInstruction {
-                            address,
-                            size: local - cursor,
-                            prefixes,
-                            rex,
-                            opcode: DecodedOpcode::MovStoreImm,
-                            operands: vec![
-                                Operand::Memory(address_operand),
-                                Operand::ImmediateU64(imm),
-                                Operand::ImmediateU64(width as u64),
-                            ],
-                            precise_faulting_memory: true,
-                            evex_info: EvexInfo::no_mask(),
+                        );
+                        match destination {
+                            Operand::Memory(address_operand) => DecodedInstruction {
+                                address,
+                                size: local - cursor,
+                                prefixes,
+                                rex,
+                                opcode: DecodedOpcode::MovStoreImm,
+                                operands: vec![
+                                    Operand::Memory(address_operand),
+                                    Operand::ImmediateU64(imm),
+                                    Operand::ImmediateU64(width as u64),
+                                ],
+                                precise_faulting_memory: true,
+                                evex_info: EvexInfo::no_mask(),
+                            },
+                            Operand::Register(register) => DecodedInstruction {
+                                address,
+                                size: local - cursor,
+                                prefixes,
+                                rex,
+                                opcode: DecodedOpcode::MovImm,
+                                operands: vec![
+                                    Operand::Register(register),
+                                    Operand::ImmediateU64(imm),
+                                ],
+                                precise_faulting_memory: false,
+                                evex_info: EvexInfo::no_mask(),
+                            },
+                            Operand::Register8(register) => DecodedInstruction {
+                                address,
+                                size: local - cursor,
+                                prefixes,
+                                rex,
+                                opcode: DecodedOpcode::MovImm,
+                                operands: vec![
+                                    Operand::Register8(register),
+                                    Operand::ImmediateU64(imm),
+                                ],
+                                precise_faulting_memory: false,
+                                evex_info: EvexInfo::no_mask(),
+                            },
+                            other => {
+                                return Err(AppError::new(
+                                    ReasonCode::RcUnimplInsn,
+                                    format!(
+                                        "opcode {opcode:#x} has unsupported destination {other:?}"
+                                    ),
+                                ));
+                            }
                         }
                     }
                 }

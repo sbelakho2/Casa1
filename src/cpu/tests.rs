@@ -3917,3 +3917,26 @@ fn concurrent_views_above_four_gib_never_observe_torn_values() {
     assert_eq!(store.materialisation_count(), 1);
     assert_eq!(store.high_page_count(), 0);
 }
+
+#[test]
+fn c7_slash0_is_mov_imm32_and_f8_is_xbegin_exactly() {
+    // MOV RBX, 0x12345678 (REX.W C7 /0, mod=11)
+    let mov = [0x48, 0xC7, 0xC3, 0x78, 0x56, 0x34, 0x12];
+    let decoded = decode_block(&mov, 0x1000, GuestArch::X64).expect("decode mov");
+    assert_eq!(decoded.len(), 1);
+    assert_ne!(decoded[0].opcode, DecodedOpcode::Xbegin);
+    assert_eq!(decoded[0].opcode, DecodedOpcode::MovImm);
+    assert_eq!(
+        decoded[0].operands,
+        vec![
+            Operand::Register(Register::Rbx),
+            Operand::ImmediateU64(0x1234_5678)
+        ]
+    );
+
+    // XBEGIN rel32 uses ModRM F8 (reg=7, rm=0), not /0.
+    let xbegin = [0xC7, 0xF8, 0x05, 0x00, 0x00, 0x00];
+    let decoded = decode_block(&xbegin, 0x2000, GuestArch::X86).expect("decode xbegin");
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].opcode, DecodedOpcode::Xbegin);
+}

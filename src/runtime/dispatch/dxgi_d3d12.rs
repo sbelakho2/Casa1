@@ -6470,10 +6470,7 @@ impl PeHostRuntime {
                     return Ok(());
                 }
                 let data_type = memory.read_u32(query_ptr)?;
-                let supported = matches!(
-                    data_type,
-                    directml::DML_TENSOR_DATA_TYPE_FLOAT32 | directml::DML_TENSOR_DATA_TYPE_FLOAT16
-                );
+                let supported = directml::supports_tensor_data_type(data_type);
                 write_u32(memory, out_ptr, u32::from(supported));
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
@@ -6487,14 +6484,11 @@ impl PeHostRuntime {
                 }
                 let count = memory.read_u32(query_ptr)?;
                 let levels_ptr = memory.read_u64(query_ptr + 8)?;
-                let mut max_supported = 0u32;
+                let mut levels = Vec::with_capacity(count as usize);
                 for index in 0..count as u64 {
-                    let level = memory.read_u32(levels_ptr + index * 4)?;
-                    if level <= directml::SUPPORTED_DML_FEATURE_LEVEL && level > max_supported {
-                        max_supported = level;
-                    }
+                    levels.push(memory.read_u32(levels_ptr + index * 4)?);
                 }
-                write_u32(memory, out_ptr, max_supported);
+                write_u32(memory, out_ptr, directml::negotiate_feature_levels(&levels));
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
             }
@@ -6625,6 +6619,98 @@ impl PeHostRuntime {
                 self.push_trace(
                     "d3d12",
                     "IDMLDevice::CompileOperator",
+                    BTreeMap::from([("error".to_string(), json!(error.message))]),
+                    json!(error.hresult),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_dml_device1_compile_graph(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_guest = state.get(Register::Rcx);
+        let desc_ptr = state.get(Register::Rdx);
+        let flags = state.get(Register::R8) as u32;
+        let iid_ptr = state.get(Register::R9);
+        let sp = state.get(Register::Rsp);
+        let out_ptr = memory.read_u64(sp + 0x20)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, directml::E_POINTER as u64);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let iid = memory.read_bytes(iid_ptr, 16).unwrap_or_default();
+        if iid != directml::IID_IDMLCOMPILEDOPERATOR.0 {
+            write_u64(memory, out_ptr, 0);
+            state.set(Register::Rax, E_NOINTERFACE);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let Some(device) = self.dml_device_handle(device_guest) else {
+            state.set(Register::Rax, directml::E_INVALIDARG as u64);
+            self.last_error = 0;
+            return Ok(());
+        };
+        if desc_ptr == 0 {
+            state.set(Register::Rax, directml::E_POINTER as u64);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let node_count = memory.read_u32(desc_ptr + 8).unwrap_or(0);
+        let nodes_ptr = memory.read_u64(desc_ptr + 16).unwrap_or(0);
+        if node_count > 65536 || (node_count != 0 && nodes_ptr == 0) {
+            state.set(Register::Rax, directml::E_INVALIDARG as u64);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let mut operator_handles = BTreeMap::new();
+        for index in 0..node_count as u64 {
+            let node_desc = nodes_ptr + index * 16;
+            let node_type = memory.read_u32(node_desc).unwrap_or(0);
+            if node_type != directml::DML_GRAPH_NODE_TYPE_OPERATOR {
+                continue;
+            }
+            let operator_desc = memory.read_u64(node_desc + 8).unwrap_or(0);
+            if operator_desc == 0 {
+                continue;
+            }
+            let operator_guest = memory.read_u64(operator_desc).unwrap_or(0);
+            if let Some(handle) = self.dml_object_handles.get(&operator_guest).copied() {
+                operator_handles.insert(operator_guest, handle);
+            }
+        }
+        match self.d3d12_runtime.directml_mut().compile_graph_from_guest(
+            device,
+            memory,
+            desc_ptr,
+            &operator_handles,
+            flags,
+        ) {
+            Ok(handle) => {
+                let guest = match self.alloc_dml_child_com(
+                    memory,
+                    GuestObjectKind::DmlCompiledOperator,
+                    device_guest,
+                    handle,
+                ) {
+                    Ok(guest) => guest,
+                    Err(error) => return Err(error),
+                };
+                write_u64(memory, out_ptr, guest);
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            Err(error) => {
+                write_u64(memory, out_ptr, 0);
+                state.set(Register::Rax, error.hresult as u64);
+                self.last_error = 0;
+                self.push_trace(
+                    "d3d12",
+                    "IDMLDevice1::CompileGraph",
                     BTreeMap::from([("error".to_string(), json!(error.message))]),
                     json!(error.hresult),
                 );
