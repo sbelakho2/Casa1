@@ -10,12 +10,20 @@
 //!
 //! Operators outside the supported set fail closed with the DirectML error
 //! (`E_INVALIDARG`), never with a fabricated success.
+//!
+//! The extended operator set (GEMM, convolution, pooling, activations, batch
+//! normalization, softmax, reductions, reshape/transpose/concat/slice) lives
+//! in [`dml_ops`] and is created, compiled, bound, and executed through the
+//! `create_operation`/`compile_operation`/`execute_operation` methods here.
 
 use std::collections::BTreeMap;
 
 use crate::metal_backend::MetalDevice;
 
 use super::state_objects::StateObjectMemory;
+
+#[path = "dml_ops.rs"]
+pub mod dml_ops;
 
 pub const S_OK: u32 = 0;
 pub const E_INVALIDARG: u32 = 0x8007_0057;
@@ -49,6 +57,7 @@ pub const DML_OPERATOR_ELEMENT_WISE_LOG: u32 = 13;
 pub const DML_OPERATOR_ELEMENT_WISE_MAX: u32 = 21;
 pub const DML_OPERATOR_ELEMENT_WISE_MIN: u32 = 23;
 pub const DML_OPERATOR_ELEMENT_WISE_MULTIPLY: u32 = 24;
+pub const DML_OPERATOR_ELEMENT_WISE_POW: u32 = 25;
 pub const DML_OPERATOR_ELEMENT_WISE_SIN: u32 = 28;
 pub const DML_OPERATOR_ELEMENT_WISE_SQRT: u32 = 29;
 pub const DML_OPERATOR_ELEMENT_WISE_SUBTRACT: u32 = 30;
@@ -274,6 +283,7 @@ pub struct DmlDeviceRecord {
     pub parent_device: u64,
     pub flags: u32,
     pub feature_level: u32,
+    pub execution_device: dml_ops::DmlExecutionDevice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +298,22 @@ pub struct DmlCompiledRecord {
     pub handle: u64,
     pub device: u64,
     pub operator: u64,
+    pub flags: u32,
+    pub msl_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DmlOperationRecord {
+    pub handle: u64,
+    pub device: u64,
+    pub plan: dml_ops::DmlOpPlan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DmlOperationCompiledRecord {
+    pub handle: u64,
+    pub device: u64,
+    pub operation: u64,
     pub flags: u32,
     pub msl_source: String,
 }
@@ -351,6 +377,8 @@ pub struct DmlRuntime {
     initializers: BTreeMap<u64, DmlInitializerRecord>,
     recorders: BTreeMap<u64, DmlRecorderRecord>,
     binding_tables: BTreeMap<u64, DmlBindingTableRecord>,
+    operations: BTreeMap<u64, DmlOperationRecord>,
+    operations_compiled: BTreeMap<u64, DmlOperationCompiledRecord>,
     dispatches: Vec<DmlDispatchRecord>,
 }
 
@@ -370,6 +398,23 @@ impl DmlRuntime {
         flags: u32,
         minimum_feature_level: u32,
         iid: DmlGuid,
+    ) -> DmlResult<u64> {
+        self.create_device_on(
+            parent_device,
+            flags,
+            minimum_feature_level,
+            iid,
+            dml_ops::DmlExecutionDevice::Metal,
+        )
+    }
+
+    pub fn create_device_on(
+        &mut self,
+        parent_device: u64,
+        flags: u32,
+        minimum_feature_level: u32,
+        iid: DmlGuid,
+        execution_device: dml_ops::DmlExecutionDevice,
     ) -> DmlResult<u64> {
         if parent_device == 0 {
             return Err(DmlError::invalid("D3D12 device pointer is null"));
@@ -399,6 +444,7 @@ impl DmlRuntime {
                 parent_device,
                 flags,
                 feature_level: SUPPORTED_DML_FEATURE_LEVEL,
+                execution_device,
             },
         );
         Ok(handle)
@@ -424,10 +470,15 @@ impl DmlRuntime {
         self.recorders.retain(|_, rec| rec.device != device);
         self.binding_tables
             .retain(|_, table| table.device != device);
+        self.operations.retain(|_, op| op.device != device);
+        self.operations_compiled.retain(|_, op| op.device != device);
         Ok(())
     }
 
-    /// Parse and validate a DML_OPERATOR_DESC from guest memory.
+    /// Parse and validate an element-wise DML_OPERATOR_DESC from guest memory.
+    ///
+    /// Extended operators are represented by [`dml_ops::DmlOpPlan`]; use
+    /// [`Self::create_operation`] for those.
     pub fn parse_operator(
         &self,
         memory: &dyn StateObjectMemory,
@@ -543,6 +594,108 @@ impl DmlRuntime {
             .ok_or_else(|| DmlError::invalid(format!("unknown compiled operator {compiled:#x}")))
     }
 
+    /// Create an extended (non-element-wise) DirectML operator.
+    pub fn create_operation(&mut self, device: u64, plan: dml_ops::DmlOpPlan) -> DmlResult<u64> {
+        self.device(device)?;
+        plan.validate()?;
+        let handle = self.alloc_handle();
+        self.operations.insert(
+            handle,
+            DmlOperationRecord {
+                handle,
+                device,
+                plan,
+            },
+        );
+        Ok(handle)
+    }
+
+    pub fn operation(&self, operation: u64) -> DmlResult<&DmlOperationRecord> {
+        self.operations
+            .get(&operation)
+            .ok_or_else(|| DmlError::invalid(format!("unknown DML operation {operation:#x}")))
+    }
+
+    /// Lower and compile an extended operator. A Metal-backed device compiles
+    /// the generated MSL into a real compute pipeline; a CPU device validates
+    /// the lowering without requiring a Metal device.
+    pub fn compile_operation(&mut self, device: u64, operation: u64, flags: u32) -> DmlResult<u64> {
+        let device_record = self.device(device)?.clone();
+        if flags & !DML_EXECUTION_FLAGS_VALID != 0 {
+            return Err(DmlError::invalid(format!(
+                "DML_EXECUTION_FLAGS {flags:#x} contain undefined bits"
+            )));
+        }
+        let record = self.operation(operation)?.clone();
+        if record.device != device {
+            return Err(DmlError::invalid(
+                "operation was created by a different DirectML device",
+            ));
+        }
+        let msl_source = dml_ops::emit_msl(&record.plan)?;
+        if device_record.execution_device == dml_ops::DmlExecutionDevice::Metal {
+            dml_ops::compile_msl(&msl_source)?;
+        }
+        let handle = self.alloc_handle();
+        self.operations_compiled.insert(
+            handle,
+            DmlOperationCompiledRecord {
+                handle,
+                device,
+                operation,
+                flags,
+                msl_source,
+            },
+        );
+        Ok(handle)
+    }
+
+    pub fn operation_compiled(&self, compiled: u64) -> DmlResult<&DmlOperationCompiledRecord> {
+        self.operations_compiled.get(&compiled).ok_or_else(|| {
+            DmlError::invalid(format!("unknown compiled DML operation {compiled:#x}"))
+        })
+    }
+
+    /// Execute an extended operator with one buffer per input tensor and a
+    /// readback buffer for the output tensor.
+    pub fn execute_operation(
+        &self,
+        compiled: u64,
+        inputs: &[&[u8]],
+        output: &mut [u8],
+    ) -> DmlResult<()> {
+        let record = self.operation_compiled(compiled)?;
+        let operation = self.operation(record.operation)?;
+        let backend = self.device(record.device)?.execution_device;
+        dml_ops::execute_plan(&operation.plan, backend, inputs, output)
+    }
+
+    pub fn operation_binding_count(&self, compiled: u64) -> DmlResult<u32> {
+        let record = self.operation_compiled(compiled)?;
+        let operation = self.operation(record.operation)?;
+        Ok(operation.plan.inputs.len() as u32 + 1)
+    }
+
+    pub fn destroy_operation(&mut self, operation: u64) -> DmlResult<()> {
+        if self.operations.remove(&operation).is_none() {
+            return Err(DmlError::invalid(format!(
+                "unknown DML operation {operation:#x}"
+            )));
+        }
+        self.operations_compiled
+            .retain(|_, record| record.operation != operation);
+        Ok(())
+    }
+
+    pub fn destroy_operation_compiled(&mut self, compiled: u64) -> DmlResult<()> {
+        self.operations_compiled
+            .remove(&compiled)
+            .map(|_| ())
+            .ok_or_else(|| {
+                DmlError::invalid(format!("unknown compiled DML operation {compiled:#x}"))
+            })
+    }
+
     pub fn create_operator_initializer(
         &mut self,
         device: u64,
@@ -617,14 +770,22 @@ impl DmlRuntime {
         bindings: Vec<DmlBufferBinding>,
     ) -> DmlResult<()> {
         let recorder_record = self.recorder(recorder)?.clone();
-        let compiled_record = self.compiled(compiled)?.clone();
-        if recorder_record.device != compiled_record.device {
+        let (compiled_device, expected) = if let Some(record) = self.compiled.get(&compiled) {
+            let op = self.operator(record.operator)?;
+            (record.device, if op.desc.is_binary() { 3usize } else { 2 })
+        } else if let Some(record) = self.operations_compiled.get(&compiled) {
+            let operation = self.operation(record.operation)?;
+            (record.device, operation.plan.inputs.len() + 1)
+        } else {
+            return Err(DmlError::invalid(format!(
+                "unknown compiled operator {compiled:#x}"
+            )));
+        };
+        if recorder_record.device != compiled_device {
             return Err(DmlError::invalid(
                 "command recorder and compiled operator belong to different devices",
             ));
         }
-        let op = self.operator(compiled_record.operator)?;
-        let expected = if op.desc.is_binary() { 3 } else { 2 };
         if bindings.len() != expected {
             return Err(DmlError::invalid(format!(
                 "RecordDispatch requires {expected} buffer bindings, got {}",
@@ -741,6 +902,14 @@ impl DmlRuntime {
             }
             return Ok(());
         }
+        if let Some(record) = self.operations_compiled.get(&dispatchable) {
+            if record.device != device {
+                return Err(DmlError::invalid(
+                    "dispatchable belongs to a different DirectML device",
+                ));
+            }
+            return Ok(());
+        }
         Err(DmlError::invalid(format!(
             "unknown DML dispatchable {dispatchable:#x}"
         )))
@@ -806,6 +975,14 @@ impl DmlRuntime {
             let bindings = if op.desc.is_binary() { 3 } else { 2 };
             return Ok(DmlBindingProperties {
                 required_descriptor_count: bindings as u32,
+                temporary_resource_size: 0,
+                persistent_resource_size: 0,
+            });
+        }
+        if let Some(record) = self.operations_compiled.get(&dispatchable) {
+            let operation = self.operation(record.operation)?;
+            return Ok(DmlBindingProperties {
+                required_descriptor_count: operation.plan.inputs.len() as u32 + 1,
                 temporary_resource_size: 0,
                 persistent_resource_size: 0,
             });
@@ -1278,6 +1455,35 @@ pub fn dml_command_recorder_record_dispatch(
     bindings: Vec<DmlBufferBinding>,
 ) -> DmlResult<()> {
     runtime.record_dispatch(recorder, compiled, bindings)
+}
+
+/// `IDMLDevice::CreateOperator` for the extended operator set.
+pub fn dml_device_create_operation(
+    runtime: &mut DmlRuntime,
+    device: u64,
+    plan: dml_ops::DmlOpPlan,
+) -> DmlResult<u64> {
+    runtime.create_operation(device, plan)
+}
+
+/// `IDMLDevice::CompileOperator` for the extended operator set.
+pub fn dml_device_compile_operation(
+    runtime: &mut DmlRuntime,
+    device: u64,
+    operation: u64,
+    flags: u32,
+) -> DmlResult<u64> {
+    runtime.compile_operation(device, operation, flags)
+}
+
+/// Execute a compiled extended operator on its device backend.
+pub fn dml_device_execute_operation(
+    runtime: &DmlRuntime,
+    compiled: u64,
+    inputs: &[&[u8]],
+    output: &mut [u8],
+) -> DmlResult<()> {
+    runtime.execute_operation(compiled, inputs, output)
 }
 
 #[cfg(test)]

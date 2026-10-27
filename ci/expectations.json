@@ -387,10 +387,124 @@
   "(error.message, \"argument buffer layout has zero size\")",
   "(argument_buffer.layout.total_size, 0)"
  ],
+ "arm64_assembler_leaf_encoding_boundary_is_pinned": [
+  "(&code[0..4], &0xd2800020u32.to_le_bytes())",
+  "(&code[4..8], &0xd2800041u32.to_le_bytes())",
+  "(&code[8..12], &0x8b010000u32.to_le_bytes())",
+  "(&code[12..16], &0xd65f03c0u32.to_le_bytes())"
+ ],
+ "arm64_code_kind_missing_chpe_map_route_is_pinned": [
+  "(code_kind_for(&image, 0x1000), None)"
+ ],
+ "arm64_exception_directory_truncation_is_rejected": [
+  "( error.message, \"exception directory is not a whole number of entries\" )"
+ ],
+ "arm64_executor_rejects_code_outside_region": [
+  "( error.message, \"ARM64 entry point 0x0000000000000000 is outside the executable region\" )"
+ ],
+ "arm64_image_rejects_out_of_range_entry": [
+  "( error.message, \"ARM64 image RVA 0x2000 is outside SizeOfImage\" )"
+ ],
+ "arm64_image_section_protection_boundary_is_pinned": [
+  "(loaded.sections()[0].protection.execute, true)",
+  "(loaded.protected, true)"
+ ],
+ "arm64_import_callback_argument_boundary_is_pinned": [
+  "(imports.resolve(\"Add\"), Some(address))",
+  "(imports.call(\"Add\", &[19, 23]).unwrap(), 42)"
+ ],
+ "arm64_import_slot_outside_image_is_rejected_exactly": [
+  "(error.message, \"ARM64 IAT slot exceeds SizeOfImage\")"
+ ],
+ "arm64_import_thunk_encoding_boundary_is_pinned": [
+  "(&thunk[56..64], &7u64.to_le_bytes())",
+  "(&thunk[64..72], &0x1234_5678u64.to_le_bytes())",
+  "(&thunk[0..4], &0x580001D0u32.to_le_bytes())"
+ ],
+ "arm64_leaf_execution_boundary_is_pinned": [
+  "(result, 42)"
+ ],
+ "arm64_misaligned_stack_is_rejected_exactly": [
+  "(error.code, ReasonCode::RcInvalidParameter)",
+  "( error.message, \"ARM64 stack pointer 0x0000000000001001 is not 16-byte aligned\" )"
+ ],
+ "arm64_missing_import_callback_fails_closed": [
+  "(error.code, ReasonCode::RcImportMissing)",
+  "(error.message, \"missing ARM64 import Missing\")"
+ ],
+ "arm64_native_import_thunk_edge_call_is_pinned": [
+  "(context.x[0], 42)"
+ ],
+ "arm64_native_pe_entry_execution_boundary_is_pinned": [
+  "(result.return_value(), 42)",
+  "(runner.image.sections().len(), 1)"
+ ],
+ "arm64_null_teb_is_rejected_exactly": [
+  "(error.message, \"ARM64 x18 (TEB) is null\")"
+ ],
+ "arm64_register_stack_and_flags_boundary_roundtrip": [
+  "(context.x[0], 123)",
+  "(context.nzcv & 0x4000_0000, 0x4000_0000)"
+ ],
+ "arm64_runtime_executes_native_pe_boundary_is_pinned": [
+  "(result.exit_code, 7)",
+  "( result.termination, crate::runtime::ExecutionTermination::GuestExit { code: 7 } )"
+ ],
+ "arm64_runtime_import_callback_boundary_is_pinned": [
+  "(result.exit_code, 9)"
+ ],
+ "arm64_section_protection_rwx_boundary_is_pinned": [
+  "( section_protection(&section) & libc::PROT_WRITE, libc::PROT_WRITE )",
+  "( section_protection(&section) & libc::PROT_EXEC, libc::PROT_EXEC )"
+ ],
+ "arm64_teb_peb_access_boundary_is_pinned": [
+  "(context.x[0], 10)",
+  "(executor.teb().peb().os_major_version, 10)"
+ ],
+ "arm64_unwind_exception_handler_boundary_is_pinned": [
+  "(table.functions.len(), 1)",
+  "(table.functions[0].end_address, 0x2040)",
+  "(table.unwind_info[0].handler_rva, Some(0x1200))",
+  "(table.unwind_info[0].function_length, 0x40)"
+ ],
+ "arm64_unwind_truncation_is_rejected": [
+  "(error.message, \"ARM64 unwind info is truncated\")"
+ ],
  "arm64_vm_config_builder": [
   "(vz_config.cpu_count, 8)",
   "(vz_config.memory_size, 8192 * 1024 * 1024)",
   "(vz_config.devices.len(), 4)"
+ ],
+ "arm64_zero_entry_point_is_rejected_exactly": [
+  "( error.message, \"ARM64 entry point 0x0000000000000000 is outside the executable region\" )"
+ ],
+ "arm64ec_missing_chpe_code_map_is_rejected_exactly": [
+  "(error.message, \"ARM64EC image is missing the CHPE code map\")",
+  "(error.code, ReasonCode::RcPeParseInvalid)"
+ ],
+ "arm64x_dynamic_relocation_parser_boundary_is_pinned": [
+  "(blocks.len(), 1)",
+  "(blocks[0].entries.len(), 2)",
+  "(blocks[0].entries[0].value, 0x1234_5678)",
+  "(blocks[0].entries[1].value, 8)"
+ ],
+ "arm64x_dynamic_value_and_delta_boundary_applies": [
+  "(&mapped.memory[0..4], &0x1234u32.to_le_bytes())",
+  "(&mapped.memory[4..8], &7u32.to_le_bytes())",
+  "(&mapped.memory[8..10], &[0, 0])"
+ ],
+ "arm64x_invalid_dynamic_relocation_type_is_rejected": [
+  "(error.message, \"invalid ARM64X relocation type\")"
+ ],
+ "arm64x_relocation_beyond_image_is_rejected": [
+  "( error.message, \"ARM64X relocation target exceeds the mapped image\" )"
+ ],
+ "arm64x_truncated_chpe_metadata_is_rejected": [
+  "(error.code, ReasonCode::RcPeParseInvalid)",
+  "(error.message, \"CHPE metadata is truncated at field 1\")"
+ ],
+ "arm64x_unaligned_dynamic_relocation_is_rejected": [
+  "(error.message, \"unaligned ARM64X value relocation\")"
  ],
  "assemble_modules_skips_duplicate_main_image_and_flags_kernel_drivers": [
   "( modules.len(), 4, \"main + 3 distinct DLLs (the duplicate is skipped)\" )",
@@ -866,6 +980,15 @@
   "(placed.0 & 0xFFFF, 0, \"placement stays 64 KiB aligned\")",
   "(error.code, ReasonCode::RcIo)",
   "(placed.0, 0x10000, \"the stack-overlapping base is skipped\")"
+ ],
+ "chpe_code_map_exceeding_image_is_rejected": [
+  "(error.message, \"CHPE code map entry exceeds SizeOfImage\")"
+ ],
+ "chpe_reserved_code_range_type_is_rejected": [
+  "( error.message, \"CHPE code map contains reserved range type 3\" )"
+ ],
+ "chpe_unsupported_version_is_rejected_exactly": [
+  "(error.message, \"unsupported CHPE metadata version 3\")"
  ],
  "chunk_verification_fail": [
   "( correct_hash.as_slice(), wrong_hash.as_slice(), \"different data should have different SHA-1 hashes\" )"
@@ -1542,6 +1665,12 @@
   "( read_u32(&memory, critical_section as u64 + 8).expect(\"recursion count\"), 0 )",
   "( read_u32(&memory, critical_section as u64 + 12).expect(\"owner thread\"), 0 )",
   "( dispatch_x86_thunk(&mut runtime, &mut memory, enter, &[critical_section]), 0 )"
+ ],
+ "cross_isa_transition_fails_closed_with_exact_status": [
+  "(error.status, 0xc000_00bb)",
+  "(error.missing_piece, MISSING_CROSS_ISA_PIECE)",
+  "(app.code, ReasonCode::RcUnimplInsn)",
+  "(app.reproduction_hints[0], \"ntstatus=0xc00000bb\")"
  ],
  "crt_access_readonly_and_missing": [
   "(ret, (-1_i32) as u32 as u64)",
@@ -2896,6 +3025,44 @@
   "(error.hresult, E_INVALIDARG)",
   "(error.message, \"output buffer is 4 bytes, tensor requires 8\")"
  ],
+ "dml_extended_execute_rejects_malformed_bindings": [
+  "( execute_plan(&relu, DmlExecutionDevice::Cpu, &[], &mut out) .unwrap_err() .message, \"operator expects 1 input buffers, got 0\" )",
+  "( execute_plan(&relu, DmlExecutionDevice::Cpu, &[&data[..8]], &mut out) .unwrap_err() .message, \"input input buffer is 8 bytes, tensor requires 16\" )",
+  "( execute_plan(&relu, DmlExecutionDevice::Cpu, &[&data], &mut out[..8]) .unwrap_err() .message, \"output buffer is 8 bytes, tensor requires 16\" )",
+  "( validate_buffer_binding(8, 16, 16).unwrap_err().message, \"buffer binding offset 8 is not 16-byte aligned\" )",
+  "( validate_buffer_binding(16, 4, 16).unwrap_err().message, \"buffer binding size 4 is smaller than the required 16 bytes\" )",
+  "( validate_buffer_binding(u64::MAX - 15, 32, 16) .unwrap_err() .message, \"buffer binding range overflows\" )"
+ ],
+ "dml_extended_rejects_invalid_descriptor_shapes_exactly": [
+  "( convolution.validate().unwrap_err().message, \"convolution filter channel count 2 must equal input channels / groups (1)\" )",
+  "( pooling.validate().unwrap_err().message, \"pooling output sizes must be [1, 1, 2, 2], got [1, 1, 1, 1]\" )",
+  "( reduce.validate().unwrap_err().message, \"reduce axis 4 is out of range for rank 4\" )",
+  "( transpose.validate().unwrap_err().message, \"transpose axis 0 appears more than once\" )",
+  "( concat.validate().unwrap_err().message, \"concat input sizes must match on non-axis dimensions\" )",
+  "( slice.validate().unwrap_err().message, \"slice window at axis 1 exceeds input size 4\" )"
+ ],
+ "dml_extended_rejects_shape_stride_overflow_empty_and_dtype_errors": [
+  "( gemm.validate().unwrap_err().message, \"GEMM inner dimensions do not match: A K=2, B K=3\" )",
+  "( overflow.validate().unwrap_err().message, \"tensor stride range overflows u64\" )",
+  "( empty_plan.validate().unwrap_err().message, \"tensor dimensions must be non-zero\" )",
+  "( unsupported_plan.validate().unwrap_err().message, \"DML_TENSOR_DATA_TYPE 5 is not supported for DML_OPERATOR_TYPE 44\" )",
+  "( convolution.validate().unwrap_err().message, \"DML_TENSOR_DATA_TYPE 2 is not supported for DML_OPERATOR_TYPE 53\" )",
+  "( zero_stride_plan.validate().unwrap_err().message, \"output tensor strides must be non-zero\" )"
+ ],
+ "dml_float16_conversion_roundtrip_edge_values": [
+  "(f32_to_f16(value), bits)",
+  "(f16_to_f32(0x0001), 2.0f32.powi(-24))",
+  "(f32_to_f16(65_504.0), 0x7bff)",
+  "(f32_to_f16(65_520.0), 0x7c00)",
+  "(f32_to_f16(f32::NAN) & 0x7c00, 0x7c00)",
+  "(f32_to_f16(f32::INFINITY), 0x7c00)"
+ ],
+ "dml_gemm_and_convolution_metal_numeric_readback_edge_values": [
+  "(gemm.operator_type(), DML_OPERATOR_GEMM)"
+ ],
+ "dml_gemm_float16_metal_numeric_readback_edge_values": [
+  "(read_f16(&cpu), vec![22.0, 28.0, 49.0, 64.0])"
+ ],
  "dml_invalid_dimension_count_is_rejected": [
   "(error.hresult, E_INVALIDARG)",
   "( error.message, \"tensor DimensionCount 0 is outside the supported 1..=4 range\" )"
@@ -2904,9 +3071,23 @@
   "(error.hresult, E_INVALIDARG)",
   "(error.message, \"input tensors must have identical Sizes\")"
  ],
+ "dml_pooling_activation_batchnorm_metal_numeric_readback_edge_values": [
+  "(max_pool.operator_type(), DML_OPERATOR_MAX_POOLING)"
+ ],
  "dml_record_dispatch_rejects_wrong_binding_count": [
   "(error.hresult, E_INVALIDARG)",
   "( error.message, \"RecordDispatch requires 2 buffer bindings, got 0\" )"
+ ],
+ "dml_reshape_transpose_concat_slice_metal_numeric_readback_edge_values": [
+  "(reshape.operator_type(), DML_OPERATOR_RESHAPE)"
+ ],
+ "dml_runtime_cpu_device_rejects_cross_device_and_executes_real_math": [
+  "( runtime .compile_operation(device, operation, 0x8) .unwrap_err() .message, \"DML_EXECUTION_FLAGS 0x8 contain undefined bits\" )",
+  "(read_f32(&output), vec![0.0, 0.0, 0.0, 3.0])",
+  "(runtime.operation_binding_count(compiled).unwrap(), 2)",
+  "( runtime .binding_properties_for_dispatchable(compiled) .unwrap() .required_descriptor_count, 2 )",
+  "(runtime.dispatches().len(), 1)",
+  "( runtime .compile_operation(other, operation, 0) .unwrap_err() .message, \"operation was created by a different DirectML device\" )"
  ],
  "dml_runtime_error_paths_and_all_operator_lowerings_are_pinned": [
   "(error.code, crate::reason::ReasonCode::RcD3dInvalidState)",
@@ -2915,6 +3096,9 @@
   "(error.message, \"DML_TENSOR_DATA_TYPE 99 is not supported\")",
   "( tensor.validate().unwrap_err().message, \"DML_TENSOR_FLAGS 0x1 are not supported (owned tensors are not implemented)\" )",
   "( tensor.validate().unwrap_err().message, \"tensor DimensionCount 0 is outside the supported 1..=4 range\" )"
+ ],
+ "dml_softmax_reduce_binary_metal_numeric_readback_edge_values": [
+  "(softmax.operator_type(), DML_OPERATOR_ACTIVATION_SOFTMAX)"
  ],
  "dml_unsupported_data_type_is_rejected": [
   "(error.hresult, E_INVALIDARG)",
@@ -7118,6 +7302,9 @@
   "( execute_in_default_app_domain(&assembly, \"Type\", \"\", None), Err(ClrHostError::InvalidArgument(\"method name\")) )",
   "( execute_in_default_app_domain(&assembly, \"Type\\0Name\", \"Method\", None), Err(ClrHostError::InvalidArgument(\"type name\")) )"
  ],
+ "missing_chpe_metadata_pointer_for_hybrid_image_is_rejected": [
+  "(error.message, \"ARM64EC image is missing CHPE metadata\")"
+ ],
  "missing_dacl_and_matched_deny_aces_fail_closed": [
   "( monitor.check_access(token, &descriptor, READ_CONTROL), Err(STATUS_ACCESS_DENIED) )",
   "(monitor.check_access(token, &descriptor, 0), Ok(()))",
@@ -9439,6 +9626,14 @@
  "roundtrip_ntstatus_to_dos_to_errno": [
   "(dos, ERROR_ACCESS_DENIED)",
   "(dos_error_to_errno(dos), libc::EACCES)"
+ ],
+ "route_entry_point_redirection_boundary_is_pinned": [
+  "( route_entry_point(&image, HybridView::Native).unwrap(), 0x1000 )",
+  "( route_entry_point(&image, HybridView::Emulation).unwrap(), 0x1180 )"
+ ],
+ "route_export_native_emulation_boundary_is_pinned": [
+  "( route_export(&image, Some(\"Run\"), 1, HybridView::Native).unwrap(), Some(0x1000) )",
+  "( route_export(&image, Some(\"Run\"), 1, HybridView::Emulation).unwrap(), Some(0x1800) )"
  ],
  "rsa_quote_signature_rejects_tampered_attest_and_pcr_digest_matches": [
   "( rc(&run(&mut tpm, &quote_command_no_sessions(handle, &[3]))), TPM_RC_AUTH_MISSING )",

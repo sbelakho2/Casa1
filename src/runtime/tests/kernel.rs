@@ -668,6 +668,7 @@ fn test_pe_resolve_imports_missing_dll() {
             is_dotnet: false,
             clr_header: None,
             bound_imports: vec![],
+            arm64: None,
         };
         let export_tables = BTreeMap::new();
         let resolver = crate::pe::ApiSetResolver::new();
@@ -722,6 +723,7 @@ fn test_relocation_unsupported_type_rejected() {
             is_dotnet: false,
             clr_header: None,
             bound_imports: vec![],
+            arm64: None,
         };
         let mut mapped = crate::pe::MappedImage {
             preferred_base: 0x400000,

@@ -6662,6 +6662,243 @@ pub fn find_casa1_runner_binary() -> AppResult<PathBuf> {
     ))
 }
 
+thread_local! {
+    static ARM64_IMPORT_ERROR: std::cell::RefCell<Option<AppError>> =
+        const { std::cell::RefCell::new(None) };
+    static ARM64_GUEST_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+fn arm64_dispatch_runtime_thunk(
+    runtime_ptr: *mut PeHostRuntime,
+    memory_ptr: *mut MemoryImage,
+    scratch: u64,
+    thunk: u64,
+    args: [u64; 8],
+) -> u64 {
+    // SAFETY: the native ARM64 image is fully synchronous; the runtime and
+    // memory outlive the call and no other borrow is active while the guest
+    // thread executes.
+    eprintln!("[arm64-dispatch] enter thunk={thunk:#x} args={args:?}");
+    let runtime = unsafe { &mut *runtime_ptr };
+    let memory = unsafe { &mut *memory_ptr };
+    let mut state = CpuState::new(GuestArch::X64);
+    state.set(Register::Rsp, scratch);
+    state.rip = 0;
+    write_u64(memory, scratch, 0);
+    for (index, value) in args.iter().copied().enumerate().skip(4) {
+        write_u64(memory, scratch + 0x28 + ((index - 4) as u64 * 8), value);
+    }
+    state.set(Register::Rcx, args[0]);
+    state.set(Register::Rdx, args[1]);
+    state.set(Register::R8, args[2]);
+    state.set(Register::R9, args[3]);
+    let dispatched = runtime.dispatch_import(thunk, &mut state, memory);
+    eprintln!(
+        "[arm64-dispatch] dispatched={:?} rax={:#x}",
+        dispatched.as_ref().map(|v| *v),
+        state.get(Register::Rax)
+    );
+    match dispatched {
+        Ok(Some(code)) => {
+            ARM64_GUEST_EXIT.with(|slot| slot.set(Some(code)));
+            state.get(Register::Rax)
+        }
+        Ok(None) => state.get(Register::Rax),
+        Err(error) => {
+            ARM64_IMPORT_ERROR.with(|slot| {
+                *slot.borrow_mut() = Some(error);
+            });
+            u64::MAX
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_native_arm64_image(
+    program: &Path,
+    args: &[String],
+    ge: &GameEnvironment,
+    image: &pe::ParsedPe,
+    bytes: &[u8],
+    env: &BTreeMap<String, String>,
+    dtm: bool,
+    _test_id: &str,
+    options: PeExecutionOptions,
+) -> AppResult<PeExecutionResult> {
+    if !crate::arm64::native_arm64_available() {
+        return Err(AppError::new(
+            ReasonCode::RcUnsupportedPlatform,
+            "native ARM64 image execution requires an aarch64 host",
+        ));
+    }
+    ARM64_IMPORT_ERROR.with(|slot| *slot.borrow_mut() = None);
+    ARM64_GUEST_EXIT.with(|slot| slot.set(None));
+    let mut runner = crate::arm64::Arm64NativeRunner::load(bytes, image)?;
+    let selected_base = runner.image.base;
+    let mut runtime = PeHostRuntime::new(
+        ge.clone(),
+        dtm,
+        load_keyboard_replay(env)?,
+        options.live_session,
+        load_trace_categories(env),
+    );
+    runtime.set_guest_arch(GuestArch::X64);
+    runtime.process_environment = env.clone();
+    for observer in options.observers {
+        runtime.add_observer(observer);
+    }
+    let mut memory = MemoryImage::default();
+    memory.set_vm(runtime.win32.address_space_mut());
+    memory.map_bytes(selected_base, &runner.image.mapped.memory);
+    runtime.win32.address_space_mut().register(
+        selected_base,
+        image.size_of_image as u64,
+        crate::vm::VmRegionKind::Image,
+    );
+    runtime.win32.address_space_mut().commit(
+        selected_base,
+        image.size_of_image as u64,
+        crate::vm::VmProtection::READ_WRITE_EXECUTE,
+        false,
+    );
+    let guest_path = program.to_string_lossy().to_string();
+    let tls_rvas: Vec<u64> = image
+        .tls_directory
+        .as_ref()
+        .map(|tls| {
+            tls.callbacks
+                .iter()
+                .map(|&va| va.wrapping_sub(image.image_base))
+                .collect()
+        })
+        .unwrap_or_default();
+    runtime.set_main_module(&guest_path, selected_base, &image.exports, &tls_rvas);
+    runtime.seed_process_state(
+        &mut memory,
+        &guest_path,
+        args,
+        selected_base,
+        image.size_of_image as u64,
+    )?;
+    let resolver = ApiSetResolver::new();
+    let imports = resolve_imports_for_runtime(image, &resolver);
+    let scratch = runtime.alloc_zeroed(&mut memory, 0x100, 16)?;
+    let runtime_ptr = &mut runtime as *mut PeHostRuntime;
+    let memory_ptr = &mut memory as *mut MemoryImage;
+    for (import_index, import) in imports.iter().enumerate() {
+        let thunk = HostThunk::from_import(import);
+        let thunk_address = runtime.alloc_host_thunk(thunk);
+        let key = match &import.symbol {
+            ImportSymbol::ByName { name, .. } => {
+                format!("{}.{}", import.requested_module, name)
+            }
+            ImportSymbol::ByOrdinal { ordinal } => {
+                format!(
+                    "{}.{}",
+                    import.requested_module,
+                    ordinal_import_name(&import.resolved_module, *ordinal).unwrap_or("")
+                )
+            }
+        };
+        let arm64_thunk =
+            runner
+                .imports
+                .register(key.clone(), move |a0, a1, a2, a3, a4, a5, a6, a7| {
+                    arm64_dispatch_runtime_thunk(
+                        runtime_ptr,
+                        memory_ptr,
+                        scratch,
+                        thunk_address,
+                        [a0, a1, a2, a3, a4, a5, a6, a7],
+                    )
+                })?;
+        runner.image.write_slot(import.iat_rva, arm64_thunk)?;
+        if let Some(chpe) = image.chpe_metadata() {
+            for auxiliary in [
+                chpe.auxiliary_iat_rva,
+                chpe.auxiliary_iat_copy_rva,
+                chpe.auxiliary_delayload_iat_rva,
+                chpe.auxiliary_delayload_iat_copy_rva,
+            ] {
+                if auxiliary != 0 {
+                    let slot = auxiliary
+                        .checked_add((import_index as u32).checked_mul(8).ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcPeParseInvalid,
+                                "ARM64EC auxiliary IAT offset overflow",
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            AppError::new(
+                                ReasonCode::RcPeParseInvalid,
+                                "ARM64EC auxiliary IAT RVA overflow",
+                            )
+                        })?;
+                    runner.image.write_slot(slot, arm64_thunk)?;
+                }
+            }
+        }
+    }
+    runner.image.protect()?;
+    for callback in &tls_rvas {
+        let callback_rva = u32::try_from(*callback).map_err(|_| {
+            AppError::new(
+                ReasonCode::RcPeParseInvalid,
+                "ARM64 TLS callback RVA does not fit in 32 bits",
+            )
+        })?;
+        runner.call_rva(callback_rva, &[selected_base, 1, 0])?;
+        if let Some(error) = ARM64_IMPORT_ERROR.with(|slot| slot.borrow_mut().take()) {
+            return Err(error);
+        }
+    }
+    eprintln!(
+        "[arm64-runtime] iat={:02x?}",
+        &runner.image.bytes()[0x2060..0x2068]
+    );
+    let entry_rva = crate::arm64x::route_entry_point(image, crate::arm64x::HybridView::Native)?;
+    if image
+        .chpe_metadata()
+        .and_then(|chpe| chpe.code_kind_at(entry_rva))
+        == Some(crate::arm64x::ChpeCodeKind::Amd64)
+    {
+        return Err(crate::arm64::CrossIsaError::new(
+            crate::arm64::Arm64Isa::Arm64,
+            crate::arm64::Arm64Isa::X64,
+        )
+        .to_app_error());
+    }
+    let start_time = std::time::Instant::now();
+    eprintln!(
+        "[arm64-runtime] entry={entry_rva:#x} code={:02x?}",
+        &runner.image.bytes()[0x1000..0x1020]
+    );
+    let result = runner.call_entry(image, &[])?;
+    if let Some(error) = ARM64_IMPORT_ERROR.with(|slot| slot.borrow_mut().take()) {
+        return Err(error);
+    }
+    let mut exit_code = result.return_value() as u32 as i32;
+    if let Some(code) = ARM64_GUEST_EXIT.with(|slot| slot.take()) {
+        exit_code = code;
+    }
+    let image_hash = util::sha256_bytes(bytes);
+    finalize_execution(
+        runtime,
+        &mut memory,
+        image,
+        &runner.image.mapped,
+        env,
+        dtm,
+        image_hash,
+        0,
+        0,
+        start_time,
+        exit_code,
+        ExecutionTermination::GuestExit { code: exit_code },
+        None,
+    )
+}
+
 pub fn execute(
     program: &Path,
     args: &[String],
@@ -6744,12 +6981,19 @@ pub fn execute_with_options(
     let guest_arch = match image.machine {
         0x8664 => GuestArch::X64,
         0x014c => GuestArch::X86,
+        crate::pe::IMAGE_FILE_MACHINE_ARM64
+        | crate::pe::IMAGE_FILE_MACHINE_ARM64EC
+        | crate::pe::IMAGE_FILE_MACHINE_ARM64X => {
+            return execute_native_arm64_image(
+                program, args, ge, &image, &bytes, env, dtm, test_id, options,
+            );
+        }
         _ => {
             return Err(AppError::new(
                 ReasonCode::RcPeParseInvalid,
                 format!("unsupported PE machine 0x{:04x}", image.machine),
             )
-            .with_hint("only x86_64 and x86 PE images are currently executable"));
+            .with_hint("supported machines are x86, x86_64, ARM64, ARM64EC and ARM64X"));
         }
     };
 

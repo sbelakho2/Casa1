@@ -155,6 +155,8 @@ pub mod anticheat;
 pub mod api_coverage;
 pub mod api_database;
 pub mod app_bundle;
+pub mod arm64;
+pub mod arm64x;
 pub mod async_pipeline_compiler;
 pub mod audio;
 pub mod audio_activation;

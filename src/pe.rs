@@ -50,6 +50,15 @@ pub const IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG: usize = 10;
 pub const IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT: usize = 11;
 pub const IMAGE_DIRECTORY_ENTRY_SECURITY: usize = 4;
 pub const IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR: usize = 14;
+pub const IMAGE_DIRECTORY_ENTRY_RESERVED: usize = 15;
+
+pub use crate::arm64x::{
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARM64EC,
+    IMAGE_FILE_MACHINE_ARM64X, IMAGE_FILE_MACHINE_CHPE_X86, IMAGE_FILE_MACHINE_I386,
+};
+
+pub const STATUS_NOT_SUPPORTED: u32 = 0xc000_00bb;
+pub const STATUS_INVALID_IMAGE_FORMAT: u32 = 0xc000_007b;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DataDirectory {
@@ -75,7 +84,7 @@ pub struct DebugDirectoryEntry {
     pub pointer_to_raw_data: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoadConfig {
     pub security_cookie: u64,
     pub guard_flags: u32,
@@ -85,6 +94,10 @@ pub struct LoadConfig {
     pub guard_cf_dispatch_function_pointer: u64,
     pub guard_cf_function_table: u64,
     pub guard_cf_function_count: u64,
+    pub dynamic_value_reloc_table: u64,
+    pub chpe_metadata_pointer: u64,
+    pub dynamic_value_reloc_table_offset: u32,
+    pub dynamic_value_reloc_table_section: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,6 +381,9 @@ pub struct ParsedPe {
     /// Bound imports are an optimization where the linker pre-computes correct IAT
     /// addresses. In our emulator we always fall back to normal import resolution.
     pub bound_imports: Vec<BoundImportDescriptor>,
+    /// ARM64EC/ARM64X hybrid metadata, code maps, dynamic relocations and
+    /// unwind tables. `None` for non-ARM64 images.
+    pub arm64: Option<crate::arm64x::Arm64ImageMetadata>,
 }
 
 impl ParsedPe {
@@ -388,6 +404,36 @@ impl ParsedPe {
 
     pub fn dynamic_base(&self) -> bool {
         self.dll_characteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE != 0
+    }
+
+    pub fn is_arm64(&self) -> bool {
+        self.machine == IMAGE_FILE_MACHINE_ARM64
+    }
+
+    pub fn is_arm64ec(&self) -> bool {
+        self.machine == IMAGE_FILE_MACHINE_ARM64EC
+    }
+
+    pub fn is_arm64x(&self) -> bool {
+        self.machine == IMAGE_FILE_MACHINE_ARM64X
+    }
+
+    pub fn is_any_arm64(&self) -> bool {
+        self.is_arm64() || self.is_arm64ec() || self.is_arm64x()
+    }
+
+    pub fn hybrid_machine(&self) -> Option<crate::arm64x::HybridMachine> {
+        crate::arm64x::HybridMachine::from_machine(self.machine)
+    }
+
+    pub fn arm64_metadata(&self) -> Option<&crate::arm64x::Arm64ImageMetadata> {
+        self.arm64.as_ref()
+    }
+
+    pub fn chpe_metadata(&self) -> Option<&crate::arm64x::ChpeMetadata> {
+        self.arm64
+            .as_ref()
+            .and_then(|metadata| metadata.chpe.as_ref())
     }
 
     /// Whether the image is compiled with hot-patch support
@@ -881,7 +927,7 @@ pub fn parse(bytes: &[u8]) -> AppResult<ParsedPe> {
         None
     };
 
-    Ok(ParsedPe {
+    let mut parsed = ParsedPe {
         machine,
         number_of_sections,
         characteristics,
@@ -909,7 +955,11 @@ pub fn parse(bytes: &[u8]) -> AppResult<ParsedPe> {
         is_dotnet,
         clr_header,
         bound_imports,
-    })
+        arm64: None,
+    };
+    parsed.arm64 =
+        crate::arm64x::parse_image_metadata(bytes, &parsed, parsed.load_config.as_ref())?;
+    Ok(parsed)
 }
 
 pub fn select_image_base(image: &ParsedPe, image_hash: &str, dtm: bool) -> u64 {
@@ -934,7 +984,13 @@ pub fn map_image(
     image_hash: &str,
     dtm: bool,
 ) -> AppResult<MappedImage> {
-    let selected_base = select_image_base(image, image_hash, dtm);
+    map_image_at(bytes, image, select_image_base(image, image_hash, dtm))
+}
+
+pub fn map_image_at(bytes: &[u8], image: &ParsedPe, selected_base: u64) -> AppResult<MappedImage> {
+    if image.section_alignment != 0 && selected_base % u64::from(image.section_alignment) != 0 {
+        return invalid("selected image base is not aligned to SectionAlignment");
+    }
     let image_size = image.size_of_image as usize;
     let headers_size = image.size_of_headers as usize;
     if headers_size > image_size {
@@ -984,6 +1040,7 @@ pub fn map_image(
         sections: mappings,
     };
     apply_relocations(image, &mut mapped)?;
+    crate::arm64x::apply_arm64x_relocations(image, &mut mapped)?;
     Ok(mapped)
 }
 
@@ -1582,7 +1639,9 @@ fn parse_load_config(
         .virtual_address
         .checked_sub(section.virtual_address)
         .ok_or_else(|| pe_error("load config directory underflow"))? as usize;
-    let available_size = section.raw_data_size as usize - relative;
+    let available_size = (section.raw_data_size as usize)
+        .checked_sub(relative)
+        .ok_or_else(|| pe_error("load config directory underflow"))?;
     let present_size = load_config_size
         .max(directory.size as usize)
         .min(available_size);
@@ -1595,6 +1654,10 @@ fn parse_load_config(
         guard_cf_function_table_offset,
         guard_cf_function_count_offset,
         guard_flags_offset,
+        dynamic_value_reloc_table_offset,
+        chpe_metadata_pointer_offset,
+        dynamic_value_reloc_table_delta_offset,
+        dynamic_value_reloc_table_section_offset,
     ) = if pointer_bytes == 8 {
         (
             Some(0x58_usize),
@@ -1605,8 +1668,12 @@ fn parse_load_config(
             0x80_usize,
             0x88_usize,
             0x90_usize,
+            0xc0_usize,
+            0xc8_usize,
+            0xe0_usize,
+            0xe4_usize,
         )
-    } else if present_size >= 0x48 {
+    } else {
         (
             Some(0x3c_usize),
             0x40_usize,
@@ -1616,11 +1683,10 @@ fn parse_load_config(
             0x50_usize,
             0x54_usize,
             0x58_usize,
-        )
-    } else {
-        (
-            None, 0x38_usize, 0x3c_usize, 0x48_usize, 0x4c_usize, 0x50_usize, 0x54_usize,
-            0x58_usize,
+            0x78_usize,
+            0x7c_usize,
+            0x88_usize,
+            0x8c_usize,
         )
     };
     Ok(Some(LoadConfig {
@@ -1692,6 +1758,40 @@ fn parse_load_config(
             pointer_bytes,
             "GuardCFFunctionCount",
         )?,
+        dynamic_value_reloc_table: read_load_config_pointer(
+            bytes,
+            offset,
+            present_size,
+            dynamic_value_reloc_table_offset,
+            pointer_bytes,
+            "DynamicValueRelocTable",
+        )?,
+        chpe_metadata_pointer: read_load_config_pointer(
+            bytes,
+            offset,
+            present_size,
+            chpe_metadata_pointer_offset,
+            pointer_bytes,
+            "CHPEMetadataPointer",
+        )?,
+        dynamic_value_reloc_table_offset: read_load_config_u32(
+            bytes,
+            offset,
+            present_size,
+            dynamic_value_reloc_table_delta_offset,
+            "DynamicValueRelocTableOffset",
+        )?,
+        dynamic_value_reloc_table_section: if dynamic_value_reloc_table_section_offset + 2
+            <= present_size
+        {
+            read_u16(
+                bytes,
+                offset + dynamic_value_reloc_table_section_offset,
+                "DynamicValueRelocTableSection",
+            )?
+        } else {
+            0
+        },
     }))
 }
 
@@ -4454,6 +4554,7 @@ mod e5_pe_parser_tests {
             is_dotnet: false,
             clr_header: None,
             bound_imports: vec![],
+            arm64: None,
         }
     }
 
@@ -4539,6 +4640,11 @@ mod e5_pe_parser_tests {
 // ── pe_stub: minimal ParsedPe for use in test helpers ──────────────────
 // (placed after the tests so it's visible inside the test module)
 #[cfg(test)]
+pub(crate) fn pe_stub_for_tests() -> ParsedPe {
+    pe_stub()
+}
+
+#[cfg(test)]
 fn pe_stub() -> ParsedPe {
     ParsedPe {
         machine: 0x014c,
@@ -4568,5 +4674,6 @@ fn pe_stub() -> ParsedPe {
         is_dotnet: false,
         clr_header: None,
         bound_imports: vec![],
+        arm64: None,
     }
 }
