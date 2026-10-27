@@ -2,9 +2,9 @@
   "entries": {
     "gate/kpi/cpu_dispatch_nop_1024": {
       "baseline": {
-        "ci_high": 571.599006652832,
-        "ci_low": 555.4065704345703,
-        "median": 563.5027885437012
+        "ci_high": 538.2757186889648,
+        "ci_low": 523.7024612426758,
+        "median": 530.9890899658203
       },
       "direction": "lower",
       "kind": "timing",
@@ -17,9 +17,9 @@
     },
     "gate/kpi/frame_present_64x64": {
       "baseline": {
-        "ci_high": 271.99459075927734,
-        "ci_low": 269.4622278213501,
-        "median": 270.7284092903137
+        "ci_high": 259.5987319946289,
+        "ci_low": 258.00037384033203,
+        "median": 258.79955291748047
       },
       "direction": "lower",
       "kind": "timing",
@@ -32,9 +32,9 @@
     },
     "gate/kpi/gfx_command_batch_128": {
       "baseline": {
-        "ci_high": 11405.661865234375,
-        "ci_low": 11392.798828125,
-        "median": 11399.230346679688
+        "ci_high": 10163.139770507812,
+        "ci_low": 9939.85009765625,
+        "median": 10051.494934082031
       },
       "direction": "lower",
       "kind": "timing",
@@ -47,9 +47,9 @@
     },
     "gate/kpi/gfx_upload_allocate_64k": {
       "baseline": {
-        "ci_high": 9.59986698627472,
-        "ci_low": 8.799901843070984,
-        "median": 9.199884414672852
+        "ci_high": 8.2325239777565,
+        "ci_low": 8.230348467826843,
+        "median": 8.231436222791672
       },
       "direction": "lower",
       "kind": "timing",
@@ -62,9 +62,9 @@
     },
     "gate/kpi/pe_parse_minimal": {
       "baseline": {
-        "ci_high": 266.6556053161621,
-        "ci_low": 262.37614822387695,
-        "median": 264.51587677001953
+        "ci_high": 272.5054473876953,
+        "ci_low": 272.1222229003906,
+        "median": 272.31383514404297
       },
       "direction": "lower",
       "kind": "timing",
@@ -77,9 +77,9 @@
     },
     "gate/kpi/shader_cache_hit": {
       "baseline": {
-        "ci_high": 1396.039306640625,
-        "ci_low": 1393.2774963378906,
-        "median": 1394.6584014892578
+        "ci_high": 1286.4761352539062,
+        "ci_low": 1279.089599609375,
+        "median": 1282.7828674316406
       },
       "direction": "lower",
       "kind": "timing",
@@ -92,9 +92,9 @@
     },
     "gate/kpi/thunk_resolve_256": {
       "baseline": {
-        "ci_high": 2066.6414794921875,
-        "ci_low": 2000.078842163086,
-        "median": 2033.3601608276367
+        "ci_high": 1863.337158203125,
+        "ci_low": 1849.5432434082031,
+        "median": 1856.440200805664
       },
       "direction": "lower",
       "kind": "timing",
@@ -106,16 +106,32 @@
       "unit": "ns"
     },
     "kpi/cpu_submit_p50_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 5.708
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "CPU command encoding + commit (submit_start/submit_end)",
+      "threshold": {
+        "abs": 100.0,
+        "rel": 0.2
+      },
+      "unit": "us"
     },
     "kpi/cpu_submit_p99_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 47.042
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "CPU command encoding + commit (submit_start/submit_end)",
+      "threshold": {
+        "abs": 200.0,
+        "rel": 0.2
+      },
+      "unit": "us"
     },
     "kpi/dispatcher_exits_per_1000_instructions": {
       "available": true,
@@ -148,7 +164,7 @@
     "kpi/frame_interval_p50_us": {
       "available": true,
       "baseline": {
-        "value": 3.625
+        "value": 3.583
       },
       "direction": "lower",
       "kind": "kpi",
@@ -162,7 +178,7 @@
     "kpi/frame_interval_p95_us": {
       "available": true,
       "baseline": {
-        "value": 3.75
+        "value": 4.375
       },
       "direction": "lower",
       "kind": "kpi",
@@ -176,7 +192,7 @@
     "kpi/frame_interval_p999_us": {
       "available": true,
       "baseline": {
-        "value": 60.417
+        "value": 34.333
       },
       "direction": "lower",
       "kind": "kpi",
@@ -190,7 +206,7 @@
     "kpi/frame_interval_p99_us": {
       "available": true,
       "baseline": {
-        "value": 9.542
+        "value": 7.875
       },
       "direction": "lower",
       "kind": "kpi",
@@ -204,7 +220,7 @@
     "kpi/frame_latency_0p1pct_low_fps": {
       "available": true,
       "baseline": {
-        "value": 7127.146874817367
+        "value": 17106.240014232393
       },
       "direction": "higher",
       "kind": "kpi",
@@ -218,7 +234,7 @@
     "kpi/frame_latency_1pct_low_fps": {
       "available": true,
       "baseline": {
-        "value": 29265.4375182909
+        "value": 46741.68395329945
       },
       "direction": "higher",
       "kind": "kpi",
@@ -233,7 +249,7 @@
       "absolute_max": 2000.0,
       "available": true,
       "baseline": {
-        "value": 3.584
+        "value": 3.542
       },
       "direction": "lower",
       "kind": "kpi",
@@ -247,7 +263,7 @@
     "kpi/frame_latency_p95_us": {
       "available": true,
       "baseline": {
-        "value": 3.75
+        "value": 4.375
       },
       "direction": "lower",
       "kind": "kpi",
@@ -261,7 +277,7 @@
     "kpi/frame_latency_p999_us": {
       "available": true,
       "baseline": {
-        "value": 60.333
+        "value": 34.292
       },
       "direction": "lower",
       "kind": "kpi",
@@ -276,7 +292,7 @@
       "absolute_max": 5000.0,
       "available": true,
       "baseline": {
-        "value": 9.541
+        "value": 7.834
       },
       "direction": "lower",
       "kind": "kpi",
@@ -330,40 +346,90 @@
       "unit": "staged copies/(zero-copy+staged)"
     },
     "kpi/gpu_frame_time_0p1pct_low_fps": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 1328.829487257854
+      },
+      "direction": "higher",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "real present/GPU-completion timeline between consecutive measured frames",
+      "threshold": {
+        "abs": 20000.0,
+        "rel": 0.9
+      },
+      "unit": "fps"
     },
     "kpi/gpu_frame_time_1pct_low_fps": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 1516.1408353329546
+      },
+      "direction": "higher",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "real present/GPU-completion timeline between consecutive measured frames",
+      "threshold": {
+        "abs": 50000.0,
+        "rel": 0.9
+      },
+      "unit": "fps"
     },
     "kpi/gpu_frame_time_p50_us": {
-      "available": false,
+      "absolute_max": 2000.0,
+      "available": true,
+      "baseline": {
+        "value": 143.875
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "real present/GPU-completion timeline between consecutive measured frames",
+      "threshold": {
+        "abs": 100.0,
+        "rel": 0.1
+      },
+      "unit": "us"
     },
     "kpi/gpu_frame_time_p95_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 244.5
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "real present/GPU-completion timeline between consecutive measured frames",
+      "threshold": {
+        "abs": 200.0,
+        "rel": 0.1
+      },
+      "unit": "us"
     },
     "kpi/gpu_frame_time_p999_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 752.542
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "real present/GPU-completion timeline between consecutive measured frames",
+      "threshold": {
+        "abs": 500.0,
+        "rel": 1.0
+      },
+      "unit": "us"
     },
     "kpi/gpu_frame_time_p99_us": {
-      "available": false,
+      "absolute_max": 5000.0,
+      "available": true,
+      "baseline": {
+        "value": 609.083
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "real present/GPU-completion timeline between consecutive measured frames",
+      "threshold": {
+        "abs": 200.0,
+        "rel": 0.1
+      },
+      "unit": "us"
     },
     "kpi/gpu_heap_faults_per_1000_frames": {
       "available": false,
@@ -372,28 +438,60 @@
       "source": "benchmark KPI"
     },
     "kpi/gpu_idle_gap_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 137.75
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime"
+      "source": "next GPUStartTime - previous GPUEndTime",
+      "threshold": {
+        "abs": 100.0,
+        "rel": 0.2
+      },
+      "unit": "us"
     },
     "kpi/gpu_time_p50_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 6.25
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "Metal command buffer GPUStartTime/GPUEndTime",
+      "threshold": {
+        "abs": 100.0,
+        "rel": 0.2
+      },
+      "unit": "us"
     },
     "kpi/gpu_time_p99_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 13.25
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "Metal command buffer GPUStartTime/GPUEndTime",
+      "threshold": {
+        "abs": 200.0,
+        "rel": 0.2
+      },
+      "unit": "us"
     },
     "kpi/guest_instructions_per_sec": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 2051758822.1622014
+      },
+      "direction": "higher",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "execute_ir NOP dispatch, 1024-instruction block, 1000 iterations",
+      "threshold": {
+        "abs": 1000000.0,
+        "rel": 0.5
+      },
+      "unit": "guest instructions/s"
     },
     "kpi/high_address_guest_page_faults_per_access": {
       "available": true,
@@ -424,10 +522,18 @@
       "unit": "sync operations/1000 instructions"
     },
     "kpi/host_cpu_time_p50_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 52.0
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "CLOCK_PROCESS_CPUTIME_ID around measured frames",
+      "threshold": {
+        "abs": 100.0,
+        "rel": 0.2
+      },
+      "unit": "us"
     },
     "kpi/iat_dispatch_bypasses": {
       "available": true,
@@ -528,34 +634,50 @@
       "unit": "targets"
     },
     "kpi/input_to_gpu_completion_p50_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 83.75
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "input event to real Metal GPUEndTime",
+      "threshold": {
+        "abs": 100.0,
+        "rel": 0.15
+      },
+      "unit": "us"
     },
     "kpi/input_to_gpu_completion_p99_us": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 556.666
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "input event to real Metal GPUEndTime",
+      "threshold": {
+        "abs": 200.0,
+        "rel": 0.15
+      },
+      "unit": "us"
     },
     "kpi/input_to_present_p50_us": {
       "available": false,
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "reason": "CAMetalLayer drawable reported presentedTime=0; no display presentation occurred",
+      "source": "benchmark KPI"
     },
     "kpi/input_to_present_p99_us": {
       "available": false,
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "reason": "CAMetalLayer drawable reported presentedTime=0; no display presentation occurred",
+      "source": "benchmark KPI"
     },
     "kpi/legacy_dispatch_mips": {
       "absolute_min": 50.0,
       "available": true,
       "baseline": {
-        "value": 2047.8320777696229
+        "value": 2051.7588221622013
       },
       "direction": "higher",
       "kind": "kpi",
@@ -597,7 +719,7 @@
     "kpi/pso_cache_hit_us": {
       "available": true,
       "baseline": {
-        "value": 0.334
+        "value": 0.25
       },
       "direction": "lower",
       "kind": "kpi",
@@ -611,7 +733,7 @@
     "kpi/pso_compile_us": {
       "available": true,
       "baseline": {
-        "value": 631.4159999999999
+        "value": 156.75
       },
       "direction": "lower",
       "kind": "kpi",
@@ -643,10 +765,18 @@
       "unit": "stalls/request"
     },
     "kpi/shader_compile_stall_rate_measured": {
-      "available": false,
+      "available": true,
+      "baseline": {
+        "value": 1.0
+      },
+      "direction": "lower",
       "kind": "kpi",
-      "reason": "awaiting the first real Metal GPU/present capture on this host; run ci/check_perf.sh --update on a quiet Metal host to promote this metric into a regression gate",
-      "source": "real Metal GPUStartTime/GPUEndTime and CAMetalLayer presentedTime"
+      "source": "shader::compile_with_cache cold requests in the measurement window",
+      "threshold": {
+        "abs": 0.05,
+        "rel": 0.1
+      },
+      "unit": "stalls/request"
     },
     "kpi/shader_compile_stall_rate_warm": {
       "available": true,
@@ -692,7 +822,7 @@
     }
   },
   "filter": "gate/kpi",
-  "generated_at": "2026-10-23T22:04:10.814761+00:00",
+  "generated_at": "2026-10-27T23:58:32.173863+00:00",
   "native_baseline": {
     "available": false,
     "reason": "no native ARM64-equivalent reference binary/benchmark is checked in; supply ci/perf-native-baseline.json to enable native-relative ratios"
