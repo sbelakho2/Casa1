@@ -183,31 +183,31 @@ fn database_seeds_interface_tables_at_runtime_levels() {
 #[test]
 fn method_level_rows_missing_proof_seed_restricted_not_exact() {
     let database = ApiDatabase::from_thunk_metadata();
-    let create_buffer = database
-        .lookup_interface_method("d3d11.dll", "ID3D11Device", "CreateBuffer")
-        .expect("CreateBuffer must be seeded from the D3D11 vtable metadata");
-    assert_eq!(create_buffer.method, "CreateBuffer");
+    let unproven = database
+        .lookup_interface_method("d3d12.dll", "ID3D12GraphicsCommandList", "ClearState")
+        .expect("ClearState must be seeded from the D3D12 vtable metadata");
+    assert_eq!(unproven.method, "ClearState");
     assert_eq!(
-        create_buffer.implementation,
+        unproven.implementation,
         ImplementationLevel::Partial,
         "a dispatched method without method-level proof is not Implemented-exact"
     );
     assert_eq!(
-        create_buffer.semantic_fidelity,
+        unproven.semantic_fidelity,
         SemanticFidelity::Restricted,
         "methods without proof never seed Exact"
     );
     assert_eq!(
-        create_buffer.subsystem_capability,
+        unproven.subsystem_capability,
         SubsystemCapability::Partial,
         "methods without proof never seed Full"
     );
     assert_eq!(
-        create_buffer.semantic_test_coverage,
+        unproven.semantic_test_coverage,
         CoverageLevel::None,
         "no method-level evidence exists yet"
     );
-    assert!(create_buffer.required);
+    assert!(unproven.required);
 
     let aggregate = database
         .interface_aggregate_status("d3d11.dll", "ID3D11Device")
@@ -1082,7 +1082,7 @@ fn method_evidence_resolves_real_test_and_rejects_uncompiled_binding() {
         .expect("the seeded D3D11 method evidence must resolve");
     assert_eq!(
         bound.evidence_id,
-        "casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil"
+        "casa1-conformance:d3d11_device_methods_reject_invalid_input_and_pin_vtable_outputs"
     );
     assert_eq!(bound.level, CoverageLevel::Conformance);
     assert_eq!(

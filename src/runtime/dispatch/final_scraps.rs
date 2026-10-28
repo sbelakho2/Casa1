@@ -1060,6 +1060,7 @@ impl PeHostRuntime {
             arguments: String::new(),
             description,
             working_directory: String::new(),
+            relative_path: String::new(),
             hotkey: 0,
             icon_location: String::new(),
             icon_index: 0,

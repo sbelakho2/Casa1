@@ -1,6 +1,9 @@
 use super::support::*;
 use super::*;
 
+#[path = "gpu_methods.rs"]
+mod gpu_methods;
+
 #[test]
 fn dxgi_adapter_desc_luid_mismatch_guard() {
     let gpu = crate::hardware_identity::host_identity().gpu.clone();
@@ -1915,8 +1918,10 @@ fn d3d12_command_signature_com_lifetime_and_execute_indirect() {
         state.set(Register::Rsp, base + 0x100);
         state.set(Register::Rcx, device);
         state.set(Register::Rdx, signature_desc);
-        state.set(Register::R8, signature_out);
+        state.set(Register::R8, 0);
+        state.set(Register::R9, 0);
         memory.write_u64(base + 0x100, 0x1000_0400);
+        memory.write_u64(base + 0x128, signature_out);
         runtime
             .dispatch_import(create_signature, &mut state, &mut memory)
             .expect("CreateCommandSignature");
@@ -3066,7 +3071,10 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
         write_u32(&mut memory, bad_arg, 99);
         state.set(Register::Rcx, device);
         state.set(Register::Rdx, bad_sig_desc);
-        state.set(Register::R8, bad_out);
+        state.set(Register::R8, 0);
+        state.set(Register::R9, 0);
+        state.set(Register::Rsp, base + 0x6e00);
+        memory.write_u64(base + 0x6e20, bad_out);
         runtime
             .dispatch_d3d12_create_command_signature(&mut memory, &mut state)
             .expect("CreateCommandSignature unsupported");
@@ -4254,7 +4262,8 @@ fn d3d12_dml_dispatch_error_paths_and_object_methods_are_pinned() {
         assert_eq!(state.get(Register::Rax), 0);
         assert_eq!(
             runtime_read_u32(&memory, feature_out),
-            crate::d3d12::directml::DML_FEATURE_LEVEL_6_3
+            crate::d3d12::directml::DML_FEATURE_LEVEL_2_0,
+            "the highest level in the caller's requested set wins"
         );
 
         // Compile and create the rest of the object graph.
@@ -5445,8 +5454,10 @@ fn d3d12_state_object_and_work_graph_dispatch_error_paths_are_pinned() {
                     s.set(Register::Rsp, base + 0x1080);
                     s.set(Register::Rcx, list);
                     s.set(Register::Rdx, signature_desc);
-                    s.set(Register::R8, signature_out);
+                    s.set(Register::R8, 0);
+                    s.set(Register::R9, 0);
                     memory.write_u64(base + 0x1080, 0x1000_0901_1);
+                    memory.write_u64(base + 0x10a8, signature_out);
                     s
                 },
                 &mut memory,
@@ -5456,11 +5467,13 @@ fn d3d12_state_object_and_work_graph_dispatch_error_paths_are_pinned() {
         for (desc_ptr, expected) in [(0u64, E_INVALIDARG), (signature_desc, E_INVALIDARG)] {
             write_u32(&mut memory, signature_desc, 16);
             write_u32(&mut memory, signature_desc + 4, 5000);
-            state.set(Register::Rsp, base + 0x10c0);
+            state.set(Register::Rsp, base + 0x1e00);
             state.set(Register::Rcx, device);
             state.set(Register::Rdx, desc_ptr);
-            state.set(Register::R8, signature_out);
-            memory.write_u64(base + 0x10c0, 0x1000_0902_1);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, 0);
+            memory.write_u64(base + 0x1e00, 0x1000_0902_1);
+            memory.write_u64(base + 0x1e28, signature_out);
             runtime
                 .dispatch_import(create_signature, &mut state, &mut memory)
                 .expect("signature arg count");
@@ -5475,8 +5488,10 @@ fn d3d12_state_object_and_work_graph_dispatch_error_paths_are_pinned() {
             state.set(Register::Rsp, base + 0x1100);
             state.set(Register::Rcx, device);
             state.set(Register::Rdx, signature_desc);
-            state.set(Register::R8, signature_out);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, 0);
             memory.write_u64(base + 0x1100, 0x1000_0903_1);
+            memory.write_u64(base + 0x1128, signature_out);
             runtime
                 .dispatch_import(create_signature, &mut state, &mut memory)
                 .expect("signature type/stride");
@@ -5490,8 +5505,10 @@ fn d3d12_state_object_and_work_graph_dispatch_error_paths_are_pinned() {
         state.set(Register::Rsp, base + 0x1140);
         state.set(Register::Rcx, device);
         state.set(Register::Rdx, signature_desc);
-        state.set(Register::R8, signature_out);
+        state.set(Register::R8, 0);
+        state.set(Register::R9, 0);
         memory.write_u64(base + 0x1140, 0x1000_0904_1);
+        memory.write_u64(base + 0x1168, signature_out);
         runtime
             .dispatch_import(create_signature, &mut state, &mut memory)
             .expect("signature valid");

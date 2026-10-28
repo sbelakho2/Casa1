@@ -5995,6 +5995,9 @@ pub enum HostThunk {
         method: u16,
         x86_arg_bytes: u8,
     },
+    /// One slot of the real `IWebBrowser2` browser-control vtable.
+    /// See `dispatch::shdocvw`.
+    WebBrowserMethod(crate::runtime::dispatch::shdocvw::WebBrowserMethod),
     /// One vtable slot of a real DirectPlay guest object: an
     /// `IDirectPlay8Address`, an `IDirectPlay8Peer`, or the legacy
     /// `IDirectPlay4` object returned by `DirectPlayCreate`.  `interface` is a
@@ -15217,8 +15220,8 @@ impl PeHostRuntime {
             // -- DXGI Factory methods (Phase 5.5 #2) --
             HostThunk::DXGIFactoryMakeWindowAssociation => {
                 let _this = state.get(Register::Rcx);
-                let flags = state.get(Register::Rdx) as u32;
-                let window_handle = state.get(Register::R8);
+                let window_handle = state.get(Register::Rdx);
+                let flags = state.get(Register::R8) as u32;
                 // Track the window association for later retrieval.
                 self.dxgi_window_assoc = Some((window_handle, flags));
                 state.set(Register::Rax, 0); // S_OK
@@ -15284,7 +15287,7 @@ impl PeHostRuntime {
                 if out_ptr != 0 {
                     write_u64(memory, out_ptr, 0);
                 }
-                state.set(Register::Rax, 0x80040154_u64.wrapping_neg()); // CLASS_E_CLASSNOTAVAILABLE
+                state.set(Register::Rax, CLASS_E_CLASSNOTAVAILABLE);
                 self.last_error = 0;
             }
             HostThunk::DXGIFactoryCreateSoftwareAdapter => {
@@ -15292,7 +15295,7 @@ impl PeHostRuntime {
                 let _software_module_ptr = state.get(Register::Rdx);
                 let _out_adapter_ptr = state.get(Register::R8);
                 // Software adapter not supported.
-                state.set(Register::Rax, 0x887A0002_u64); // DXGI_ERROR_UNSUPPORTED
+                state.set(Register::Rax, 0x887A0004_u64); // DXGI_ERROR_UNSUPPORTED
                 self.last_error = 0;
             }
             // ── DXGI Factory gap-fill dispatch handlers (Phase 3.4) ──
@@ -17846,7 +17849,8 @@ impl PeHostRuntime {
             }
             HostThunk::D3D11DeviceContextGetResourceMinLOD => {
                 let _context_object = state.get(Register::Rcx);
-                let out_lod = state.get(Register::Rdx);
+                let _resource_object = state.get(Register::Rdx);
+                let out_lod = state.get(Register::R8);
                 if out_lod != 0 {
                     memory.write_u32(out_lod, 0.0f32.to_bits());
                 }
@@ -30613,7 +30617,10 @@ impl PeHostRuntime {
                 } else {
                     let clsid_str = read_guid_string(memory, clsid_ptr)?;
                     write_guest_pointer(memory, out_factory, 0, self.guest_arch)?;
-                    if !self.com_class_available(&clsid_str) {
+                    let browser_class = clsid_str
+                        .eq_ignore_ascii_case("{8856F961-340A-11D0-A96B-00C04FD705A2}")
+                        || clsid_str.eq_ignore_ascii_case("{0002DF01-0000-0000-C000-000000000046}");
+                    if !browser_class && !self.com_class_available(&clsid_str) {
                         state.set(Register::Rax, CLASS_E_CLASSNOTAVAILABLE);
                         self.last_error = ERROR_INVALID_PARAMETER;
                     } else {
@@ -30917,6 +30924,9 @@ impl PeHostRuntime {
             //    (see `crate::xact` and `dispatch::final_scraps`) ──
             ref thunk @ HostThunk::Xact3Method { .. } => {
                 self.dispatch_final_scraps(thunk, state, memory)?;
+            }
+            HostThunk::WebBrowserMethod(method) => {
+                self.dispatch_web_browser_method(method, state, memory)?;
             }
             // ── DirectPlay: the real software DirectPlay8 peer engine (see
             //    `crate::dplay` and `dispatch::final_scraps`) — every vtable
@@ -31839,6 +31849,38 @@ impl PeHostRuntime {
                 let path = self.shell_link_state_for_interface(this)?.path.clone();
                 if find_data_ptr != 0 {
                     memory.map_bytes(find_data_ptr, &vec![0; 592]);
+                    let attributes = self
+                        .win32
+                        .get_file_attributes_w(&path)
+                        .map(|attributes| file_attributes_mask(&attributes))
+                        .unwrap_or(FILE_ATTRIBUTE_NORMAL);
+                    write_u32(memory, find_data_ptr, attributes);
+                    if let Ok(metadata) = self.win32.ge().get_file_metadata(&path) {
+                        write_u64(
+                            memory,
+                            find_data_ptr + 20,
+                            metadata.last_write_time_ticks,
+                        );
+                    }
+                    let size = self
+                        .win32
+                        .guest_path_to_host_path(&path)
+                        .ok()
+                        .and_then(|host_path| fs::metadata(host_path).ok())
+                        .map(|metadata| {
+                            if metadata.is_dir() {
+                                0
+                            } else {
+                                metadata.len().min(u64::from(u32::MAX)) as u32
+                            }
+                        })
+                        .unwrap_or(0);
+                    write_u32(memory, find_data_ptr + 28, 0);
+                    write_u32(memory, find_data_ptr + 32, size);
+                    let name = path.rsplit('\\').next().unwrap_or(&path);
+                    for (index, unit) in name.encode_utf16().take(259).enumerate() {
+                        write_u16(memory, find_data_ptr + 44 + index as u64 * 2, unit);
+                    }
                 }
                 let written = write_utf16_api_string(memory, file_ptr, cch, &path)?;
                 state.set(Register::Rax, written as u64);
@@ -31992,11 +32034,22 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::ShellLinkSetRelativePath => {
+                let this = guest_call_arg(state, memory, 0)?;
+                let path_ptr = guest_call_arg(state, memory, 1)?;
+                let value = if path_ptr == 0 {
+                    String::new()
+                } else {
+                    read_utf16_string(memory, path_ptr)?
+                };
+                let state_ref = self.shell_link_state_for_interface_mut(this)?;
+                state_ref.relative_path = value;
+                state_ref.dirty = true;
                 state.set(Register::Rax, 0);
                 self.last_error = 0;
             }
             HostThunk::ShellLinkResolve => {
-                state.set(Register::Rax, 0);
+                let this = guest_call_arg(state, memory, 0)?;
+                state.set(Register::Rax, u64::from(self.resolve_shell_link(this)?));
                 self.last_error = 0;
             }
             HostThunk::ShellLinkSetPathW => {
@@ -32033,15 +32086,16 @@ impl PeHostRuntime {
             HostThunk::ShellLinkPersistLoad => {
                 let this = guest_call_arg(state, memory, 0)?;
                 let path_ptr = guest_call_arg(state, memory, 1)?;
-                let path = if path_ptr == 0 {
-                    String::new()
+                if path_ptr == 0 {
+                    state.set(Register::Rax, E_INVALIDARG);
                 } else {
-                    resolve_guest_path(&self.current_directory, &read_utf16_string(memory, path_ptr)?)
-                };
-                let state_ref = self.shell_link_state_for_interface_mut(this)?;
-                state_ref.current_file = if path.is_empty() { None } else { Some(path) };
-                state_ref.dirty = false;
-                state.set(Register::Rax, 0);
+                    let path = resolve_guest_path(
+                        &self.current_directory,
+                        &read_utf16_string(memory, path_ptr)?,
+                    );
+                    let loaded = self.load_shell_link(this, &path)?;
+                    state.set(Register::Rax, loaded);
+                }
                 self.last_error = 0;
             }
             HostThunk::ShellLinkPersistSave => {
@@ -68212,6 +68266,10 @@ impl PeHostRuntime {
                 self.context_menu_paths.remove(&address);
                 self.guest_objects.remove(&address);
             }
+            GuestObjectKind::WebBrowser => {
+                self.web_browsers.remove(&address);
+                self.guest_objects.remove(&address);
+            }
             GuestObjectKind::PropertyStore
             | GuestObjectKind::XmlDomDocument
             | GuestObjectKind::UrlMoniker => {
@@ -68346,6 +68404,13 @@ impl PeHostRuntime {
                 self.ensure_shell_link_persist_file_object(memory, shell_link_object)?
             };
             return Ok(Some(interface_object));
+        }
+        // CLSID_WebBrowser / CLSID_InternetExplorer: the browser control.
+        if clsid.eq_ignore_ascii_case("{8856F961-340A-11D0-A96B-00C04FD705A2}")
+            || clsid.eq_ignore_ascii_case("{0002DF01-0000-0000-C000-000000000046}")
+        {
+            let object = self.alloc_web_browser_object(memory, "about:blank")?;
+            return Ok(Some(object));
         }
         // CLSID_FilterGraph (DirectShow)
         if clsid.eq_ignore_ascii_case("{E436EBB3-524F-11CE-9F53-0020AF0BA770}") {
@@ -68596,6 +68661,7 @@ impl PeHostRuntime {
                 arguments: String::new(),
                 description: String::new(),
                 working_directory: String::new(),
+                relative_path: String::new(),
                 hotkey: 0,
                 icon_location: String::new(),
                 icon_index: 0,
@@ -68842,6 +68908,85 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    /// Load a persisted shell link into the object's state.  The parser is
+    /// the same `src/lnk.rs` reader the writer's round-trip tests use: a
+    /// structurally invalid stream is `E_FAIL`, an unreadable path keeps the
+    /// file layer's honest failure.
+    fn load_shell_link(&mut self, address: u64, guest_path: &str) -> AppResult<u64> {
+        let host_path = match self.win32.guest_path_to_host_path(guest_path) {
+            Ok(path) => path,
+            Err(_) => return Ok(0x8000_4005),
+        };
+        let bytes = match fs::read(&host_path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(0x8000_4005),
+        };
+        let Some(parsed) = crate::lnk::parse(&bytes) else {
+            return Ok(0x8000_4005);
+        };
+        let Some(target) = parsed.target_path else {
+            return Ok(0x8000_4005);
+        };
+        let state = self.shell_link_state_for_interface_mut(address)?;
+        state.path = target;
+        state.description = parsed.description.unwrap_or_default();
+        state.relative_path = parsed.relative_path.unwrap_or_default();
+        state.working_directory = parsed.working_directory.unwrap_or_default();
+        state.arguments = parsed.arguments.unwrap_or_default();
+        state.icon_location = parsed.icon_location.unwrap_or_default();
+        state.icon_index = parsed.icon_index;
+        state.show_cmd = parsed.show_cmd;
+        state.hotkey = parsed.hotkey;
+        state.current_file = Some(guest_path.to_string());
+        state.dirty = false;
+        Ok(0)
+    }
+
+    /// Resolve a shell link's target: the stored path wins when it exists;
+    /// otherwise the stored relative path is resolved against the link file's
+    /// directory (then the working directory) and committed when it exists.
+    /// A genuinely unresolvable link reports `S_FALSE`.
+    fn resolve_shell_link(&mut self, address: u64) -> AppResult<u32> {
+        let snapshot = self.shell_link_state_for_interface(address)?.clone();
+        if !snapshot.path.is_empty()
+            && self
+                .win32
+                .guest_path_to_host_path(&snapshot.path)
+                .is_ok_and(|path| path.exists())
+        {
+            return Ok(0);
+        }
+        if snapshot.relative_path.is_empty() {
+            return Ok(1);
+        }
+        let mut bases = Vec::new();
+        if let Some(current_file) = &snapshot.current_file {
+            if let Some((dir, _)) = current_file.rsplit_once('\\') {
+                bases.push(dir.to_string());
+            }
+        }
+        if !snapshot.working_directory.is_empty() {
+            bases.push(snapshot.working_directory.clone());
+        }
+        if bases.is_empty() {
+            bases.push(self.current_directory.clone());
+        }
+        for base in bases {
+            let candidate = resolve_guest_path(&base, &snapshot.relative_path);
+            if self
+                .win32
+                .guest_path_to_host_path(&candidate)
+                .is_ok_and(|path| path.exists())
+            {
+                let state = self.shell_link_state_for_interface_mut(address)?;
+                state.path = candidate;
+                state.dirty = true;
+                return Ok(0);
+            }
+        }
+        Ok(1)
+    }
+
     fn shell_link_file_bytes(&self, state: &GuestShellLinkState) -> AppResult<Vec<u8>> {
         let target_attributes = self
             .win32
@@ -68872,6 +69017,7 @@ impl PeHostRuntime {
         Ok(crate::lnk::encode(&crate::lnk::ShellLinkData {
             target_path: state.path.clone(),
             description: state.description.clone(),
+            relative_path: state.relative_path.clone(),
             working_directory: state.working_directory.clone(),
             arguments: state.arguments.clone(),
             icon_location: state.icon_location.clone(),
@@ -81655,6 +81801,7 @@ impl HostThunk {
             // thunk itself (see `crate::xact`).
             Self::Xact3CreateEngine | Self::Xact3CreateEngineWithFlags => 8,
             Self::Xact3Method { x86_arg_bytes, .. } => u64::from(*x86_arg_bytes),
+            Self::WebBrowserMethod(method) => method.x86_arg_bytes(),
             // DirectPlay: the guest-object vtable methods carry their stdcall
             // argument byte count on the thunk itself (see `crate::dplay`).
             Self::Dplay8Method { x86_arg_bytes, .. } => u64::from(*x86_arg_bytes),

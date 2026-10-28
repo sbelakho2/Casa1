@@ -3192,6 +3192,25 @@ impl PeHostRuntime {
                 product_type: version.product_type,
             });
         let (total_phys, avail_phys, total_page, avail_page) = host_memory_status();
+        let heap = if self
+            .host_thunks
+            .values()
+            .any(|thunk| matches!(thunk, HostThunk::HeapSize))
+        {
+            self.heap_allocations.clone()
+        } else {
+            BTreeMap::new()
+        };
+        let registry = if self.host_thunks.values().any(|thunk| {
+            matches!(
+                thunk,
+                HostThunk::RegQueryValueExA | HostThunk::RegQueryValueExW
+            )
+        }) {
+            self.build_worker_registry()
+        } else {
+            WorkerRegistry::default()
+        };
         self.process_shared.publish_environment(WorkerEnvironment {
             identity: WorkerIdentity {
                 process_id: self.win32.current_process_id(),
@@ -3209,12 +3228,88 @@ impl PeHostRuntime {
                 total_page,
                 avail_page,
             }),
+            locale: WorkerLocale {
+                acp: self.win32.acp(),
+                oemcp: self.win32.oemcp(),
+            },
+            environment: self.process_environment.clone(),
+            heap,
+            registry,
         });
         self.process_shared.publish_parallel_thunks(
             self.host_thunks
                 .iter()
                 .map(|(address, thunk)| (*address, thunk)),
         );
+    }
+
+    /// Snapshot the registry surface the read-only query thunks can service:
+    /// the root keys for every view plus every open key handle's values.
+    ///
+    /// `GameEnvironment` reads the registry database from disk, so these are
+    /// safe concurrent reads; the snapshot lives behind
+    /// [`ProcessShared`]'s `RwLock` for the whole dispatch round.
+    fn build_worker_registry(&self) -> WorkerRegistry {
+        let mut registry = WorkerRegistry::default();
+        let roots = [
+            (HKEY_CLASSES_ROOT, "HKCR", ""),
+            (HKEY_CURRENT_USER, "HKCU", ""),
+            (HKEY_LOCAL_MACHINE, "HKLM", ""),
+            (HKEY_USERS, "HKCU", ""),
+            (
+                HKEY_CURRENT_CONFIG,
+                "HKLM",
+                "System\\CurrentControlSet\\Hardware Profiles\\Current",
+            ),
+        ];
+        for (view, code) in [
+            (crate::ge::RegistryView::Native, 0_u8),
+            (crate::ge::RegistryView::Wow6432, 1_u8),
+            (crate::ge::RegistryView::Native64, 2_u8),
+        ] {
+            for (handle, hive, base_key) in roots {
+                let key = normalize_registry_runtime_key(hive, base_key);
+                registry
+                    .roots
+                    .insert((handle, code), self.worker_registry_key(hive, &key, view));
+            }
+        }
+        let upper = self.win32.next_handle_value();
+        for handle in 1..upper {
+            let Ok(state) = self.win32.key_state(handle) else {
+                continue;
+            };
+            let key = normalize_registry_runtime_key(&state.hive, &state.key);
+            registry.keys.insert(
+                handle,
+                self.worker_registry_key(&state.hive, &key, state.view),
+            );
+        }
+        registry
+    }
+
+    fn worker_registry_key(
+        &self,
+        hive: &str,
+        key: &str,
+        view: crate::ge::RegistryView,
+    ) -> WorkerRegistryKey {
+        let mut values = BTreeMap::new();
+        for name in self
+            .win32
+            .ge()
+            .registry_enum_values(hive, key, view)
+            .unwrap_or_default()
+        {
+            if let Ok(Some(value)) = self.win32.ge().registry_get_value(hive, key, &name, view) {
+                values.insert(name, value);
+            }
+        }
+        WorkerRegistryKey {
+            hive: hive.to_string(),
+            key: key.to_string(),
+            values,
+        }
     }
 
     /// Execute one round of concurrent guest slices for explicit per-thread
@@ -6946,7 +7041,7 @@ mod tests {
             let _guard = test_guard();
             let (_temp_dir, mut session) = test_session();
             install_jit(&mut session);
-            let thunk = session.alloc_thunk(HostThunk::GetTimeZoneInformation);
+            let thunk = session.alloc_thunk(HostThunk::GetFocus);
             assert!(
                 thunk <= u64::from(u32::MAX),
                 "x86 thunk address fits 32 bits"
@@ -6965,7 +7060,7 @@ mod tests {
                     .runtime
                     .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
             );
-            let before = trace_calls(&session, "time", "GetTimeZoneInformation");
+            let before = trace_calls(&session, "input", "GetFocus");
             let request = GuestSliceRequest {
                 thread_id: 0xB1,
                 priority: 0,
@@ -6990,7 +7085,7 @@ mod tests {
                 "RIP points at the unresolved host thunk, with the return address already pushed"
             );
             assert_eq!(
-                trace_calls(&session, "time", "GetTimeZoneInformation"),
+                trace_calls(&session, "input", "GetFocus"),
                 before,
                 "a production worker must never run the host thunk"
             );
@@ -7001,7 +7096,7 @@ mod tests {
                 assert!(rounds < 64, "the cooperative owner must finish the thread");
             }
             assert_eq!(
-                trace_calls(&session, "time", "GetTimeZoneInformation"),
+                trace_calls(&session, "input", "GetFocus"),
                 before + 1,
                 "the runtime owner executes the thunk exactly once"
             );
@@ -7027,6 +7122,26 @@ mod tests {
             system_thunk <= u64::from(u32::MAX),
             "x86 thunk address fits 32 bits"
         );
+        // Registering these thunks makes the owner publish the heap and
+        // registry snapshots that the widened worker subset reads.
+        let _ = session.alloc_thunk(HostThunk::HeapSize);
+        let _ = session.alloc_thunk(HostThunk::GetEnvironmentVariableW);
+        let _ = session.alloc_thunk(HostThunk::RegQueryValueExW);
+        let _ = session.alloc_thunk(HostThunk::MultiByteToWideChar);
+        // Give the registry snapshot a real value to enumerate and an open
+        // key handle so both registry-snapshot paths are exercised.
+        session
+            .runtime
+            .win32
+            .ensure_default_locale_registry()
+            .expect("seed locale registry");
+        let key = session.runtime.win32.open_registry_key(
+            "HKCU",
+            "Control Panel\\International",
+            crate::ge::RegistryView::Native,
+            false,
+        );
+        assert_ne!(key, 0, "the seeded key handle must be open");
         const CALLS: usize = 32;
         const SYSTEM_INFO_OUT: u64 = 0x19_000;
         let mut code = Vec::new();
@@ -7093,6 +7208,49 @@ mod tests {
             )
             .expect("dispatch zero-budget round");
         assert_eq!(runs[0].exit, GuestSliceExit::Budget);
+
+        // A round that registers only stateless thunks must not pay for the
+        // heap/registry snapshots: the published environment stays empty and
+        // the worker still services the thunk.
+        let (_plain_dir, mut plain) = test_session();
+        install_jit(&mut plain);
+        let plain_thunk = plain.alloc_thunk(HostThunk::GetTickCount64);
+        let mut plain_code = vec![0xFF, 0x15];
+        plain_code.extend_from_slice(&(SLICE_THUNK_SLOT as u32).to_le_bytes());
+        plain_code.push(0xC3);
+        plain.map_guest(SLICE_CODE_2, &plain_code);
+        plain.map_guest(SLICE_THUNK_SLOT, &(plain_thunk as u32).to_le_bytes());
+        plain.map_guest(SLICE_STACK_A - 0x100, &[0_u8; 0x200]);
+        plain.memory.write_u32(SLICE_STACK_A, 0);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = SLICE_CODE_2;
+        state.set(Register::Rsp, SLICE_STACK_A);
+        let context = GuestThreadContext::new(0xB4, state);
+        assert!(
+            plain
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let runs = plain
+            .runtime
+            .dispatch_parallel_thread_contexts(&mut plain.memory, vec![context], 64)
+            .expect("dispatch stateless-only round");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].context.state.rip, 0);
+        let metrics = plain.runtime.process_shared.api_dispatch_metrics();
+        assert_eq!(metrics.parallel_dispatched, 1);
+        assert_eq!(metrics.stateless_dispatched, 1);
+        assert_eq!(metrics.read_mostly_dispatched, 0);
+        assert_eq!(
+            plain.runtime.process_shared.heap_snapshot().is_empty(),
+            true,
+            "no HeapSize thunk means no heap snapshot is published"
+        );
+        assert_eq!(
+            plain.runtime.process_shared.registry_snapshot(),
+            crate::runtime::WorkerRegistry::default(),
+            "no registry thunk means no registry snapshot is published"
+        );
     }
 
     #[test]
@@ -7499,7 +7657,7 @@ mod tests {
             let _guard = test_guard();
             let (_temp_dir, mut session) = test_session();
             install_jit(&mut session);
-            let thunk = session.alloc_thunk(HostThunk::GetTimeZoneInformation);
+            let thunk = session.alloc_thunk(HostThunk::GetFocus);
             assert!(thunk <= u64::from(u32::MAX));
             // call [slot]; sub ecx,1; cmp ecx,0; jnz call; ret
             let mut code = vec![0xFF, 0x15];
@@ -7529,13 +7687,13 @@ mod tests {
                     .runtime
                     .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
             );
-            let before = trace_calls(&session, "time", "GetTimeZoneInformation");
+            let before = trace_calls(&session, "input", "GetFocus");
             let mut rounds = 0;
             while pump_once(&mut session) && rounds < 1_000 {
                 rounds += 1;
             }
             assert_eq!(
-                trace_calls(&session, "time", "GetTimeZoneInformation"),
+                trace_calls(&session, "input", "GetFocus"),
                 before + 2 * iterations as usize,
                 "every guest call must dispatch its thunk exactly once"
             );

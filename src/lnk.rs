@@ -57,14 +57,12 @@ const LINK_CLSID: [u8; 16] = [
 ];
 
 /// LinkFlags: a LinkTargetIDList follows the header.
-#[cfg(test)]
 const LINK_FLAG_HAS_LINK_TARGET_ID_LIST: u32 = 0x0000_0001;
 /// LinkFlags: a LinkInfo structure follows the (optional) ID list.
 const LINK_FLAG_HAS_LINK_INFO: u32 = 0x0000_0002;
 /// LinkFlags: StringData begins with a NAME_STRING.
 const LINK_FLAG_HAS_NAME: u32 = 0x0000_0004;
 /// LinkFlags: StringData contains a RELATIVE_PATH string.
-#[cfg(test)]
 const LINK_FLAG_HAS_RELATIVE_PATH: u32 = 0x0000_0008;
 /// LinkFlags: StringData contains a WORKING_DIR string.
 const LINK_FLAG_HAS_WORKING_DIR: u32 = 0x0000_0010;
@@ -96,6 +94,8 @@ pub(crate) struct ShellLinkData {
     pub target_path: String,
     /// NAME_STRING (the shortcut's description / display name).
     pub description: String,
+    /// RELATIVE_PATH string.
+    pub relative_path: String,
     /// WORKING_DIR string.
     pub working_directory: String,
     /// COMMAND_LINE_ARGUMENTS string.
@@ -118,12 +118,6 @@ pub(crate) struct ShellLinkData {
 }
 
 /// The result of parsing a shell-link byte stream.
-///
-/// The parser is test-facing (`cfg(test)`): the runtime never reads .lnk
-/// files back — `parse` exists to verify the links `encode`/`SHCreateLinks`
-/// persist, in the module's round-trip tests and the runtime dispatch
-/// tests.
-#[cfg(test)]
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub(crate) struct ParsedShellLink {
@@ -162,6 +156,9 @@ pub(crate) fn encode(data: &ShellLinkData) -> Vec<u8> {
     let mut link_flags = LINK_FLAG_HAS_LINK_INFO | LINK_FLAG_IS_UNICODE;
     if !data.description.is_empty() {
         link_flags |= LINK_FLAG_HAS_NAME;
+    }
+    if !data.relative_path.is_empty() {
+        link_flags |= LINK_FLAG_HAS_RELATIVE_PATH;
     }
     if !data.working_directory.is_empty() {
         link_flags |= LINK_FLAG_HAS_WORKING_DIR;
@@ -203,6 +200,9 @@ pub(crate) fn encode(data: &ShellLinkData) -> Vec<u8> {
     if !data.description.is_empty() {
         append_string_data(&mut bytes, &data.description);
     }
+    if !data.relative_path.is_empty() {
+        append_string_data(&mut bytes, &data.relative_path);
+    }
     if !data.working_directory.is_empty() {
         append_string_data(&mut bytes, &data.working_directory);
     }
@@ -218,7 +218,6 @@ pub(crate) fn encode(data: &ShellLinkData) -> Vec<u8> {
 /// Parse a shell-link byte stream back into its fields.  Returns `None`
 /// when the stream is not a structurally valid shell link (wrong header
 /// size, wrong CLSID, truncated members, corrupt offsets).
-#[cfg(test)]
 pub(crate) fn parse(bytes: &[u8]) -> Option<ParsedShellLink> {
     if bytes.len() < 76 {
         return None;
@@ -321,7 +320,6 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<ParsedShellLink> {
 
 /// Reconstruct the link target from the LinkInfo local-base/common-suffix
 /// path pair.
-#[cfg(test)]
 fn parse_link_info_target(bytes: &[u8], start: usize, end: usize) -> Option<String> {
     if end < start + 0x24 {
         return None;
@@ -362,7 +360,6 @@ fn parse_link_info_target(bytes: &[u8], start: usize, end: usize) -> Option<Stri
 /// the LinkInfo size.  The runtime's writer stores the UTF-8 bytes of the
 /// guest path in this slot (there is no ANSI code page); Windows-native
 /// files are decoded lossily.
-#[cfg(test)]
 fn read_link_info_ansi(info: &[u8], offset: usize) -> Option<String> {
     if offset >= info.len() {
         return None;
@@ -375,7 +372,6 @@ fn read_link_info_ansi(info: &[u8], offset: usize) -> Option<String> {
 }
 
 /// Read a null-terminated UTF-16 string out of a LinkInfo.
-#[cfg(test)]
 fn read_link_info_utf16(info: &[u8], offset: usize) -> Option<String> {
     let mut end = offset;
     loop {
@@ -398,7 +394,6 @@ fn read_link_info_utf16(info: &[u8], offset: usize) -> Option<String> {
 /// Read one StringData member (u16 character count + UTF-16 units) and the
 /// cursor position after it (consuming the 4-byte-alignment padding real
 /// Windows appends after an odd unit count, when present).
-#[cfg(test)]
 fn read_string_data(bytes: &[u8], cursor: usize) -> Option<(String, usize)> {
     if cursor + 2 > bytes.len() {
         return None;
@@ -581,6 +576,7 @@ mod tests {
         ShellLinkData {
             target_path: "C:\\Program Files (x86)\\Steam\\Steam.exe".to_string(),
             description: "Steam".to_string(),
+            relative_path: String::new(),
             working_directory: "C:\\Program Files (x86)\\Steam".to_string(),
             arguments: "-silent".to_string(),
             icon_location: "C:\\Program Files (x86)\\Steam\\Steam.exe".to_string(),

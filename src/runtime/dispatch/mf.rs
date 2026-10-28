@@ -2491,7 +2491,8 @@ impl PeHostRuntime {
         is_get: bool,
     ) -> AppResult<()> {
         let _this = guest_call_arg(state, memory, 0)?;
-        let out = guest_call_arg(state, memory, 1)?;
+        let _key = guest_call_arg(state, memory, 1)?;
+        let out = guest_call_arg(state, memory, 2)?;
         if is_get && out != 0 {
             write_guest_pointer(memory, out, 0, self.guest_arch).ok();
         }
@@ -10442,6 +10443,1758 @@ mod tests {
                 ),
                 u64::from(E_FAIL)
             );
+        })
+    }
+    #[test]
+    fn mf_method_evidence_attributes_media_type_buffer_sample_reject_invalid_inputs() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-method-attrs");
+            let mut memory = MemoryImage::default();
+            let create_type: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaType);
+            let type_out = 0x60_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, create_type, &[type_out as u32]),
+                0
+            );
+            let mt = read_guest_pointer(&memory, type_out, GuestArch::X86).unwrap();
+            let bad_this = 0xDEAD_BEEF_u32;
+            let key = 0x60_100_u64;
+            let key2 = 0x60_110_u64;
+            memory.map_bytes(key, &[0x11; 16]);
+            memory.map_bytes(key2, &[0x22; 16]);
+
+            let set_u32: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetUint32);
+            let get_u32: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetUint32);
+            let set_u64: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetUint64);
+            let get_u64: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetUint64);
+            let set_double: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetDouble);
+            let get_double: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetDouble);
+            let set_guid: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetGuid);
+            let get_guid: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetGuid);
+            let set_string: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetString);
+            let get_string: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetString);
+            let get_string_length: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetStringLength);
+            let get_allocated_string: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfAttrGetAllocatedString);
+            let set_blob: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetBlob);
+            let get_blob_size: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetBlobSize);
+            let get_blob: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetBlob);
+            let get_allocated_blob: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfAttrGetAllocatedBlob);
+            let set_unknown: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetUnknown);
+            let get_unknown: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetUnknown);
+            let set_item: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrSetItem);
+            let get_item: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetItem);
+            let get_item_type: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetItemType);
+            let compare_item: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrCompareItem);
+            let compare: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrCompare);
+            let get_count: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetCount);
+            let get_item_by_index: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetItemByIndex);
+            let copy_all: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrCopyAllItems);
+            let delete_item: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrDeleteItem);
+            let delete_all: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrDeleteAllItems);
+            let lock_store: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrLockStore);
+            let unlock_store: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrUnlockStore);
+            let out = 0x61_000_u64;
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_u32,
+                    &[mt as u32, key as u32, 1234]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_u32,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 1234);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_u32,
+                    &[mt as u32, key2 as u32, out as u32]
+                ),
+                0xC00D_36E6
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_u32,
+                    &[bad_this, key as u32, 1]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_u64,
+                    &[mt as u32, key as u32, 0x1234_5678]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_u64,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u64(&memory, out).unwrap(), 0x1234_5678);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_u64,
+                    &[mt as u32, key2 as u32, out as u32]
+                ),
+                0xC00D_36E6
+            );
+
+            let double_bits = 1.25_f64.to_bits();
+            write_guest_u64(&mut memory, out, double_bits).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_double,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_double,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(f64::from_bits(read_guest_u64(&memory, out).unwrap()), 1.25);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_double,
+                    &[mt as u32, key2 as u32, out as u32]
+                ),
+                0xC00D_36E6
+            );
+
+            memory.map_bytes(out, &[0x5A; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_guid,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            memory.map_bytes(out, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_guid,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(memory.read_bytes(out, 16).unwrap(), vec![0x5A; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_guid,
+                    &[mt as u32, key2 as u32, out as u32]
+                ),
+                0xC00D_36E6
+            );
+
+            let text = 0x62_000_u64;
+            write_utf16(&mut memory, text, "hello");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_string,
+                    &[mt as u32, key as u32, text as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_string_length,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 6);
+            let buffer = 0x62_100_u64;
+            memory.map_bytes(buffer, &[0_u8; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_string,
+                    &[mt as u32, key as u32, buffer as u32, 6, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_utf16_string(&memory, buffer).unwrap(), "hello");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_string,
+                    &[mt as u32, key as u32, buffer as u32, 1, out as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_allocated_string,
+                    &[mt as u32, key as u32, out as u32, (out + 4) as u32]
+                ),
+                0
+            );
+            let allocated = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            assert_eq!(read_utf16_string(&memory, allocated).unwrap(), "hello");
+            assert_eq!(read_guest_u32(&memory, out + 4).unwrap(), 5);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_string,
+                    &[mt as u32, key2 as u32, buffer as u32, 6, out as u32]
+                ),
+                0xC00D_36E6
+            );
+
+            let blob = 0x63_000_u64;
+            memory.map_bytes(blob, &[1, 2, 3]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_blob,
+                    &[mt as u32, key as u32, blob as u32, 3]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_blob_size,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 3);
+            let blob_out = 0x63_100_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_blob,
+                    &[mt as u32, key as u32, blob_out as u32, 3]
+                ),
+                0
+            );
+            assert_eq!(memory.read_bytes(blob_out, 3).unwrap(), vec![1, 2, 3]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_blob,
+                    &[mt as u32, key as u32, blob_out as u32, 1]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_allocated_blob,
+                    &[mt as u32, key as u32, out as u32, (out + 4) as u32]
+                ),
+                0
+            );
+            let allocated_blob = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            assert_eq!(memory.read_bytes(allocated_blob, 3).unwrap(), vec![1, 2, 3]);
+            assert_eq!(read_guest_u32(&memory, out + 4).unwrap(), 3);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_unknown,
+                    &[mt as u32, key as u32, 0]
+                ),
+                0xC00D_36B4
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_unknown,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0xC00D_36E5
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0);
+            assert_eq!(memory.read_bytes(key, 16).unwrap(), vec![0x11; 16]);
+
+            let value = 0x64_000_u64;
+            memory.map_bytes(value, &[0_u8; 72]);
+            write_guest_u32(&mut memory, value, 19).ok();
+            write_guest_u32(&mut memory, value + 8, 777).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_item,
+                    &[mt as u32, key as u32, value as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_item_type,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 19);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_item,
+                    &[mt as u32, key as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 19);
+            assert_eq!(read_guest_u32(&memory, out + 8).unwrap(), 777);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    compare_item,
+                    &[mt as u32, key as u32, value as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 1);
+            write_guest_u32(&mut memory, value + 8, 778).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    compare_item,
+                    &[mt as u32, key as u32, value as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0);
+            write_guest_u32(&mut memory, value, 7).ok();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_item,
+                    &[mt as u32, key as u32, value as u32]
+                ),
+                0xC00D_36B4
+            );
+
+            let second_type = 0x65_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_type,
+                    &[second_type as u32]
+                ),
+                0
+            );
+            let mt2 = read_guest_pointer(&memory, second_type, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    copy_all,
+                    &[mt as u32, mt2 as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    compare,
+                    &[mt as u32, mt2 as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    compare,
+                    &[mt as u32, bad_this, out as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    compare,
+                    &[bad_this, mt2 as u32, out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, copy_all, &[bad_this, mt2 as u32]),
+                u64::from(E_NOINTERFACE)
+            );
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_count,
+                    &[mt as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_item_by_index,
+                    &[mt as u32, 0, out as u32, (out + 16) as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_item_by_index,
+                    &[mt as u32, 999, out as u32, (out + 16) as u32]
+                ),
+                0x8007_0059
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_count,
+                    &[bad_this, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, lock_store, &[bad_this]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, unlock_store, &[bad_this]),
+                0
+            );
+            write_guest_guid(&mut memory, key2, crate::media::MF_MT_MAJOR_TYPE);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    delete_item,
+                    &[mt as u32, key2 as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, delete_all, &[mt as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_count,
+                    &[mt as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, delete_all, &[bad_this]),
+                u64::from(E_NOINTERFACE)
+            );
+
+            let major_key = 0x66_000_u64;
+            write_guest_guid(&mut memory, major_key, crate::media::MF_MT_MAJOR_TYPE);
+            let major_value = 0x66_100_u64;
+            write_guest_guid(&mut memory, major_value, crate::media::MFMediaType_Video);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_guid,
+                    &[mt as u32, major_key as u32, major_value as u32]
+                ),
+                0
+            );
+            let get_major: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaTypeGetMajorType);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_major,
+                    &[mt as u32, out as u32]
+                ),
+                0
+            );
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&crate::media::MFMediaType_Video.data1.to_le_bytes());
+            expected.extend_from_slice(&crate::media::MFMediaType_Video.data2.to_le_bytes());
+            expected.extend_from_slice(&crate::media::MFMediaType_Video.data3.to_le_bytes());
+            expected.extend_from_slice(&crate::media::MFMediaType_Video.data4);
+            assert_eq!(memory.read_bytes(out, 16).unwrap(), expected);
+            let compressed: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaTypeIsCompressedFormat);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    compressed,
+                    &[mt as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0);
+            let is_equal: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaTypeIsEqual);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    is_equal,
+                    &[mt as u32, mt as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0x1f);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    is_equal,
+                    &[mt as u32, bad_this, out as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            let representation: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaTypeGetRepresentation);
+            let free_representation: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaTypeFreeRepresentation);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    representation,
+                    &[mt as u32, 0, out as u32]
+                ),
+                0xC00D_36B4
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    free_representation,
+                    &[mt as u32, 0]
+                ),
+                0xC00D_36B4
+            );
+
+            let create_buffer: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMemoryBuffer);
+            let buffer_out = 0x67_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_buffer,
+                    &[16, buffer_out as u32]
+                ),
+                0
+            );
+            let media_buffer = read_guest_pointer(&memory, buffer_out, GuestArch::X86).unwrap();
+            let get_max: u64 = runtime.alloc_host_thunk(HostThunk::MfBufferGetMaxLength);
+            let get_current: u64 = runtime.alloc_host_thunk(HostThunk::MfBufferGetCurrentLength);
+            let set_current: u64 = runtime.alloc_host_thunk(HostThunk::MfBufferSetCurrentLength);
+            let lock: u64 = runtime.alloc_host_thunk(HostThunk::MfBufferLock);
+            let unlock: u64 = runtime.alloc_host_thunk(HostThunk::MfBufferUnlock);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_max,
+                    &[media_buffer as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 16);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_current,
+                    &[media_buffer as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_current,
+                    &[media_buffer as u32, 4]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_current,
+                    &[media_buffer as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 4);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_current,
+                    &[media_buffer as u32, 17]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_current, &[bad_this, 4]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    lock,
+                    &[
+                        media_buffer as u32,
+                        out as u32,
+                        (out + 4) as u32,
+                        (out + 8) as u32
+                    ]
+                ),
+                0
+            );
+            let locked = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            assert_ne!(locked, 0);
+            assert_eq!(read_guest_u32(&memory, out + 8).unwrap(), 4);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, unlock, &[media_buffer as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, unlock, &[bad_this]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    lock,
+                    &[bad_this, out as u32, 0, 0]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+
+            let sample_out = 0x68_000_u64;
+            let create_sample: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateSample);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_sample,
+                    &[sample_out as u32]
+                ),
+                0
+            );
+            let sample = read_guest_pointer(&memory, sample_out, GuestArch::X86).unwrap();
+            runtime.mf_samples.insert(
+                sample,
+                crate::media::ImfSample {
+                    buffer: vec![1, 2, 3, 4],
+                    sample_time: 0,
+                    sample_duration: 0,
+                    flags: 0,
+                },
+            );
+            let set_flags: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleSetSampleFlags);
+            let get_flags: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleGetSampleFlags);
+            let set_time: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleSetSampleTime);
+            let get_time: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleGetSampleTime);
+            let set_duration: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleSetSampleDuration);
+            let get_duration: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleGetSampleDuration);
+            let buffer_count: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleGetBufferCount);
+            let buffer_by_index: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSampleGetBufferByIndex);
+            let add_buffer: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleAddBuffer);
+            let remove_buffer: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSampleRemoveBufferByIndex);
+            let remove_all: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleRemoveAllBuffers);
+            let total_length: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleGetTotalLength);
+            let copy_to_buffer: u64 = runtime.alloc_host_thunk(HostThunk::MfSampleCopyToBuffer);
+            let contiguous: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSampleConvertToContiguousBuffer);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_flags, &[sample as u32, 3]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_flags,
+                    &[sample as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 3);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_time,
+                    &[sample as u32, out as u32]
+                ),
+                0xC00D_36A4
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_time, &[sample as u32, 100]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_time,
+                    &[sample as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                100
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_duration,
+                    &[sample as u32, 50]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_duration,
+                    &[sample as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                50
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    buffer_count,
+                    &[sample as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    buffer_by_index,
+                    &[sample as u32, 0, out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    add_buffer,
+                    &[sample as u32, media_buffer as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    remove_buffer,
+                    &[sample as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, remove_all, &[sample as u32]),
+                0
+            );
+            runtime.mf_samples.get_mut(&sample).unwrap().buffer = vec![1, 2, 3, 4];
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    total_length,
+                    &[sample as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 4);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    copy_to_buffer,
+                    &[sample as u32, media_buffer as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                runtime.mf_media_buffers.get(&media_buffer).unwrap().data,
+                vec![1, 2, 3, 4]
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    contiguous,
+                    &[sample as u32, out as u32]
+                ),
+                0
+            );
+            let contiguous_buffer = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+            assert_eq!(
+                runtime
+                    .mf_media_buffers
+                    .get(&contiguous_buffer)
+                    .unwrap()
+                    .data,
+                vec![1, 2, 3, 4]
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, set_flags, &[bad_this, 1]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_flags,
+                    &[bad_this, out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    add_buffer,
+                    &[bad_this, media_buffer as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    copy_to_buffer,
+                    &[bad_this, media_buffer as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    contiguous,
+                    &[bad_this, out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+        })
+    }
+
+    #[test]
+    fn mf_method_evidence_session_source_topology_transform_reject_invalid_inputs() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-method-pipeline");
+            let mut memory = MemoryImage::default();
+            let out = 0x70_000_u64;
+            let bad_this = 0xDEAD_BEEF_u32;
+
+            let create_session: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaSession);
+            let create_topology: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateTopology);
+            let session_out = 0x70_100_u64;
+            let topology_out = 0x70_110_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_session,
+                    &[0, session_out as u32]
+                ),
+                0
+            );
+            let session = read_guest_pointer(&memory, session_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_topology,
+                    &[topology_out as u32]
+                ),
+                0
+            );
+            let topology = read_guest_pointer(&memory, topology_out, GuestArch::X86).unwrap();
+
+            let set_topology: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionSetTopology);
+            let caps: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionGetSessionCapabilities);
+            let full: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionGetFullTopology);
+            let descriptor: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSessionGetDescriptorFromTopology);
+            let start: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionStart);
+            let pause: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionPause);
+            let stop: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionStop);
+            let close: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionClose);
+            let get_clock: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionGetClock);
+            let shutdown: u64 = runtime.alloc_host_thunk(HostThunk::MfSessionShutdown);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_topology,
+                    &[session as u32, 0, topology as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_topology,
+                    &[session as u32, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_topology,
+                    &[session as u32, 0, topology as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_topology,
+                    &[bad_this, 0, topology as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    caps,
+                    &[session as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0x0B);
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, caps, &[bad_this, out as u32]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    full,
+                    &[session as u32, 0, 0, out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                topology
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    full,
+                    &[bad_this, 0, 0, out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    descriptor,
+                    &[session as u32, topology as u32, out as u32]
+                ),
+                u64::from(MF_E_UNSUPPORTED_REPRESENTATION)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    descriptor,
+                    &[bad_this, topology as u32, out as u32]
+                ),
+                u64::from(MF_E_UNSUPPORTED_REPRESENTATION)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, start, &[session as u32, 0, 0]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, pause, &[session as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, stop, &[session as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[session as u32]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_clock,
+                    &[session as u32, out as u32]
+                ),
+                0
+            );
+            assert_ne!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_clock,
+                    &[bad_this, out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, start, &[bad_this, 0, 0]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, pause, &[bad_this]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, stop, &[bad_this]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, close, &[bad_this]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, shutdown, &[session as u32]),
+                0
+            );
+            assert!(!runtime.mf_sessions.contains_key(&session));
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, shutdown, &[bad_this]),
+                0
+            );
+
+            let add_node: u64 = runtime.alloc_host_thunk(HostThunk::MfTopologyAddNode);
+            let node_count: u64 = runtime.alloc_host_thunk(HostThunk::MfTopologyGetNodeCount);
+            let node_get: u64 = runtime.alloc_host_thunk(HostThunk::MfTopologyNodeGetObject);
+            let node_set: u64 = runtime.alloc_host_thunk(HostThunk::MfTopologyNodeSetObject);
+            let node = 0x71_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    add_node,
+                    &[topology as u32, node as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    node_count,
+                    &[topology as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    node_count,
+                    &[bad_this, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    add_node,
+                    &[bad_this, node as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, node_set, &[node as u32, 0x1234]),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    node_get,
+                    &[node as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, out, GuestArch::X86).unwrap(),
+                0x1234
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, node_set, &[bad_this, 0x1234]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, node_get, &[bad_this, out as u32]),
+                0
+            );
+
+            write_sandbox_file(&runtime, "C:\\media\\method.mp4", &minimal_mp4_file());
+            let graph = create_source_graph(&mut runtime, &mut memory, "C:\\media\\method.mp4");
+            let characteristics: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaSourceGetCharacteristics);
+            let create_pd: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaSourceCreatePresentationDescriptor);
+            let queue_event: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceQueueEvent);
+            let get_event: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceGetEvent);
+            let cancel_event: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaSourceCancelGetEvent);
+            let source_start: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceStart);
+            let source_pause: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourcePause);
+            let source_stop: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceStop);
+            let source_shutdown: u64 = runtime.alloc_host_thunk(HostThunk::MfMediaSourceShutdown);
+
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    characteristics,
+                    &[graph.source as u32, out as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, out).unwrap(), 0xE6);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    characteristics,
+                    &[bad_this, out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_pd,
+                    &[graph.source as u32, out as u32]
+                ),
+                0
+            );
+            assert_ne!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_pd,
+                    &[graph.source as u32, 0]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_pd,
+                    &[bad_this, out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    queue_event,
+                    &[graph.source as u32, 100, 0, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_event,
+                    &[graph.source as u32, 0, out as u32]
+                ),
+                0
+            );
+            assert_ne!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    queue_event,
+                    &[bad_this, 100, 0, 0, 0]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_event,
+                    &[bad_this, 0, out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    cancel_event,
+                    &[graph.source as u32]
+                ),
+                u64::from(S_FALSE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, cancel_event, &[bad_this]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    source_start,
+                    &[graph.source as u32, 0, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    source_pause,
+                    &[graph.source as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    source_stop,
+                    &[graph.source as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    source_start,
+                    &[bad_this, 0, 0, 0]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, source_pause, &[bad_this]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, source_stop, &[bad_this]),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    source_shutdown,
+                    &[graph.source as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    source_start,
+                    &[graph.source as u32, 0, 0, 0]
+                ),
+                u64::from(MF_E_SHUTDOWN)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, source_shutdown, &[bad_this]),
+                u64::from(E_NOINTERFACE)
+            );
+
+            let enum_ex: u64 = runtime.alloc_host_thunk(HostThunk::MftEnumEx);
+            let category = 0x72_000_u64;
+            memory.map_bytes(category, &MFT_CATEGORY_VIDEO_DECODER);
+            let activate_out = 0x72_100_u64;
+            let count_out = 0x72_110_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    enum_ex,
+                    &[
+                        category as u32,
+                        0,
+                        0,
+                        0,
+                        activate_out as u32,
+                        count_out as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, count_out).unwrap(), 1);
+            let activate = read_guest_pointer(&memory, activate_out, GuestArch::X86).unwrap();
+            let activate_object: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfActivateActivateObject);
+            let transform_out = 0x72_200_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    activate_object,
+                    &[activate as u32, 0, transform_out as u32]
+                ),
+                0
+            );
+            let transform = read_guest_pointer(&memory, transform_out, GuestArch::X86).unwrap();
+
+            let stream_limits: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfTransformGetStreamLimits);
+            let stream_counts: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfTransformGetStreamCounts);
+            let stream_ids: u64 = runtime.alloc_host_thunk(HostThunk::MfTransformGetStreamIds);
+            let stream_info: u64 = runtime.alloc_host_thunk(HostThunk::MfTransformGetStreamInfo);
+            let get_attributes: u64 = runtime.alloc_host_thunk(HostThunk::MfTransformGetAttributes);
+            let input_available: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfTransformGetInputAvailableType);
+            let output_available: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfTransformGetOutputAvailableType);
+            let set_input: u64 = runtime.alloc_host_thunk(HostThunk::MfTransformSetInputType);
+            let set_output: u64 = runtime.alloc_host_thunk(HostThunk::MfTransformSetOutputType);
+            let input_current: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfTransformGetInputCurrentType);
+            let output_current: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfTransformGetOutputCurrentType);
+            let input_status: u64 = runtime.alloc_host_thunk(HostThunk::MfTransformGetInputStatus);
+            let output_status: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfTransformGetOutputStatus);
+            let process_input: u64 = runtime.alloc_host_thunk(HostThunk::MfTransformProcessInput);
+            let process_output: u64 = runtime.alloc_host_thunk(HostThunk::MfTransformProcessOutput);
+            let process_message: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfTransformProcessMessage);
+
+            let dst = 0x73_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    stream_limits,
+                    &[
+                        transform as u32,
+                        dst as u32,
+                        (dst + 4) as u32,
+                        (dst + 8) as u32,
+                        (dst + 12) as u32
+                    ]
+                ),
+                0
+            );
+            for offset in [0_u64, 4, 8, 12] {
+                assert_eq!(read_guest_u32(&memory, dst + offset).unwrap(), 1);
+            }
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    stream_counts,
+                    &[transform as u32, dst as u32, (dst + 4) as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, dst).unwrap(), 1);
+            assert_eq!(read_guest_u32(&memory, dst + 4).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    stream_ids,
+                    &[transform as u32, 1, dst as u32, 1, (dst + 4) as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, dst).unwrap(), 0);
+            assert_eq!(read_guest_u32(&memory, dst + 4).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    stream_ids,
+                    &[transform as u32, 0, dst as u32, 0, (dst + 4) as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    stream_info,
+                    &[transform as u32, 0, dst as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, dst + 8).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_attributes,
+                    &[transform as u32, dst as u32]
+                ),
+                0
+            );
+            assert_ne!(read_guest_pointer(&memory, dst, GuestArch::X86).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    input_available,
+                    &[transform as u32, 0, 0, dst as u32]
+                ),
+                0
+            );
+            assert_ne!(read_guest_pointer(&memory, dst, GuestArch::X86).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    input_available,
+                    &[transform as u32, 0, 99, dst as u32]
+                ),
+                0xC00D_36D6
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    output_available,
+                    &[transform as u32, 0, 0, dst as u32]
+                ),
+                0
+            );
+            assert_ne!(read_guest_pointer(&memory, dst, GuestArch::X86).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    output_available,
+                    &[transform as u32, 0, 99, dst as u32]
+                ),
+                0xC00D_36D6
+            );
+
+            let input_type = runtime
+                .alloc_guest_object(&mut memory, GuestObjectKind::ImfMediaType, 0)
+                .unwrap();
+            let mut input_mt = crate::media::ImfMediaType::new();
+            input_mt.set_guid(
+                crate::media::MF_MT_MAJOR_TYPE,
+                crate::media::MFMediaType_Video,
+            );
+            input_mt.set_guid(
+                crate::media::MF_MT_SUBTYPE,
+                crate::media::MFVideoFormat_H264,
+            );
+            runtime.mf_media_types.insert(input_type, input_mt);
+            let output_type = runtime
+                .alloc_guest_object(&mut memory, GuestObjectKind::ImfMediaType, 0)
+                .unwrap();
+            let mut output_mt = crate::media::ImfMediaType::new();
+            output_mt.set_guid(
+                crate::media::MF_MT_MAJOR_TYPE,
+                crate::media::MFMediaType_Video,
+            );
+            output_mt.set_guid(
+                crate::media::MF_MT_SUBTYPE,
+                crate::media::MFVideoFormat_NV12,
+            );
+            runtime.mf_media_types.insert(output_type, output_mt);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_input,
+                    &[transform as u32, 0, input_type as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    set_output,
+                    &[transform as u32, 0, output_type as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    input_current,
+                    &[transform as u32, 0, dst as u32]
+                ),
+                0
+            );
+            assert_ne!(read_guest_pointer(&memory, dst, GuestArch::X86).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    output_current,
+                    &[transform as u32, 0, dst as u32]
+                ),
+                0
+            );
+            assert_ne!(read_guest_pointer(&memory, dst, GuestArch::X86).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    input_status,
+                    &[transform as u32, 0, dst as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, dst).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    output_status,
+                    &[transform as u32, dst as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, dst).unwrap(), 0);
+
+            let sample_out = 0x74_000_u64;
+            let create_sample: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateSample);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_sample,
+                    &[sample_out as u32]
+                ),
+                0
+            );
+            let sample = read_guest_pointer(&memory, sample_out, GuestArch::X86).unwrap();
+            runtime.mf_samples.insert(
+                sample,
+                crate::media::ImfSample {
+                    buffer: b"frame".to_vec(),
+                    sample_time: 10,
+                    sample_duration: 5,
+                    flags: 0,
+                },
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    process_input,
+                    &[transform as u32, 0, sample as u32, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    input_status,
+                    &[transform as u32, 0, dst as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, dst).unwrap(), 0);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    output_status,
+                    &[transform as u32, dst as u32]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, dst).unwrap(), 1);
+            let output_buffer = 0x75_000_u64;
+            let status_out = 0x75_100_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    process_output,
+                    &[
+                        transform as u32,
+                        0,
+                        1,
+                        output_buffer as u32,
+                        status_out as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(read_guest_u32(&memory, output_buffer + 16).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    process_message,
+                    &[transform as u32, 0x0000_0001, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    process_output,
+                    &[
+                        transform as u32,
+                        0,
+                        1,
+                        output_buffer as u32,
+                        status_out as u32
+                    ]
+                ),
+                0xC00D_36D7
+            );
+
+            for (thunk, args) in [
+                (stream_limits, vec![bad_this, 0, 0, 0, 0]),
+                (stream_counts, vec![bad_this, 0, 0]),
+                (
+                    stream_ids,
+                    vec![bad_this, 1, dst as u32, 1, (dst + 4) as u32],
+                ),
+                (stream_info, vec![bad_this, 0, dst as u32]),
+                (get_attributes, vec![bad_this, dst as u32]),
+                (input_available, vec![bad_this, 0, 0, dst as u32]),
+                (output_available, vec![bad_this, 0, 0, dst as u32]),
+                (set_input, vec![bad_this, 0, input_type as u32, 0]),
+                (set_output, vec![bad_this, 0, output_type as u32, 0]),
+                (input_current, vec![bad_this, 0, dst as u32]),
+                (output_current, vec![bad_this, 0, dst as u32]),
+                (input_status, vec![bad_this, 0, dst as u32]),
+                (output_status, vec![bad_this, dst as u32]),
+                (process_input, vec![bad_this, 0, sample as u32, 0]),
+                (
+                    process_output,
+                    vec![bad_this, 0, 1, output_buffer as u32, status_out as u32],
+                ),
+                (process_message, vec![bad_this, 0x0000_0001, 0]),
+            ] {
+                assert_eq!(
+                    dispatch_x86_thunk(&mut runtime, &mut memory, thunk, &args),
+                    u64::from(E_NOINTERFACE)
+                );
+            }
         })
     }
 }

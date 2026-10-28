@@ -24,13 +24,21 @@
 //! barrier verdict rather than guessing.
 
 use super::super::{
-    ERROR_INVALID_PARAMETER, GuestThreadContext, HostThunk, ProcessShared,
-    WINDOWS_EPOCH_OFFSET_100NS, WorkerVersion, current_host_ticks_100ns,
-    is_processor_feature_present, shlwapi_format_time_interval,
+    ABBR_MONTHS, ABBR_WEEKDAYS, CP_ACP, ERROR_ENVVAR_NOT_FOUND, ERROR_FILE_NOT_FOUND,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FULL_MONTHS,
+    FULL_WEEKDAYS, GuestThreadContext, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER,
+    HKEY_LOCAL_MACHINE, HKEY_USERS, HostThunk, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+    PROCESS_HEAP_HANDLE, ProcessShared, WINDOWS_EPOCH_OFFSET_100NS, WorkerLocale, WorkerVersion,
+    civil_day_of_week, current_guest_utc_components, current_host_ticks_100ns,
+    current_host_time_zone_information, encode_registry_value_data,
+    encode_registry_value_data_ansi, guest_code_page_max_char_size, is_processor_feature_present,
+    locale_name_to_lcid, normalize_registry_runtime_key, registry_value_type_to_win32,
+    shlwapi_format_time_interval,
 };
 use crate::cpu::{GuestArch, Register};
 use crate::host_thunks::ThunkConcurrency;
 use crate::jit::GuestSliceMemory;
+use crate::win32::{CP_THREAD_ACP, CP_UTF8};
 
 /// The concurrency-safe worker implementation of one host thunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +66,27 @@ pub(crate) enum WorkerApi {
     CharNextW,
     CharPrevW,
     StrFromTimeIntervalW,
+    Strlen,
+    LstrlenW,
+    LstrcmpW,
+    LstrcmpiW,
+    CompareStringW,
+    MultiByteToWideChar,
+    WideCharToMultiByte,
+    GetACP,
+    GetOEMCP,
+    GetCPInfo,
+    IsValidCodePage,
+    LocaleNameToLCID,
+    GetProcessHeap,
+    GetProcessHeaps,
+    HeapSize,
+    GetTimeZoneInformation,
+    GetDateFormatW,
+    GetTimeFormatW,
+    GetEnvironmentVariableW,
+    RegQueryValueExA,
+    RegQueryValueExW,
 }
 
 impl WorkerApi {
@@ -69,7 +98,15 @@ impl WorkerApi {
             | Self::GetSystemInfo
             | Self::GetNativeSystemInfo
             | Self::GlobalMemoryStatusEx
-            | Self::IsWow64Process => ThunkConcurrency::ReadMostly,
+            | Self::IsWow64Process
+            | Self::MultiByteToWideChar
+            | Self::WideCharToMultiByte
+            | Self::GetACP
+            | Self::GetOEMCP
+            | Self::HeapSize
+            | Self::GetEnvironmentVariableW
+            | Self::RegQueryValueExA
+            | Self::RegQueryValueExW => ThunkConcurrency::ReadMostly,
             _ => ThunkConcurrency::Stateless,
         }
     }
@@ -101,6 +138,27 @@ pub(crate) fn worker_api(thunk: &HostThunk) -> Option<WorkerApi> {
         HostThunk::CharNextW => WorkerApi::CharNextW,
         HostThunk::CharPrevW => WorkerApi::CharPrevW,
         HostThunk::StrFromTimeIntervalW => WorkerApi::StrFromTimeIntervalW,
+        HostThunk::Strlen => WorkerApi::Strlen,
+        HostThunk::LstrlenW => WorkerApi::LstrlenW,
+        HostThunk::LstrcmpW => WorkerApi::LstrcmpW,
+        HostThunk::LstrcmpiW => WorkerApi::LstrcmpiW,
+        HostThunk::CompareStringW => WorkerApi::CompareStringW,
+        HostThunk::MultiByteToWideChar => WorkerApi::MultiByteToWideChar,
+        HostThunk::WideCharToMultiByte => WorkerApi::WideCharToMultiByte,
+        HostThunk::GetACP => WorkerApi::GetACP,
+        HostThunk::GetOEMCP => WorkerApi::GetOEMCP,
+        HostThunk::GetCPInfo => WorkerApi::GetCPInfo,
+        HostThunk::IsValidCodePage => WorkerApi::IsValidCodePage,
+        HostThunk::LocaleNameToLCID => WorkerApi::LocaleNameToLCID,
+        HostThunk::GetProcessHeap => WorkerApi::GetProcessHeap,
+        HostThunk::GetProcessHeaps => WorkerApi::GetProcessHeaps,
+        HostThunk::HeapSize => WorkerApi::HeapSize,
+        HostThunk::GetTimeZoneInformation => WorkerApi::GetTimeZoneInformation,
+        HostThunk::GetDateFormatW => WorkerApi::GetDateFormatW,
+        HostThunk::GetTimeFormatW => WorkerApi::GetTimeFormatW,
+        HostThunk::GetEnvironmentVariableW => WorkerApi::GetEnvironmentVariableW,
+        HostThunk::RegQueryValueExA => WorkerApi::RegQueryValueExA,
+        HostThunk::RegQueryValueExW => WorkerApi::RegQueryValueExW,
         _ => return None,
     })
 }
@@ -347,6 +405,11 @@ fn execute(
             write_version_info_a(context, memory, pointer, &version)
         }
         WorkerApi::IsWow64Process => {
+            // The owner reads (and ignores) the process handle argument, so
+            // an unreadable first argument must stay on the barrier too.
+            if read_arg(context, memory, 0).is_none() {
+                return false;
+            }
             let Some(pointer) = read_arg(context, memory, 1) else {
                 return false;
             };
@@ -484,7 +547,1149 @@ fn execute(
             context.last_error = 0;
             true
         }
+        WorkerApi::Strlen => {
+            let Some([string_ptr]) = read_args::<1>(context, memory) else {
+                return false;
+            };
+            let Some(text) = read_c_string_lossy(memory, string_ptr) else {
+                return false;
+            };
+            context.state.set(Register::Rax, text.len() as u64);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::LstrlenW => {
+            let Some([string_ptr]) = read_args::<1>(context, memory) else {
+                return false;
+            };
+            let Some(text) = read_utf16_lossy(memory, string_ptr) else {
+                return false;
+            };
+            context
+                .state
+                .set(Register::Rax, text.encode_utf16().count() as u64);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::LstrcmpW | WorkerApi::LstrcmpiW => {
+            let Some([left_ptr, right_ptr]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            let left = if left_ptr == 0 {
+                String::new()
+            } else {
+                let Some(text) = read_utf16_lossy(memory, left_ptr) else {
+                    return false;
+                };
+                text
+            };
+            let right = if right_ptr == 0 {
+                String::new()
+            } else {
+                let Some(text) = read_utf16_lossy(memory, right_ptr) else {
+                    return false;
+                };
+                text
+            };
+            let result = if api == WorkerApi::LstrcmpiW {
+                match left.to_lowercase().cmp(&right.to_lowercase()) {
+                    std::cmp::Ordering::Less => -1_i32,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }
+            } else {
+                match left.encode_utf16().cmp(right.encode_utf16()) {
+                    std::cmp::Ordering::Less => -1_i32,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }
+            };
+            context.state.set(Register::Rax, result as i64 as u64);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::CompareStringW => {
+            let Some([_locale, flags, str1_ptr, str1_len, str2_ptr, str2_len]) =
+                read_args::<6>(context, memory)
+            else {
+                return false;
+            };
+            // The owner reads the NUL-terminated strings and then takes the
+            // requested prefix; unreadable input degrades to the empty string
+            // exactly like `read_utf16_string(..).unwrap_or_default()`.
+            let s1 = take_utf16_prefix(
+                read_utf16_lossy(memory, str1_ptr).unwrap_or_default(),
+                str1_len as i32,
+            );
+            let s2 = take_utf16_prefix(
+                read_utf16_lossy(memory, str2_ptr).unwrap_or_default(),
+                str2_len as i32,
+            );
+            const NORM_IGNORECASE: u32 = 0x0000_0001;
+            const NORM_IGNORECASE_NONSPACE: u32 = 0x0000_0002;
+            let flags = flags as u32;
+            let result = if flags & (NORM_IGNORECASE | NORM_IGNORECASE_NONSPACE) != 0 {
+                match s1.to_lowercase().cmp(&s2.to_lowercase()) {
+                    std::cmp::Ordering::Less => 1_u64,
+                    std::cmp::Ordering::Equal => 2,
+                    std::cmp::Ordering::Greater => 3,
+                }
+            } else {
+                match s1.cmp(&s2) {
+                    std::cmp::Ordering::Less => 1_u64,
+                    std::cmp::Ordering::Equal => 2,
+                    std::cmp::Ordering::Greater => 3,
+                }
+            };
+            context.state.set(Register::Rax, result);
+            true
+        }
+        WorkerApi::MultiByteToWideChar => {
+            let Some([code_page, _flags, multi_ptr, multi_len, wide_ptr, wide_len]) =
+                read_args::<6>(context, memory)
+            else {
+                return false;
+            };
+            let multi_len = multi_len as i32;
+            let wide_len = wide_len as i32;
+            if multi_ptr == 0 && multi_len != 0 {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            let normalized_code_page = if code_page as u32 == CP_ACP {
+                1252
+            } else {
+                code_page as u32
+            };
+            let multi_bytes = if multi_len < 0 {
+                let Some(text) = read_c_string_lossy(memory, multi_ptr) else {
+                    return false;
+                };
+                let mut bytes = text.into_bytes();
+                bytes.push(0);
+                bytes
+            } else {
+                let Some(bytes) = read_raw(memory, multi_ptr, multi_len as usize) else {
+                    return false;
+                };
+                bytes
+            };
+            let locale = shared.locale_snapshot();
+            let converted = multi_byte_to_wide(normalized_code_page, &multi_bytes, locale);
+            match converted {
+                Conversion::Value(wide_units) => {
+                    let required = wide_units.len() as u32;
+                    if wide_ptr == 0 || wide_len == 0 {
+                        context.state.set(Register::Rax, u64::from(required));
+                        context.last_error = 0;
+                    } else if wide_len < required as i32 {
+                        context.state.set(Register::Rax, 0);
+                        context.last_error = ERROR_INSUFFICIENT_BUFFER;
+                    } else {
+                        let encoded = wide_units
+                            .iter()
+                            .flat_map(|unit| unit.to_le_bytes())
+                            .collect::<Vec<_>>();
+                        if !encoded.is_empty() && !write_bytes(memory, wide_ptr, &encoded) {
+                            return false;
+                        }
+                        context.state.set(Register::Rax, u64::from(required));
+                        context.last_error = 0;
+                    }
+                    true
+                }
+                Conversion::Invalid => {
+                    context.state.set(Register::Rax, 0);
+                    context.last_error = ERROR_INVALID_PARAMETER;
+                    true
+                }
+                Conversion::Unsupported => false,
+            }
+        }
+        WorkerApi::WideCharToMultiByte => {
+            let Some(
+                [
+                    code_page,
+                    _flags,
+                    wide_ptr,
+                    wide_len,
+                    multi_ptr,
+                    multi_len,
+                    _default_char_ptr,
+                    used_default_ptr,
+                ],
+            ) = read_args::<8>(context, memory)
+            else {
+                return false;
+            };
+            let wide_len = wide_len as i32;
+            let multi_len = multi_len as i32;
+            if used_default_ptr != 0 && !write_u32(memory, used_default_ptr, 0) {
+                return false;
+            }
+            if wide_ptr == 0 && wide_len != 0 {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            let normalized_code_page = if code_page as u32 == CP_ACP {
+                1252
+            } else {
+                code_page as u32
+            };
+            let wide_units = if wide_len < 0 {
+                let Some(text) = read_utf16_lossy(memory, wide_ptr) else {
+                    return false;
+                };
+                text.encode_utf16().chain(std::iter::once(0)).collect()
+            } else {
+                let Some(units) = read_utf16_units(memory, wide_ptr, wide_len as usize) else {
+                    return false;
+                };
+                units
+            };
+            let locale = shared.locale_snapshot();
+            let converted = wide_to_multi_byte(normalized_code_page, &wide_units, locale);
+            match converted {
+                Conversion::Value(encoded) => {
+                    let required = encoded.len() as u32;
+                    if multi_ptr == 0 || multi_len == 0 {
+                        context.state.set(Register::Rax, u64::from(required));
+                        context.last_error = 0;
+                    } else if multi_len < required as i32 {
+                        context.state.set(Register::Rax, 0);
+                        context.last_error = ERROR_INSUFFICIENT_BUFFER;
+                    } else {
+                        if !encoded.is_empty() && !write_bytes(memory, multi_ptr, &encoded) {
+                            return false;
+                        }
+                        context.state.set(Register::Rax, u64::from(required));
+                        context.last_error = 0;
+                    }
+                    true
+                }
+                Conversion::Invalid => {
+                    context.state.set(Register::Rax, 0);
+                    context.last_error = ERROR_INVALID_PARAMETER;
+                    true
+                }
+                Conversion::Unsupported => false,
+            }
+        }
+        WorkerApi::GetACP => {
+            context
+                .state
+                .set(Register::Rax, u64::from(shared.locale_snapshot().acp));
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetOEMCP => {
+            context
+                .state
+                .set(Register::Rax, u64::from(shared.locale_snapshot().oemcp));
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetCPInfo => {
+            let Some([code_page, cp_info]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            let Some(max_char_size) = guest_code_page_max_char_size(code_page as u32) else {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            };
+            if cp_info != 0 {
+                if !write_u32(memory, cp_info, max_char_size) {
+                    return false;
+                }
+                if !write_bytes(
+                    memory,
+                    cp_info + 4,
+                    &[b'?', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                ) {
+                    return false;
+                }
+            }
+            context.state.set(Register::Rax, 1);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::IsValidCodePage => {
+            let Some(code_page) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            let valid = guest_code_page_max_char_size(code_page as u32).is_some();
+            context.state.set(Register::Rax, u64::from(valid));
+            context.last_error = if valid { 0 } else { ERROR_INVALID_PARAMETER };
+            true
+        }
+        WorkerApi::LocaleNameToLCID => {
+            let Some([locale_name_ptr, _flags]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            const LOCALE_EN_US: u32 = 0x0409;
+            if locale_name_ptr == 0 {
+                context.state.set(Register::Rax, u64::from(LOCALE_EN_US));
+                context.last_error = 0;
+                return true;
+            }
+            let Some(locale_name) = read_utf16_lossy(memory, locale_name_ptr) else {
+                return false;
+            };
+            if let Some(result) = locale_name_to_lcid(&locale_name) {
+                context.state.set(Register::Rax, u64::from(result));
+                context.last_error = 0;
+            } else {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+            }
+            true
+        }
+        WorkerApi::GetProcessHeap => {
+            context.state.set(Register::Rax, PROCESS_HEAP_HANDLE);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetProcessHeaps => {
+            let Some([count, heaps_ptr]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            if count != 0
+                && heaps_ptr != 0
+                && !write_pointer(memory, heaps_ptr, PROCESS_HEAP_HANDLE, context.state.arch)
+            {
+                return false;
+            }
+            context.state.set(Register::Rax, 1);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::HeapSize => {
+            let Some([heap, _flags, address]) = read_args::<3>(context, memory) else {
+                return false;
+            };
+            let size = if heap == PROCESS_HEAP_HANDLE {
+                shared
+                    .heap_snapshot()
+                    .get(&address)
+                    .map(|size| *size as u64)
+            } else {
+                None
+            };
+            let result = size.unwrap_or(match context.state.arch {
+                GuestArch::X64 => u64::MAX,
+                GuestArch::X86 => u32::MAX as u64,
+            });
+            context.state.set(Register::Rax, result);
+            context.last_error = if size.is_some() {
+                0
+            } else {
+                ERROR_INVALID_PARAMETER
+            };
+            true
+        }
+        WorkerApi::GetTimeZoneInformation => {
+            let Some([time_zone_information_ptr]) = read_args::<1>(context, memory) else {
+                return false;
+            };
+            let dtm = shared.clock_snapshot().dtm;
+            let info = current_host_time_zone_information(dtm);
+            if time_zone_information_ptr != 0
+                && !write_time_zone_information_worker(memory, time_zone_information_ptr, &info)
+            {
+                return false;
+            }
+            context.state.set(Register::Rax, u64::from(info.result));
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetDateFormatW => {
+            let Some(
+                [
+                    _locale,
+                    flags,
+                    date_ptr,
+                    format_ptr,
+                    buffer_ptr,
+                    buffer_size,
+                ],
+            ) = read_args::<6>(context, memory)
+            else {
+                return false;
+            };
+            let flags = flags as u32;
+            let (year, month, day, dow) = if date_ptr != 0 {
+                let y = memory.load(date_ptr, 2).unwrap_or(0) as u16;
+                let m = memory.load(date_ptr + 2, 2).unwrap_or(0) as u16;
+                let d = memory.load(date_ptr + 6, 2).unwrap_or(0) as u16;
+                (y, m, d, civil_day_of_week(y, m, d))
+            } else {
+                let (y, m, d, _h, _mi, _s) = current_guest_utc_components().unwrap_or_default();
+                (y, m, d, civil_day_of_week(y, m, d))
+            };
+            let date_str = if format_ptr != 0 {
+                let Some(formatted) =
+                    format_date_tokens_worker(memory, format_ptr, year, month, day, dow)
+                else {
+                    return false;
+                };
+                formatted
+            } else if flags & 0x02 != 0 {
+                format!(
+                    "{}, {} {}, {}",
+                    FULL_WEEKDAYS[dow as usize],
+                    FULL_MONTHS[(month as usize).saturating_sub(1)],
+                    day,
+                    year
+                )
+            } else {
+                format!("{}/{}/{}", month, day, year)
+            };
+            write_date_time_result_worker(
+                memory,
+                context,
+                &date_str,
+                buffer_ptr,
+                buffer_size as i32,
+            )
+        }
+        WorkerApi::GetTimeFormatW => {
+            let Some(
+                [
+                    _locale,
+                    flags,
+                    time_ptr,
+                    format_ptr,
+                    buffer_ptr,
+                    buffer_size,
+                ],
+            ) = read_args::<6>(context, memory)
+            else {
+                return false;
+            };
+            let flags = flags as u32;
+            let (hour, minute, second) = if time_ptr != 0 {
+                (
+                    memory.load(time_ptr + 8, 2).unwrap_or(0) as u16,
+                    memory.load(time_ptr + 10, 2).unwrap_or(0) as u16,
+                    memory.load(time_ptr + 12, 2).unwrap_or(0) as u16,
+                )
+            } else {
+                let (_y, _m, _d, h, mi, s) = current_guest_utc_components().unwrap_or_default();
+                (h, mi, s)
+            };
+            let force24 = flags & 0x08 != 0;
+            let no_marker = flags & 0x04 != 0;
+            let time_str = if format_ptr != 0 {
+                let Some(formatted) =
+                    format_time_tokens_worker(memory, format_ptr, hour, minute, second, force24)
+                else {
+                    return false;
+                };
+                formatted
+            } else {
+                let (h12, meridian) = if force24 || no_marker {
+                    (hour, "")
+                } else {
+                    let h12 = hour % 12;
+                    (
+                        if h12 == 0 { 12 } else { h12 },
+                        if hour < 12 { "AM" } else { "PM" },
+                    )
+                };
+                let mut text = format!(
+                    "{}{}{:02}",
+                    if force24 || no_marker {
+                        format!("{:02}", h12)
+                    } else {
+                        h12.to_string()
+                    },
+                    ":",
+                    minute,
+                );
+                if flags & 0x02 == 0 {
+                    text.push_str(&format!(":{:02}", second));
+                }
+                if !meridian.is_empty() {
+                    text.push(' ');
+                    text.push_str(meridian);
+                }
+                text
+            };
+            write_date_time_result_worker(
+                memory,
+                context,
+                &time_str,
+                buffer_ptr,
+                buffer_size as i32,
+            )
+        }
+        WorkerApi::GetEnvironmentVariableW => {
+            let Some([name_ptr, buffer_ptr, buffer_len]) = read_args::<3>(context, memory) else {
+                return false;
+            };
+            let buffer_len = buffer_len as u32 as usize;
+            if name_ptr == 0 || (buffer_ptr == 0 && buffer_len != 0) {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            let Some(name) = read_utf16_lossy(memory, name_ptr) else {
+                return false;
+            };
+            let environment = shared.environment_snapshot();
+            let value = environment
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                .map(|(_, value)| value.clone());
+            let Some(value) = value else {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_ENVVAR_NOT_FOUND;
+                return true;
+            };
+            let required = value.encode_utf16().count() + 1;
+            if buffer_len == 0 {
+                context.state.set(Register::Rax, required as u64);
+                context.last_error = 0;
+            } else if required > buffer_len {
+                context.state.set(Register::Rax, required as u64);
+                context.last_error = ERROR_INSUFFICIENT_BUFFER;
+            } else {
+                let bytes = value
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .flat_map(|unit| unit.to_le_bytes())
+                    .collect::<Vec<_>>();
+                if !write_bytes(memory, buffer_ptr, &bytes) {
+                    return false;
+                }
+                context
+                    .state
+                    .set(Register::Rax, value.encode_utf16().count() as u64);
+                context.last_error = 0;
+            }
+            true
+        }
+        WorkerApi::RegQueryValueExA | WorkerApi::RegQueryValueExW => {
+            query_registry_value(api, shared, context, memory)
+        }
     }
+}
+
+fn take_utf16_prefix(text: String, length: i32) -> String {
+    if length < 0 {
+        text
+    } else {
+        let units: Vec<u16> = text.encode_utf16().take(length as usize).collect();
+        String::from_utf16_lossy(&units)
+    }
+}
+
+fn write_time_zone_information_worker(
+    memory: &dyn WorkerMemoryView,
+    address: u64,
+    info: &super::super::HostTimeZoneInformation,
+) -> bool {
+    const TIME_ZONE_INFORMATION_SIZE: usize = 172;
+    const TIME_ZONE_NAME_CAPACITY: usize = 32;
+    if !write_bytes(memory, address, &[0_u8; TIME_ZONE_INFORMATION_SIZE]) {
+        return false;
+    }
+    if !write_u32(memory, address, info.bias_minutes as u32) {
+        return false;
+    }
+    if !write_utf16_fixed(
+        memory,
+        address + 4,
+        TIME_ZONE_NAME_CAPACITY,
+        &info.standard_name,
+    ) {
+        return false;
+    }
+    if !write_u32(memory, address + 84, 0) {
+        return false;
+    }
+    if !write_utf16_fixed(
+        memory,
+        address + 88,
+        TIME_ZONE_NAME_CAPACITY,
+        &info.daylight_name,
+    ) {
+        return false;
+    }
+    write_u32(memory, address + 168, 0)
+}
+
+fn write_utf16_fixed(
+    memory: &dyn WorkerMemoryView,
+    address: u64,
+    capacity: usize,
+    value: &str,
+) -> bool {
+    let mut bytes = vec![0_u8; capacity * 2];
+    for (index, unit) in value
+        .encode_utf16()
+        .take(capacity.saturating_sub(1))
+        .enumerate()
+    {
+        let offset = index * 2;
+        bytes[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    write_bytes(memory, address, &bytes)
+}
+
+fn write_date_time_result_worker(
+    memory: &dyn WorkerMemoryView,
+    context: &mut GuestThreadContext,
+    text: &str,
+    buffer_ptr: u64,
+    buffer_size: i32,
+) -> bool {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let required = utf16.len() + 1;
+    if buffer_ptr == 0 || buffer_size <= 0 {
+        context.state.set(Register::Rax, required as u64);
+        return true;
+    }
+    if (buffer_size as usize) < required {
+        context.state.set(Register::Rax, 0);
+        context.last_error = ERROR_INSUFFICIENT_BUFFER;
+        return true;
+    }
+    let bytes = utf16
+        .iter()
+        .chain(std::iter::once(&0_u16))
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect::<Vec<_>>();
+    if !write_bytes(memory, buffer_ptr, &bytes) {
+        return false;
+    }
+    context.state.set(Register::Rax, utf16.len() as u64);
+    context.last_error = 0;
+    true
+}
+
+fn format_date_tokens_worker(
+    memory: &dyn WorkerMemoryView,
+    format_ptr: u64,
+    year: u16,
+    month: u16,
+    day: u16,
+    dow: u16,
+) -> Option<String> {
+    let format = read_utf16_lossy(memory, format_ptr)?;
+    let units: Vec<u16> = format.encode_utf16().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < units.len() {
+        let unit = units[index];
+        let ch = char::from_u32(u32::from(unit)).unwrap_or('?');
+        match ch {
+            '\'' => {
+                index += 1;
+                let mut closed = false;
+                while index < units.len() {
+                    let current = units[index];
+                    if current == b'\'' as u16 {
+                        if index + 1 < units.len() && units[index + 1] == b'\'' as u16 {
+                            out.push('\'');
+                            index += 2;
+                            continue;
+                        }
+                        closed = true;
+                        index += 1;
+                        break;
+                    }
+                    out.push(char::from_u32(u32::from(current)).unwrap_or('?'));
+                    index += 1;
+                }
+                if !closed {
+                    break;
+                }
+            }
+            'd' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b'd' as u16 {
+                    count += 1;
+                }
+                match count {
+                    1 => out.push_str(&day.to_string()),
+                    2 => out.push_str(&format!("{:02}", day)),
+                    3 => out.push_str(ABBR_WEEKDAYS[dow as usize]),
+                    _ => out.push_str(FULL_WEEKDAYS[dow as usize]),
+                }
+                index += count;
+            }
+            'M' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b'M' as u16 {
+                    count += 1;
+                }
+                let month_index = (month as usize).saturating_sub(1);
+                match count {
+                    1 => out.push_str(&month.to_string()),
+                    2 => out.push_str(&format!("{:02}", month)),
+                    3 => out.push_str(ABBR_MONTHS[month_index]),
+                    _ => out.push_str(FULL_MONTHS[month_index]),
+                }
+                index += count;
+            }
+            'y' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b'y' as u16 {
+                    count += 1;
+                }
+                match count {
+                    1 => out.push_str(&format!("{}", year % 100)),
+                    2 => out.push_str(&format!("{:02}", year % 100)),
+                    _ => out.push_str(&format!("{:04}", year)),
+                }
+                index += count;
+            }
+            other => {
+                out.push(char::from_u32(u32::from(other)).unwrap_or('?'));
+                index += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn format_time_tokens_worker(
+    memory: &dyn WorkerMemoryView,
+    format_ptr: u64,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    force24: bool,
+) -> Option<String> {
+    let format = read_utf16_lossy(memory, format_ptr)?;
+    let units: Vec<u16> = format.encode_utf16().collect();
+    let meridian = if hour < 12 { "AM" } else { "PM" };
+    let hour12 = hour % 12;
+    let hour12_display = if hour12 == 0 { 12 } else { hour12 };
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < units.len() {
+        let unit = units[index];
+        let ch = char::from_u32(u32::from(unit)).unwrap_or('?');
+        match ch {
+            '\'' => {
+                index += 1;
+                let mut closed = false;
+                while index < units.len() {
+                    let current = units[index];
+                    if current == b'\'' as u16 {
+                        if index + 1 < units.len() && units[index + 1] == b'\'' as u16 {
+                            out.push('\'');
+                            index += 2;
+                            continue;
+                        }
+                        closed = true;
+                        index += 1;
+                        break;
+                    }
+                    out.push(char::from_u32(u32::from(current)).unwrap_or('?'));
+                    index += 1;
+                }
+                if !closed {
+                    break;
+                }
+            }
+            'h' | 'H' => {
+                let mut count = 0usize;
+                while index + count < units.len()
+                    && (units[index + count] == b'h' as u16 || units[index + count] == b'H' as u16)
+                {
+                    count += 1;
+                }
+                let value = if unit == b'h' as u16 && !force24 {
+                    hour12_display
+                } else {
+                    hour
+                };
+                if count >= 2 {
+                    out.push_str(&format!("{:02}", value));
+                } else {
+                    out.push_str(&value.to_string());
+                }
+                index += count;
+            }
+            'm' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b'm' as u16 {
+                    count += 1;
+                }
+                if count >= 2 {
+                    out.push_str(&format!("{:02}", minute));
+                } else {
+                    out.push_str(&minute.to_string());
+                }
+                index += count;
+            }
+            's' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b's' as u16 {
+                    count += 1;
+                }
+                if count >= 2 {
+                    out.push_str(&format!("{:02}", second));
+                } else {
+                    out.push_str(&second.to_string());
+                }
+                index += count;
+            }
+            't' => {
+                let mut count = 0usize;
+                while index + count < units.len() && units[index + count] == b't' as u16 {
+                    count += 1;
+                }
+                if force24 {
+                    // TIME_FORCE24HOURFORMAT: the meridian token renders empty.
+                } else if count >= 2 {
+                    out.push_str(meridian);
+                } else {
+                    out.push_str(&meridian[..1]);
+                }
+                index += count;
+            }
+            other => {
+                out.push(char::from_u32(u32::from(other)).unwrap_or('?'));
+                index += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn read_c_string_lossy(memory: &dyn WorkerMemoryView, address: u64) -> Option<String> {
+    if address == 0 {
+        return Some(String::new());
+    }
+    let mut bytes = Vec::new();
+    let mut cursor = address;
+    loop {
+        let byte = memory.load(cursor, 1)? as u8;
+        if byte == 0 {
+            break;
+        }
+        bytes.push(byte);
+        cursor = cursor.wrapping_add(1);
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn read_utf16_lossy(memory: &dyn WorkerMemoryView, address: u64) -> Option<String> {
+    if address == 0 {
+        return Some(String::new());
+    }
+    let mut units = Vec::new();
+    let mut cursor = address;
+    loop {
+        let unit = memory.load(cursor, 2)? as u16;
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+        cursor = cursor.wrapping_add(2);
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
+fn read_utf16_units(
+    memory: &dyn WorkerMemoryView,
+    address: u64,
+    length: usize,
+) -> Option<Vec<u16>> {
+    let mut units = Vec::with_capacity(length);
+    for index in 0..length {
+        units.push(memory.load(address.wrapping_add((index as u64) * 2), 2)? as u16);
+    }
+    Some(units)
+}
+
+fn read_raw(memory: &dyn WorkerMemoryView, address: u64, length: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(length);
+    let mut offset = 0usize;
+    while offset < length {
+        let chunk = (length - offset).min(8);
+        let value = memory.load(address.wrapping_add(offset as u64), chunk)?;
+        for index in 0..chunk {
+            bytes.push((value >> (index * 8)) as u8);
+        }
+        offset += chunk;
+    }
+    Some(bytes)
+}
+
+fn write_pointer(memory: &dyn WorkerMemoryView, address: u64, value: u64, arch: GuestArch) -> bool {
+    match arch {
+        GuestArch::X86 => write_u32(memory, address, value as u32),
+        GuestArch::X64 => write_u64(memory, address, value),
+    }
+}
+
+enum Conversion<T> {
+    Value(T),
+    Invalid,
+    Unsupported,
+}
+
+fn multi_byte_to_wide(code_page: u32, bytes: &[u8], locale: WorkerLocale) -> Conversion<Vec<u16>> {
+    let cp = if code_page == CP_ACP || code_page == CP_THREAD_ACP {
+        locale.acp
+    } else {
+        code_page
+    };
+    match cp {
+        CP_UTF8 => match std::str::from_utf8(bytes) {
+            Ok(text) => Conversion::Value(text.encode_utf16().collect()),
+            Err(_) => Conversion::Invalid,
+        },
+        1252 if locale.acp == 1252 => Conversion::Value(
+            bytes
+                .iter()
+                .map(|byte| decode_cp1252(*byte) as u16)
+                .collect(),
+        ),
+        _ => Conversion::Unsupported,
+    }
+}
+
+fn wide_to_multi_byte(code_page: u32, wide: &[u16], locale: WorkerLocale) -> Conversion<Vec<u8>> {
+    let cp = if code_page == CP_ACP || code_page == CP_THREAD_ACP {
+        locale.acp
+    } else {
+        code_page
+    };
+    let Ok(text) = String::from_utf16(wide) else {
+        return Conversion::Invalid;
+    };
+    match cp {
+        CP_UTF8 => Conversion::Value(text.into_bytes()),
+        1252 if locale.acp == 1252 => {
+            let mut encoded = Vec::with_capacity(text.len());
+            for ch in text.chars() {
+                let Some(byte) = encode_cp1252(ch) else {
+                    return Conversion::Invalid;
+                };
+                encoded.push(byte);
+            }
+            Conversion::Value(encoded)
+        }
+        _ => Conversion::Unsupported,
+    }
+}
+
+fn decode_cp1252(byte: u8) -> char {
+    match byte {
+        0x80 => '€',
+        0x82 => '‚',
+        0x83 => 'ƒ',
+        0x84 => '„',
+        0x85 => '…',
+        0x86 => '†',
+        0x87 => '‡',
+        0x88 => 'ˆ',
+        0x89 => '‰',
+        0x8A => 'Š',
+        0x8B => '‹',
+        0x8C => 'Œ',
+        0x8E => 'Ž',
+        0x91 => '‘',
+        0x92 => '’',
+        0x93 => '“',
+        0x94 => '”',
+        0x95 => '•',
+        0x96 => '–',
+        0x97 => '—',
+        0x98 => '˜',
+        0x99 => '™',
+        0x9A => 'š',
+        0x9B => '›',
+        0x9C => 'œ',
+        0x9E => 'ž',
+        0x9F => 'Ÿ',
+        other => char::from(other),
+    }
+}
+
+fn encode_cp1252(ch: char) -> Option<u8> {
+    match ch {
+        '€' => Some(0x80),
+        '‚' => Some(0x82),
+        'ƒ' => Some(0x83),
+        '„' => Some(0x84),
+        '…' => Some(0x85),
+        '†' => Some(0x86),
+        '‡' => Some(0x87),
+        'ˆ' => Some(0x88),
+        '‰' => Some(0x89),
+        'Š' => Some(0x8A),
+        '‹' => Some(0x8B),
+        'Œ' => Some(0x8C),
+        'Ž' => Some(0x8E),
+        '‘' => Some(0x91),
+        '’' => Some(0x92),
+        '“' => Some(0x93),
+        '”' => Some(0x94),
+        '•' => Some(0x95),
+        '–' => Some(0x96),
+        '—' => Some(0x97),
+        '˜' => Some(0x98),
+        '™' => Some(0x99),
+        'š' => Some(0x9A),
+        '›' => Some(0x9B),
+        'œ' => Some(0x9C),
+        'ž' => Some(0x9E),
+        'Ÿ' => Some(0x9F),
+        '\u{0081}' => Some(0x81),
+        '\u{008d}' => Some(0x8D),
+        '\u{008f}' => Some(0x8F),
+        '\u{0090}' => Some(0x90),
+        '\u{009d}' => Some(0x9D),
+        other if (other as u32) < 0x80 || (other as u32) >= 0xA0 && (other as u32) <= 0xFF => {
+            Some(other as u8)
+        }
+        _ => None,
+    }
+}
+
+fn worker_registry_view(sam_desired: u32, guest_arch: GuestArch) -> u8 {
+    if sam_desired & KEY_WOW64_64KEY != 0 {
+        2 // Native64
+    } else if sam_desired & KEY_WOW64_32KEY != 0 || guest_arch == GuestArch::X86 {
+        1 // Wow6432
+    } else {
+        0 // Native
+    }
+}
+
+fn root_registry_key(hkey: u32) -> Option<(&'static str, &'static str)> {
+    match hkey {
+        HKEY_CLASSES_ROOT => Some(("HKCR", "")),
+        HKEY_CURRENT_USER => Some(("HKCU", "")),
+        HKEY_LOCAL_MACHINE => Some(("HKLM", "")),
+        HKEY_USERS => Some(("HKCU", "")),
+        HKEY_CURRENT_CONFIG => Some((
+            "HKLM",
+            "System\\CurrentControlSet\\Hardware Profiles\\Current",
+        )),
+        _ => None,
+    }
+}
+
+fn query_registry_value(
+    api: WorkerApi,
+    shared: &ProcessShared,
+    context: &mut GuestThreadContext,
+    memory: &dyn WorkerMemoryView,
+) -> bool {
+    let Some(
+        [
+            hkey,
+            value_name_ptr,
+            reserved_ptr,
+            value_type_ptr,
+            data_ptr,
+            data_len_ptr,
+        ],
+    ) = read_args::<6>(context, memory)
+    else {
+        return false;
+    };
+    if reserved_ptr != 0 || data_len_ptr == 0 {
+        context
+            .state
+            .set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+        context.last_error = ERROR_INVALID_PARAMETER;
+        return true;
+    }
+    let value_name = if value_name_ptr == 0 {
+        String::new()
+    } else if api == WorkerApi::RegQueryValueExA {
+        let Some(name) = read_c_string_lossy(memory, value_name_ptr) else {
+            return false;
+        };
+        name
+    } else {
+        let Some(name) = read_utf16_lossy(memory, value_name_ptr) else {
+            return false;
+        };
+        name
+    };
+    let registry = shared.registry_snapshot();
+    let key = if let Some((hive, base_key)) = root_registry_key(hkey as u32) {
+        let view = worker_registry_view(0, context.state.arch);
+        let normalized = normalize_registry_runtime_key(hive, base_key);
+        registry
+            .roots
+            .get(&(hkey as u32, view))
+            .filter(|entry| entry.hive == hive && entry.key == normalized)
+    } else {
+        registry.keys.get(&(hkey as u32))
+    };
+    let Some(key) = key else {
+        return false;
+    };
+    let value = key.values.get(&value_name);
+    let Some(value) = value else {
+        if !write_u32(memory, data_len_ptr, 0) {
+            return false;
+        }
+        if value_type_ptr != 0 && !write_u32(memory, value_type_ptr, 0) {
+            return false;
+        }
+        context
+            .state
+            .set(Register::Rax, u64::from(ERROR_FILE_NOT_FOUND));
+        context.last_error = ERROR_FILE_NOT_FOUND;
+        return true;
+    };
+    let Ok(type_code) = registry_value_type_to_win32(&value.value_type) else {
+        return false;
+    };
+    let encoded = if api == WorkerApi::RegQueryValueExA {
+        encode_registry_value_data_ansi(value)
+    } else {
+        encode_registry_value_data(value)
+    };
+    let Ok(encoded) = encoded else {
+        return false;
+    };
+    let Some(buffer_capacity) = read_u32(memory, data_len_ptr) else {
+        return false;
+    };
+    if !write_u32(memory, data_len_ptr, encoded.len() as u32) {
+        return false;
+    }
+    if value_type_ptr != 0 && !write_u32(memory, value_type_ptr, type_code) {
+        return false;
+    }
+    if data_ptr != 0 && buffer_capacity < encoded.len() as u32 {
+        context.state.set(Register::Rax, u64::from(ERROR_MORE_DATA));
+        context.last_error = ERROR_MORE_DATA;
+    } else {
+        if data_ptr != 0 && !encoded.is_empty() && !write_bytes(memory, data_ptr, &encoded) {
+            return false;
+        }
+        context.state.set(Register::Rax, 0);
+        context.last_error = 0;
+    }
+    true
+}
+
+fn read_args<const N: usize>(
+    context: &GuestThreadContext,
+    memory: &dyn WorkerMemoryView,
+) -> Option<[u64; N]> {
+    let mut values = [0_u64; N];
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = read_arg(context, memory, index)?;
+    }
+    Some(values)
 }
 
 fn read_arg(
@@ -657,10 +1862,14 @@ mod tests {
     use super::*;
     use crate::anticheat::MonotonicClock;
     use crate::cpu::CpuState;
+    use crate::ge::StoredRegistryValue;
     use crate::runtime::{
         GuestThreadContext, ParallelThunk, ProcessShared, WorkerClock, WorkerEnvironment,
-        WorkerIdentity, WorkerMemoryStatus, WorkerVersion,
+        WorkerIdentity, WorkerLocale, WorkerMemoryStatus, WorkerRegistry, WorkerRegistryKey,
+        WorkerVersion,
     };
+    use serde_json::json;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -708,7 +1917,69 @@ mod tests {
         }
     }
 
+    fn registry_with_value(value: &str) -> WorkerRegistry {
+        let mut registry = WorkerRegistry::default();
+        let mut values = BTreeMap::new();
+        values.insert(
+            "Demo".to_string(),
+            StoredRegistryValue {
+                value_type: "REG_SZ".to_string(),
+                data: json!(value),
+            },
+        );
+        values.insert(
+            "Ansi".to_string(),
+            StoredRegistryValue {
+                value_type: "REG_SZ".to_string(),
+                data: json!("hi"),
+            },
+        );
+        values.insert(
+            "Count".to_string(),
+            StoredRegistryValue {
+                value_type: "REG_DWORD".to_string(),
+                data: json!(7),
+            },
+        );
+        let roots = [
+            (HKEY_CLASSES_ROOT, "HKCR", ""),
+            (HKEY_CURRENT_USER, "HKCU", ""),
+            (HKEY_LOCAL_MACHINE, "HKLM", ""),
+            (HKEY_USERS, "HKCU", ""),
+            (
+                HKEY_CURRENT_CONFIG,
+                "HKLM",
+                "System\\CurrentControlSet\\Hardware Profiles\\Current",
+            ),
+        ];
+        for (handle, hive, base) in roots {
+            for view in 0..=2 {
+                registry.roots.insert(
+                    (handle, view),
+                    WorkerRegistryKey {
+                        hive: hive.to_string(),
+                        key: base.to_string(),
+                        values: values.clone(),
+                    },
+                );
+            }
+        }
+        registry.keys.insert(
+            0x1234,
+            WorkerRegistryKey {
+                hive: "HKCU".to_string(),
+                key: "Software\\Casa".to_string(),
+                values,
+            },
+        );
+        registry
+    }
+
     fn environment(process_id: u32) -> WorkerEnvironment {
+        let mut environment = BTreeMap::new();
+        environment.insert("CASA_TEST".to_string(), "value".to_string());
+        let mut heap = BTreeMap::new();
+        heap.insert(0x5000, 77_usize);
         WorkerEnvironment {
             identity: WorkerIdentity {
                 process_id,
@@ -734,6 +2005,13 @@ mod tests {
                 total_page: 32 * 1024 * 1024 * 1024,
                 avail_page: 16 * 1024 * 1024 * 1024,
             }),
+            locale: WorkerLocale {
+                acp: 1252,
+                oemcp: 437,
+            },
+            environment,
+            heap,
+            registry: registry_with_value("hello"),
         }
     }
 
@@ -783,45 +2061,365 @@ mod tests {
         assert_eq!(memory.store(STACK + index * 4, &value.to_le_bytes()), true);
     }
 
+    fn invoke_x86(
+        shared: &ProcessShared,
+        context: &mut GuestThreadContext,
+        memory: &TestMemory,
+        thunk: HostThunk,
+        args: &[u64],
+    ) -> bool {
+        context.state.set(Register::Rsp, STACK);
+        for (index, value) in args.iter().enumerate() {
+            set_x86_arg(memory, index as u64, *value as u32);
+        }
+        invoke(shared, context, memory, thunk)
+    }
+
+    fn store_ascii(memory: &TestMemory, address: u64, text: &str) {
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        assert_eq!(memory.store(address, &bytes), true);
+    }
+
+    fn store_utf16(memory: &TestMemory, address: u64, text: &str) {
+        let mut bytes = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        assert_eq!(memory.store(address, &bytes), true);
+    }
+
+    fn load_utf16(memory: &TestMemory, address: u64, max_units: usize) -> String {
+        let mut units = Vec::new();
+        for index in 0..max_units {
+            let unit = memory.load(address + index as u64 * 2, 2).unwrap_or(0) as u16;
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+        }
+        String::from_utf16_lossy(&units)
+    }
+
+    const C_STR: u64 = 0x1000;
+    const W_ABC: u64 = 0x1010;
+    const W_ABC_UPPER: u64 = 0x1020;
+    const W_DATE_FMT: u64 = 0x1040;
+    const W_TIME_FMT: u64 = 0x1060;
+    const SYSTEMTIME_DATE: u64 = 0x1100;
+    const SYSTEMTIME_TIME: u64 = 0x1120;
+    const ENV_NAME: u64 = 0x1140;
+    const ENV_BUFFER: u64 = 0x1180;
+    const MULTI_IN: u64 = 0x1200;
+    const WIDE_IN: u64 = 0x1210;
+    const MULTI_OUT: u64 = 0x1220;
+    const WIDE_OUT: u64 = 0x1240;
+    const REG_NAME: u64 = 0x1260;
+    const REG_BUF: u64 = 0x1280;
+    const REG_LEN: u64 = 0x12c0;
+    const REG_TYPE: u64 = 0x12c4;
+    const CP_INFO: u64 = 0x12d0;
+    const HEAPS_OUT: u64 = 0x12e0;
+    const TZ_OUT: u64 = 0x1300;
+    const DATE_OUT: u64 = 0x1320;
+    const TIME_OUT: u64 = 0x1340;
+    const ANSI_NAME: u64 = 0x1360;
+
+    fn prepare_hammer_memory(memory: &TestMemory) {
+        store_ascii(memory, C_STR, "abc");
+        store_utf16(memory, W_ABC, "abc");
+        store_utf16(memory, W_ABC_UPPER, "ABC");
+        store_utf16(memory, W_DATE_FMT, "yyyy-MM-dd");
+        store_utf16(memory, W_TIME_FMT, "HH:mm:ss");
+        assert_eq!(memory.store(SYSTEMTIME_DATE, &2024_u16.to_le_bytes()), true);
+        assert_eq!(
+            memory.store(SYSTEMTIME_DATE + 2, &3_u16.to_le_bytes()),
+            true
+        );
+        assert_eq!(
+            memory.store(SYSTEMTIME_DATE + 6, &5_u16.to_le_bytes()),
+            true
+        );
+        assert_eq!(
+            memory.store(SYSTEMTIME_TIME + 8, &14_u16.to_le_bytes()),
+            true
+        );
+        assert_eq!(
+            memory.store(SYSTEMTIME_TIME + 10, &5_u16.to_le_bytes()),
+            true
+        );
+        assert_eq!(
+            memory.store(SYSTEMTIME_TIME + 12, &9_u16.to_le_bytes()),
+            true
+        );
+        store_utf16(memory, ENV_NAME, "CASA_TEST");
+        assert_eq!(memory.store(MULTI_IN, &[b'A', 0]), true);
+        store_utf16(memory, WIDE_IN, "A");
+        store_utf16(memory, REG_NAME, "Demo");
+        store_ascii(memory, ANSI_NAME, "Ansi");
+    }
+
+    fn hammer_x64_iteration(
+        shared: &ProcessShared,
+        context: &mut GuestThreadContext,
+        memory: &TestMemory,
+        thread: u32,
+    ) {
+        let expected_version = (22631_u64 << 16) | (10_u64 << 8) | 0x8000_0000;
+        assert_eq!(
+            invoke(shared, context, memory, HostThunk::GetCurrentThreadId),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), u64::from(0x100 + thread));
+        assert_eq!(
+            invoke(shared, context, memory, HostThunk::GetCurrentProcessId),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0x1234);
+        assert_eq!(invoke(shared, context, memory, HostThunk::GetVersion), true);
+        assert_eq!(context.state.get(Register::Rax), expected_version);
+
+        context.state.set(Register::Rcx, C_STR);
+        assert_eq!(invoke(shared, context, memory, HostThunk::Strlen), true);
+        assert_eq!(context.state.get(Register::Rax), 3);
+
+        context.state.set(Register::Rcx, W_ABC);
+        assert_eq!(invoke(shared, context, memory, HostThunk::LstrlenW), true);
+        assert_eq!(context.state.get(Register::Rax), 3);
+
+        context.state.set(Register::Rcx, W_ABC);
+        context.state.set(Register::Rdx, W_ABC);
+        assert_eq!(invoke(shared, context, memory, HostThunk::LstrcmpW), true);
+        assert_eq!(context.state.get(Register::Rax), 0);
+        context.state.set(Register::Rdx, W_ABC_UPPER);
+        assert_eq!(invoke(shared, context, memory, HostThunk::LstrcmpW), true);
+        assert_eq!(context.state.get(Register::Rax), 1);
+        context.state.set(Register::Rdx, W_ABC_UPPER);
+        assert_eq!(invoke(shared, context, memory, HostThunk::LstrcmpiW), true);
+        assert_eq!(context.state.get(Register::Rax), 0);
+
+        assert_eq!(invoke(shared, context, memory, HostThunk::GetACP), true);
+        assert_eq!(context.state.get(Register::Rax), 1252);
+        assert_eq!(invoke(shared, context, memory, HostThunk::GetOEMCP), true);
+        assert_eq!(context.state.get(Register::Rax), 437);
+
+        context.state.set(Register::Rcx, 1252);
+        context.state.set(Register::Rdx, CP_INFO);
+        assert_eq!(invoke(shared, context, memory, HostThunk::GetCPInfo), true);
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(memory.load(CP_INFO, 4), Some(1));
+
+        context.state.set(Register::Rcx, 65001);
+        assert_eq!(
+            invoke(shared, context, memory, HostThunk::IsValidCodePage),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(context.last_error, 0);
+        context.state.set(Register::Rcx, 12_345);
+        assert_eq!(
+            invoke(shared, context, memory, HostThunk::IsValidCodePage),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        context.state.set(Register::Rcx, 0);
+        assert_eq!(
+            invoke(shared, context, memory, HostThunk::LocaleNameToLCID),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0x0409);
+
+        assert_eq!(
+            invoke(shared, context, memory, HostThunk::GetProcessHeap),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), PROCESS_HEAP_HANDLE);
+        context.state.set(Register::Rcx, 1);
+        context.state.set(Register::Rdx, HEAPS_OUT);
+        assert_eq!(
+            invoke(shared, context, memory, HostThunk::GetProcessHeaps),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(memory.load(HEAPS_OUT, 8), Some(PROCESS_HEAP_HANDLE));
+
+        context.state.set(Register::Rcx, PROCESS_HEAP_HANDLE);
+        context.state.set(Register::Rdx, 0);
+        context.state.set(Register::R8, 0x5000);
+        assert_eq!(invoke(shared, context, memory, HostThunk::HeapSize), true);
+        assert_eq!(context.state.get(Register::Rax), 77);
+        assert_eq!(context.last_error, 0);
+        context.state.set(Register::R8, 0x5001);
+        assert_eq!(invoke(shared, context, memory, HostThunk::HeapSize), true);
+        assert_eq!(context.state.get(Register::Rax), u64::MAX);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        context.state.set(Register::Rcx, TZ_OUT);
+        assert_eq!(
+            invoke(shared, context, memory, HostThunk::GetTimeZoneInformation),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(memory.load(TZ_OUT, 4), Some(0));
+        assert_eq!(memory.load(TZ_OUT + 4, 6), Some(0x00_43_00_54_00_55));
+
+        context.state.set(Register::Rcx, ENV_NAME);
+        context.state.set(Register::Rdx, ENV_BUFFER);
+        context.state.set(Register::R8, 16);
+        assert_eq!(
+            invoke(shared, context, memory, HostThunk::GetEnvironmentVariableW),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 5);
+        assert_eq!(memory.load(ENV_BUFFER, 5), Some(0x6c_0061_0076));
+    }
+
+    fn hammer_x86_iteration(
+        shared: &ProcessShared,
+        context: &mut GuestThreadContext,
+        memory: &TestMemory,
+    ) {
+        assert_eq!(
+            invoke_x86(
+                shared,
+                context,
+                memory,
+                HostThunk::MultiByteToWideChar,
+                &[65001, 0, MULTI_IN, 1, WIDE_OUT, 4],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(memory.load(WIDE_OUT, 2), Some(0x41));
+
+        assert_eq!(
+            invoke_x86(
+                shared,
+                context,
+                memory,
+                HostThunk::WideCharToMultiByte,
+                &[65001, 0, WIDE_IN, 1, MULTI_OUT, 4, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(memory.load(MULTI_OUT, 1), Some(0x41));
+
+        assert_eq!(
+            invoke_x86(
+                shared,
+                context,
+                memory,
+                HostThunk::CompareStringW,
+                &[0x0409, 1, W_ABC, 3, W_ABC_UPPER, 3],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 2);
+
+        assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                shared,
+                context,
+                memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(memory.load(REG_LEN, 4), Some(12));
+        assert_eq!(memory.load(REG_TYPE, 4), Some(1));
+        assert_eq!(memory.load(REG_BUF, 2), Some(0x68));
+
+        assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                shared,
+                context,
+                memory,
+                HostThunk::RegQueryValueExA,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    ANSI_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(memory.load(REG_LEN, 4), Some(3));
+        assert_eq!(memory.load(REG_BUF, 3), Some(0x0000_6968));
+
+        assert_eq!(
+            invoke_x86(
+                shared,
+                context,
+                memory,
+                HostThunk::GetDateFormatW,
+                &[0, 0, SYSTEMTIME_DATE, W_DATE_FMT, DATE_OUT, 16],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 10);
+        assert_eq!(memory.load(DATE_OUT, 2), Some(0x32));
+
+        assert_eq!(
+            invoke_x86(
+                shared,
+                context,
+                memory,
+                HostThunk::GetTimeFormatW,
+                &[0, 0, SYSTEMTIME_TIME, W_TIME_FMT, TIME_OUT, 16],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 8);
+        assert_eq!(memory.load(TIME_OUT, 2), Some(0x31));
+    }
+
     #[test]
     fn parallel_api_stateless_hammer_has_exact_per_thread_results() {
         let shared = Arc::new(ProcessShared::new());
-        shared.publish_environment(environment(0x1234));
+        let mut environment = environment(0x1234);
+        environment.clock.dtm = true;
+        environment.clock.deterministic_tick_ms = 0;
+        shared.publish_environment(environment);
         const THREADS: u32 = 8;
-        const CALLS: u32 = 400;
-        let expected_version = (22631_u64 << 16) | (10_u64 << 8) | 0x8000_0000;
+        const X64_CALLS: u32 = 100;
+        const X86_CALLS: u32 = 50;
         let mut workers = Vec::new();
         for thread in 0..THREADS {
-            let shared = Arc::clone(&shared);
+            let x64_shared = Arc::clone(&shared);
             workers.push(std::thread::spawn(move || {
                 let mut context = x64_context(0x100 + thread);
                 let memory = TestMemory::new();
-                for _ in 0..CALLS {
-                    assert_eq!(
-                        invoke(
-                            &shared,
-                            &mut context,
-                            &memory,
-                            HostThunk::GetCurrentThreadId
-                        ),
-                        true
-                    );
-                    assert_eq!(context.state.get(Register::Rax), 0x100 + thread as u64);
-                    assert_eq!(
-                        invoke(
-                            &shared,
-                            &mut context,
-                            &memory,
-                            HostThunk::GetCurrentProcessId
-                        ),
-                        true
-                    );
-                    assert_eq!(context.state.get(Register::Rax), 0x1234);
-                    assert_eq!(
-                        invoke(&shared, &mut context, &memory, HostThunk::GetVersion),
-                        true
-                    );
-                    assert_eq!(context.state.get(Register::Rax), expected_version);
+                prepare_hammer_memory(&memory);
+                for _ in 0..X64_CALLS {
+                    hammer_x64_iteration(&x64_shared, &mut context, &memory, thread);
+                }
+            }));
+            let x86_shared = Arc::clone(&shared);
+            workers.push(std::thread::spawn(move || {
+                let mut context = x86_context(0x180 + thread);
+                let memory = TestMemory::new();
+                prepare_hammer_memory(&memory);
+                for _ in 0..X86_CALLS {
+                    hammer_x86_iteration(&x86_shared, &mut context, &memory);
                 }
             }));
         }
@@ -829,8 +2427,21 @@ mod tests {
             worker.join().expect("stateless hammer worker");
         }
         let metrics = shared.api_dispatch_metrics();
-        assert_eq!(metrics.parallel_dispatched, u64::from(THREADS * CALLS * 3));
+        assert_eq!(
+            metrics.parallel_dispatched,
+            u64::from(THREADS * (X64_CALLS * 20 + X86_CALLS * 7))
+        );
+        assert_eq!(
+            metrics.stateless_dispatched,
+            u64::from(THREADS * (X64_CALLS * 14 + X86_CALLS * 3))
+        );
+        assert_eq!(
+            metrics.read_mostly_dispatched,
+            u64::from(THREADS * (X64_CALLS * 6 + X86_CALLS * 4))
+        );
         assert_eq!(metrics.barrier_calls, 0);
+        assert_eq!(metrics.owner_only_barriers, 0);
+        assert_eq!(metrics.fallback_barriers, 0);
     }
 
     #[test]
@@ -879,8 +2490,9 @@ mod tests {
             let stop = Arc::clone(&stop);
             let reads = Arc::clone(&reads);
             readers.push(std::thread::spawn(move || {
-                let mut context = x64_context(0x300 + thread);
+                let mut context = x86_context(0x300 + thread);
                 let memory = TestMemory::new();
+                prepare_hammer_memory(&memory);
                 while !stop.load(Ordering::Acquire) {
                     assert_eq!(
                         invoke(
@@ -893,15 +2505,60 @@ mod tests {
                     );
                     let pid = context.state.get(Register::Rax);
                     assert_eq!(pid == 100 || pid == 101, true);
+
+                    assert_eq!(
+                        invoke_x86(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            HostThunk::GetEnvironmentVariableW,
+                            &[ENV_NAME, ENV_BUFFER, 16],
+                        ),
+                        true
+                    );
+                    assert_eq!(context.state.get(Register::Rax), 5);
+                    let first = memory.load(ENV_BUFFER, 2);
+                    assert_eq!(first == Some(0x76) || first == Some(0x6f), true);
+
+                    assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+                    assert_eq!(
+                        invoke_x86(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            HostThunk::RegQueryValueExW,
+                            &[
+                                u64::from(HKEY_CURRENT_USER),
+                                REG_NAME,
+                                0,
+                                REG_TYPE,
+                                REG_BUF,
+                                REG_LEN,
+                            ],
+                        ),
+                        true
+                    );
+                    assert_eq!(context.state.get(Register::Rax), 0);
+                    assert_eq!(memory.load(REG_LEN, 4), Some(12));
+                    let first = memory.load(REG_BUF, 2);
+                    assert_eq!(first == Some(0x68) || first == Some(0x6f), true);
                     reads.fetch_add(1, Ordering::Relaxed);
                 }
             }));
         }
         for iteration in 0..2_000 {
-            shared.publish_identity(WorkerIdentity {
+            let mut environment = environment(100);
+            let value = if iteration % 2 == 0 { "other" } else { "value" };
+            environment.identity = WorkerIdentity {
                 process_id: if iteration % 2 == 0 { 101 } else { 100 },
                 process_handle: 0x44,
-            });
+            };
+            environment
+                .environment
+                .insert("CASA_TEST".to_string(), value.to_string());
+            environment.registry =
+                registry_with_value(if value == "value" { "hello" } else { "other" });
+            shared.publish_environment(environment);
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while reads.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
@@ -929,6 +2586,8 @@ mod tests {
         let metrics = shared.api_dispatch_metrics();
         assert_eq!(metrics.parallel_dispatched, 0);
         assert_eq!(metrics.barrier_calls, 1);
+        assert_eq!(metrics.owner_only_barriers, 1);
+        assert_eq!(metrics.fallback_barriers, 0);
     }
 
     #[test]
@@ -998,6 +2657,67 @@ mod tests {
             crate::host_thunks::classify_thunk_concurrency("CreateFileW"),
             ThunkConcurrency::OwnerOnly
         );
+        for thunk in [
+            HostThunk::Strlen,
+            HostThunk::LstrlenW,
+            HostThunk::LstrcmpW,
+            HostThunk::LstrcmpiW,
+            HostThunk::CompareStringW,
+            HostThunk::GetCPInfo,
+            HostThunk::IsValidCodePage,
+            HostThunk::LocaleNameToLCID,
+            HostThunk::GetProcessHeap,
+            HostThunk::GetProcessHeaps,
+            HostThunk::GetTimeZoneInformation,
+            HostThunk::GetDateFormatW,
+            HostThunk::GetTimeFormatW,
+        ] {
+            assert_eq!(thunk_class(&thunk), ThunkConcurrency::Stateless);
+        }
+        for thunk in [
+            HostThunk::MultiByteToWideChar,
+            HostThunk::WideCharToMultiByte,
+            HostThunk::GetACP,
+            HostThunk::GetOEMCP,
+            HostThunk::HeapSize,
+            HostThunk::GetEnvironmentVariableW,
+            HostThunk::RegQueryValueExA,
+            HostThunk::RegQueryValueExW,
+        ] {
+            assert_eq!(thunk_class(&thunk), ThunkConcurrency::ReadMostly);
+        }
+        assert_eq!(
+            crate::host_thunks::classify_thunk_concurrency("lstrlenA"),
+            ThunkConcurrency::Stateless
+        );
+        assert_eq!(
+            crate::host_thunks::classify_thunk_concurrency("MultiByteToWideChar"),
+            ThunkConcurrency::ReadMostly
+        );
+        assert_eq!(
+            crate::host_thunks::classify_thunk_concurrency("RegQueryValueExW"),
+            ThunkConcurrency::ReadMostly
+        );
+
+        assert_eq!(worker_registry_view(0, GuestArch::X64), 0);
+        assert_eq!(worker_registry_view(KEY_WOW64_32KEY, GuestArch::X64), 1);
+        assert_eq!(worker_registry_view(KEY_WOW64_64KEY, GuestArch::X86), 2);
+        assert_eq!(root_registry_key(HKEY_CLASSES_ROOT), Some(("HKCR", "")));
+        assert_eq!(root_registry_key(HKEY_CURRENT_USER), Some(("HKCU", "")));
+        assert_eq!(root_registry_key(HKEY_LOCAL_MACHINE), Some(("HKLM", "")));
+        assert_eq!(root_registry_key(HKEY_USERS), Some(("HKCU", "")));
+        assert_eq!(
+            root_registry_key(HKEY_CURRENT_CONFIG),
+            Some((
+                "HKLM",
+                "System\\CurrentControlSet\\Hardware Profiles\\Current"
+            ))
+        );
+        assert_eq!(root_registry_key(0x1234), None);
+        for byte in 0..=u8::MAX {
+            assert_eq!(encode_cp1252(decode_cp1252(byte)), Some(byte));
+        }
+        assert_eq!(encode_cp1252('\u{0100}'), None);
     }
 
     #[test]
@@ -1076,6 +2796,11 @@ mod tests {
             false
         );
         assert_eq!(context.state.rip, thunk_address(&context));
+        let metrics = shared.api_dispatch_metrics();
+        assert_eq!(metrics.parallel_dispatched, 0);
+        assert_eq!(metrics.barrier_calls, 1);
+        assert_eq!(metrics.fallback_barriers, 1);
+        assert_eq!(metrics.owner_only_barriers, 0);
 
         // VersionEx* also refuse to guess without a published version.
         let mut context_w = x64_context(0x702);
@@ -1125,12 +2850,559 @@ mod tests {
         assert_eq!(super::read_arg(&context, &memory, 4), Some(0));
         context.state.set(Register::Rsp, 0x1_0000);
         assert_eq!(super::read_arg(&context, &memory, 4), None);
+
+        // String-conversion boundaries.  Invalid UTF-8/UTF-16 and an
+        // unencodable CP1252 character map to ERROR_INVALID_PARAMETER; a
+        // too-small destination maps to ERROR_INSUFFICIENT_BUFFER.
+        let shared = ProcessShared::new();
+        shared.publish_environment(environment(12));
+        let memory = TestMemory::new();
+        prepare_hammer_memory(&memory);
+        let mut context = x86_context(0x640);
+
+        assert_eq!(memory.store(MULTI_IN, &[0xff]), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::MultiByteToWideChar,
+                &[65001, 0, MULTI_IN, 1, WIDE_OUT, 4],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        assert_eq!(memory.store(WIDE_IN, &0xD800_u16.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::WideCharToMultiByte,
+                &[65001, 0, WIDE_IN, 1, MULTI_OUT, 4, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        assert_eq!(memory.store(MULTI_IN, b"AB"), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::MultiByteToWideChar,
+                &[65001, 0, MULTI_IN, 2, WIDE_OUT, 1],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INSUFFICIENT_BUFFER);
+
+        assert_eq!(memory.store(WIDE_IN, &[0x41, 0, 0x42, 0]), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::WideCharToMultiByte,
+                &[65001, 0, WIDE_IN, 2, MULTI_OUT, 1, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INSUFFICIENT_BUFFER);
+
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::MultiByteToWideChar,
+                &[65001, 0, 0, 1, WIDE_OUT, 4],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        // CP1252 cannot encode U+0100 (the owner reports RcCliInvalid).
+        assert_eq!(memory.store(WIDE_IN, &0x0100_u16.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::WideCharToMultiByte,
+                &[1252, 0, WIDE_IN, 1, MULTI_OUT, 4, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        // Input/format pointers outside the view fall back to the barrier.
+        for (thunk, args) in [
+            (HostThunk::Strlen, vec![0x5000]),
+            (HostThunk::LstrlenW, vec![0x5000]),
+            (HostThunk::LstrcmpW, vec![0x5000, 0x5000]),
+            (HostThunk::LstrcmpW, vec![W_ABC, 0x5000]),
+            (HostThunk::LstrcmpiW, vec![0x5000, W_ABC]),
+            (HostThunk::LocaleNameToLCID, vec![0x5000, 0]),
+            (
+                HostThunk::GetEnvironmentVariableW,
+                vec![0x5000, ENV_BUFFER, 16],
+            ),
+            (
+                HostThunk::MultiByteToWideChar,
+                vec![65001, 0, 0x5000, 0xFFFF_FFFF, WIDE_OUT, 4],
+            ),
+            (
+                HostThunk::WideCharToMultiByte,
+                vec![65001, 0, 0x5000, 0xFFFF_FFFF, MULTI_OUT, 4, 0, 0],
+            ),
+            (
+                HostThunk::WideCharToMultiByte,
+                vec![65001, 0, WIDE_IN, 0x7FFF_FFFF, MULTI_OUT, 4, 0, 0],
+            ),
+            (
+                HostThunk::GetDateFormatW,
+                vec![0, 0, SYSTEMTIME_DATE, 0x5000, DATE_OUT, 16],
+            ),
+            (
+                HostThunk::GetTimeFormatW,
+                vec![0, 0, SYSTEMTIME_TIME, 0x5000, TIME_OUT, 16],
+            ),
+            (
+                HostThunk::RegQueryValueExA,
+                vec![
+                    u64::from(HKEY_CURRENT_USER),
+                    0x5000,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN,
+                ],
+            ),
+            (
+                HostThunk::RegQueryValueExW,
+                vec![
+                    u64::from(HKEY_CURRENT_USER),
+                    0x5000,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    0x5000,
+                ],
+            ),
+        ] {
+            let mut context = x86_context(0x680);
+            assert_eq!(
+                invoke_x86(&shared, &mut context, &memory, thunk, &args),
+                false,
+                "an unreadable input must fall back to the barrier"
+            );
+        }
+
+        // The default value name (NULL) is looked up as the empty name; an
+        // unreadable data-length pointer fails closed.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    0,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ],
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            u64::from(ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    0x5000
+                ],
+            ),
+            false
+        );
+
+        // A code page the worker cannot reproduce exactly stays on the owner
+        // barrier rather than guessing.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::MultiByteToWideChar,
+                &[932, 0, MULTI_IN, 1, WIDE_OUT, 4],
+            ),
+            false
+        );
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::WideCharToMultiByte,
+                &[932, 0, WIDE_IN, 1, MULTI_OUT, 4, 0, 0],
+            ),
+            false
+        );
+
+        // CP_ACP and CP_THREAD_ACP both resolve through the published locale.
+        assert_eq!(memory.store(MULTI_IN, &[b'A', 0]), true);
+        store_utf16(&memory, WIDE_IN, "A");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::MultiByteToWideChar,
+                &[0, 0, MULTI_IN, 1, WIDE_OUT, 4],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::MultiByteToWideChar,
+                &[3, 0, MULTI_IN, 1, WIDE_OUT, 4],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::WideCharToMultiByte,
+                &[0, 0, WIDE_IN, 1, MULTI_OUT, 4, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::WideCharToMultiByte,
+                &[3, 0, WIDE_IN, 1, MULTI_OUT, 4, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+
+        // A NULL source with a non-zero length is the documented Invalid
+        // Parameter case for the wide conversion.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::WideCharToMultiByte,
+                &[65001, 0, 0, 1, MULTI_OUT, 4, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        // GetCPInfo rejects an unknown code page while IsValidCodePage simply
+        // reports false.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetCPInfo,
+                &[12_345, CP_INFO],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        // A valid locale name resolves even though the runtime models en-US.
+        store_utf16(&memory, ANSI_NAME, "en-US");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::LocaleNameToLCID,
+                &[ANSI_NAME, 0],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0x0409);
+        assert_eq!(context.last_error, 0);
+
+        // Environment argument validation.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetEnvironmentVariableW,
+                &[ENV_NAME, ENV_BUFFER, 0],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 6);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetEnvironmentVariableW,
+                &[ENV_NAME, 0, 1],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+        // An overflowing input length is an unreadable window, not a guess.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::MultiByteToWideChar,
+                &[65001, 0, MULTI_IN, i32::MAX as u64, WIDE_OUT, 4],
+            ),
+            false
+        );
+
+        // CompareStringW honours the requested prefix length exactly.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::CompareStringW,
+                &[0x0409, 0, W_ABC, 2, W_ABC, 3],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+
+        // Registry boundary errors: reserved argument, missing value and a
+        // buffer that cannot hold the encoded value.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    1,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ],
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            u64::from(ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        store_utf16(&memory, REG_NAME, "Missing");
+        assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ],
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            u64::from(ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(context.last_error, ERROR_FILE_NOT_FOUND);
+        assert_eq!(memory.load(REG_LEN, 4), Some(0));
+        assert_eq!(memory.load(REG_TYPE, 4), Some(0));
+
+        store_utf16(&memory, REG_NAME, "Demo");
+        assert_eq!(memory.store(REG_LEN, &4_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), u64::from(ERROR_MORE_DATA));
+        assert_eq!(context.last_error, ERROR_MORE_DATA);
+        assert_eq!(memory.load(REG_LEN, 4), Some(12));
+
+        // Date formatting's too-small buffer is ERROR_INSUFFICIENT_BUFFER.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetDateFormatW,
+                &[0, 0, SYSTEMTIME_DATE, W_DATE_FMT, DATE_OUT, 4],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INSUFFICIENT_BUFFER);
+
+        // A value whose type the owner cannot encode falls back to the
+        // barrier; a malformed value of a known type does too, while an empty
+        // REG_BINARY succeeds with a zero-length write.
+        let mut environment = environment(13);
+        let mut registry = registry_with_value("hello");
+        for key in registry
+            .roots
+            .values_mut()
+            .chain(registry.keys.values_mut())
+        {
+            key.values.insert(
+                "BadType".to_string(),
+                StoredRegistryValue {
+                    value_type: "REG_UNKNOWN".to_string(),
+                    data: json!("x"),
+                },
+            );
+            key.values.insert(
+                "BadData".to_string(),
+                StoredRegistryValue {
+                    value_type: "REG_DWORD".to_string(),
+                    data: json!("not-a-number"),
+                },
+            );
+            key.values.insert(
+                "EmptyBin".to_string(),
+                StoredRegistryValue {
+                    value_type: "REG_BINARY".to_string(),
+                    data: json!([]),
+                },
+            );
+        }
+        environment.registry = registry;
+        shared.publish_environment(environment);
+
+        store_utf16(&memory, REG_NAME, "BadType");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ],
+            ),
+            false
+        );
+        store_utf16(&memory, REG_NAME, "BadData");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ],
+            ),
+            false
+        );
+        store_utf16(&memory, REG_NAME, "EmptyBin");
+        assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ],
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(memory.load(REG_LEN, 4), Some(0));
+        assert_eq!(memory.load(REG_TYPE, 4), Some(3));
     }
 
     #[test]
     fn parallel_api_worker_success_paths_have_exact_results() {
         let shared = ProcessShared::new();
-        shared.publish_environment(environment(0x2222));
+        let mut environment = environment(0x2222);
+        environment.clock.dtm = true;
+        shared.publish_environment(environment);
         let memory = TestMemory::new();
 
         let mut context = x64_context(0x800);
@@ -1353,6 +3625,512 @@ mod tests {
             true
         );
         assert_eq!(context.state.get(Register::Rax), 0);
+
+        // The string helpers accept NULL as the empty string.
+        prepare_hammer_memory(&memory);
+        context.state.set(Register::Rcx, 0);
+        assert_eq!(
+            invoke(&shared, &mut context, &memory, HostThunk::Strlen),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(
+            invoke(&shared, &mut context, &memory, HostThunk::LstrlenW),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+
+        let mut x86 = x86_context(0xE00);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::CompareStringW,
+                &[0x0409, 0, W_ABC, 0xFFFF_FFFF, W_ABC, 3],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 2);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::CompareStringW,
+                &[0x0409, 0, W_ABC, 3, W_ABC_UPPER, 3],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 3);
+
+        // Negative lengths use the NUL terminator (including it for the
+        // wide-to-multi conversion), and NULL destinations query the size.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::MultiByteToWideChar,
+                &[65001, 0, MULTI_IN, 0xFFFF_FFFF, WIDE_OUT, 4],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 2);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::MultiByteToWideChar,
+                &[65001, 0, MULTI_IN, 1, 0, 4],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 1);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::WideCharToMultiByte,
+                &[65001, 0, WIDE_IN, 0xFFFF_FFFF, MULTI_OUT, 4, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 2);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::WideCharToMultiByte,
+                &[65001, 0, WIDE_IN, 1, 0, 4, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 1);
+
+        // GetCPInfo accepts a NULL output pointer.
+        assert_eq!(
+            invoke_x86(&shared, &mut x86, &memory, HostThunk::GetCPInfo, &[1252, 0]),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 1);
+
+        // LocaleNameToLCID rejects an unknown locale name.
+        store_utf16(&memory, ANSI_NAME, "zz-ZZ");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::LocaleNameToLCID,
+                &[ANSI_NAME, 0],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 0);
+        assert_eq!(x86.last_error, ERROR_INVALID_PARAMETER);
+
+        // GetProcessHeaps writes nothing when the buffer is omitted.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetProcessHeaps,
+                &[0, HEAPS_OUT],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 1);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetProcessHeaps,
+                &[1, HEAPS_OUT],
+            ),
+            true
+        );
+        assert_eq!(memory.load(HEAPS_OUT, 4), Some(PROCESS_HEAP_HANDLE));
+
+        // HeapSize on a non-process heap is the arch-specific sentinel.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::HeapSize,
+                &[0x2000, 0, 0x5000],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), u32::MAX as u64);
+        assert_eq!(x86.last_error, ERROR_INVALID_PARAMETER);
+
+        // A NULL TIME_ZONE_INFORMATION pointer still reports the zone id.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetTimeZoneInformation,
+                &[0],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 0);
+
+        // Default date/time pictures (no format string).
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetDateFormatW,
+                &[0, 0, SYSTEMTIME_DATE, 0, DATE_OUT, 32],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 8);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetDateFormatW,
+                &[0, 2, SYSTEMTIME_DATE, 0, DATE_OUT, 32],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 22);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetTimeFormatW,
+                &[0, 0, SYSTEMTIME_TIME, 0, TIME_OUT, 32],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 10);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetTimeFormatW,
+                &[0, 8, SYSTEMTIME_TIME, 0, TIME_OUT, 32],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 8);
+
+        // Every date token width, quoted literals, escaped quotes and an
+        // unterminated literal.
+        store_utf16(&memory, ANSI_NAME, "d dd ddd dddd M MM MMM MMMM y yy yyyy");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetDateFormatW,
+                &[0, 0, SYSTEMTIME_DATE, ANSI_NAME, DATE_OUT, 64],
+            ),
+            true
+        );
+        assert_eq!(
+            load_utf16(&memory, DATE_OUT, 64),
+            "5 05 Tue Tuesday 3 03 Mar March 24 24 2024"
+        );
+        store_utf16(&memory, ANSI_NAME, "'Lit''eral'");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetDateFormatW,
+                &[0, 0, SYSTEMTIME_DATE, ANSI_NAME, DATE_OUT, 64],
+            ),
+            true
+        );
+        assert_eq!(load_utf16(&memory, DATE_OUT, 64), "Lit'eral");
+        store_utf16(&memory, ANSI_NAME, "'oops");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetDateFormatW,
+                &[0, 0, SYSTEMTIME_DATE, ANSI_NAME, DATE_OUT, 64],
+            ),
+            true
+        );
+        assert_eq!(load_utf16(&memory, DATE_OUT, 64), "oops");
+
+        // Every time token width, a quoted literal, and the force-24 form.
+        store_utf16(&memory, ANSI_NAME, "h hh H HH m mm s ss t tt");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetTimeFormatW,
+                &[0, 0, SYSTEMTIME_TIME, ANSI_NAME, TIME_OUT, 64],
+            ),
+            true
+        );
+        assert_eq!(
+            load_utf16(&memory, TIME_OUT, 64),
+            "2 02 14 14 5 05 9 09 P PM"
+        );
+        store_utf16(&memory, ANSI_NAME, "'T'");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetTimeFormatW,
+                &[0, 0, SYSTEMTIME_TIME, ANSI_NAME, TIME_OUT, 64],
+            ),
+            true
+        );
+        assert_eq!(load_utf16(&memory, TIME_OUT, 64), "T");
+        store_utf16(&memory, ANSI_NAME, "t");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetTimeFormatW,
+                &[0, 8, SYSTEMTIME_TIME, ANSI_NAME, TIME_OUT, 64],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 0);
+        assert_eq!(load_utf16(&memory, TIME_OUT, 64), "");
+
+        // Buffer-size queries preserve the guest last-error value.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetDateFormatW,
+                &[0, 0, SYSTEMTIME_DATE, W_DATE_FMT, 0, 64],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 11);
+
+        // Direct helper coverage for escaped and unterminated quoted
+        // literals in both formatters, plus the "today"/"now" paths.
+        let helper = TestMemory::new();
+        store_utf16(&helper, ANSI_NAME, "'a''b'");
+        assert_eq!(
+            format_date_tokens_worker(&helper, ANSI_NAME, 2024, 3, 5, 2).unwrap(),
+            "a'b"
+        );
+        store_utf16(&helper, ANSI_NAME, "'oops");
+        assert_eq!(
+            format_date_tokens_worker(&helper, ANSI_NAME, 2024, 3, 5, 2).unwrap(),
+            "oops"
+        );
+        store_utf16(&helper, ANSI_NAME, "'a''b'");
+        assert_eq!(
+            format_time_tokens_worker(&helper, ANSI_NAME, 14, 5, 9, false).unwrap(),
+            "a'b"
+        );
+        store_utf16(&helper, ANSI_NAME, "'oops");
+        assert_eq!(
+            format_time_tokens_worker(&helper, ANSI_NAME, 14, 5, 9, false).unwrap(),
+            "oops"
+        );
+        store_utf16(&memory, ANSI_NAME, "'X'");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetDateFormatW,
+                &[0, 0, 0, ANSI_NAME, DATE_OUT, 16],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 1);
+        assert_eq!(load_utf16(&memory, DATE_OUT, 16), "X");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetTimeFormatW,
+                &[0, 0, 0, ANSI_NAME, TIME_OUT, 16],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 1);
+        assert_eq!(load_utf16(&memory, TIME_OUT, 16), "X");
+
+        // Comparison ordering: every Less/Equal/Greater arm in both the
+        // case-folding and case-sensitive paths.
+        store_utf16(&memory, 0x13A0, "a");
+        store_utf16(&memory, 0x13B0, "b");
+        context.state.set(Register::Rcx, 0x13A0);
+        context.state.set(Register::Rdx, 0x13B0);
+        assert_eq!(
+            invoke(&shared, &mut context, &memory, HostThunk::LstrcmpW),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), u64::MAX);
+        context.state.set(Register::Rcx, 0);
+        context.state.set(Register::Rdx, 0);
+        assert_eq!(
+            invoke(&shared, &mut context, &memory, HostThunk::LstrcmpW),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        context.state.set(Register::Rcx, 0x13A0);
+        context.state.set(Register::Rdx, 0x13B0);
+        assert_eq!(
+            invoke(&shared, &mut context, &memory, HostThunk::LstrcmpiW),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), u64::MAX);
+        context.state.set(Register::Rcx, 0x13B0);
+        context.state.set(Register::Rdx, 0x13A0);
+        assert_eq!(
+            invoke(&shared, &mut context, &memory, HostThunk::LstrcmpiW),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::CompareStringW,
+                &[0x0409, 1, 0x13A0, 1, 0x13B0, 1],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 1);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::CompareStringW,
+                &[0x0409, 1, 0x13B0, 1, 0x13A0, 1],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 3);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::CompareStringW,
+                &[0x0409, 0, 0x13A0, 1, 0x13A0, 1],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 2);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetDateFormatW,
+                &[0, 0, SYSTEMTIME_DATE, W_DATE_FMT, DATE_OUT, 0],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 11);
+
+        // Environment read: size query, insufficient buffer, missing value
+        // and case-insensitive lookup.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetEnvironmentVariableW,
+                &[ENV_NAME, 0, 0],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 6);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetEnvironmentVariableW,
+                &[ENV_NAME, ENV_BUFFER, 3],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 6);
+        assert_eq!(x86.last_error, ERROR_INSUFFICIENT_BUFFER);
+        store_utf16(&memory, ENV_NAME, "casa_test");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetEnvironmentVariableW,
+                &[ENV_NAME, ENV_BUFFER, 16],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 5);
+        store_utf16(&memory, ENV_NAME, "MISSING_ENV");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::GetEnvironmentVariableW,
+                &[ENV_NAME, ENV_BUFFER, 16],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 0);
+        assert_eq!(x86.last_error, ERROR_ENVVAR_NOT_FOUND);
+
+        // Registry: an opened key handle, NULL type/data pointers and an
+        // unknown handle that must fall back to the barrier.
+        store_utf16(&memory, REG_NAME, "Demo");
+        assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[0x1234, REG_NAME, 0, 0, 0, REG_LEN],
+            ),
+            true
+        );
+        assert_eq!(x86.state.get(Register::Rax), 0);
+        assert_eq!(memory.load(REG_LEN, 4), Some(12));
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut x86,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[0x9999, REG_NAME, 0, REG_TYPE, REG_BUF, REG_LEN],
+            ),
+            false
+        );
     }
 
     struct FailingMemory<'a> {
@@ -1391,6 +4169,20 @@ mod tests {
         );
         context.state.set(Register::Rsp, pushed);
         address
+    }
+
+    fn prepare_x86_call(
+        shared: &ProcessShared,
+        context: &mut GuestThreadContext,
+        memory: &TestMemory,
+        thunk: HostThunk,
+        args: &[u64],
+    ) -> u64 {
+        context.state.set(Register::Rsp, STACK);
+        for (index, value) in args.iter().enumerate() {
+            set_x86_arg(memory, index as u64, *value as u32);
+        }
+        prepare_call(shared, context, memory, thunk)
     }
 
     #[test]
@@ -1452,6 +4244,24 @@ mod tests {
             HostThunk::CharNextW,
             HostThunk::CharPrevW,
             HostThunk::StrFromTimeIntervalW,
+            HostThunk::Strlen,
+            HostThunk::LstrlenW,
+            HostThunk::LstrcmpW,
+            HostThunk::LstrcmpiW,
+            HostThunk::CompareStringW,
+            HostThunk::MultiByteToWideChar,
+            HostThunk::WideCharToMultiByte,
+            HostThunk::GetCPInfo,
+            HostThunk::IsValidCodePage,
+            HostThunk::LocaleNameToLCID,
+            HostThunk::GetProcessHeaps,
+            HostThunk::HeapSize,
+            HostThunk::GetTimeZoneInformation,
+            HostThunk::GetDateFormatW,
+            HostThunk::GetTimeFormatW,
+            HostThunk::GetEnvironmentVariableW,
+            HostThunk::RegQueryValueExA,
+            HostThunk::RegQueryValueExW,
         ];
         for (index, thunk) in first_arg.into_iter().enumerate() {
             let mut context = x86_context(0xC00 + index as u32);
@@ -1476,6 +4286,39 @@ mod tests {
         let address = prepare_call(&shared, &mut context, &memory, HostThunk::CharPrevW);
         assert_eq!(shared.run_worker_api(&mut context, &memory, address), false);
 
+        // IsWow64Process also reads (and ignores) its first argument, so a
+        // first-argument-only fault must not execute the thunk.
+        struct LoadHoleMemory<'a> {
+            inner: &'a TestMemory,
+            hole: u64,
+        }
+        impl WorkerMemoryView for LoadHoleMemory<'_> {
+            fn load(&self, address: u64, len: usize) -> Option<u64> {
+                if address == self.hole {
+                    None
+                } else {
+                    self.inner.load(address, len)
+                }
+            }
+
+            fn store(&self, address: u64, bytes: &[u8]) -> bool {
+                self.inner.store(address, bytes)
+            }
+        }
+        let mut context = x86_context(0xC82);
+        let hole_memory = TestMemory::new();
+        let address = prepare_call(
+            &shared,
+            &mut context,
+            &hole_memory,
+            HostThunk::IsWow64Process,
+        );
+        let hole = LoadHoleMemory {
+            inner: &hole_memory,
+            hole: STACK,
+        };
+        assert_eq!(shared.run_worker_api(&mut context, &hole, address), false);
+
         // StrFromTimeIntervalW reads arguments 1..3 after a readable buffer.
         for (index, stack) in [(1_u32, 0x1FFC_u64), (2, 0x1FF8), (3, 0x1FF4)] {
             let mut context = x86_context(0xC90 + index);
@@ -1499,6 +4342,7 @@ mod tests {
         let shared = ProcessShared::new();
         shared.publish_environment(environment(0x5555));
         let memory = TestMemory::new();
+        prepare_hammer_memory(&memory);
         // Seed a full-size version header so the writers get past the size read.
         assert_eq!(memory.store(0x1B00, &0x11C_u32.to_le_bytes()), true);
         assert_eq!(memory.store(0x1D00, &0x9C_u32.to_le_bytes()), true);
@@ -1514,6 +4358,13 @@ mod tests {
             (HostThunk::GetNativeSystemInfo, [0x1B00, 0, 0, 0]),
             (HostThunk::GlobalMemoryStatusEx, [0x1B00, 0, 0, 0]),
             (HostThunk::StrFromTimeIntervalW, [0x1B00, 8, 3_723_000, 4]),
+            (HostThunk::GetCPInfo, [1252, CP_INFO, 0, 0]),
+            (HostThunk::GetProcessHeaps, [1, HEAPS_OUT, 0, 0]),
+            (HostThunk::GetTimeZoneInformation, [TZ_OUT, 0, 0, 0]),
+            (
+                HostThunk::GetEnvironmentVariableW,
+                [ENV_NAME, ENV_BUFFER, 16, 0],
+            ),
         ];
         for (index, (thunk, args)) in cases.iter().enumerate() {
             let mut context = x64_context(0xB00 + index as u32);
@@ -1544,6 +4395,67 @@ mod tests {
             assert_eq!(
                 saw_false, true,
                 "a write fault must fall back to the barrier (case {index}: {thunk:?})"
+            );
+        }
+
+        // Six- and eight-argument writers use the x86 stack form.
+        let x86_cases: Vec<(HostThunk, Vec<u64>)> = vec![
+            (
+                HostThunk::MultiByteToWideChar,
+                vec![65001, 0, MULTI_IN, 1, WIDE_OUT, 4],
+            ),
+            (
+                HostThunk::WideCharToMultiByte,
+                vec![65001, 0, WIDE_IN, 1, MULTI_OUT, 4, 0, 0x1C00],
+            ),
+            (
+                HostThunk::RegQueryValueExW,
+                vec![
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN,
+                ],
+            ),
+            (
+                HostThunk::RegQueryValueExA,
+                vec![
+                    u64::from(HKEY_CURRENT_USER),
+                    ANSI_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN,
+                ],
+            ),
+            (
+                HostThunk::GetDateFormatW,
+                vec![0, 0, SYSTEMTIME_DATE, W_DATE_FMT, DATE_OUT, 16],
+            ),
+            (
+                HostThunk::GetTimeFormatW,
+                vec![0, 0, SYSTEMTIME_TIME, W_TIME_FMT, TIME_OUT, 16],
+            ),
+        ];
+        for (index, (thunk, args)) in x86_cases.iter().enumerate() {
+            let mut saw_false = false;
+            for allowed in 0..=64 {
+                let mut context = x86_context(0xB40 + index as u32);
+                assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+                let address = prepare_x86_call(&shared, &mut context, &memory, thunk.clone(), args);
+                let failing = FailingMemory {
+                    inner: &memory,
+                    remaining: std::cell::Cell::new(allowed),
+                };
+                if !shared.run_worker_api(&mut context, &failing, address) {
+                    saw_false = true;
+                }
+            }
+            assert_eq!(
+                saw_false, true,
+                "an x86 write fault must fall back to the barrier (case {index}: {thunk:?})"
             );
         }
 

@@ -3553,15 +3553,18 @@ mod tests {
             );
             let directory_buffer = words(&mut fixture.memory, 0x41_600, 16);
             let length = words(&mut fixture.memory, 0x41_640, 1);
+            // The host has a real CoreCLR: a 16-char buffer is too small, so
+            // the call reports the required size instead of failing absent.
             assert_eq!(
                 dispatch_x86(
                     &mut fixture,
                     HostThunk::GetCorSystemDirectory,
                     &[directory_buffer as u32, 16, length as u32],
                 ),
-                u64::from(E_FAIL)
+                0x8007_007A,
+                "insufficient CoreCLR directory buffer"
             );
-            assert_eq!(read_u32_at(&fixture.memory, length), 0);
+            assert_ne!(read_u32_at(&fixture.memory, length), 0);
             assert_eq!(
                 dispatch_x86(
                     &mut fixture,

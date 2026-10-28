@@ -20715,4 +20715,1204 @@ mod tests {
             assert_ne!(guest_ptr(&fixture, REG_REG_OUT), 0);
         })
     }
+    #[test]
+    fn com_method_evidence_istream_full_surface_rejects_invalid_inputs() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-method-stream");
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, b"abcdef".to_vec(), "s.bin", None)
+                .unwrap();
+            let bad_this = 0xDEAD_BEEF_u32;
+            fixture.memory.map_bytes(BUF, &[0_u8; 16]);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[stream as u32, BUF as u32, 2, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 2);
+            assert_eq!(fixture.memory.read_bytes(BUF, 2).unwrap(), b"ab");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[stream as u32, BUF as u32, 99, OUT as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 4);
+            assert_eq!(
+                call_slot(&mut fixture, stream, 3, &[stream as u32, 0, 1, OUT as u32]),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    3,
+                    &[bad_this, BUF as u32, 1, OUT as u32]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+
+            fixture.memory.map_bytes(BUF, b"XY");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    4,
+                    &[stream as u32, BUF as u32, 2, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 2);
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_streams
+                    .get(&stream)
+                    .unwrap()
+                    .data
+                    .clone(),
+                b"abcdefXY".to_vec()
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 4, &[stream as u32, 0, 1, OUT as u32]),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    4,
+                    &[bad_this, BUF as u32, 1, OUT as u32]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    5,
+                    &[stream as u32, 0, 0, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u64(OUT).unwrap(), 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    5,
+                    &[stream as u32, 0, 0, 9, OUT as u32]
+                ),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    5,
+                    &[stream as u32, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, OUT as u32]
+                ),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 5, &[bad_this, 0, 0, 0, OUT as u32]),
+                STG_E_INVALIDPOINTER
+            );
+
+            assert_eq!(
+                call_slot(&mut fixture, stream, 6, &[stream as u32, 4, 0]),
+                S_OK
+            );
+            assert_eq!(
+                fixture.runtime.com_streams.get(&stream).unwrap().data.len(),
+                4
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    6,
+                    &[stream as u32, 0xFFFF_FFFF, 0xFFFF_FFFF]
+                ),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 6, &[bad_this, 4, 0]),
+                STG_E_INVALIDPOINTER
+            );
+
+            let destination = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, Vec::new(), "copy.bin", None)
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    7,
+                    &[
+                        stream as u32,
+                        destination as u32,
+                        2,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32
+                    ]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 2);
+            assert_eq!(fixture.memory.read_u32(OUT + 4).unwrap(), 2);
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_streams
+                    .get(&destination)
+                    .unwrap()
+                    .data
+                    .clone(),
+                b"ab".to_vec()
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    7,
+                    &[
+                        stream as u32,
+                        destination as u32,
+                        0xFFFF_FFFF,
+                        0xFFFF_FFFF,
+                        OUT as u32,
+                        (OUT + 4) as u32
+                    ]
+                ),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    7,
+                    &[stream as u32, 0, 1, 0, OUT as u32, (OUT + 4) as u32]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    7,
+                    &[
+                        bad_this,
+                        destination as u32,
+                        1,
+                        0,
+                        OUT as u32,
+                        (OUT + 4) as u32
+                    ]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+
+            assert_eq!(
+                call_slot(&mut fixture, stream, 8, &[stream as u32, 0]),
+                S_OK
+            );
+            assert_eq!(call_slot(&mut fixture, stream, 9, &[stream as u32]), S_OK);
+            assert_eq!(
+                call_slot(&mut fixture, stream, 8, &[bad_this, 0]),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 9, &[bad_this]),
+                STG_E_INVALIDPOINTER
+            );
+
+            assert_eq!(
+                call_slot(&mut fixture, stream, 10, &[stream as u32, 0, 0, 2, 0, 1]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 10, &[stream as u32, 0, 0, 2, 0, 1]),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    10,
+                    &[stream as u32, 0xFFFF_FFFF, 0xFFFF_FFFF, 2, 0, 1]
+                ),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 10, &[bad_this, 0, 0, 2, 0, 1]),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 11, &[stream as u32, 0, 0, 2, 0, 1]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 11, &[stream as u32, 0, 0, 2, 0, 1]),
+                STG_E_INVALIDFUNCTION
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 11, &[bad_this, 0, 0, 2, 0, 1]),
+                STG_E_INVALIDPOINTER
+            );
+
+            fixture.memory.map_bytes(STAT, &[0_u8; 72]);
+            assert_eq!(
+                call_slot(&mut fixture, stream, 12, &[stream as u32, STAT as u32, 0]),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT + 4).unwrap(), 2);
+            assert_eq!(fixture.memory.read_u64(STAT + 8).unwrap(), 4);
+            let stat_name = guest_ptr(&fixture, STAT);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, stat_name).unwrap(),
+                "s.bin"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 12, &[bad_this, STAT as u32, 0]),
+                STG_E_INVALIDPOINTER
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, stream, 13, &[stream as u32, OUT as u32]),
+                S_OK
+            );
+            let clone = guest_ptr(&fixture, OUT);
+            assert_ne!(clone, stream);
+            assert_eq!(
+                fixture.runtime.com_streams.get(&clone).unwrap().data,
+                b"abcd".to_vec()
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 13, &[bad_this, OUT as u32]),
+                STG_E_INVALIDPOINTER
+            );
+        })
+    }
+
+    #[test]
+    fn com_method_evidence_istorage_full_surface_rejects_invalid_inputs() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-method-storage");
+            let directory = fixture._temp.path().join("method-store");
+            std::fs::create_dir_all(&directory).unwrap();
+            let storage = fixture
+                .runtime
+                .alloc_com_storage_object(
+                    &mut fixture.memory,
+                    Some(directory.to_string_lossy().to_string()),
+                    "method-store",
+                    0,
+                )
+                .unwrap();
+            let bad_this = 0xDEAD_BEEF_u32;
+            let second = NAME + 0x100;
+            let absent = NAME + 0x200;
+
+            write_utf16(&mut fixture, NAME, "a.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    3,
+                    &[storage as u32, NAME as u32, 0x1002, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            let stream = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, b"abc");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    4,
+                    &[stream as u32, BUF as u32, 3, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, stream, 8, &[stream as u32, 0]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    3,
+                    &[storage as u32, NAME as u32, 0x1002, 0, OUT as u32]
+                ),
+                STG_E_FILEALREADYEXISTS
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    3,
+                    &[storage as u32, bad_this, 0x1002, 0, OUT as u32]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    3,
+                    &[storage as u32, NAME as u32, 0x1002, 0, 0]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    3,
+                    &[bad_this, NAME as u32, 0x1002, 0, OUT as u32]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    4,
+                    &[storage as u32, NAME as u32, 0, 0x1000, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+            write_utf16(&mut fixture, NAME, "missing.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    4,
+                    &[storage as u32, NAME as u32, 0, 0x1000, 0, OUT as u32]
+                ),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    4,
+                    &[storage as u32, NAME as u32, 0, 0x1000, 0, 0]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    4,
+                    &[bad_this, NAME as u32, 0, 0x1000, 0, OUT as u32]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+
+            write_utf16(&mut fixture, NAME, "sub");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    5,
+                    &[storage as u32, NAME as u32, 0x1000, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    5,
+                    &[storage as u32, NAME as u32, 0x1000, 0, OUT as u32]
+                ),
+                STG_E_FILEALREADYEXISTS
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    5,
+                    &[storage as u32, NAME as u32, 0x1000, 0, 0]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    6,
+                    &[storage as u32, NAME as u32, 0, 0x1000, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            write_utf16(&mut fixture, NAME, "absent");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    6,
+                    &[storage as u32, NAME as u32, 0, 0x1000, 0, OUT as u32]
+                ),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    6,
+                    &[bad_this, NAME as u32, 0, 0x1000, 0, OUT as u32]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+
+            let destination = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "dest", 0)
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    7,
+                    &[storage as u32, 0, 0, 0, destination as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    7,
+                    &[storage as u32, 0, 0, 0, storage as u32]
+                ),
+                STG_E_ACCESSDENIED
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 7, &[storage as u32, 0, 0, 0, 0]),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    7,
+                    &[bad_this, 0, 0, 0, destination as u32]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+
+            write_utf16(&mut fixture, NAME, "m.bin");
+            write_utf16(&mut fixture, second, "moved.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    3,
+                    &[storage as u32, NAME as u32, 0x1002, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    8,
+                    &[storage as u32, NAME as u32, second as u32, 1]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    8,
+                    &[storage as u32, second as u32, NAME as u32, 0]
+                ),
+                STG_E_INVALIDFUNCTION
+            );
+            write_utf16(&mut fixture, absent, "absent.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    8,
+                    &[storage as u32, absent as u32, second as u32, 1]
+                ),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    8,
+                    &[bad_this, absent as u32, second as u32, 1]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+
+            assert_eq!(
+                call_slot(&mut fixture, storage, 9, &[storage as u32, 0]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 10, &[storage as u32]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 9, &[bad_this, 0]),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 10, &[bad_this]),
+                STG_E_INVALIDPOINTER
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    11,
+                    &[storage as u32, 0, 0, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            let enumerator = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 1, BUF as u32, STAT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 11, &[bad_this, 0, 0, 0, OUT as u32]),
+                STG_E_INVALIDPOINTER
+            );
+
+            write_utf16(&mut fixture, NAME, "moved.bin");
+            assert_eq!(
+                call_slot(&mut fixture, storage, 12, &[storage as u32, NAME as u32]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 12, &[storage as u32, NAME as u32]),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 12, &[bad_this, NAME as u32]),
+                STG_E_INVALIDPOINTER
+            );
+
+            write_utf16(&mut fixture, NAME, "r.bin");
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    3,
+                    &[storage as u32, NAME as u32, 0x1002, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            write_utf16(&mut fixture, second, "r2.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    13,
+                    &[storage as u32, NAME as u32, second as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    13,
+                    &[storage as u32, NAME as u32, second as u32]
+                ),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    13,
+                    &[bad_this, NAME as u32, second as u32]
+                ),
+                STG_E_INVALIDPOINTER
+            );
+
+            write_utf16(&mut fixture, NAME, "a.bin");
+            fixture.memory.map_bytes(STAT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    14,
+                    &[storage as u32, NAME as u32, 0, 0, STAT as u32]
+                ),
+                S_OK
+            );
+            write_utf16(&mut fixture, NAME, "absent.bin");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    14,
+                    &[storage as u32, NAME as u32, 0, 0, STAT as u32]
+                ),
+                STG_E_FILENOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    14,
+                    &[bad_this, NAME as u32, 0, 0, STAT as u32]
+                ),
+                STG_E_FILENOTFOUND
+            );
+
+            fixture.memory.map_bytes(STAT + 0x20, &[0xAB; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    storage,
+                    15,
+                    &[storage as u32, (STAT + 0x20) as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 15, &[storage as u32, 0]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 15, &[bad_this, 0]),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 16, &[storage as u32, 0, 0]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, storage, 16, &[bad_this, 0, 0]),
+                STG_E_INVALIDPOINTER
+            );
+
+            fixture.memory.map_bytes(STAT, &[0_u8; 72]);
+            assert_eq!(
+                call_slot(&mut fixture, storage, 17, &[storage as u32, STAT as u32, 0]),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT + 4).unwrap(), 1);
+            assert_eq!(
+                call_slot(&mut fixture, storage, 17, &[bad_this, STAT as u32, 0]),
+                STG_E_INVALIDPOINTER
+            );
+        })
+    }
+
+    #[test]
+    fn com_method_evidence_idispatch_enum_connection_points_reject_invalid_inputs() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-method-automation");
+            let server = create_server(&mut fixture);
+            let bad_this = 0xDEAD_BEEF_u32;
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, server, 3, &[server as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 1);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, server, 4, &[server as u32, 0, OUT as u32]),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+            assert_eq!(
+                call_slot(&mut fixture, server, 4, &[server as u32, 1, OUT as u32]),
+                TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::DispatchGetTypeInfo),
+                    &[bad_this, 0, OUT as u32]
+                ) as u32,
+                TYPE_E_ELEMENTNOTFOUND
+            );
+
+            write_utf16(&mut fixture, NAME, "Value");
+            fixture
+                .memory
+                .map_bytes(NAMES, &(NAME as u32).to_le_bytes());
+            fixture.memory.map_bytes(IDS, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    5,
+                    &[server as u32, 0, NAMES as u32, 1, 0, IDS as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 1);
+            write_utf16(&mut fixture, NAME, "NoSuchMember");
+            fixture
+                .memory
+                .map_bytes(NAMES, &(NAME as u32).to_le_bytes());
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    5,
+                    &[server as u32, 0, NAMES as u32, 1, 0, IDS as u32]
+                ),
+                DISP_E_UNKNOWNNAME
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), (-1_i32) as u32);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    5,
+                    &[server as u32, 0, 0, 1, 0, IDS as u32]
+                ),
+                E_POINTER
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    5,
+                    &[server as u32, 0, NAMES as u32, 1, 0, 0]
+                ),
+                E_POINTER
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::DispatchGetIDsOfNames),
+                    &[bad_this, 0, NAMES as u32, 1, 0, IDS as u32]
+                ) as u32,
+                E_NOINTERFACE
+            );
+
+            fixture.memory.map_bytes(VARIANT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    6,
+                    &[server as u32, 1, 0, 0, 2, 0, VARIANT as u32, 0, 0]
+                ),
+                S_OK
+            );
+            assert_eq!(read_variant_i4(&fixture, VARIANT), 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    6,
+                    &[server as u32, 99, 0, 0, 2, 0, VARIANT as u32, 0, 0]
+                ),
+                DISP_E_MEMBERNOTFOUND
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    server,
+                    6,
+                    &[server as u32, 1, 0, 0, 4, 0, VARIANT as u32, 0, 0]
+                ),
+                DISP_E_BADPARAMCOUNT
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::DispatchInvoke),
+                    &[bad_this, 1, 0, 0, 2, 0, VARIANT as u32, 0, 0]
+                ) as u32,
+                E_NOINTERFACE
+            );
+
+            let enumerator = fixture
+                .runtime
+                .alloc_com_enum_object(
+                    &mut fixture.memory,
+                    vec![1_u32.to_le_bytes().to_vec(), 2_u32.to_le_bytes().to_vec()],
+                )
+                .unwrap();
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            fixture.memory.map_bytes(STAT, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 1, BUF as u32, STAT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(BUF).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 5, BUF as u32, STAT as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(BUF).unwrap(), 2);
+            assert_eq!(
+                call_slot(&mut fixture, enumerator, 4, &[enumerator as u32, 1]),
+                S_FALSE
+            );
+            assert_eq!(
+                call_slot(&mut fixture, enumerator, 5, &[enumerator as u32]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 1, BUF as u32, STAT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(BUF).unwrap(), 1);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    6,
+                    &[enumerator as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), enumerator);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[bad_this, 1, BUF as u32, STAT as u32]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, enumerator, 4, &[bad_this, 1]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, enumerator, 5, &[bad_this]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, enumerator, 6, &[bad_this, OUT as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 1, 0, STAT as u32]
+                ),
+                E_POINTER
+            );
+
+            let point = fixture
+                .runtime
+                .alloc_com_connection_point(&mut fixture.memory, server, COM_AUTOMATION_EVENTS_IID)
+                .unwrap();
+            let container = fixture
+                .runtime
+                .alloc_com_connection_point_container(&mut fixture.memory, server)
+                .unwrap();
+            write_iid(&mut fixture, IID_PTR, &COM_AUTOMATION_EVENTS_IID);
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(&mut fixture, point, 3, &[point as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(OUT, 16).unwrap(),
+                COM_AUTOMATION_EVENTS_IID.to_vec()
+            );
+            assert_eq!(
+                call_slot(&mut fixture, point, 3, &[point as u32, 0]),
+                E_POINTER
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::GetConnectionInterface),
+                    &[bad_this, OUT as u32]
+                ) as u32,
+                E_INVALIDARG
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, point, 4, &[point as u32, OUT as u32]),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+            assert_eq!(
+                call_slot(&mut fixture, point, 4, &[point as u32, 0]),
+                E_POINTER
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::GetConnectionPointContainer),
+                    &[bad_this, OUT as u32]
+                ) as u32,
+                E_POINTER
+            );
+
+            let sink = fixture
+                .runtime
+                .alloc_com_sink_object(&mut fixture.memory, "ICasa1AutomationEvents")
+                .unwrap();
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    point,
+                    5,
+                    &[point as u32, sink as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            let cookie = fixture.memory.read_u32(COOKIE).unwrap();
+            assert_ne!(cookie, 0);
+            assert_eq!(
+                call_slot(&mut fixture, point, 5, &[point as u32, 0, COOKIE as u32]),
+                E_POINTER
+            );
+            assert_eq!(
+                call_slot(&mut fixture, point, 5, &[point as u32, sink as u32, 0]),
+                E_POINTER
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::Advise),
+                    &[bad_this, sink as u32, COOKIE as u32]
+                ) as u32,
+                E_INVALIDARG
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, point, 7, &[point as u32, OUT as u32]),
+                S_OK
+            );
+            let connections = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    connections,
+                    3,
+                    &[connections as u32, 1, BUF as u32, STAT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u32(BUF).unwrap(), sink as u32);
+            assert_eq!(fixture.memory.read_u32(BUF + 4).unwrap(), cookie);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::EnumConnections),
+                    &[bad_this, OUT as u32]
+                ) as u32,
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, point, 6, &[point as u32, cookie]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, point, 6, &[point as u32, cookie]),
+                CONNECT_E_NOCONNECTION
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::Unadvise),
+                    &[bad_this, cookie]
+                ) as u32,
+                E_INVALIDARG
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, container, 3, &[container as u32, OUT as u32]),
+                S_OK
+            );
+            let points = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    points,
+                    3,
+                    &[points as u32, 1, BUF as u32, STAT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(STAT).unwrap(), 1);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::EnumConnectionPoints),
+                    &[bad_this, OUT as u32]
+                ) as u32,
+                E_INVALIDARG
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), point);
+            write_iid(&mut fixture, IID_PTR, &[0xAA; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, IID_PTR as u32, OUT as u32]
+                ),
+                CONNECT_E_NOCONNECTION
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    container,
+                    4,
+                    &[container as u32, IID_PTR as u32, 0]
+                ),
+                E_POINTER
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::FindConnectionPoint),
+                    &[bad_this, IID_PTR as u32, OUT as u32]
+                ) as u32,
+                CONNECT_E_NOCONNECTION
+            );
+        })
+    }
+
+    #[test]
+    fn com_method_evidence_class_factory_and_moniker_notimpl_edges() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-method-factory-moniker");
+            let bad_this = 0xDEAD_BEEF_u32;
+            assert_eq!(
+                dispatch_get_class_object(&mut fixture, "{E436EBB3-524F-11CE-9F53-0020AF0BA770}"),
+                u64::from(S_OK)
+            );
+            let factory = guest_ptr(&fixture, REG_REG_OUT);
+            assert_eq!(
+                call_slot(&mut fixture, factory, 4, &[factory as u32, 1]),
+                S_OK
+            );
+            assert_eq!(call_slot(&mut fixture, factory, 4, &[bad_this, 0]), S_OK);
+            fixture.memory.map_bytes(REG_REG_OUT, &[0_u8; 8]);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComFactoryCreateInstance,
+                    &[factory as u32, 0, 0, REG_REG_OUT as u32]
+                ),
+                u64::from(S_OK)
+            );
+            assert_ne!(guest_ptr(&fixture, REG_REG_OUT), 0);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComFactoryCreateInstance,
+                    &[0, 0, 0, REG_REG_OUT as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComFactoryCreateInstance,
+                    &[factory as u32, 0, 0, 0]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+
+            let moniker = parse_moniker(&mut fixture, "file:C:\\method.bin");
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 5, &[moniker as u32, 0, 0]),
+                E_NOTIMPL
+            );
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 6, &[moniker as u32, 0, 0]),
+                E_NOTIMPL
+            );
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 5, &[bad_this, 0, 0]),
+                E_NOTIMPL
+            );
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 6, &[bad_this, 0, 0]),
+                E_NOTIMPL
+            );
+        })
+    }
 }

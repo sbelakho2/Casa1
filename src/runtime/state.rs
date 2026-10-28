@@ -156,6 +156,8 @@ pub(crate) enum GuestObjectKind {
     ShellItem,
     /// IContextMenu COM object.
     ContextMenu,
+    /// shdocvw IWebBrowser2 browser-control object.
+    WebBrowser,
     /// IPropertyStore COM object.
     PropertyStore,
     /// IXMLDOMDocument COM object.
@@ -328,6 +330,7 @@ pub(crate) struct GuestShellLinkState {
     pub(crate) arguments: String,
     pub(crate) description: String,
     pub(crate) working_directory: String,
+    pub(crate) relative_path: String,
     pub(crate) hotkey: u16,
     pub(crate) icon_location: String,
     pub(crate) icon_index: i32,
@@ -1210,6 +1213,7 @@ pub(crate) struct PeHostRuntime {
     /// Maps guest thunk addresses → fast-thunk indices for JIT direct calls.
     pub(crate) thunk_to_fast_index: U64Map<usize>,
     pub(crate) guest_objects: BTreeMap<u64, GuestObjectMeta>,
+    pub(crate) web_browsers: BTreeMap<u64, crate::runtime::dispatch::shdocvw::WebBrowserState>,
     pub(crate) shell_link_interfaces: BTreeMap<u64, GuestShellLinkInterface>,
     pub(crate) shell_link_states: BTreeMap<u64, GuestShellLinkState>,
     pub(crate) xaudio_engines: BTreeMap<u64, GuestXAudio2Engine>,
@@ -2352,6 +2356,7 @@ impl PeHostRuntime {
             iat_patches: crate::runtime::IatPatchTable::default(),
             thunk_to_fast_index: U64Map::default(),
             guest_objects: BTreeMap::new(),
+            web_browsers: BTreeMap::new(),
             shell_link_interfaces: BTreeMap::new(),
             shell_link_states: BTreeMap::new(),
             xaudio_engines: BTreeMap::new(),

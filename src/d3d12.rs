@@ -5062,12 +5062,16 @@ impl D3d12Runtime {
         values: &[u64],
         destinations: &[u64],
     ) -> AppResult<()> {
-        if count == 0 || values.len() != count as usize || destinations.len() != count as usize {
+        if values.len() != count as usize || destinations.len() != count as usize {
             return Err(AppError::new(
                 ReasonCode::RcD3dInvalidState,
                 "write_buffer_immediate: count mismatch",
             ));
         }
+        // A zero count is a documented no-op.
+        if count == 0 {
+            return Ok(());
+        } // coverage: unreachable — llvm-cov zero-region on the closing token of the early return
         // Bound the pending queue so a guest calling WriteBufferImmediate
         // every frame cannot grow memory without limit. The queue is drained
         // on the next execute_command_lists.

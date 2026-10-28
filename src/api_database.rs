@@ -903,22 +903,23 @@ impl ApiDatabase {
     pub fn apply_interface_method_surface(&mut self) {
         for interface in INTERFACE_METHOD_SURFACE {
             for method in interface.methods {
-                let (implementation, fidelity, capability, coverage) = match method.dispatch {
-                    MethodDispatch::Dispatched => (
-                        ImplementationLevel::Partial,
-                        SemanticFidelity::Restricted,
-                        SubsystemCapability::Partial,
-                        CoverageLevel::None,
-                    ),
-                    MethodDispatch::Missing => (
-                        ImplementationLevel::Unsupported,
-                        SemanticFidelity::Restricted,
-                        SubsystemCapability::Partial,
-                        CoverageLevel::None,
-                    ),
-                };
                 let evidence =
                     method_coverage_evidence_for(interface.dll, interface.interface, method.method);
+                // A real dispatch plus a compiled proof is Implemented; fidelity
+                // and capability stay conservative until a method-specific
+                // exactness claim exists.  No dispatch is Unsupported.
+                let implementation = match method.dispatch {
+                    MethodDispatch::Dispatched if evidence.is_some() => {
+                        ImplementationLevel::Implemented
+                    }
+                    MethodDispatch::Dispatched => ImplementationLevel::Partial,
+                    MethodDispatch::Missing => ImplementationLevel::Unsupported,
+                };
+                let (fidelity, capability, coverage) = (
+                    SemanticFidelity::Restricted,
+                    SubsystemCapability::Partial,
+                    CoverageLevel::None,
+                );
                 self.interface_methods.push(InterfaceMethodEntry {
                     dll: interface.dll.to_string(),
                     interface: interface.interface.to_string(),
@@ -2518,7 +2519,7 @@ static COM_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         "IWebBrowser2",
         ImplementationLevel::Implemented,
         false,
-        "No IWebBrowser2 dispatch in the runtime.",
+        "Real 53-slot WebBrowser control dispatch with navigation/history state,          registry-backed home/search, IDispatch, and documented restrictions          (GetDocument S_FALSE, GetTypeInfo/ShowBrowserBar E_NOTIMPL).",
     ),
     interface_skeleton(
         "ole32.dll",
@@ -3540,59 +3541,59 @@ const ISHELL_LINK_METHODS: &[MethodSeed] = &[
 /// Browser `IWebBrowser2` vtable.  The runtime exposes the shdocvw interface
 /// identity but allocates no browser vtable, so every method is unsupported.
 const IWEB_BROWSER2_METHODS: &[MethodSeed] = &[
-    missing("QueryInterface", MISSING_METHOD),
-    missing("AddRef", MISSING_METHOD),
-    missing("Release", MISSING_METHOD),
-    missing("GetTypeInfoCount", MISSING_METHOD),
-    missing("GetTypeInfo", MISSING_METHOD),
-    missing("GetIDsOfNames", MISSING_METHOD),
-    missing("Invoke", MISSING_METHOD),
-    missing("GoBack", MISSING_METHOD),
-    missing("GoForward", MISSING_METHOD),
-    missing("GoHome", MISSING_METHOD),
-    missing("GoSearch", MISSING_METHOD),
-    missing("Navigate", MISSING_METHOD),
-    missing("Refresh", MISSING_METHOD),
-    missing("Refresh2", MISSING_METHOD),
-    missing("Stop", MISSING_METHOD),
-    missing("get_Application", MISSING_METHOD),
-    missing("get_Parent", MISSING_METHOD),
-    missing("get_Container", MISSING_METHOD),
-    missing("get_Document", MISSING_METHOD),
-    missing("get_Name", MISSING_METHOD),
-    missing("get_FullName", MISSING_METHOD),
-    missing("get_Path", MISSING_METHOD),
-    missing("get_Visible", MISSING_METHOD),
-    missing("put_Visible", MISSING_METHOD),
-    missing("get_StatusBar", MISSING_METHOD),
-    missing("put_StatusBar", MISSING_METHOD),
-    missing("get_StatusText", MISSING_METHOD),
-    missing("put_StatusText", MISSING_METHOD),
-    missing("get_ToolBar", MISSING_METHOD),
-    missing("put_ToolBar", MISSING_METHOD),
-    missing("get_MenuBar", MISSING_METHOD),
-    missing("put_MenuBar", MISSING_METHOD),
-    missing("get_FullScreen", MISSING_METHOD),
-    missing("put_FullScreen", MISSING_METHOD),
-    missing("Navigate2", MISSING_METHOD),
-    missing("QueryStatusWB", MISSING_METHOD),
-    missing("ExecWB", MISSING_METHOD),
-    missing("ShowBrowserBar", MISSING_METHOD),
-    missing("get_ReadyState", MISSING_METHOD),
-    missing("Quit", MISSING_METHOD),
-    missing("ClientToWindow", MISSING_METHOD),
-    missing("PutProperty", MISSING_METHOD),
-    missing("GetProperty", MISSING_METHOD),
-    missing("get_RegisterAsBrowser", MISSING_METHOD),
-    missing("put_RegisterAsBrowser", MISSING_METHOD),
-    missing("get_RegisterAsDropTarget", MISSING_METHOD),
-    missing("put_RegisterAsDropTarget", MISSING_METHOD),
-    missing("get_TheaterMode", MISSING_METHOD),
-    missing("put_TheaterMode", MISSING_METHOD),
-    missing("get_AddressBar", MISSING_METHOD),
-    missing("put_AddressBar", MISSING_METHOD),
-    missing("get_Resizable", MISSING_METHOD),
-    missing("put_Resizable", MISSING_METHOD),
+    method("QueryInterface", DISPATCHED_METHOD),
+    method("AddRef", DISPATCHED_METHOD),
+    method("Release", DISPATCHED_METHOD),
+    method("GetTypeInfoCount", DISPATCHED_METHOD),
+    method("GetTypeInfo", DISPATCHED_METHOD),
+    method("GetIDsOfNames", DISPATCHED_METHOD),
+    method("Invoke", DISPATCHED_METHOD),
+    method("GoBack", DISPATCHED_METHOD),
+    method("GoForward", DISPATCHED_METHOD),
+    method("GoHome", DISPATCHED_METHOD),
+    method("GoSearch", DISPATCHED_METHOD),
+    method("Navigate", DISPATCHED_METHOD),
+    method("Refresh", DISPATCHED_METHOD),
+    method("Refresh2", DISPATCHED_METHOD),
+    method("Stop", DISPATCHED_METHOD),
+    method("get_Application", DISPATCHED_METHOD),
+    method("get_Parent", DISPATCHED_METHOD),
+    method("get_Container", DISPATCHED_METHOD),
+    method("get_Document", DISPATCHED_METHOD),
+    method("get_Name", DISPATCHED_METHOD),
+    method("get_FullName", DISPATCHED_METHOD),
+    method("get_Path", DISPATCHED_METHOD),
+    method("get_Visible", DISPATCHED_METHOD),
+    method("put_Visible", DISPATCHED_METHOD),
+    method("get_StatusBar", DISPATCHED_METHOD),
+    method("put_StatusBar", DISPATCHED_METHOD),
+    method("get_StatusText", DISPATCHED_METHOD),
+    method("put_StatusText", DISPATCHED_METHOD),
+    method("get_ToolBar", DISPATCHED_METHOD),
+    method("put_ToolBar", DISPATCHED_METHOD),
+    method("get_MenuBar", DISPATCHED_METHOD),
+    method("put_MenuBar", DISPATCHED_METHOD),
+    method("get_FullScreen", DISPATCHED_METHOD),
+    method("put_FullScreen", DISPATCHED_METHOD),
+    method("Navigate2", DISPATCHED_METHOD),
+    method("QueryStatusWB", DISPATCHED_METHOD),
+    method("ExecWB", DISPATCHED_METHOD),
+    method("ShowBrowserBar", DISPATCHED_METHOD),
+    method("get_ReadyState", DISPATCHED_METHOD),
+    method("Quit", DISPATCHED_METHOD),
+    method("ClientToWindow", DISPATCHED_METHOD),
+    method("PutProperty", DISPATCHED_METHOD),
+    method("GetProperty", DISPATCHED_METHOD),
+    method("get_RegisterAsBrowser", DISPATCHED_METHOD),
+    method("put_RegisterAsBrowser", DISPATCHED_METHOD),
+    method("get_RegisterAsDropTarget", DISPATCHED_METHOD),
+    method("put_RegisterAsDropTarget", DISPATCHED_METHOD),
+    method("get_TheaterMode", DISPATCHED_METHOD),
+    method("put_TheaterMode", DISPATCHED_METHOD),
+    method("get_AddressBar", DISPATCHED_METHOD),
+    method("put_AddressBar", DISPATCHED_METHOD),
+    method("get_Resizable", DISPATCHED_METHOD),
+    method("put_Resizable", DISPATCHED_METHOD),
 ];
 
 /// Media Foundation `IMFAttributes` vtable.
@@ -4455,45 +4456,47 @@ mod method_proof_tests {
         assert_eq!(bound.semantic_test_coverage, CoverageLevel::Conformance);
         assert_eq!(
             bound.evidence_id.as_deref(),
-            Some("casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil"),
+            Some(
+                "casa1-conformance:d3d11_device_methods_reject_invalid_input_and_pin_vtable_outputs"
+            ),
             "the method row must name the compiled contract that proves it"
         );
 
         let unbound = report
             .method_registry
             .iter()
-            .find(|row| row.interface == "ID3D11Device" && row.method == "CreateBuffer")
-            .expect("CreateBuffer row");
+            .find(|row| row.interface == "ID3D12GraphicsCommandList" && row.method == "ClearState")
+            .expect("ClearState row");
         assert_eq!(unbound.semantic_test_coverage, CoverageLevel::None);
         assert_eq!(unbound.evidence_id, None);
 
         let interface = report
             .interface_registry
             .iter()
-            .find(|row| row.dll == "d3d11.dll" && row.interface == "ID3D11Device")
-            .expect("ID3D11Device aggregate");
+            .find(|row| row.dll == "d3d12.dll" && row.interface == "ID3D12GraphicsCommandList")
+            .expect("ID3D12GraphicsCommandList aggregate");
         assert_eq!(interface.proven, false);
         assert!(
             interface
                 .unproven_methods
-                .contains(&"CreateBuffer".to_string()),
-            "the interface registry must list CreateBuffer as unproven"
+                .contains(&"ClearState".to_string()),
+            "the interface registry must list ClearState as unproven"
         );
         assert!(
             report.gate.unproven_method_count >= interface.unproven_methods.len(),
             "the gate count must include the interface's unproven methods"
         );
 
-        let summary = report.per_dll.get("d3d11.dll").expect("d3d11 summary");
+        let summary = report.per_dll.get("d3d12.dll").expect("d3d12 summary");
         assert!(summary.method_proven >= 1);
         assert!(summary.method_unproven >= 1);
 
         let value = serde_json::to_value(&report).expect("report serializes");
         assert!(value.get("interface_registry").is_some());
         assert!(value["gate"].get("unproven_method_count").is_some());
-        assert!(value["per_dll"]["d3d11.dll"].get("method_proven").is_some());
+        assert!(value["per_dll"]["d3d12.dll"].get("method_proven").is_some());
         assert!(
-            value["per_dll"]["d3d11.dll"]
+            value["per_dll"]["d3d12.dll"]
                 .get("method_unproven")
                 .is_some()
         );

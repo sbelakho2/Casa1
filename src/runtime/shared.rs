@@ -78,6 +78,34 @@ pub(crate) struct WorkerMemoryStatus {
     pub(crate) avail_page: u64,
 }
 
+/// Owner-published NLS code pages consulted by `GetACP`/`GetOEMCP` and the
+/// string-conversion thunks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorkerLocale {
+    pub(crate) acp: u32,
+    pub(crate) oemcp: u32,
+}
+
+/// One registry key's read-only snapshot: its normalized runtime key and the
+/// values the owner enumerated when the round was published.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkerRegistryKey {
+    pub(crate) hive: String,
+    pub(crate) key: String,
+    pub(crate) values: BTreeMap<String, crate::ge::StoredRegistryValue>,
+}
+
+/// Read-only registry snapshot published behind an `RwLock`.
+///
+/// Root keys are indexed by `(HKEY_*, view)` because their view is selected by
+/// the query's `samDesired`/guest architecture, while opened key handles carry
+/// the view they were opened with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkerRegistry {
+    pub(crate) roots: BTreeMap<(u32, u8), WorkerRegistryKey>,
+    pub(crate) keys: BTreeMap<u32, WorkerRegistryKey>,
+}
+
 /// Read-mostly process state published for worker API execution.
 #[derive(Clone)]
 pub(crate) struct WorkerEnvironment {
@@ -85,6 +113,10 @@ pub(crate) struct WorkerEnvironment {
     pub(crate) clock: WorkerClock,
     pub(crate) version: Option<WorkerVersion>,
     pub(crate) memory_status: Option<WorkerMemoryStatus>,
+    pub(crate) locale: WorkerLocale,
+    pub(crate) environment: BTreeMap<String, String>,
+    pub(crate) heap: BTreeMap<u64, usize>,
+    pub(crate) registry: WorkerRegistry,
 }
 
 /// One registered thunk's worker-execution classification.
@@ -100,6 +132,10 @@ pub(crate) struct ParallelThunk {
 pub(crate) struct ApiDispatchMetrics {
     pub(crate) parallel_dispatched: u64,
     pub(crate) barrier_calls: u64,
+    pub(crate) stateless_dispatched: u64,
+    pub(crate) read_mostly_dispatched: u64,
+    pub(crate) owner_only_barriers: u64,
+    pub(crate) fallback_barriers: u64,
 }
 
 /// Result of a worker's attempt to service a host barrier itself.
@@ -157,6 +193,14 @@ pub(crate) struct ProcessShared {
     version: RwLock<Option<WorkerVersion>>,
     /// Published host memory figures.
     memory_status: RwLock<Option<WorkerMemoryStatus>>,
+    /// Published NLS code pages.
+    locale: RwLock<WorkerLocale>,
+    /// Process environment snapshot for read-only `GetEnvironmentVariableW`.
+    environment: RwLock<BTreeMap<String, String>>,
+    /// Read-only process-heap allocation snapshot for `HeapSize`.
+    heap: RwLock<BTreeMap<u64, usize>>,
+    /// Read-only registry snapshot for the query thunks.
+    registry: RwLock<WorkerRegistry>,
     /// Worker-execution classification for every registered host thunk, keyed
     /// by guest thunk address for the current dispatch round.
     thunks: RwLock<BTreeMap<u64, ParallelThunk>>,
@@ -164,6 +208,10 @@ pub(crate) struct ProcessShared {
     parallel_api_calls: AtomicU64,
     /// Host thunks that yielded to the owner barrier.
     barrier_api_calls: AtomicU64,
+    stateless_api_calls: AtomicU64,
+    read_mostly_api_calls: AtomicU64,
+    owner_only_api_calls: AtomicU64,
+    fallback_api_calls: AtomicU64,
 }
 
 impl std::fmt::Debug for ProcessShared {
@@ -206,9 +254,17 @@ impl ProcessShared {
             clock: RwLock::new(WorkerClock::default()),
             version: RwLock::new(None),
             memory_status: RwLock::new(None),
+            locale: RwLock::new(WorkerLocale::default()),
+            environment: RwLock::new(BTreeMap::new()),
+            heap: RwLock::new(BTreeMap::new()),
+            registry: RwLock::new(WorkerRegistry::default()),
             thunks: RwLock::new(BTreeMap::new()),
             parallel_api_calls: AtomicU64::new(0),
             barrier_api_calls: AtomicU64::new(0),
+            stateless_api_calls: AtomicU64::new(0),
+            read_mostly_api_calls: AtomicU64::new(0),
+            owner_only_api_calls: AtomicU64::new(0),
+            fallback_api_calls: AtomicU64::new(0),
         }
     }
 
@@ -231,6 +287,22 @@ impl ProcessShared {
             .memory_status
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.memory_status;
+        *self
+            .locale
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.locale;
+        *self
+            .environment
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.environment;
+        *self
+            .heap
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.heap;
+        *self
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.registry;
     }
 
     /// Replace only the guest process identity (read-mostly writer path).
@@ -302,11 +374,43 @@ impl ProcessShared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    pub(crate) fn locale_snapshot(&self) -> WorkerLocale {
+        *self
+            .locale
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn environment_snapshot(&self) -> BTreeMap<String, String> {
+        self.environment
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn heap_snapshot(&self) -> BTreeMap<u64, usize> {
+        self.heap
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn registry_snapshot(&self) -> WorkerRegistry {
+        self.registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Parallel-versus-barrier API dispatch split.
     pub(crate) fn api_dispatch_metrics(&self) -> ApiDispatchMetrics {
         ApiDispatchMetrics {
             parallel_dispatched: self.parallel_api_calls.load(Ordering::Relaxed),
             barrier_calls: self.barrier_api_calls.load(Ordering::Relaxed),
+            stateless_dispatched: self.stateless_api_calls.load(Ordering::Relaxed),
+            read_mostly_dispatched: self.read_mostly_api_calls.load(Ordering::Relaxed),
+            owner_only_barriers: self.owner_only_api_calls.load(Ordering::Relaxed),
+            fallback_barriers: self.fallback_api_calls.load(Ordering::Relaxed),
         }
     }
 
@@ -337,11 +441,26 @@ impl ProcessShared {
             && parallel_api::invoke_parallel_api(self, context, memory, &entry)
         {
             self.parallel_api_calls.fetch_add(1, Ordering::Relaxed);
+            // Only Stateless and ReadMostly reach this path (the guard above
+            // rejects OwnerOnly), so the two counters are exhaustive here.
+            if entry.class == ThunkConcurrency::Stateless {
+                self.stateless_api_calls.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.read_mostly_api_calls.fetch_add(1, Ordering::Relaxed);
+            }
             WorkerApiAttempt::Executed
         } else {
             context.state = saved_state;
             context.last_error = saved_last_error;
             self.barrier_api_calls.fetch_add(1, Ordering::Relaxed);
+            match entry.class {
+                ThunkConcurrency::OwnerOnly => {
+                    self.owner_only_api_calls.fetch_add(1, Ordering::Relaxed);
+                }
+                ThunkConcurrency::Stateless | ThunkConcurrency::ReadMostly => {
+                    self.fallback_api_calls.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             WorkerApiAttempt::Blocked
         }
     }

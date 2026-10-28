@@ -971,7 +971,7 @@ impl PeHostRuntime {
         let queue_object = state.get(Register::Rdx);
         let desc_ptr = state.get(Register::R8);
         let out_ptr = state.get(Register::R9);
-        if out_ptr == 0 {
+        if desc_ptr == 0 || out_ptr == 0 {
             state.set(Register::Rax, E_INVALIDARG);
             self.last_error = 0;
             return Ok(());
@@ -1936,7 +1936,7 @@ impl PeHostRuntime {
         let _desc_ptr = state.get(Register::R8);
         let _out_ptr = state.get(Register::R9);
         // Composition swapchain not supported — return DXGI_ERROR_UNSUPPORTED.
-        state.set(Register::Rax, 0x887A0002_u64); // DXGI_ERROR_UNSUPPORTED
+        state.set(Register::Rax, 0x887A0004_u64); // DXGI_ERROR_UNSUPPORTED
         self.last_error = 0;
         Ok(())
     }
@@ -2068,7 +2068,7 @@ impl PeHostRuntime {
         let _riid_ptr = state.get(Register::Rdx);
         let _out_ptr = state.get(Register::R8);
         // WARP adapter not supported.
-        state.set(Register::Rax, 0x887A0002_u64); // DXGI_ERROR_UNSUPPORTED
+        state.set(Register::Rax, 0x887A0004_u64); // DXGI_ERROR_UNSUPPORTED
         self.last_error = 0;
         Ok(())
     }
@@ -2420,7 +2420,8 @@ impl PeHostRuntime {
         let parent_object = state.get(Register::Rcx);
         let bundle_object = state.get(Register::Rdx);
 
-        // The parent must be a direct command list (not a bundle)
+        // The parent must be an open direct command list (not a bundle).
+        let parent_id = self.open_d3d12_command_list_id(parent_object)?;
         let parent = self.d3d12_command_list(parent_object)?;
         if parent.is_bundle {
             // Cannot ExecuteBundle on a bundle — only direct lists can replay bundles
@@ -2428,16 +2429,10 @@ impl PeHostRuntime {
             self.last_error = 0;
             return Ok(());
         }
-        let parent_id = match parent.command_list_id {
-            Some(id) => id,
-            None => {
-                state.set(Register::Rax, E_INVALIDARG);
-                self.last_error = 0;
-                return Ok(());
-            }
-        };
 
-        // The bundle must actually be a bundle and have a valid ID
+        // The bundle must actually be a bundle and have been closed so its
+        // recorded stream is available. Closing moves the id into
+        // `closed_stream`, so that is the authoritative source.
         let bundle = self.d3d12_command_list(bundle_object)?;
         if !bundle.is_bundle {
             // Cannot ExecuteBundle with a non-bundle command list
@@ -2445,8 +2440,8 @@ impl PeHostRuntime {
             self.last_error = 0;
             return Ok(());
         }
-        let bundle_id = match bundle.command_list_id {
-            Some(id) => id,
+        let bundle_id = match bundle.closed_stream.as_ref() {
+            Some(stream) => stream.id,
             None => {
                 // Bundle hasn't been closed yet — need to close first
                 state.set(Register::Rax, E_INVALIDARG);
@@ -4037,7 +4032,10 @@ impl PeHostRuntime {
             ));
         }
         let desc_ptr = state.get(Register::Rdx);
-        let out_ptr = state.get(Register::R8);
+        let _root_signature_object = state.get(Register::R8);
+        let _riid_ptr = state.get(Register::R9);
+        let stack = state.get(Register::Rsp);
+        let out_ptr = memory.read_u64(stack + 0x20)?;
         if desc_ptr == 0 || out_ptr == 0 {
             state.set(Register::Rax, E_INVALIDARG);
             self.last_error = 0;
@@ -5091,7 +5089,7 @@ impl PeHostRuntime {
                 ),
             ));
         }
-        let _cbv_desc_ptr = state.get(Register::Rdx);
+        let cbv_desc_ptr = state.get(Register::Rdx);
         let descriptor_handle = state.get(Register::R8);
         let (heap, index) = self
             .decode_d3d12_cpu_descriptor_handle(descriptor_handle, DescriptorHeapType::CbvSrvUav)?;
@@ -5100,20 +5098,23 @@ impl PeHostRuntime {
             self.last_error = 0;
             return Ok(());
         }
-        self.d3d12_runtime.write_descriptor(
-            heap.heap_id,
-            index,
-            crate::gfx::ViewDescriptor::Cbv {
-                resource: 0u64,
-                size: 0,
-            },
-        )?; // coverage: unreachable — llvm-cov zero-region on the closing token of a multi-line call; the call is exercised
+        // A NULL D3D12_CONSTANT_BUFFER_VIEW_DESC is the documented way to
+        // create a null CBV descriptor. The bridge has no GPU virtual-address
+        // table, so a null descriptor is the only representable form.
+        if cbv_desc_ptr != 0 {
+            state.set(Register::Rax, E_NOTIMPL);
+            self.last_error = 0;
+            return Ok(());
+        }
         state.set(Register::Rax, 0);
         self.last_error = 0;
         self.push_trace(
             "d3d12",
             "ID3D12Device::CreateConstantBufferView",
-            BTreeMap::from([("descriptor_index".to_string(), json!(index))]),
+            BTreeMap::from([
+                ("descriptor_index".to_string(), json!(index)),
+                ("null_descriptor".to_string(), json!(true)),
+            ]),
             json!(0),
         );
         Ok(())
@@ -5715,13 +5716,9 @@ impl PeHostRuntime {
         state: &mut CpuState,
     ) -> AppResult<()> {
         let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _heap_object = state.get(Register::Rdx);
+        let query_heap = state.get(Register::Rdx);
         let _query_type = state.get(Register::R8) as u32;
         let index = state.get(Register::R9) as u32;
-        // Use a temporary query heap from the runtime
-        let query_heap = self
-            .d3d12_runtime
-            .create_query_heap(crate::gfx::QueryType::Occlusion, 64);
         self.d3d12_runtime
             .record_begin_query(command_list_id, query_heap, index)?;
         state.set(Register::Rax, 0);
@@ -5741,12 +5738,9 @@ impl PeHostRuntime {
         state: &mut CpuState,
     ) -> AppResult<()> {
         let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _heap_object = state.get(Register::Rdx);
+        let query_heap = state.get(Register::Rdx);
         let _query_type = state.get(Register::R8) as u32;
         let index = state.get(Register::R9) as u32;
-        let query_heap = self
-            .d3d12_runtime
-            .create_query_heap(crate::gfx::QueryType::Occlusion, 64);
         self.d3d12_runtime
             .record_end_query(command_list_id, query_heap, index)?;
         state.set(Register::Rax, 0);
@@ -5766,20 +5760,27 @@ impl PeHostRuntime {
         state: &mut CpuState,
     ) -> AppResult<()> {
         let command_list_id = self.open_d3d12_command_list_id(state.get(Register::Rcx))?;
-        let _heap_object = state.get(Register::Rdx);
-        let _start = state.get(Register::R8) as u32;
-        let _count = state.get(Register::R9) as u32;
+        let query_heap = state.get(Register::Rdx);
+        let _query_type = state.get(Register::R8) as u32;
+        let start = state.get(Register::R9) as u32;
         let sp = state.get(Register::Rsp);
-        let _dst_resource = memory.read_u64(sp + 0x20)?;
-        let query_heap = self
-            .d3d12_runtime
-            .create_query_heap(crate::gfx::QueryType::Occlusion, 64);
+        let count = memory.read_u32(sp + 0x20)?;
+        let dst_object = memory.read_u64(sp + 0x28)?;
+        let _offset = memory.read_u64(sp + 0x30)?;
+        let dst_resource = match self.d3d12_resource(dst_object) {
+            Ok(resource) => resource.resource_id,
+            Err(_) => {
+                state.set(Register::Rax, E_INVALIDARG);
+                self.last_error = 0;
+                return Ok(());
+            }
+        };
         self.d3d12_runtime.record_resolve_query_data(
             command_list_id,
             query_heap,
-            _start,
-            _count,
-            0u64,
+            start,
+            count,
+            dst_resource,
         )?; // coverage: unreachable — llvm-cov zero-region on the closing token of a multi-line call; the call is exercised
         state.set(Register::Rax, 0);
         self.last_error = 0;
