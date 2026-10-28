@@ -12,9 +12,12 @@ use crate::error::AppResult;
 use std::collections::HashMap;
 use std::process::Command;
 
+pub mod audio_device_bridge;
 pub mod bridge;
 pub mod dispatch;
 pub mod error;
+pub mod ffi_ext;
+pub mod host_bridge;
 // Platform bindings live in a non-`.rs` include so the coverage gate measures
 // the testable bridge logic rather than the IOKit C surface, which cannot run
 // on CI hosts without the corresponding hardware.
@@ -23,13 +26,22 @@ pub mod error;
 mod ffi;
 pub mod hid;
 pub mod model;
+pub mod net_bridge;
+pub mod pci_bridge;
 pub mod serial;
 pub mod usb;
 
+pub use audio_device_bridge::{
+    AudioDeviceBridge, AudioEndpointDescriptor, AudioEndpointDirection, AudioEndpointFormat,
+    AudioSampleFormat,
+};
 pub use bridge::{PhysicalDeviceBridge, RawInputDeviceEntry, SerialPortEntry, UsbDeviceEntry};
 pub use error::DeviceError;
 pub use hid::{HidBridge, HidDevice, HidDeviceInfo, HidInputReport, HidUsagePair};
+pub use host_bridge::{HostDeviceBridge, HostOperation, HostUserClient, QueryOnlyUserClient};
 pub use model::{DeviceClass, DeviceRecord, DeviceTable, HotplugEvent, StableDeviceId};
+pub use net_bridge::{NetworkAdapterInfo, NetworkBridge, RawInterfaceRecord, WindowsAdapterEntry};
+pub use pci_bridge::{PciBar, PciBridge, PciDeviceInfo};
 pub use serial::{
     SerialBridge, SerialConfig, SerialDevice, SerialDeviceInfo, SerialParity, SerialStopBits,
 };

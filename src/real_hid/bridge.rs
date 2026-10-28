@@ -4,9 +4,14 @@
 //! COM-port table for serial devices, and exact hotplug deltas.  Nothing is
 //! added to any table unless a real host scan reported it.
 
+use super::audio_device_bridge::{
+    AudioDeviceBridge, AudioEndpointDescriptor, scan_audio_endpoints,
+};
 use super::error::DeviceError;
 use super::hid::{HidBridge, HidDevice};
 use super::model::{DeviceClass, DeviceRecord, HotplugEvent, StableDeviceId};
+use super::net_bridge::{NetworkBridge, WindowsAdapterEntry, scan_network_adapters};
+use super::pci_bridge::{PciBridge, PciDeviceInfo, scan_pci_devices};
 use super::serial::{SerialBridge, SerialConfig, SerialDevice};
 use super::usb::{UsbBridge, UsbDeviceInfo, UsbTransferRequest};
 
@@ -46,6 +51,9 @@ pub struct PhysicalDeviceBridge {
     hid: HidBridge,
     usb: UsbBridge,
     serial: SerialBridge,
+    pci: PciBridge,
+    network: NetworkBridge,
+    audio: AudioDeviceBridge,
 }
 
 impl PhysicalDeviceBridge {
@@ -77,15 +85,45 @@ impl PhysicalDeviceBridge {
         &mut self.serial
     }
 
-    /// Scans all three buses before mutating any table, so a failed bus cannot
+    pub fn pci(&self) -> &PciBridge {
+        &self.pci
+    }
+
+    pub fn pci_mut(&mut self) -> &mut PciBridge {
+        &mut self.pci
+    }
+
+    pub fn network(&self) -> &NetworkBridge {
+        &self.network
+    }
+
+    pub fn network_mut(&mut self) -> &mut NetworkBridge {
+        &mut self.network
+    }
+
+    pub fn audio(&self) -> &AudioDeviceBridge {
+        &self.audio
+    }
+
+    pub fn audio_mut(&mut self) -> &mut AudioDeviceBridge {
+        &mut self.audio
+    }
+
+    /// Scans every bus before mutating any table, so a failed bus cannot
     /// produce a partial "unplug" of another bus's devices.
     pub fn refresh(&mut self) -> Result<Vec<HotplugEvent>, DeviceError> {
         let hid = super::hid::scan_hid_devices()?;
         let usb = super::usb::scan_usb_devices()?;
         let serial = super::serial::scan_serial_devices()?;
+        let pci = scan_pci_devices()?;
+        let network = scan_network_adapters()?;
+        let audio = scan_audio_endpoints()?;
         let mut events = self.hid.apply(hid);
         events.extend(self.usb.apply(usb));
         events.extend(self.serial.apply(serial));
+        events.extend(self.pci.apply(pci));
+        events.extend(self.network.apply(network));
+        events.extend(self.audio.apply(audio));
         events.sort_by(|left, right| {
             left.device()
                 .id
@@ -100,6 +138,9 @@ impl PhysicalDeviceBridge {
         records.extend(self.hid.table().iter().cloned());
         records.extend(self.usb.table().iter().cloned());
         records.extend(self.serial.table().iter().cloned());
+        records.extend(self.pci.table().iter().cloned());
+        records.extend(self.network.table().iter().cloned());
+        records.extend(self.audio.table().iter().cloned());
         records.sort_by(|left, right| {
             left.class
                 .cmp(&right.class)
@@ -114,11 +155,34 @@ impl PhysicalDeviceBridge {
             .get(id)
             .or_else(|| self.usb.table().get(id))
             .or_else(|| self.serial.table().get(id))
+            .or_else(|| self.pci.table().get(id))
+            .or_else(|| self.network.table().get(id))
+            .or_else(|| self.audio.table().get(id))
             .cloned()
     }
 
     pub fn device_count(&self) -> usize {
-        self.hid.devices().len() + self.usb.devices().len() + self.serial.devices().len()
+        self.hid.devices().len()
+            + self.usb.devices().len()
+            + self.serial.devices().len()
+            + self.pci.devices().len()
+            + self.network.devices().len()
+            + self.audio.devices().len()
+    }
+
+    /// Real PCI devices with the identity and BAR sizes the host publishes.
+    pub fn pci_devices(&self) -> Vec<PciDeviceInfo> {
+        self.pci.devices().to_vec()
+    }
+
+    /// Real host adapters mapped to Windows-adapter-style metadata.
+    pub fn network_adapters(&self) -> Vec<WindowsAdapterEntry> {
+        self.network.adapters()
+    }
+
+    /// Real CoreAudio endpoints mapped to WASAPI-style descriptors.
+    pub fn audio_endpoints(&self) -> Vec<AudioEndpointDescriptor> {
+        self.audio.endpoints()
     }
 
     pub fn raw_input_table(&self) -> Vec<RawInputDeviceEntry> {
@@ -316,6 +380,12 @@ mod tests {
         assert!(bridge.hid_mut().devices().is_empty());
         assert!(bridge.usb_mut().devices().is_empty());
         assert!(bridge.serial_mut().devices().is_empty());
+        assert!(bridge.pci().devices().is_empty());
+        assert!(bridge.network().devices().is_empty());
+        assert!(bridge.audio().devices().is_empty());
+        assert!(bridge.pci_mut().devices().is_empty());
+        assert!(bridge.network_mut().devices().is_empty());
+        assert!(bridge.audio_mut().devices().is_empty());
 
         let hid = hid_info();
         let usb = usb_info();
@@ -452,6 +522,9 @@ mod tests {
         assert_eq!(bridge.raw_input_table(), Vec::new());
         assert_eq!(bridge.serial_ports(), Vec::new());
         assert_eq!(bridge.usb_devices(), Vec::new());
+        assert_eq!(bridge.pci_devices(), Vec::new());
+        assert_eq!(bridge.network_adapters(), Vec::new());
+        assert_eq!(bridge.audio_endpoints(), Vec::new());
     }
 
     #[test]

@@ -10,6 +10,9 @@ pub enum DeviceClass {
     Hid,
     Usb,
     Serial,
+    Pci,
+    Network,
+    Audio,
 }
 
 impl DeviceClass {
@@ -18,6 +21,9 @@ impl DeviceClass {
             Self::Hid => "hid",
             Self::Usb => "usb",
             Self::Serial => "serial",
+            Self::Pci => "pci",
+            Self::Network => "network",
+            Self::Audio => "audio",
         }
     }
 }
@@ -281,6 +287,9 @@ mod tests {
         assert_eq!(DeviceClass::Hid.as_str(), "hid");
         assert_eq!(DeviceClass::Usb.as_str(), "usb");
         assert_eq!(DeviceClass::Serial.as_str(), "serial");
+        assert_eq!(DeviceClass::Pci.as_str(), "pci");
+        assert_eq!(DeviceClass::Network.as_str(), "network");
+        assert_eq!(DeviceClass::Audio.as_str(), "audio");
 
         let id = StableDeviceId::derive(DeviceClass::Hid, &["045e", "028e"]);
         assert_eq!(id.as_u64(), 0x7817_8703_29fa_74f7);
