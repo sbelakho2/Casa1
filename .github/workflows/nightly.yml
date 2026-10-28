@@ -33,14 +33,15 @@ jobs:
         run: |
           set -euo pipefail
           brew install ffmpeg@7
-          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+          # One assignment only: a later PKG_CONFIG_PATH write would drop the
+          # ffmpeg@7 path that ffmpeg-sys-next 7.1.x must see first.
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
           # ffmpeg-next discovers the system libraries through pkg-config.
           # Homebrew does not put its lib/pkgconfig on the default search path
           # for every runner image, so make it explicit for this step and for
           # every later step (this is the same environment the stable
           # clippy-all-features job uses).
-          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
-          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
           pkg-config --modversion libavcodec
       - name: Test with all features (cargo-invoking meta tests skipped)
         run: |
