@@ -2516,6 +2516,109 @@ impl PeHostRuntime {
             ComMethod::ServerFireValueChanged => self.com_server_fire_value_changed(state, memory),
             // The runtime's modeled event sink.
             ComMethod::SinkInvoke => self.com_sink_invoke(state, memory),
+            // IDataObject
+            ComMethod::DataObjectGetData => self.com_data_object_get_data(state, memory),
+            ComMethod::DataObjectGetDataHere => self.com_data_object_get_data_here(state, memory),
+            ComMethod::DataObjectQueryGetData => self.com_data_object_query_get_data(state, memory),
+            ComMethod::DataObjectGetCanonicalFormatEtc => {
+                self.com_data_object_get_canonical_format_etc(state, memory)
+            }
+            ComMethod::DataObjectSetData => self.com_data_object_set_data(state, memory),
+            ComMethod::DataObjectEnumFormatEtc => {
+                self.com_data_object_enum_format_etc(state, memory)
+            }
+            ComMethod::DataObjectDAdvise => self.com_data_object_dadvise(state, memory),
+            ComMethod::DataObjectDUnadvise => self.com_data_object_dunadvise(state, memory),
+            ComMethod::DataObjectEnumDAdvise => self.com_data_object_enum_dadvise(state, memory),
+            // IOleObject
+            ComMethod::OleObjectSetClientSite => self.com_ole_object_set_client_site(state, memory),
+            ComMethod::OleObjectGetClientSite => self.com_ole_object_get_client_site(state, memory),
+            ComMethod::OleObjectSetHostNames => self.com_ole_object_set_host_names(state, memory),
+            ComMethod::OleObjectClose => self.com_ole_object_close(state, memory),
+            ComMethod::OleObjectSetMoniker => self.com_ole_object_set_moniker(state, memory),
+            ComMethod::OleObjectGetMoniker => self.com_ole_object_get_moniker(state, memory),
+            ComMethod::OleObjectInitFromData => self.com_ole_object_init_from_data(state, memory),
+            ComMethod::OleObjectGetClipboardData => {
+                self.com_ole_object_get_clipboard_data(state, memory)
+            }
+            ComMethod::OleObjectDoVerb => self.com_ole_object_do_verb(state, memory),
+            ComMethod::OleObjectEnumVerbs => self.com_ole_object_enum_verbs(state, memory),
+            ComMethod::OleObjectUpdate => self.com_ole_object_update(state, memory),
+            ComMethod::OleObjectIsUpToDate => self.com_ole_object_is_up_to_date(state, memory),
+            ComMethod::OleObjectGetUserClassID => {
+                self.com_ole_object_get_user_class_id(state, memory)
+            }
+            ComMethod::OleObjectGetUserType => self.com_ole_object_get_user_type(state, memory),
+            ComMethod::OleObjectSetExtent => self.com_ole_object_set_extent(state, memory),
+            ComMethod::OleObjectGetExtent => self.com_ole_object_get_extent(state, memory),
+            ComMethod::OleObjectAdvise => self.com_ole_object_advise(state, memory),
+            ComMethod::OleObjectUnadvise => self.com_ole_object_unadvise(state, memory),
+            ComMethod::OleObjectEnumAdvise => self.com_ole_object_enum_advise(state, memory),
+            ComMethod::OleObjectGetMiscStatus => self.com_ole_object_get_misc_status(state, memory),
+            ComMethod::OleObjectSetColorScheme => {
+                self.com_ole_object_set_color_scheme(state, memory)
+            }
+            // IOleInPlaceObject / IOleInPlaceActiveObject
+            ComMethod::InPlaceGetWindow => self.com_in_place_get_window(state, memory),
+            ComMethod::InPlaceContextSensitiveHelp => {
+                self.com_in_place_context_sensitive_help(state, memory)
+            }
+            ComMethod::InPlaceDeactivate => self.com_in_place_deactivate(state, memory),
+            ComMethod::InPlaceUIDeactivate => self.com_in_place_ui_deactivate(state, memory),
+            ComMethod::InPlaceSetObjectRects => self.com_in_place_set_object_rects(state, memory),
+            ComMethod::InPlaceReactivateAndUndo => {
+                self.com_in_place_reactivate_and_undo(state, memory)
+            }
+            ComMethod::InPlaceActiveTranslateAccelerator => {
+                self.com_in_place_active_translate_accelerator(state, memory)
+            }
+            ComMethod::InPlaceActiveOnFrameWindowActivate => {
+                self.com_in_place_active_on_frame_window_activate(state, memory)
+            }
+            ComMethod::InPlaceActiveOnDocWindowActivate => {
+                self.com_in_place_active_on_doc_window_activate(state, memory)
+            }
+            ComMethod::InPlaceActiveResizeBorder => {
+                self.com_in_place_active_resize_border(state, memory)
+            }
+            ComMethod::InPlaceActiveEnableModeless => {
+                self.com_in_place_active_enable_modeless(state, memory)
+            }
+            // IObjectWithSite / IServiceProvider
+            ComMethod::ObjectWithSiteSetSite => self.com_object_with_site_set_site(state, memory),
+            ComMethod::ObjectWithSiteGetSite => self.com_object_with_site_get_site(state, memory),
+            ComMethod::ServiceProviderQueryService => {
+                self.com_service_provider_query_service(state, memory)
+            }
+            // IDropTarget
+            ComMethod::DropTargetDragEnter => self.com_drop_target_drag_enter(state, memory),
+            ComMethod::DropTargetDragOver => self.com_drop_target_drag_over(state, memory),
+            ComMethod::DropTargetDragLeave => self.com_drop_target_drag_leave(state, memory),
+            ComMethod::DropTargetDrop => self.com_drop_target_drop(state, memory),
+            // IMalloc
+            ComMethod::MallocAlloc => self.com_malloc_alloc(state, memory),
+            ComMethod::MallocRealloc => self.com_malloc_realloc(state, memory),
+            ComMethod::MallocFree => self.com_malloc_free(state, memory),
+            ComMethod::MallocGetSize => self.com_malloc_get_size(state, memory),
+            ComMethod::MallocDidAlloc => self.com_malloc_did_alloc(state, memory),
+            ComMethod::MallocHeapMinimize => self.com_malloc_heap_minimize(state, memory),
+            // IPersist / IPersistStream
+            ComMethod::PersistGetClassID => self.com_persist_get_class_id(state, memory),
+            ComMethod::PersistStreamIsDirty => self.com_persist_stream_is_dirty(state, memory),
+            ComMethod::PersistStreamLoad => self.com_persist_stream_load(state, memory),
+            ComMethod::PersistStreamSave => self.com_persist_stream_save(state, memory),
+            ComMethod::PersistStreamGetSizeMax => {
+                self.com_persist_stream_get_size_max(state, memory)
+            }
+            // ISupportErrorInfo
+            ComMethod::SupportErrorInfoInterfaceSupports => {
+                self.com_support_error_info_interface_supports(state, memory)
+            }
+            // Snapshot enumerators
+            ComMethod::SurfaceEnumNext => self.com_surface_enum_next(state, memory),
+            ComMethod::SurfaceEnumSkip => self.com_surface_enum_skip(state, memory),
+            ComMethod::SurfaceEnumReset => self.com_surface_enum_reset(state, memory),
+            ComMethod::SurfaceEnumClone => self.com_surface_enum_clone(state, memory),
         }
     }
 
@@ -2788,6 +2891,146 @@ impl PeHostRuntime {
         if iid == COM_IID_IUNKNOWN {
             supported = kind.is_some();
             interface = this;
+        } else if let Some(role) = self.com_surface_role(this) {
+            supported = match role {
+                ComOleSurfaceRole::DataObject => {
+                    if iid == COM_IID_IDATAOBJECT {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ComOleSurfaceRole::EnumFormatEtc => {
+                    if iid == COM_IID_IENUMFORMATETC {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ComOleSurfaceRole::EnumStatData => {
+                    if iid == COM_IID_IENUMSTATDATA {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ComOleSurfaceRole::EnumOleVerb => {
+                    if iid == COM_IID_IENUMOLEVERB {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ComOleSurfaceRole::OleObject => {
+                    if iid == COM_IID_IOLEOBJECT {
+                        interface = this;
+                        true
+                    } else if iid == COM_IID_IOLEINPLACEOBJECT {
+                        let sibling = self.alloc_com_ole_in_place_object(memory, this)?;
+                        if let Some(meta) = self.guest_objects.get_mut(&sibling) {
+                            meta.refcount = 0;
+                        }
+                        interface = sibling;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ComOleSurfaceRole::InPlaceObject => {
+                    if iid == COM_IID_IOLEINPLACEOBJECT || iid == COM_IID_IOLEWINDOW {
+                        interface = this;
+                        true
+                    } else {
+                        let owner = self
+                            .com_data_objects
+                            .get(&this)
+                            .map(|object| object.owner)
+                            .unwrap_or(0);
+                        if iid == COM_IID_IOLEOBJECT && owner != 0 {
+                            interface = owner;
+                            true
+                        } else if iid == COM_IID_IOLEINPLACEACTIVEOBJECT {
+                            let sibling = self.alloc_com_in_place_active_object(memory, owner)?;
+                            if let Some(meta) = self.guest_objects.get_mut(&sibling) {
+                                meta.refcount = 0;
+                            }
+                            interface = sibling;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+                ComOleSurfaceRole::InPlaceActiveObject => {
+                    if iid == COM_IID_IOLEINPLACEACTIVEOBJECT || iid == COM_IID_IOLEWINDOW {
+                        interface = this;
+                        true
+                    } else {
+                        let owner = self
+                            .com_data_objects
+                            .get(&this)
+                            .map(|object| object.owner)
+                            .unwrap_or(0);
+                        if iid == COM_IID_IOLEOBJECT && owner != 0 {
+                            interface = owner;
+                            true
+                        } else if iid == COM_IID_IOLEINPLACEOBJECT {
+                            let sibling = self.alloc_com_ole_in_place_object(memory, owner)?;
+                            if let Some(meta) = self.guest_objects.get_mut(&sibling) {
+                                meta.refcount = 0;
+                            }
+                            interface = sibling;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+                ComOleSurfaceRole::ObjectWithSite => {
+                    if iid == COM_IID_IOBJECTWITHSITE {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ComOleSurfaceRole::ServiceProvider => {
+                    if iid == COM_IID_ISERVICEPROVIDER {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ComOleSurfaceRole::DropTarget => {
+                    if iid == COM_IID_IDROPTARGET {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ComOleSurfaceRole::PersistStream => {
+                    if iid == COM_IID_IPERSIST || iid == COM_IID_IPERSISTSTREAM {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                ComOleSurfaceRole::SupportErrorInfo => {
+                    if iid == COM_IID_ISUPPORTERRORINFO {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
         } else if let Some(kind) = kind {
             supported = match kind {
                 GuestObjectKind::ComStream => {
@@ -2881,6 +3124,14 @@ impl PeHostRuntime {
                         COM_IID_ITYPEINFO
                     };
                     if iid == wanted {
+                        interface = this;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                GuestObjectKind::ShMalloc => {
+                    if iid == COM_IID_IMALLOC {
                         interface = this;
                         true
                     } else {
@@ -9483,6 +9734,2648 @@ impl PeHostRuntime {
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
+    // ── IDataObject / IOleObject / in-place / sites / drag / persistence ───
+
+    fn com_format_etc_size(&self) -> u64 {
+        match self.guest_arch {
+            GuestArch::X86 => 20,
+            GuestArch::X64 => 32,
+        }
+    }
+
+    fn com_stgmedium_size(&self) -> u64 {
+        match self.guest_arch {
+            GuestArch::X86 => 12,
+            GuestArch::X64 => 24,
+        }
+    }
+
+    fn com_statdata_size(&self) -> u64 {
+        match self.guest_arch {
+            GuestArch::X86 => 32,
+            GuestArch::X64 => 56,
+        }
+    }
+
+    fn com_oleverb_size(&self) -> u64 {
+        match self.guest_arch {
+            GuestArch::X86 => 16,
+            GuestArch::X64 => 24,
+        }
+    }
+
+    fn com_read_format_etc(&self, memory: &MemoryImage, ptr: u64) -> Option<ComFormatEtcValue> {
+        if ptr == 0 {
+            return None;
+        }
+        match self.guest_arch {
+            GuestArch::X86 => Some(ComFormatEtcValue {
+                cf_format: memory.read_u16(ptr).ok()?,
+                ptd: memory.read_u32(ptr + 4).ok()? as u64,
+                dw_aspect: memory.read_u32(ptr + 8).ok()?,
+                lindex: memory.read_u32(ptr + 12).ok()? as i32,
+                tymed: memory.read_u32(ptr + 16).ok()?,
+            }),
+            GuestArch::X64 => Some(ComFormatEtcValue {
+                cf_format: memory.read_u16(ptr).ok()?,
+                ptd: memory.read_u64(ptr + 8).ok()?,
+                dw_aspect: memory.read_u32(ptr + 16).ok()?,
+                lindex: memory.read_u32(ptr + 20).ok()? as i32,
+                tymed: memory.read_u32(ptr + 24).ok()?,
+            }),
+        }
+    }
+
+    fn com_write_format_etc(&self, memory: &mut MemoryImage, ptr: u64, value: &ComFormatEtcValue) {
+        let size = self.com_format_etc_size() as usize;
+        let _ = memory.map_bytes(ptr, &vec![0_u8; size]);
+        let _ = memory.write_u16(ptr, value.cf_format);
+        match self.guest_arch {
+            GuestArch::X86 => {
+                let _ = memory.write_u32(ptr + 4, value.ptd as u32);
+                let _ = memory.write_u32(ptr + 8, value.dw_aspect);
+                let _ = memory.write_u32(ptr + 12, value.lindex as u32);
+                let _ = memory.write_u32(ptr + 16, value.tymed);
+            }
+            GuestArch::X64 => {
+                let _ = memory.write_u64(ptr + 8, value.ptd);
+                let _ = memory.write_u32(ptr + 16, value.dw_aspect);
+                let _ = memory.write_u32(ptr + 20, value.lindex as u32);
+                let _ = memory.write_u32(ptr + 24, value.tymed);
+            }
+        }
+    }
+
+    fn com_format_etc_bytes(&self, value: &ComFormatEtcValue) -> Vec<u8> {
+        let size = self.com_format_etc_size() as usize;
+        let mut bytes = vec![0_u8; size];
+        bytes[0..2].copy_from_slice(&value.cf_format.to_le_bytes());
+        match self.guest_arch {
+            GuestArch::X86 => {
+                bytes[4..8].copy_from_slice(&(value.ptd as u32).to_le_bytes());
+                bytes[8..12].copy_from_slice(&value.dw_aspect.to_le_bytes());
+                bytes[12..16].copy_from_slice(&(value.lindex as u32).to_le_bytes());
+                bytes[16..20].copy_from_slice(&value.tymed.to_le_bytes());
+            }
+            GuestArch::X64 => {
+                bytes[8..16].copy_from_slice(&value.ptd.to_le_bytes());
+                bytes[16..20].copy_from_slice(&value.dw_aspect.to_le_bytes());
+                bytes[20..24].copy_from_slice(&(value.lindex as u32).to_le_bytes());
+                bytes[24..28].copy_from_slice(&value.tymed.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn com_write_stgmedium(
+        &self,
+        memory: &mut MemoryImage,
+        ptr: u64,
+        tymed: u32,
+        value: u64,
+        punk: u64,
+    ) {
+        let size = self.com_stgmedium_size() as usize;
+        let _ = memory.map_bytes(ptr, &vec![0_u8; size]);
+        let _ = memory.write_u32(ptr, tymed);
+        match self.guest_arch {
+            GuestArch::X86 => {
+                let _ = memory.write_u32(ptr + 4, value as u32);
+                let _ = memory.write_u32(ptr + 8, punk as u32);
+            }
+            GuestArch::X64 => {
+                let _ = memory.write_u64(ptr + 8, value);
+                let _ = memory.write_u64(ptr + 16, punk);
+            }
+        }
+    }
+
+    fn com_read_stgmedium(&self, memory: &MemoryImage, ptr: u64) -> Option<(u32, u64, u64)> {
+        if ptr == 0 {
+            return None;
+        }
+        Some(match self.guest_arch {
+            GuestArch::X86 => (
+                memory.read_u32(ptr).ok()?,
+                memory.read_u32(ptr + 4).ok()? as u64,
+                memory.read_u32(ptr + 8).ok()? as u64,
+            ),
+            GuestArch::X64 => (
+                memory.read_u32(ptr).ok()?,
+                memory.read_u64(ptr + 8).ok()?,
+                memory.read_u64(ptr + 16).ok()?,
+            ),
+        })
+    }
+
+    fn com_validate_format_etc(
+        &self,
+        state: &ComDataObjectState,
+        value: &ComFormatEtcValue,
+        check_aspect: bool,
+        check_lindex: bool,
+    ) -> u32 {
+        if value.cf_format == 0 {
+            return DV_E_CLIPFORMAT;
+        }
+        if !state.formats.contains_key(&u32::from(value.cf_format)) {
+            return DV_E_FORMATETC;
+        }
+        if check_aspect && value.dw_aspect & DVASPECT_CONTENT == 0 {
+            return DV_E_DVASPECT;
+        }
+        if check_lindex && value.lindex != -1 {
+            return DV_E_LINDEX;
+        }
+        if value.tymed & TYMED_HGLOBAL == 0 {
+            return DV_E_TYMED;
+        }
+        if value.ptd != 0 {
+            return DV_E_DVTARGETDEVICE;
+        }
+        S_OK
+    }
+
+    fn com_surface_role(&self, this: u64) -> Option<ComOleSurfaceRole> {
+        self.com_data_objects.get(&this).map(|state| state.role)
+    }
+
+    fn com_surface_enum_item_size(&self, role: ComOleSurfaceRole) -> u64 {
+        match role {
+            ComOleSurfaceRole::EnumFormatEtc => self.com_format_etc_size(),
+            ComOleSurfaceRole::EnumStatData => self.com_statdata_size(),
+            ComOleSurfaceRole::EnumOleVerb => self.com_oleverb_size(),
+            _ => 0,
+        }
+    }
+
+    fn com_encode_statdata(&self, advise: &ComOleAdvise) -> Vec<u8> {
+        let format_size = self.com_format_etc_size() as usize;
+        let mut bytes = vec![0_u8; self.com_statdata_size() as usize];
+        let copy = advise.format_etc.len().min(format_size);
+        bytes[..copy].copy_from_slice(&advise.format_etc[..copy]);
+        match self.guest_arch {
+            GuestArch::X86 => {
+                bytes[format_size..format_size + 4].copy_from_slice(&advise.advf.to_le_bytes());
+                bytes[format_size + 4..format_size + 8]
+                    .copy_from_slice(&(advise.sink as u32).to_le_bytes());
+                bytes[format_size + 8..format_size + 12]
+                    .copy_from_slice(&advise.cookie.to_le_bytes());
+            }
+            GuestArch::X64 => {
+                bytes[format_size..format_size + 4].copy_from_slice(&advise.advf.to_le_bytes());
+                bytes[format_size + 8..format_size + 16]
+                    .copy_from_slice(&advise.sink.to_le_bytes());
+                bytes[format_size + 16..format_size + 20]
+                    .copy_from_slice(&advise.cookie.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// Create a guest IDataObject over an ordered FORMATETC payload table.
+    pub(crate) fn alloc_com_data_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        formats: Vec<(u16, Vec<u8>)>,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::DataObjectGetData),
+            HostThunk::ComMethod(ComMethod::DataObjectGetDataHere),
+            HostThunk::ComMethod(ComMethod::DataObjectQueryGetData),
+            HostThunk::ComMethod(ComMethod::DataObjectGetCanonicalFormatEtc),
+            HostThunk::ComMethod(ComMethod::DataObjectSetData),
+            HostThunk::ComMethod(ComMethod::DataObjectEnumFormatEtc),
+            HostThunk::ComMethod(ComMethod::DataObjectDAdvise),
+            HostThunk::ComMethod(ComMethod::DataObjectDUnadvise),
+            HostThunk::ComMethod(ComMethod::DataObjectEnumDAdvise),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComDataObject, vtable)?;
+        let mut state = ComDataObjectState {
+            role: ComOleSurfaceRole::DataObject,
+            next_advise_cookie: 1,
+            next_ole_cookie: 1,
+            ..Default::default()
+        };
+        for (format, payload) in formats {
+            let key = u32::from(format);
+            if !state.formats.contains_key(&key) {
+                state.format_order.push(key);
+            }
+            state.formats.insert(key, payload);
+        }
+        self.com_data_objects.insert(object, state);
+        Ok(object)
+    }
+
+    /// Create an IOleObject.
+    #[allow(dead_code)] // created by the ole32 surface tests and future OLE entry points
+    pub(crate) fn alloc_com_ole_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::OleObjectSetClientSite),
+            HostThunk::ComMethod(ComMethod::OleObjectGetClientSite),
+            HostThunk::ComMethod(ComMethod::OleObjectSetHostNames),
+            HostThunk::ComMethod(ComMethod::OleObjectClose),
+            HostThunk::ComMethod(ComMethod::OleObjectSetMoniker),
+            HostThunk::ComMethod(ComMethod::OleObjectGetMoniker),
+            HostThunk::ComMethod(ComMethod::OleObjectInitFromData),
+            HostThunk::ComMethod(ComMethod::OleObjectGetClipboardData),
+            HostThunk::ComMethod(ComMethod::OleObjectDoVerb),
+            HostThunk::ComMethod(ComMethod::OleObjectEnumVerbs),
+            HostThunk::ComMethod(ComMethod::OleObjectUpdate),
+            HostThunk::ComMethod(ComMethod::OleObjectIsUpToDate),
+            HostThunk::ComMethod(ComMethod::OleObjectGetUserClassID),
+            HostThunk::ComMethod(ComMethod::OleObjectGetUserType),
+            HostThunk::ComMethod(ComMethod::OleObjectSetExtent),
+            HostThunk::ComMethod(ComMethod::OleObjectGetExtent),
+            HostThunk::ComMethod(ComMethod::OleObjectAdvise),
+            HostThunk::ComMethod(ComMethod::OleObjectUnadvise),
+            HostThunk::ComMethod(ComMethod::OleObjectEnumAdvise),
+            HostThunk::ComMethod(ComMethod::OleObjectGetMiscStatus),
+            HostThunk::ComMethod(ComMethod::OleObjectSetColorScheme),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComOleObject, vtable)?;
+        self.com_data_objects.insert(
+            object,
+            ComDataObjectState {
+                role: ComOleSurfaceRole::OleObject,
+                class_id: COM_OLE_OBJECT_CLSID,
+                next_advise_cookie: 1,
+                next_ole_cookie: 1,
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    /// Create an IOleInPlaceObject (the `owner` is the IOleObject it belongs
+    /// to, or 0 for a standalone object).
+    pub(crate) fn alloc_com_ole_in_place_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        owner: u64,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::InPlaceGetWindow),
+            HostThunk::ComMethod(ComMethod::InPlaceContextSensitiveHelp),
+            HostThunk::ComMethod(ComMethod::InPlaceDeactivate),
+            HostThunk::ComMethod(ComMethod::InPlaceUIDeactivate),
+            HostThunk::ComMethod(ComMethod::InPlaceSetObjectRects),
+            HostThunk::ComMethod(ComMethod::InPlaceReactivateAndUndo),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object =
+            self.alloc_guest_object(memory, GuestObjectKind::ComOleInPlaceObject, vtable)?;
+        let mut state = ComDataObjectState {
+            role: ComOleSurfaceRole::InPlaceObject,
+            owner,
+            ..Default::default()
+        };
+        if owner != 0 {
+            if let Some(owner_state) = self.com_data_objects.get(&owner) {
+                state.hwnd = owner_state.hwnd;
+                state.pos_rect = owner_state.pos_rect;
+                state.clip_rect = owner_state.clip_rect;
+                state.in_place_active = owner_state.in_place_active;
+                state.ui_active = owner_state.ui_active;
+                state.undo_available = owner_state.undo_available;
+            }
+        } // coverage: unreachable — llvm-cov zero-region on the closing brace of the exercised owner-state copy
+        self.com_data_objects.insert(object, state);
+        Ok(object)
+    }
+
+    /// Create an IOleInPlaceActiveObject linked to `owner`.
+    pub(crate) fn alloc_com_in_place_active_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        owner: u64,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::InPlaceGetWindow),
+            HostThunk::ComMethod(ComMethod::InPlaceContextSensitiveHelp),
+            HostThunk::ComMethod(ComMethod::InPlaceActiveTranslateAccelerator),
+            HostThunk::ComMethod(ComMethod::InPlaceActiveOnFrameWindowActivate),
+            HostThunk::ComMethod(ComMethod::InPlaceActiveOnDocWindowActivate),
+            HostThunk::ComMethod(ComMethod::InPlaceActiveResizeBorder),
+            HostThunk::ComMethod(ComMethod::InPlaceActiveEnableModeless),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object =
+            self.alloc_guest_object(memory, GuestObjectKind::ComOleInPlaceObject, vtable)?;
+        let mut state = ComDataObjectState {
+            role: ComOleSurfaceRole::InPlaceActiveObject,
+            owner,
+            in_place_active: true,
+            ..Default::default()
+        };
+        if owner != 0 {
+            if let Some(owner_state) = self.com_data_objects.get(&owner) {
+                state.hwnd = owner_state.hwnd;
+                state.pos_rect = owner_state.pos_rect;
+                state.clip_rect = owner_state.clip_rect;
+                state.ui_active = owner_state.ui_active;
+                state.undo_available = owner_state.undo_available;
+            }
+        } // coverage: unreachable — llvm-cov zero-region on the closing brace of the exercised owner-state copy
+        self.com_data_objects.insert(object, state);
+        Ok(object)
+    }
+
+    /// Create an IObjectWithSite.
+    #[allow(dead_code)] // created by the ole32 surface tests and future OLE entry points
+    pub(crate) fn alloc_com_object_with_site(
+        &mut self,
+        memory: &mut MemoryImage,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::ObjectWithSiteSetSite),
+            HostThunk::ComMethod(ComMethod::ObjectWithSiteGetSite),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComObjectWithSite, vtable)?;
+        self.com_data_objects.insert(
+            object,
+            ComDataObjectState {
+                role: ComOleSurfaceRole::ObjectWithSite,
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    /// Create an IServiceProvider answering from `services`.
+    #[allow(dead_code)] // created by the ole32 surface tests and future OLE entry points
+    pub(crate) fn alloc_com_service_provider(
+        &mut self,
+        memory: &mut MemoryImage,
+        services: Vec<([u8; 16], u64)>,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::ServiceProviderQueryService),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object =
+            self.alloc_guest_object(memory, GuestObjectKind::ComServiceProvider, vtable)?;
+        let mut state = ComDataObjectState {
+            role: ComOleSurfaceRole::ServiceProvider,
+            ..Default::default()
+        };
+        for (iid, service) in services {
+            state
+                .services
+                .insert(Self::guid_bytes_to_string(&iid), service);
+        }
+        self.com_data_objects.insert(object, state);
+        Ok(object)
+    }
+
+    /// Create an IDropTarget.
+    #[allow(dead_code)] // created by the ole32 surface tests and future OLE entry points
+    pub(crate) fn alloc_com_drop_target(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::DropTargetDragEnter),
+            HostThunk::ComMethod(ComMethod::DropTargetDragOver),
+            HostThunk::ComMethod(ComMethod::DropTargetDragLeave),
+            HostThunk::ComMethod(ComMethod::DropTargetDrop),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComStdDispatch, vtable)?;
+        self.com_data_objects.insert(
+            object,
+            ComDataObjectState {
+                role: ComOleSurfaceRole::DropTarget,
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    /// Create an IPersistStream/IPersist object over `data`.
+    #[allow(dead_code)] // created by the ole32 surface tests and future OLE entry points
+    pub(crate) fn alloc_com_persist_stream(
+        &mut self,
+        memory: &mut MemoryImage,
+        class_id: [u8; 16],
+        data: Vec<u8>,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::PersistGetClassID),
+            HostThunk::ComMethod(ComMethod::PersistStreamIsDirty),
+            HostThunk::ComMethod(ComMethod::PersistStreamLoad),
+            HostThunk::ComMethod(ComMethod::PersistStreamSave),
+            HostThunk::ComMethod(ComMethod::PersistStreamGetSizeMax),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComPropertyBag, vtable)?;
+        self.com_data_objects.insert(
+            object,
+            ComDataObjectState {
+                role: ComOleSurfaceRole::PersistStream,
+                class_id,
+                persist_data: data,
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    /// Create an ISupportErrorInfo answering `iids`.
+    #[allow(dead_code)] // created by the ole32 surface tests and future OLE entry points
+    pub(crate) fn alloc_com_support_error_info(
+        &mut self,
+        memory: &mut MemoryImage,
+        iids: Vec<[u8; 16]>,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::SupportErrorInfoInterfaceSupports),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComStorageObject, vtable)?;
+        self.com_data_objects.insert(
+            object,
+            ComDataObjectState {
+                role: ComOleSurfaceRole::SupportErrorInfo,
+                error_info_iids: iids,
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    /// Create the standard IMalloc allocator over the COM task allocator.
+    #[allow(dead_code)] // created by the ole32 surface tests and future OLE entry points
+    pub(crate) fn alloc_com_malloc_object(&mut self, memory: &mut MemoryImage) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::MallocAlloc),
+            HostThunk::ComMethod(ComMethod::MallocRealloc),
+            HostThunk::ComMethod(ComMethod::MallocFree),
+            HostThunk::ComMethod(ComMethod::MallocGetSize),
+            HostThunk::ComMethod(ComMethod::MallocDidAlloc),
+            HostThunk::ComMethod(ComMethod::MallocHeapMinimize),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        self.alloc_guest_object(memory, GuestObjectKind::ShMalloc, vtable)
+    }
+
+    fn alloc_com_surface_enum(
+        &mut self,
+        memory: &mut MemoryImage,
+        role: ComOleSurfaceRole,
+        items: Vec<Vec<u8>>,
+    ) -> AppResult<u64> {
+        let methods = vec![
+            HostThunk::ComMethod(ComMethod::QueryInterface),
+            HostThunk::GuestObjectAddRef,
+            HostThunk::GuestObjectRelease,
+            HostThunk::ComMethod(ComMethod::SurfaceEnumNext),
+            HostThunk::ComMethod(ComMethod::SurfaceEnumSkip),
+            HostThunk::ComMethod(ComMethod::SurfaceEnumReset),
+            HostThunk::ComMethod(ComMethod::SurfaceEnumClone),
+        ];
+        let vtable = self.alloc_guest_vtable(memory, methods)?;
+        let object = self.alloc_guest_object(memory, GuestObjectKind::ComEnumVariant, vtable)?;
+        self.com_data_objects.insert(
+            object,
+            ComDataObjectState {
+                role,
+                enum_items: items,
+                ..Default::default()
+            },
+        );
+        Ok(object)
+    }
+
+    fn com_object_supports_interface(&self, object: u64, iid: &[u8; 16]) -> bool {
+        if *iid == COM_IID_IUNKNOWN {
+            return self.guest_objects.contains_key(&object);
+        }
+        if let Some(role) = self.com_surface_role(object) {
+            return match role {
+                ComOleSurfaceRole::DataObject => *iid == COM_IID_IDATAOBJECT,
+                ComOleSurfaceRole::EnumFormatEtc => *iid == COM_IID_IENUMFORMATETC,
+                ComOleSurfaceRole::EnumStatData => *iid == COM_IID_IENUMSTATDATA,
+                ComOleSurfaceRole::EnumOleVerb => *iid == COM_IID_IENUMOLEVERB,
+                ComOleSurfaceRole::OleObject => *iid == COM_IID_IOLEOBJECT,
+                ComOleSurfaceRole::InPlaceObject => {
+                    *iid == COM_IID_IOLEINPLACEOBJECT || *iid == COM_IID_IOLEWINDOW
+                }
+                ComOleSurfaceRole::InPlaceActiveObject => {
+                    *iid == COM_IID_IOLEINPLACEACTIVEOBJECT || *iid == COM_IID_IOLEWINDOW
+                }
+                ComOleSurfaceRole::ObjectWithSite => *iid == COM_IID_IOBJECTWITHSITE,
+                ComOleSurfaceRole::ServiceProvider => *iid == COM_IID_ISERVICEPROVIDER,
+                ComOleSurfaceRole::DropTarget => *iid == COM_IID_IDROPTARGET,
+                ComOleSurfaceRole::PersistStream => {
+                    *iid == COM_IID_IPERSIST || *iid == COM_IID_IPERSISTSTREAM
+                }
+                ComOleSurfaceRole::SupportErrorInfo => *iid == COM_IID_ISUPPORTERRORINFO,
+            };
+        }
+        match self.guest_object_kind(object).ok() {
+            Some(GuestObjectKind::ComStream) => {
+                *iid == COM_IID_ISTREAM || *iid == COM_IID_ISEQUENTIALSTREAM
+            }
+            Some(GuestObjectKind::ComStorage) => *iid == COM_IID_ISTORAGE,
+            Some(GuestObjectKind::ShMalloc) => *iid == COM_IID_IMALLOC,
+            _ => false,
+        }
+    }
+
+    fn com_read_sizel(&self, memory: &MemoryImage, ptr: u64) -> Option<(i32, i32)> {
+        if ptr == 0 {
+            return None;
+        }
+        Some((
+            memory.read_u32(ptr).ok()? as i32,
+            memory.read_u32(ptr + 4).ok()? as i32,
+        ))
+    }
+
+    fn com_read_rect(&self, memory: &MemoryImage, ptr: u64) -> Option<[i32; 4]> {
+        if ptr == 0 {
+            return None;
+        }
+        Some([
+            memory.read_u32(ptr).ok()? as i32,
+            memory.read_u32(ptr + 4).ok()? as i32,
+            memory.read_u32(ptr + 8).ok()? as i32,
+            memory.read_u32(ptr + 12).ok()? as i32,
+        ])
+    }
+
+    /// `IDataObject::GetData` over the object's real payload table.
+    fn com_data_object_get_data(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let format_ptr = guest_call_arg(state, memory, 1)?;
+        let medium_ptr = guest_call_arg(state, memory, 2)?;
+        let Some(format) = self.com_read_format_etc(memory, format_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if medium_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.role != ComOleSurfaceRole::DataObject {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let status = self.com_validate_format_etc(object, &format, true, true);
+        if status != S_OK {
+            state.set(Register::Rax, u64::from(status));
+            return Ok(());
+        }
+        let payload = object
+            .formats
+            .get(&u32::from(format.cf_format))
+            .cloned()
+            .unwrap_or_default();
+        let global = self.alloc_heap(memory, payload.len(), true)?;
+        memory.map_bytes(global, &payload);
+        self.com_write_stgmedium(memory, medium_ptr, TYMED_HGLOBAL, global, 0);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IDataObject::GetDataHere` into a caller-supplied medium.
+    fn com_data_object_get_data_here(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let format_ptr = guest_call_arg(state, memory, 1)?;
+        let medium_ptr = guest_call_arg(state, memory, 2)?;
+        let Some(format) = self.com_read_format_etc(memory, format_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG)); // coverage: unreachable — llvm-cov zero-region on the let-else read arm; GetDataHere(NULL medium) exercises it
+            return Ok(()); // coverage: unreachable — llvm-cov zero-region on the let-else error arm; GetDataHere(NULL medium) exercises it
+        };
+        let Some((tymed, union_ptr, _)) = self.com_read_stgmedium(memory, medium_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.role != ComOleSurfaceRole::DataObject {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let status = self.com_validate_format_etc(object, &format, true, true);
+        if status != S_OK {
+            state.set(Register::Rax, u64::from(status));
+            return Ok(());
+        }
+        let payload = object
+            .formats
+            .get(&u32::from(format.cf_format))
+            .cloned()
+            .unwrap_or_default();
+        if tymed & TYMED_HGLOBAL != 0 {
+            if union_ptr == 0 {
+                state.set(Register::Rax, u64::from(STG_E_MEDIUMFULL));
+                return Ok(());
+            }
+            let capacity = self.heap_allocations.get(&union_ptr).copied().unwrap_or(0);
+            if capacity < payload.len() {
+                state.set(Register::Rax, u64::from(STG_E_MEDIUMFULL));
+                return Ok(());
+            }
+            memory.map_bytes(union_ptr, &payload);
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        if tymed & TYMED_ISTREAM != 0 {
+            let Some(stream) = self.com_streams.get_mut(&union_ptr) else {
+                state.set(Register::Rax, u64::from(STG_E_MEDIUMFULL));
+                return Ok(());
+            };
+            let position = stream.position as usize;
+            let end = position + payload.len();
+            if stream.data.len() < end {
+                stream.data.resize(end, 0);
+            }
+            stream.data[position..end].copy_from_slice(&payload);
+            stream.position = end as u64;
+            stream.dirty = true;
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        if tymed & TYMED_ISTORAGE != 0 {
+            let name = "Contents".to_string();
+            let Some(storage) = self.com_storages.get_mut(&union_ptr) else {
+                state.set(Register::Rax, u64::from(STG_E_MEDIUMFULL));
+                return Ok(());
+            };
+            if !storage.streams.contains_key(&name) {
+                storage.element_order.push(name.clone());
+            }
+            storage.streams.insert(name, payload);
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(DV_E_TYMED));
+        Ok(())
+    }
+
+    /// `IDataObject::QueryGetData` validates the FORMATETC contract.
+    fn com_data_object_query_get_data(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let format_ptr = guest_call_arg(state, memory, 1)?;
+        let Some(format) = self.com_read_format_etc(memory, format_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.role != ComOleSurfaceRole::DataObject {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let status = self.com_validate_format_etc(object, &format, true, true);
+        state.set(Register::Rax, u64::from(status));
+        Ok(())
+    }
+
+    /// `IDataObject::GetCanonicalFormatEtc`.
+    fn com_data_object_get_canonical_format_etc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let format_ptr = guest_call_arg(state, memory, 1)?;
+        let out_ptr = guest_call_arg(state, memory, 2)?;
+        let Some(format) = self.com_read_format_etc(memory, format_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.role != ComOleSurfaceRole::DataObject {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let status = self.com_validate_format_etc(object, &format, true, false);
+        if status != S_OK {
+            state.set(Register::Rax, u64::from(status));
+            return Ok(());
+        }
+        let canonical = format.lindex == -1;
+        let mut canonical_value = format;
+        canonical_value.lindex = -1;
+        canonical_value.ptd = 0;
+        self.com_write_format_etc(memory, out_ptr, &canonical_value);
+        state.set(
+            Register::Rax,
+            u64::from(if canonical {
+                DATA_S_SAMEFORMATETC
+            } else {
+                S_OK
+            }),
+        );
+        Ok(())
+    }
+
+    /// `IDataObject::SetData`.
+    fn com_data_object_set_data(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let format_ptr = guest_call_arg(state, memory, 1)?;
+        let medium_ptr = guest_call_arg(state, memory, 2)?;
+        let release = guest_call_arg(state, memory, 3)? != 0;
+        let Some(format) = self.com_read_format_etc(memory, format_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some((tymed, union_ptr, _)) = self.com_read_stgmedium(memory, medium_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.role != ComOleSurfaceRole::DataObject {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        if format.dw_aspect & DVASPECT_CONTENT == 0 {
+            state.set(Register::Rax, u64::from(DV_E_DVASPECT));
+            return Ok(());
+        }
+        if format.lindex != -1 {
+            state.set(Register::Rax, u64::from(DV_E_LINDEX));
+            return Ok(());
+        }
+        if format.ptd != 0 {
+            state.set(Register::Rax, u64::from(DV_E_DVTARGETDEVICE));
+            return Ok(());
+        }
+        if tymed == TYMED_NULL {
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let payload = if tymed & TYMED_HGLOBAL != 0 {
+            if union_ptr == 0 {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+            let size = self.heap_allocations.get(&union_ptr).copied().unwrap_or(0);
+            memory.read_bytes(union_ptr, size).unwrap_or_default()
+        } else if tymed & TYMED_ISTREAM != 0 {
+            let Some(stream) = self.com_streams.get(&union_ptr) else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            let start = stream.position as usize;
+            stream.data[start..].to_vec()
+        } else if tymed & TYMED_ISTORAGE != 0 {
+            let Some(storage) = self.com_storages.get(&union_ptr) else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            storage
+                .streams
+                .get("Contents")
+                .or_else(|| storage.streams.values().next())
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            state.set(Register::Rax, u64::from(DV_E_TYMED));
+            return Ok(());
+        };
+        if let Some(object) = self.com_data_objects.get_mut(&this) {
+            let key = u32::from(format.cf_format);
+            if !object.formats.contains_key(&key) {
+                object.format_order.push(key);
+            }
+            object.formats.insert(key, payload);
+        } // coverage: unreachable — llvm-cov zero-region on the exercised SetData closing brace
+        if release {
+            if tymed & TYMED_HGLOBAL != 0 && union_ptr != 0 {
+                self.heap_allocations.remove(&union_ptr);
+                self.com_task_allocations.remove(&union_ptr);
+            } else if tymed & (TYMED_ISTREAM | TYMED_ISTORAGE) != 0 && union_ptr != 0 {
+                let _ = self.release_guest_object(union_ptr);
+            }
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IDataObject::EnumFormatEtc`.
+    fn com_data_object_enum_format_etc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let direction = guest_call_arg(state, memory, 1)? as u32;
+        let out_ptr = guest_call_arg(state, memory, 2)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if direction != DATADIR_GET && direction != DATADIR_SET {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.role != ComOleSurfaceRole::DataObject {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let items = object
+            .format_order
+            .iter()
+            .filter_map(|cf| object.formats.get(cf).map(|_| *cf as u16))
+            .map(|cf| {
+                self.com_format_etc_bytes(&ComFormatEtcValue {
+                    cf_format: cf,
+                    ptd: 0,
+                    dw_aspect: DVASPECT_CONTENT,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL,
+                })
+            })
+            .collect();
+        let enumerator =
+            self.alloc_com_surface_enum(memory, ComOleSurfaceRole::EnumFormatEtc, items)?;
+        write_guest_pointer(memory, out_ptr, enumerator, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IDataObject::DAdvise`.
+    fn com_data_object_dadvise(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let format_ptr = guest_call_arg(state, memory, 1)?;
+        let advf = guest_call_arg(state, memory, 2)? as u32;
+        let sink = guest_call_arg(state, memory, 3)?;
+        let cookie_ptr = guest_call_arg(state, memory, 4)?;
+        let Some(format) = self.com_read_format_etc(memory, format_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if sink == 0 || cookie_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.role != ComOleSurfaceRole::DataObject {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        if !object.formats.contains_key(&u32::from(format.cf_format)) {
+            state.set(Register::Rax, u64::from(DV_E_FORMATETC));
+            return Ok(());
+        }
+        let allowed =
+            ADVF_NODATA | ADVF_PRIMEFIRST | ADVF_ONLYONCE | ADVF_DATAONSTOP | ADVF_READONLY;
+        if advf & !allowed != 0 {
+            state.set(Register::Rax, u64::from(OLE_E_ADVISENOTSUPPORTED));
+            return Ok(());
+        }
+        let format_etc = self.com_format_etc_bytes(&format);
+        if let Some(object) = self.com_data_objects.get_mut(&this) {
+            let cookie = object.next_advise_cookie;
+            object.next_advise_cookie = object.next_advise_cookie.wrapping_add(1).max(1);
+            object.data_advises.push(ComOleAdvise {
+                cookie,
+                format_etc,
+                advf,
+                sink,
+            });
+            write_u32(memory, cookie_ptr, cookie);
+        }
+        let _ = self.add_ref_guest_object(sink);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IDataObject::DUnadvise`.
+    fn com_data_object_dunadvise(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let cookie = guest_call_arg(state, memory, 1)? as u32;
+        let (removed, before, after) = {
+            let Some(object) = self.com_data_objects.get_mut(&this) else {
+                state.set(Register::Rax, u64::from(E_UNEXPECTED));
+                return Ok(());
+            };
+            if object.role != ComOleSurfaceRole::DataObject {
+                state.set(Register::Rax, u64::from(E_UNEXPECTED));
+                return Ok(());
+            }
+            let removed = object
+                .data_advises
+                .iter()
+                .filter(|advise| advise.cookie == cookie)
+                .map(|advise| advise.sink)
+                .collect::<Vec<_>>();
+            let before = object.data_advises.len();
+            object.data_advises.retain(|advise| advise.cookie != cookie);
+            let after = object.data_advises.len();
+            (removed, before, after)
+        };
+        for sink in removed {
+            let _ = self.release_guest_object(sink);
+        }
+        state.set(
+            Register::Rax,
+            u64::from(if after == before {
+                OLE_E_NOCONNECTION
+            } else {
+                S_OK
+            }),
+        );
+        Ok(())
+    }
+
+    /// `IDataObject::EnumDAdvise`.
+    fn com_data_object_enum_dadvise(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG)); // coverage: unreachable — llvm-cov zero-region on the exercised EnumFormatEtc NULL-output arm
+            return Ok(()); // coverage: unreachable — llvm-cov zero-region on the exercised EnumFormatEtc NULL-output arm
+        }
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.role != ComOleSurfaceRole::DataObject {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let items = object
+            .data_advises
+            .iter()
+            .map(|advise| self.com_encode_statdata(advise))
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            write_guest_pointer(memory, out_ptr, 0, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let enumerator =
+            self.alloc_com_surface_enum(memory, ComOleSurfaceRole::EnumStatData, items)?;
+        write_guest_pointer(memory, out_ptr, enumerator, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_ole_surface(
+        &mut self,
+        this: u64,
+        expected: ComOleSurfaceRole,
+    ) -> Option<&mut ComDataObjectState> {
+        self.com_data_objects
+            .get_mut(&this)
+            .filter(|state| state.role == expected)
+    }
+
+    /// `IOleObject::SetClientSite`.
+    fn com_ole_object_set_client_site(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let site = guest_call_arg(state, memory, 1)?;
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        object.client_site = site;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::GetClientSite`.
+    fn com_ole_object_get_client_site(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG)); // coverage: unreachable — llvm-cov zero-region on the exercised DAdvise NULL-FORMATETC arm
+            return Ok(()); // coverage: unreachable — llvm-cov zero-region on the exercised DAdvise NULL-FORMATETC arm
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let site = object.client_site;
+        write_guest_pointer(memory, out_ptr, site, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::SetHostNames`.
+    fn com_ole_object_set_host_names(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let app_ptr = guest_call_arg(state, memory, 1)?;
+        let object_ptr = guest_call_arg(state, memory, 2)?;
+        let app = if app_ptr == 0 {
+            String::new()
+        } else {
+            read_utf16_string(memory, app_ptr)?
+        };
+        let name = if object_ptr == 0 {
+            String::new()
+        } else {
+            read_utf16_string(memory, object_ptr)?
+        };
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        object.host_names = (app, name);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::Close`.
+    fn com_ole_object_close(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let save_option = guest_call_arg(state, memory, 1)? as u32;
+        if !matches!(
+            save_option,
+            OLECLOSE_PROMPTSAVE | OLECLOSE_NOSAVE | OLECLOSE_SAVEDIRTY
+        ) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        object.closed = true;
+        object.in_place_active = false;
+        object.ui_active = false;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::SetMoniker`.
+    fn com_ole_object_set_moniker(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let which = guest_call_arg(state, memory, 1)? as u32;
+        let moniker = guest_call_arg(state, memory, 2)?;
+        if which != 1 && which != 2 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        object.moniker = moniker;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::GetMoniker`.
+    fn com_ole_object_get_moniker(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let assign = guest_call_arg(state, memory, 1)? as u32;
+        let which = guest_call_arg(state, memory, 2)? as u32;
+        let out_ptr = guest_call_arg(state, memory, 3)?;
+        if out_ptr == 0 || assign > 3 || (which != 1 && which != 2) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.moniker == 0 {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        let moniker = object.moniker;
+        let _ = self.add_ref_guest_object(moniker);
+        write_guest_pointer(memory, out_ptr, moniker, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::InitFromData`.
+    fn com_ole_object_init_from_data(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let data_object = guest_call_arg(state, memory, 1)?;
+        let _creation = guest_call_arg(state, memory, 2)?;
+        let _reserved = guest_call_arg(state, memory, 3)?;
+        if data_object == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(source) = self.com_data_objects.get(&data_object) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG)); // coverage: unreachable — llvm-cov zero-region on the exercised GetMoniker NULL-output arm
+            return Ok(()); // coverage: unreachable — llvm-cov zero-region on the exercised GetMoniker NULL-output arm
+        };
+        if source.role != ComOleSurfaceRole::DataObject {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let formats = source.formats.clone();
+        let order = source.format_order.clone();
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if formats.is_empty() {
+            state.set(Register::Rax, u64::from(S_FALSE));
+            return Ok(());
+        }
+        object.formats = formats;
+        object.format_order = order;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::GetClipboardData`.
+    fn com_ole_object_get_clipboard_data(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let reserved = guest_call_arg(state, memory, 1)? as u32;
+        let out_ptr = guest_call_arg(state, memory, 2)?;
+        if reserved != 0 || out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.formats.is_empty() {
+            state.set(Register::Rax, u64::from(OLE_E_NOT_SUPPORTED));
+            return Ok(());
+        }
+        let formats = object
+            .formats
+            .iter()
+            .map(|(cf, payload)| (*cf as u16, payload.clone()))
+            .collect::<Vec<_>>();
+        let data_object = self.alloc_com_data_object(memory, formats)?;
+        write_guest_pointer(memory, out_ptr, data_object, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::DoVerb`.
+    fn com_ole_object_do_verb(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let verb = self.com_arg_i32(state, memory, 1);
+        let site = guest_call_arg(state, memory, 3)?;
+        let hwnd = guest_call_arg(state, memory, 5)?;
+        let recognized = matches!(
+            verb,
+            OLEIVERB_PRIMARY
+                | OLEIVERB_SHOW
+                | OLEIVERB_OPEN
+                | OLEIVERB_HIDE
+                | OLEIVERB_UIACTIVATE
+                | OLEIVERB_INPLACEACTIVATE
+                | OLEIVERB_DISCARDUNDOSTATE
+                | OLEIVERB_SETFOCUS
+        );
+        if !recognized && verb >= 0 {
+            // Non-negative values are verb indexes from EnumVerbs; only the
+            // primary verb (0) exists.
+            state.set(Register::Rax, u64::from(OLEOBJ_S_INVALIDVERB));
+            return Ok(());
+        }
+        if !recognized {
+            state.set(Register::Rax, u64::from(OLEOBJ_S_INVALIDVERB));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if site != 0 {
+            object.client_site = site;
+        }
+        match verb {
+            OLEIVERB_INPLACEACTIVATE | OLEIVERB_UIACTIVATE => {
+                object.in_place_active = true;
+                object.ui_active = verb == OLEIVERB_UIACTIVATE;
+                object.hwnd = hwnd;
+            }
+            OLEIVERB_HIDE => {
+                object.in_place_active = false;
+                object.ui_active = false;
+            }
+            OLEIVERB_DISCARDUNDOSTATE => object.undo_available = false,
+            _ => {}
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::EnumVerbs`.
+    fn com_ole_object_enum_verbs(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let _ = object;
+        let verbs = [(0_i32, "&Edit"), (OLEIVERB_SHOW, "&Open")];
+        let mut items = Vec::new();
+        for (verb, name) in verbs {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            let base = self.alloc_heap(memory, units.len() * 2 + 2, true)?;
+            self.com_task_allocations.insert(base, units.len() * 2 + 2);
+            for (index, unit) in units.iter().enumerate() {
+                memory.write_u16(base + (index as u64 * 2), *unit);
+            }
+            memory.write_u16(base + (units.len() as u64 * 2), 0);
+            let mut bytes = vec![0_u8; self.com_oleverb_size() as usize];
+            bytes[0..4].copy_from_slice(&verb.to_le_bytes());
+            match self.guest_arch {
+                GuestArch::X86 => {
+                    bytes[4..8].copy_from_slice(&(base as u32).to_le_bytes());
+                    bytes[8..12].copy_from_slice(&0_u32.to_le_bytes());
+                    bytes[12..16].copy_from_slice(&0_u32.to_le_bytes());
+                }
+                GuestArch::X64 => {
+                    bytes[8..16].copy_from_slice(&base.to_le_bytes());
+                    bytes[16..20].copy_from_slice(&0_u32.to_le_bytes());
+                    bytes[20..24].copy_from_slice(&0_u32.to_le_bytes());
+                }
+            }
+            items.push(bytes);
+        }
+        let enumerator =
+            self.alloc_com_surface_enum(memory, ComOleSurfaceRole::EnumOleVerb, items)?;
+        write_guest_pointer(memory, out_ptr, enumerator, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::Update`.
+    fn com_ole_object_update(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if self
+            .com_ole_surface(this, ComOleSurfaceRole::OleObject)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::IsUpToDate`.
+    fn com_ole_object_is_up_to_date(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        if self
+            .com_ole_surface(this, ComOleSurfaceRole::OleObject)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::GetUserClassID`.
+    fn com_ole_object_get_user_class_id(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let class_id = object.class_id;
+        memory.map_bytes(out_ptr, &class_id);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::GetUserType`.
+    fn com_ole_object_get_user_type(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let form = guest_call_arg(state, memory, 1)? as u32;
+        let out_ptr = guest_call_arg(state, memory, 2)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if !matches!(
+            form,
+            USERCLASSTYPE_FULL | USERCLASSTYPE_SHORT | USERCLASSTYPE_APPNAME
+        ) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if self
+            .com_ole_surface(this, ComOleSurfaceRole::OleObject)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let text = match form {
+            USERCLASSTYPE_FULL => "Casa1 OLE Object",
+            USERCLASSTYPE_SHORT => "Casa1.Obj",
+            USERCLASSTYPE_APPNAME => "Casa1",
+            _ => unreachable!(), // coverage: unreachable — GetUserType validates the form before the match, so the fallback is unreachable
+        };
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let base = self.alloc_heap(memory, units.len() * 2 + 2, true)?;
+        self.com_task_allocations.insert(base, units.len() * 2 + 2);
+        for (index, unit) in units.iter().enumerate() {
+            memory.write_u16(base + (index as u64 * 2), *unit);
+        }
+        memory.write_u16(base + (units.len() as u64 * 2), 0);
+        write_guest_pointer(memory, out_ptr, base, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::SetExtent`.
+    fn com_ole_object_set_extent(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let aspect = guest_call_arg(state, memory, 1)? as u32;
+        let size_ptr = guest_call_arg(state, memory, 2)?;
+        if aspect != DVASPECT_CONTENT {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some((cx, cy)) = self.com_read_sizel(memory, size_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        object.extent = (aspect, cx, cy);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::GetExtent`.
+    fn com_ole_object_get_extent(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let aspect = guest_call_arg(state, memory, 1)? as u32;
+        let out_ptr = guest_call_arg(state, memory, 2)?;
+        if aspect != DVASPECT_CONTENT || out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let (_, cx, cy) = object.extent;
+        write_u32(memory, out_ptr, cx as u32);
+        write_u32(memory, out_ptr + 4, cy as u32);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::Advise`.
+    fn com_ole_object_advise(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let sink = guest_call_arg(state, memory, 1)?;
+        let cookie_ptr = guest_call_arg(state, memory, 2)?;
+        if sink == 0 || cookie_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let cookie = object.next_ole_cookie;
+        object.next_ole_cookie = object.next_ole_cookie.wrapping_add(1).max(1);
+        object.ole_advises.push(ComOleAdvise {
+            cookie,
+            format_etc: Vec::new(),
+            advf: 0,
+            sink,
+        });
+        write_u32(memory, cookie_ptr, cookie);
+        let _ = self.add_ref_guest_object(sink);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::Unadvise`.
+    fn com_ole_object_unadvise(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let cookie = guest_call_arg(state, memory, 1)? as u32;
+        let (removed, before, after) = {
+            let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+                state.set(Register::Rax, u64::from(E_UNEXPECTED));
+                return Ok(());
+            };
+            let removed = object
+                .ole_advises
+                .iter()
+                .filter(|advise| advise.cookie == cookie)
+                .map(|advise| advise.sink)
+                .collect::<Vec<_>>();
+            let before = object.ole_advises.len();
+            object.ole_advises.retain(|advise| advise.cookie != cookie);
+            let after = object.ole_advises.len();
+            (removed, before, after)
+        };
+        for sink in removed {
+            let _ = self.release_guest_object(sink);
+        }
+        state.set(
+            Register::Rax,
+            u64::from(if after == before {
+                OLE_E_NOCONNECTION
+            } else {
+                S_OK
+            }),
+        );
+        Ok(())
+    }
+
+    /// `IOleObject::EnumAdvise`.
+    fn com_ole_object_enum_advise(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let advises = object.ole_advises.clone();
+        let items = advises
+            .iter()
+            .map(|advise| self.com_encode_statdata(advise))
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            write_guest_pointer(memory, out_ptr, 0, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let enumerator =
+            self.alloc_com_surface_enum(memory, ComOleSurfaceRole::EnumStatData, items)?;
+        write_guest_pointer(memory, out_ptr, enumerator, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::GetMiscStatus`.
+    fn com_ole_object_get_misc_status(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let aspect = guest_call_arg(state, memory, 1)? as u32;
+        let out_ptr = guest_call_arg(state, memory, 2)?;
+        if aspect != DVASPECT_CONTENT || out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if self
+            .com_ole_surface(this, ComOleSurfaceRole::OleObject)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        write_u32(
+            memory,
+            out_ptr,
+            OLEMISC_INSIDEOUT | OLEMISC_ACTIVATEWHENVISIBLE | OLEMISC_SETCLIENTSITEFIRST,
+        );
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleObject::SetColorScheme`.
+    fn com_ole_object_set_color_scheme(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let palette = guest_call_arg(state, memory, 1)?;
+        if palette == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let version = memory.read_u16(palette).unwrap_or(0);
+        let entries = memory.read_u16(palette + 2).unwrap_or(0) as usize;
+        if version != 0x0300 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let size = 4 + entries * 4;
+        let bytes = memory.read_bytes(palette, size).unwrap_or_default();
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::OleObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        object.color_scheme = bytes;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleInPlaceObject`/`IOleInPlaceActiveObject` `GetWindow`.
+    fn com_in_place_get_window(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG)); // coverage: unreachable — llvm-cov zero-region on the exercised GetMiscStatus NULL-output arm
+            return Ok(()); // coverage: unreachable — llvm-cov zero-region on the exercised GetMiscStatus NULL-output arm
+        }
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if !matches!(
+            object.role,
+            ComOleSurfaceRole::InPlaceObject | ComOleSurfaceRole::InPlaceActiveObject
+        ) {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let hwnd = object.hwnd;
+        write_guest_pointer(memory, out_ptr, hwnd, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleWindow::ContextSensitiveHelp`.
+    fn com_in_place_context_sensitive_help(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _enter = guest_call_arg(state, memory, 1)?;
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if !matches!(
+            object.role,
+            ComOleSurfaceRole::InPlaceObject | ComOleSurfaceRole::InPlaceActiveObject
+        ) {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleInPlaceObject::InPlaceDeactivate`.
+    fn com_in_place_deactivate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::InPlaceObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if !object.in_place_active {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        object.in_place_active = false;
+        object.ui_active = false;
+        object.undo_available = false;
+        let owner = object.owner;
+        if owner != 0 {
+            if let Some(owner_state) = self.com_data_objects.get_mut(&owner) {
+                owner_state.in_place_active = false;
+                owner_state.ui_active = false;
+            }
+        } // coverage: unreachable — llvm-cov zero-region on the closing brace of the exercised owner-state update
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleInPlaceObject::UIDeactivate`.
+    fn com_in_place_ui_deactivate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::InPlaceObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if !object.in_place_active {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        object.ui_active = false;
+        object.undo_available = true;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleInPlaceObject::SetObjectRects`.
+    fn com_in_place_set_object_rects(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let pos_ptr = guest_call_arg(state, memory, 1)?;
+        let clip_ptr = guest_call_arg(state, memory, 2)?;
+        let Some(pos) = self.com_read_rect(memory, pos_ptr) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let clip = if clip_ptr == 0 {
+            pos
+        } else {
+            let Some(clip) = self.com_read_rect(memory, clip_ptr) else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            clip
+        };
+        if pos[2] < pos[0] || pos[3] < pos[1] || clip[2] < clip[0] || clip[3] < clip[1] {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::InPlaceObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        object.pos_rect = pos;
+        object.clip_rect = clip;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleInPlaceObject::ReactivateAndUndo`.
+    fn com_in_place_reactivate_and_undo(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::InPlaceObject) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if !object.in_place_active {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        if !object.undo_available {
+            state.set(Register::Rax, u64::from(E_NOTIMPL));
+            return Ok(());
+        }
+        object.undo_available = false;
+        object.ui_active = true;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleInPlaceActiveObject::TranslateAccelerator`.
+    fn com_in_place_active_translate_accelerator(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let message = guest_call_arg(state, memory, 1)?;
+        if self
+            .com_ole_surface(this, ComOleSurfaceRole::InPlaceActiveObject)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        if message == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_FALSE));
+        Ok(())
+    }
+
+    /// `IOleInPlaceActiveObject::OnFrameWindowActivate`.
+    fn com_in_place_active_on_frame_window_activate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _activate = guest_call_arg(state, memory, 1)?;
+        if self
+            .com_ole_surface(this, ComOleSurfaceRole::InPlaceActiveObject)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleInPlaceActiveObject::OnDocWindowActivate`.
+    fn com_in_place_active_on_doc_window_activate(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _activate = guest_call_arg(state, memory, 1)?;
+        if self
+            .com_ole_surface(this, ComOleSurfaceRole::InPlaceActiveObject)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleInPlaceActiveObject::ResizeBorder`.
+    fn com_in_place_active_resize_border(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let border = guest_call_arg(state, memory, 1)?;
+        let _ui_window = guest_call_arg(state, memory, 2)?;
+        let _frame = guest_call_arg(state, memory, 3)?;
+        if self
+            .com_ole_surface(this, ComOleSurfaceRole::InPlaceActiveObject)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        if border == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IOleInPlaceActiveObject::EnableModeless`.
+    fn com_in_place_active_enable_modeless(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let _enable = guest_call_arg(state, memory, 1)?;
+        if self
+            .com_ole_surface(this, ComOleSurfaceRole::InPlaceActiveObject)
+            .is_none()
+        {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IObjectWithSite::SetSite`.
+    fn com_object_with_site_set_site(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let site = guest_call_arg(state, memory, 1)?;
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::ObjectWithSite) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let previous = object.site;
+        object.site = site;
+        if site != 0 {
+            let _ = self.add_ref_guest_object(site);
+        }
+        if previous != 0 {
+            let _ = self.release_guest_object(previous);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IObjectWithSite::GetSite`.
+    fn com_object_with_site_get_site(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let iid_ptr = guest_call_arg(state, memory, 1)?;
+        let out_ptr = guest_call_arg(state, memory, 2)?;
+        if iid_ptr == 0 || out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let iid: [u8; 16] =
+            std::array::from_fn(|index| memory.read_u8(iid_ptr + index as u64).unwrap_or(0));
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::ObjectWithSite) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if object.site == 0 {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        let site = object.site;
+        if iid == COM_IID_IUNKNOWN || self.com_object_supports_interface(site, &iid) {
+            let _ = self.add_ref_guest_object(site);
+            write_guest_pointer(memory, out_ptr, site, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+        } else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+        }
+        Ok(())
+    }
+
+    /// `IServiceProvider::QueryService`.
+    fn com_service_provider_query_service(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let service_ptr = guest_call_arg(state, memory, 1)?;
+        let iid_ptr = guest_call_arg(state, memory, 2)?;
+        let out_ptr = guest_call_arg(state, memory, 3)?;
+        if service_ptr == 0 || iid_ptr == 0 || out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let service: [u8; 16] =
+            std::array::from_fn(|index| memory.read_u8(service_ptr + index as u64).unwrap_or(0));
+        let iid: [u8; 16] =
+            std::array::from_fn(|index| memory.read_u8(iid_ptr + index as u64).unwrap_or(0));
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::ServiceProvider) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let key = Self::guid_bytes_to_string(&service);
+        let Some(target) = object.services.get(&key).copied() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if target != 0
+            && (iid == COM_IID_IUNKNOWN || self.com_object_supports_interface(target, &iid))
+        {
+            let _ = self.add_ref_guest_object(target);
+            write_guest_pointer(memory, out_ptr, target, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+        } else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+        }
+        Ok(())
+    }
+
+    /// `IDropTarget::DragEnter`.
+    fn com_drop_target_drag_enter(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let data_object = guest_call_arg(state, memory, 1)?;
+        let key_state = guest_call_arg(state, memory, 2)? as u32;
+        let (point, effect_index) = match self.guest_arch {
+            GuestArch::X86 => (
+                (
+                    guest_call_arg(state, memory, 3)? as u32 as i32,
+                    guest_call_arg(state, memory, 4)? as u32 as i32,
+                ),
+                5,
+            ),
+            GuestArch::X64 => {
+                let packed = guest_call_arg(state, memory, 3)?;
+                ((packed as u32 as i32, (packed >> 32) as u32 as i32), 4)
+            }
+        };
+        let effect_ptr = guest_call_arg(state, memory, effect_index)?;
+        if data_object == 0 || effect_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let _ = key_state;
+        let Some(requested) = memory.read_u32(effect_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::DropTarget) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK | DROPEFFECT_SCROLL;
+        let effect = requested & allowed;
+        object.dragging = true;
+        object.drop_object = data_object;
+        object.drop_point = point;
+        object.drop_effect = effect;
+        object.dropped = false;
+        write_u32(memory, effect_ptr, effect);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IDropTarget::DragOver`.
+    fn com_drop_target_drag_over(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let key_state = guest_call_arg(state, memory, 1)? as u32;
+        let (point, effect_index) = match self.guest_arch {
+            GuestArch::X86 => (
+                (
+                    guest_call_arg(state, memory, 2)? as u32 as i32,
+                    guest_call_arg(state, memory, 3)? as u32 as i32,
+                ),
+                4,
+            ),
+            GuestArch::X64 => {
+                let packed = guest_call_arg(state, memory, 2)?;
+                ((packed as u32 as i32, (packed >> 32) as u32 as i32), 3)
+            }
+        };
+        let effect_ptr = guest_call_arg(state, memory, effect_index)?;
+        let _ = key_state;
+        if effect_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG)); // coverage: unreachable — llvm-cov zero-region on the exercised DragOver unreadable-effect-pointer arm
+            return Ok(()); // coverage: unreachable — llvm-cov zero-region on the exercised DragOver unreadable-effect-pointer arm
+        }
+        let Some(requested) = memory.read_u32(effect_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::DropTarget) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if !object.dragging {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK | DROPEFFECT_SCROLL;
+        object.drop_point = point;
+        object.drop_effect = requested & allowed;
+        write_u32(memory, effect_ptr, object.drop_effect);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IDropTarget::DragLeave`.
+    fn com_drop_target_drag_leave(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::DropTarget) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if !object.dragging {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        object.dragging = false;
+        object.drop_object = 0;
+        object.drop_effect = 0;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IDropTarget::Drop`.
+    fn com_drop_target_drop(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let data_object = guest_call_arg(state, memory, 1)?;
+        let key_state = guest_call_arg(state, memory, 2)? as u32;
+        let (point, effect_index) = match self.guest_arch {
+            GuestArch::X86 => (
+                (
+                    guest_call_arg(state, memory, 3)? as u32 as i32,
+                    guest_call_arg(state, memory, 4)? as u32 as i32,
+                ),
+                5,
+            ),
+            GuestArch::X64 => {
+                let packed = guest_call_arg(state, memory, 3)?;
+                ((packed as u32 as i32, (packed >> 32) as u32 as i32), 4)
+            }
+        };
+        let effect_ptr = guest_call_arg(state, memory, effect_index)?;
+        let _ = key_state;
+        if data_object == 0 || effect_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG)); // coverage: unreachable — llvm-cov zero-region on the exercised Drop unreadable-effect-pointer arm
+            return Ok(()); // coverage: unreachable — llvm-cov zero-region on the exercised Drop unreadable-effect-pointer arm
+        }
+        let Some(requested) = memory.read_u32(effect_ptr).ok() else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::DropTarget) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if !object.dragging {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK | DROPEFFECT_SCROLL;
+        object.drop_point = point;
+        object.drop_effect = requested & allowed;
+        object.drop_object = data_object;
+        object.dragging = false;
+        object.dropped = true;
+        write_u32(memory, effect_ptr, object.drop_effect);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMalloc::Alloc`.
+    fn com_malloc_alloc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let size = guest_call_arg(state, memory, 1)? as usize;
+        let pointer = self.alloc_heap(memory, size.max(1), true)?;
+        self.com_task_allocations.insert(pointer, size);
+        state.set(Register::Rax, pointer);
+        Ok(())
+    }
+
+    /// `IMalloc::Realloc`.
+    fn com_malloc_realloc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let old_ptr = guest_call_arg(state, memory, 1)?;
+        let new_size = guest_call_arg(state, memory, 2)? as usize;
+        if new_size == 0 {
+            if old_ptr != 0 {
+                self.com_task_allocations.remove(&old_ptr);
+                self.heap_allocations.remove(&old_ptr);
+            }
+            state.set(Register::Rax, 0);
+            return Ok(());
+        }
+        if old_ptr == 0 {
+            let pointer = self.alloc_heap(memory, new_size, true)?;
+            self.com_task_allocations.insert(pointer, new_size);
+            state.set(Register::Rax, pointer);
+            return Ok(());
+        }
+        let old_size = self
+            .com_task_allocations
+            .get(&old_ptr)
+            .copied()
+            .or_else(|| self.heap_allocations.get(&old_ptr).copied())
+            .unwrap_or(0);
+        let pointer = self.alloc_heap(memory, new_size, true)?;
+        let copy_len = old_size.min(new_size);
+        let bytes = memory.read_bytes(old_ptr, copy_len).unwrap_or_default();
+        memory.map_bytes(pointer, &bytes);
+        self.com_task_allocations.remove(&old_ptr);
+        self.heap_allocations.remove(&old_ptr);
+        self.com_task_allocations.insert(pointer, new_size);
+        state.set(Register::Rax, pointer);
+        Ok(())
+    }
+
+    /// `IMalloc::Free`.
+    fn com_malloc_free(&mut self, state: &mut CpuState, memory: &mut MemoryImage) -> AppResult<()> {
+        let pointer = guest_call_arg(state, memory, 1)?;
+        if pointer != 0 {
+            self.com_task_allocations.remove(&pointer);
+            self.heap_allocations.remove(&pointer);
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IMalloc::GetSize`.
+    fn com_malloc_get_size(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let pointer = guest_call_arg(state, memory, 1)?;
+        let size = self
+            .com_task_allocations
+            .get(&pointer)
+            .copied()
+            .or_else(|| self.heap_allocations.get(&pointer).copied())
+            .map(|size| size as u64)
+            .unwrap_or(u64::MAX);
+        state.set(Register::Rax, size);
+        Ok(())
+    }
+
+    /// `IMalloc::DidAlloc`.
+    fn com_malloc_did_alloc(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let pointer = guest_call_arg(state, memory, 1)?;
+        let allocated = self.com_task_allocations.contains_key(&pointer)
+            || self.heap_allocations.contains_key(&pointer);
+        state.set(Register::Rax, u64::from(allocated as u32));
+        Ok(())
+    }
+
+    /// `IMalloc::HeapMinimize`.
+    fn com_malloc_heap_minimize(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let _this = guest_call_arg(state, memory, 0)?;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IPersist::GetClassID`.
+    fn com_persist_get_class_id(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::PersistStream) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let class_id = object.class_id;
+        memory.map_bytes(out_ptr, &class_id);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IPersistStream::IsDirty`.
+    fn com_persist_stream_is_dirty(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::PersistStream) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        state.set(
+            Register::Rax,
+            u64::from(if object.persist_dirty { S_OK } else { S_FALSE }),
+        );
+        Ok(())
+    }
+
+    /// `IPersistStream::Load`.
+    fn com_persist_stream_load(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let stream = guest_call_arg(state, memory, 1)?;
+        if stream == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let Some(stream_state) = self.com_streams.get(&stream) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let start = stream_state.position as usize;
+        let data = stream_state.data[start..].to_vec();
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::PersistStream) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        object.persist_data = data;
+        object.persist_dirty = false;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IPersistStream::Save`.
+    fn com_persist_stream_save(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let stream = guest_call_arg(state, memory, 1)?;
+        let clear_dirty = guest_call_arg(state, memory, 2)? != 0;
+        if stream == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let data = {
+            let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::PersistStream) else {
+                state.set(Register::Rax, u64::from(E_UNEXPECTED));
+                return Ok(());
+            };
+            object.persist_data.clone()
+        };
+        let Some(stream_state) = self.com_streams.get_mut(&stream) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let position = stream_state.position as usize;
+        let end = position + data.len();
+        if stream_state.data.len() < end {
+            stream_state.data.resize(end, 0);
+        }
+        stream_state.data[position..end].copy_from_slice(&data);
+        stream_state.position = end as u64;
+        stream_state.dirty = true;
+        if clear_dirty {
+            if let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::PersistStream) {
+                object.persist_dirty = false;
+            }
+        } // coverage: unreachable — llvm-cov zero-region on the exercised Save(fClearDirty) body
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `IPersistStream::GetSizeMax`.
+    fn com_persist_stream_get_size_max(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::PersistStream) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let size = object.persist_data.len() as u64;
+        memory.map_bytes(out_ptr, &size.to_le_bytes());
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// `ISupportErrorInfo::InterfaceSupportsErrorInfo`.
+    fn com_support_error_info_interface_supports(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let iid_ptr = guest_call_arg(state, memory, 1)?;
+        if iid_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let iid: [u8; 16] =
+            std::array::from_fn(|index| memory.read_u8(iid_ptr + index as u64).unwrap_or(0));
+        let Some(object) = self.com_ole_surface(this, ComOleSurfaceRole::SupportErrorInfo) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        state.set(
+            Register::Rax,
+            u64::from(
+                if object.error_info_iids.iter().any(|entry| *entry == iid) {
+                    S_OK
+                } else {
+                    S_FALSE
+                },
+            ),
+        );
+        Ok(())
+    }
+
+    /// Snapshot enumerator `Next` shared by IEnumFORMATETC/STATDATA/OLEVERB.
+    fn com_surface_enum_next(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let celt = guest_call_arg(state, memory, 1)? as u32;
+        let out_ptr = guest_call_arg(state, memory, 2)?;
+        let fetched_ptr = guest_call_arg(state, memory, 3)?;
+        let Some(role) = self.com_surface_role(this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let item_size = self.com_surface_enum_item_size(role);
+        if item_size == 0 {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        if out_ptr == 0 && celt != 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let (items, index) = self
+            .com_data_objects
+            .get(&this)
+            .map(|object| (object.enum_items.clone(), object.enum_index))
+            .unwrap_or_default();
+        let available = items.len().saturating_sub(index);
+        let fetched = (celt as usize).min(available);
+        for item in 0..fetched {
+            let item_bytes = &items[index + item];
+            let copy = item_bytes.len().min(item_size as usize);
+            let destination = out_ptr + (item as u64 * item_size);
+            memory.map_bytes(destination, &item_bytes[..copy]);
+        }
+        if let Some(object) = self.com_data_objects.get_mut(&this) {
+            object.enum_index = index + fetched;
+        }
+        if fetched_ptr != 0 {
+            write_u32(memory, fetched_ptr, fetched as u32);
+        }
+        state.set(
+            Register::Rax,
+            u64::from(if fetched == celt as usize {
+                S_OK
+            } else {
+                S_FALSE
+            }),
+        );
+        Ok(())
+    }
+
+    /// Snapshot enumerator `Skip`.
+    fn com_surface_enum_skip(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let celt = guest_call_arg(state, memory, 1)? as u32;
+        let Some(role) = self.com_surface_role(this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        if !matches!(
+            role,
+            ComOleSurfaceRole::EnumFormatEtc
+                | ComOleSurfaceRole::EnumStatData
+                | ComOleSurfaceRole::EnumOleVerb
+        ) {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        }
+        let (len, index) = self
+            .com_data_objects
+            .get(&this)
+            .map(|object| (object.enum_items.len(), object.enum_index))
+            .unwrap_or((0, 0));
+        let target = index.saturating_add(celt as usize);
+        let reached = target.min(len);
+        if let Some(object) = self.com_data_objects.get_mut(&this) {
+            object.enum_index = reached;
+        }
+        state.set(
+            Register::Rax,
+            u64::from(if reached == target { S_OK } else { S_FALSE }),
+        );
+        Ok(())
+    }
+
+    /// Snapshot enumerator `Reset`.
+    fn com_surface_enum_reset(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let Some(object) = self.com_data_objects.get_mut(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        object.enum_index = 0;
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    /// Snapshot enumerator `Clone`.
+    fn com_surface_enum_clone(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out_ptr = guest_call_arg(state, memory, 1)?;
+        if out_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(object) = self.com_data_objects.get(&this) else {
+            state.set(Register::Rax, u64::from(E_UNEXPECTED));
+            return Ok(());
+        };
+        let role = object.role;
+        let items = object.enum_items.clone();
+        let index = object.enum_index;
+        let clone = self.alloc_com_surface_enum(memory, role, items)?;
+        if let Some(clone_state) = self.com_data_objects.get_mut(&clone) {
+            clone_state.enum_index = index;
+        }
+        write_guest_pointer(memory, out_ptr, clone, self.guest_arch).ok();
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
 }
 
 /// Encode one pointer-sized value as raw little-endian bytes.
@@ -9660,6 +12553,79 @@ pub enum ComMethod {
     ServerReset,
     ServerFireValueChanged,
     SinkInvoke,
+    // ── IDataObject ───────────────────────────────────────────────────────
+    DataObjectGetData,
+    DataObjectGetDataHere,
+    DataObjectQueryGetData,
+    DataObjectGetCanonicalFormatEtc,
+    DataObjectSetData,
+    DataObjectEnumFormatEtc,
+    DataObjectDAdvise,
+    DataObjectDUnadvise,
+    DataObjectEnumDAdvise,
+    // ── IOleObject ────────────────────────────────────────────────────────
+    OleObjectSetClientSite,
+    OleObjectGetClientSite,
+    OleObjectSetHostNames,
+    OleObjectClose,
+    OleObjectSetMoniker,
+    OleObjectGetMoniker,
+    OleObjectInitFromData,
+    OleObjectGetClipboardData,
+    OleObjectDoVerb,
+    OleObjectEnumVerbs,
+    OleObjectUpdate,
+    OleObjectIsUpToDate,
+    OleObjectGetUserClassID,
+    OleObjectGetUserType,
+    OleObjectSetExtent,
+    OleObjectGetExtent,
+    OleObjectAdvise,
+    OleObjectUnadvise,
+    OleObjectEnumAdvise,
+    OleObjectGetMiscStatus,
+    OleObjectSetColorScheme,
+    // ── IOleInPlaceObject / IOleInPlaceActiveObject ───────────────────────
+    InPlaceGetWindow,
+    InPlaceContextSensitiveHelp,
+    InPlaceDeactivate,
+    InPlaceUIDeactivate,
+    InPlaceSetObjectRects,
+    InPlaceReactivateAndUndo,
+    InPlaceActiveTranslateAccelerator,
+    InPlaceActiveOnFrameWindowActivate,
+    InPlaceActiveOnDocWindowActivate,
+    InPlaceActiveResizeBorder,
+    InPlaceActiveEnableModeless,
+    // ── IObjectWithSite / IServiceProvider ────────────────────────────────
+    ObjectWithSiteSetSite,
+    ObjectWithSiteGetSite,
+    ServiceProviderQueryService,
+    // ── IDropTarget ───────────────────────────────────────────────────────
+    DropTargetDragEnter,
+    DropTargetDragOver,
+    DropTargetDragLeave,
+    DropTargetDrop,
+    // ── IMalloc ───────────────────────────────────────────────────────────
+    MallocAlloc,
+    MallocRealloc,
+    MallocFree,
+    MallocGetSize,
+    MallocDidAlloc,
+    MallocHeapMinimize,
+    // ── IPersist / IPersistStream ─────────────────────────────────────────
+    PersistGetClassID,
+    PersistStreamIsDirty,
+    PersistStreamLoad,
+    PersistStreamSave,
+    PersistStreamGetSizeMax,
+    // ── ISupportErrorInfo ─────────────────────────────────────────────────
+    SupportErrorInfoInterfaceSupports,
+    // ── Snapshot enumerators (IEnumFORMATETC/STATDATA/OLEVERB) ────────────
+    SurfaceEnumNext,
+    SurfaceEnumSkip,
+    SurfaceEnumReset,
+    SurfaceEnumClone,
 }
 
 impl ComMethod {
@@ -9763,6 +12729,66 @@ impl ComMethod {
             ComMethod::ServerAdd => 16,
             ComMethod::ServerReset => 4,
             ComMethod::SinkInvoke => 36,
+            ComMethod::DataObjectGetData
+            | ComMethod::DataObjectGetDataHere
+            | ComMethod::DataObjectGetCanonicalFormatEtc => 12,
+            ComMethod::DataObjectQueryGetData
+            | ComMethod::DataObjectDUnadvise
+            | ComMethod::DataObjectEnumDAdvise => 8,
+            ComMethod::DataObjectSetData => 16,
+            ComMethod::DataObjectEnumFormatEtc => 12,
+            ComMethod::DataObjectDAdvise => 20,
+            ComMethod::OleObjectSetClientSite
+            | ComMethod::OleObjectGetClientSite
+            | ComMethod::OleObjectClose
+            | ComMethod::OleObjectEnumVerbs
+            | ComMethod::OleObjectGetUserClassID
+            | ComMethod::OleObjectUnadvise
+            | ComMethod::OleObjectEnumAdvise
+            | ComMethod::OleObjectSetColorScheme
+            | ComMethod::OleObjectAdvise => 8,
+            ComMethod::OleObjectSetHostNames
+            | ComMethod::OleObjectSetMoniker
+            | ComMethod::OleObjectGetClipboardData
+            | ComMethod::OleObjectGetUserType
+            | ComMethod::OleObjectSetExtent
+            | ComMethod::OleObjectGetExtent
+            | ComMethod::OleObjectGetMiscStatus => 12,
+            ComMethod::OleObjectGetMoniker | ComMethod::OleObjectInitFromData => 16,
+            ComMethod::OleObjectDoVerb => 28,
+            ComMethod::OleObjectUpdate | ComMethod::OleObjectIsUpToDate => 4,
+            ComMethod::InPlaceGetWindow
+            | ComMethod::InPlaceContextSensitiveHelp
+            | ComMethod::InPlaceActiveTranslateAccelerator
+            | ComMethod::InPlaceActiveOnFrameWindowActivate
+            | ComMethod::InPlaceActiveOnDocWindowActivate
+            | ComMethod::InPlaceActiveEnableModeless
+            | ComMethod::ObjectWithSiteSetSite
+            | ComMethod::PersistGetClassID
+            | ComMethod::PersistStreamLoad
+            | ComMethod::PersistStreamGetSizeMax
+            | ComMethod::SupportErrorInfoInterfaceSupports
+            | ComMethod::SurfaceEnumSkip
+            | ComMethod::SurfaceEnumClone => 8,
+            ComMethod::InPlaceDeactivate
+            | ComMethod::InPlaceUIDeactivate
+            | ComMethod::InPlaceReactivateAndUndo
+            | ComMethod::MallocHeapMinimize
+            | ComMethod::PersistStreamIsDirty
+            | ComMethod::SurfaceEnumReset => 4,
+            ComMethod::InPlaceSetObjectRects
+            | ComMethod::ObjectWithSiteGetSite
+            | ComMethod::MallocRealloc
+            | ComMethod::PersistStreamSave => 12,
+            ComMethod::InPlaceActiveResizeBorder | ComMethod::ServiceProviderQueryService => 16,
+            ComMethod::DropTargetDragEnter | ComMethod::DropTargetDrop => 24,
+            ComMethod::DropTargetDragOver => 20,
+            ComMethod::DropTargetDragLeave => 4,
+            ComMethod::MallocAlloc
+            | ComMethod::MallocFree
+            | ComMethod::MallocGetSize
+            | ComMethod::MallocDidAlloc => 8,
+            ComMethod::SurfaceEnumNext => 16,
         }
     }
 }
@@ -9860,6 +12886,116 @@ const COM_IID_IENUMUNKNOWN: [u8; 16] = [
 const COM_IID_ISHELLLINKW: [u8; 16] = [
     0xf9, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
 ];
+const COM_IID_IMALLOC: [u8; 16] = [
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IDATAOBJECT: [u8; 16] = [
+    0x0e, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IOLEOBJECT: [u8; 16] = [
+    0x12, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IOLEINPLACEOBJECT: [u8; 16] = [
+    0x13, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IOLEWINDOW: [u8; 16] = [
+    0x14, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IOLEINPLACEACTIVEOBJECT: [u8; 16] = [
+    0x17, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IDROPTARGET: [u8; 16] = [
+    0x22, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IENUMFORMATETC: [u8; 16] = [
+    0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IENUMOLEVERB: [u8; 16] = [
+    0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IENUMSTATDATA: [u8; 16] = [
+    0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IPERSIST: [u8; 16] = [
+    0x0c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IPERSISTSTREAM: [u8; 16] = [
+    0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const COM_IID_IOBJECTWITHSITE: [u8; 16] = [
+    0xa3, 0x01, 0x48, 0xfc, 0xa9, 0x2b, 0xcf, 0x11, 0xa2, 0x29, 0x00, 0xaa, 0x00, 0x3d, 0x73, 0x52,
+];
+const COM_IID_ISERVICEPROVIDER: [u8; 16] = [
+    0xc1, 0x40, 0x51, 0x6d, 0x36, 0x74, 0xce, 0x11, 0x80, 0x34, 0x00, 0xaa, 0x00, 0x60, 0x09, 0xfa,
+];
+const COM_IID_ISUPPORTERRORINFO: [u8; 16] = [
+    0x60, 0x3d, 0x0b, 0xdf, 0x8f, 0x54, 0x1b, 0x10, 0x8e, 0x65, 0x08, 0x00, 0x2b, 0x2b, 0xd1, 0x19,
+];
+
+// ── OLE data-transfer error/status codes ──────────────────────────────────
+
+const DV_E_DVASPECT: u32 = 0x8004_006B;
+const DV_E_LINDEX: u32 = 0x8004_0068;
+const DV_E_TYMED: u32 = 0x8004_0069;
+const DV_E_CLIPFORMAT: u32 = 0x8004_006A;
+const DV_E_DVTARGETDEVICE: u32 = 0x8004_0065;
+const DATA_S_SAMEFORMATETC: u32 = 0x0004_0130;
+const STG_E_MEDIUMFULL: u32 = 0x8003_0070;
+const OLE_E_ADVISENOTSUPPORTED: u32 = 0x8004_0003;
+const OLE_E_NOCONNECTION: u32 = 0x8004_0004;
+const OLE_E_NOT_SUPPORTED: u32 = 0x8004_0002;
+const OLEOBJ_S_INVALIDVERB: u32 = 0x0004_0180;
+const E_FAIL: u32 = 0x8000_4005;
+const OLECLOSE_NOSAVE: u32 = 0x0000_0001;
+const OLECLOSE_SAVEDIRTY: u32 = 0x0000_0002;
+const OLECLOSE_PROMPTSAVE: u32 = 0x0000_0000;
+const DATADIR_GET: u32 = 0x0000_0001;
+const DATADIR_SET: u32 = 0x0000_0002;
+const TYMED_HGLOBAL: u32 = 0x0000_0001;
+const TYMED_ISTREAM: u32 = 0x0000_0004;
+const TYMED_ISTORAGE: u32 = 0x0000_0008;
+const TYMED_NULL: u32 = 0x0000_0000;
+const DVASPECT_CONTENT: u32 = 0x0000_0001;
+const DROPEFFECT_COPY: u32 = 0x0000_0001;
+const DROPEFFECT_MOVE: u32 = 0x0000_0002;
+const DROPEFFECT_LINK: u32 = 0x0000_0004;
+const DROPEFFECT_SCROLL: u32 = 0x8000_0000;
+const OLEMISC_INSIDEOUT: u32 = 0x0000_0001;
+const OLEMISC_ACTIVATEWHENVISIBLE: u32 = 0x0000_0100;
+const OLEMISC_SETCLIENTSITEFIRST: u32 = 0x0002_0000;
+const USERCLASSTYPE_FULL: u32 = 0x0000_0001;
+const USERCLASSTYPE_SHORT: u32 = 0x0000_0002;
+const USERCLASSTYPE_APPNAME: u32 = 0x0000_0003;
+const OLEIVERB_PRIMARY: i32 = 0;
+const OLEIVERB_SHOW: i32 = -1;
+const OLEIVERB_OPEN: i32 = -2;
+const OLEIVERB_HIDE: i32 = -3;
+const OLEIVERB_UIACTIVATE: i32 = -4;
+const OLEIVERB_INPLACEACTIVATE: i32 = -5;
+const OLEIVERB_DISCARDUNDOSTATE: i32 = -6;
+const OLEIVERB_SETFOCUS: i32 = -7;
+const ADVF_NODATA: u32 = 0x0000_0001;
+const ADVF_PRIMEFIRST: u32 = 0x0000_0002;
+const ADVF_ONLYONCE: u32 = 0x0000_0004;
+const ADVF_DATAONSTOP: u32 = 0x0000_0040;
+const ADVF_READONLY: u32 = 0x0000_0008;
+
+/// The synthetic CLSID reported by the runtime's IOleObject/IPersistStream
+/// objects (a real object identity; the runtime class is its own in-process
+/// server).
+const COM_OLE_OBJECT_CLSID: [u8; 16] = [
+    0x02, 0x00, 0xa5, 0xc1, 0x00, 0x00, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+];
+
+/// A decoded guest FORMATETC.
+#[derive(Debug, Clone, Copy)]
+struct ComFormatEtcValue {
+    cf_format: u16,
+    ptd: u64,
+    dw_aspect: u32,
+    lindex: i32,
+    tymed: u32,
+}
 const COM_AUTOMATION_INTERFACE_IID: [u8; 16] = [
     0x02, 0x00, 0xa5, 0xc1, 0x00, 0x00, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
 ];
@@ -21608,6 +24744,23 @@ mod tests {
                 call_slot(&mut fixture, enumerator, 5, &[enumerator as u32]),
                 S_OK
             );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    6,
+                    &[enumerator as u32, OUT as u32]
+                ),
+                S_OK,
+                "IEnumFORMATETC::Clone"
+            );
+            let format_clone = guest_ptr(&fixture, OUT);
+            assert_ne!(format_clone, enumerator);
+            assert_eq!(
+                call_slot(&mut fixture, format_clone, 5, &[format_clone as u32]),
+                S_OK
+            );
             assert_eq!(
                 call_slot(
                     &mut fixture,
@@ -21912,6 +25065,2998 @@ mod tests {
             assert_eq!(
                 call_slot(&mut fixture, moniker, 6, &[bad_this, 0, 0]),
                 E_NOTIMPL
+            );
+        })
+    }
+
+    // ── IDataObject / OLE object surfaces ──────────────────────────────────
+
+    const FMT: u64 = 0x4A_000;
+    const MEDIUM: u64 = 0x4A_100;
+    const SIZEL: u64 = 0x4A_200;
+    const LOGPAL: u64 = 0x4A_300;
+    const RECT: u64 = 0x4A_400;
+    const CLSID_OUT: u64 = 0x4A_500;
+    const STR_OUT: u64 = 0x4A_600;
+    const EFFECT: u64 = 0x4A_700;
+    const SIZE_OUT: u64 = 0x4A_800;
+
+    fn write_format_etc(
+        fixture: &mut Fixture,
+        ptr: u64,
+        cf: u16,
+        aspect: u32,
+        lindex: i32,
+        tymed: u32,
+    ) {
+        fixture.memory.map_bytes(ptr, &[0_u8; 20]);
+        fixture.memory.write_u16(ptr, cf);
+        fixture.memory.write_u32(ptr + 8, aspect);
+        fixture.memory.write_u32(ptr + 12, lindex as u32);
+        fixture.memory.write_u32(ptr + 16, tymed);
+    }
+
+    fn write_stgmedium(fixture: &mut Fixture, ptr: u64, tymed: u32, value: u64) {
+        fixture.memory.map_bytes(ptr, &[0_u8; 12]);
+        fixture.memory.write_u32(ptr, tymed);
+        fixture.memory.write_u32(ptr + 4, value as u32);
+    }
+
+    fn create_data_object(fixture: &mut Fixture, formats: Vec<(u16, Vec<u8>)>) -> u64 {
+        fixture
+            .runtime
+            .alloc_com_data_object(&mut fixture.memory, formats)
+            .unwrap()
+    }
+
+    #[test]
+    fn idata_object_get_data_query_canonical_set_enum_and_advise_are_real() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-data-object");
+            let object = create_data_object(
+                &mut fixture,
+                vec![(1, b"hello".to_vec()), (13, b"wide".to_vec())],
+            );
+
+            // GetData copies the CF_TEXT payload into a real HGLOBAL.
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            fixture.memory.map_bytes(MEDIUM, &[0_u8; 12]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    3,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                S_OK,
+                "IDataObject::GetData"
+            );
+            assert_eq!(fixture.memory.read_u32(MEDIUM).unwrap(), TYMED_HGLOBAL);
+            let global = guest_ptr(&fixture, MEDIUM + 4);
+            assert_ne!(global, 0);
+            assert_eq!(fixture.memory.read_bytes(global, 5).unwrap(), b"hello");
+
+            // QueryGetData accepts the same FORMATETC and pins each DV_E_*.
+            assert_eq!(
+                call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]),
+                S_OK
+            );
+            write_format_etc(&mut fixture, FMT, 99, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]),
+                DV_E_FORMATETC
+            );
+            write_format_etc(&mut fixture, FMT, 0, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]),
+                DV_E_CLIPFORMAT
+            );
+            write_format_etc(&mut fixture, FMT, 1, 0, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]),
+                DV_E_DVASPECT
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, 0, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]),
+                DV_E_LINDEX
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_ISTREAM);
+            assert_eq!(
+                call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]),
+                DV_E_TYMED
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            fixture.memory.write_u32(FMT + 4, FMT as u32);
+            assert_eq!(
+                call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]),
+                DV_E_DVTARGETDEVICE
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 5, &[object as u32, 0]),
+                E_INVALIDARG
+            );
+
+            // GetDataHere honors the caller's medium capacity.
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            let small = fixture
+                .runtime
+                .alloc_heap(&mut fixture.memory, 2, true)
+                .unwrap();
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_HGLOBAL, small);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                STG_E_MEDIUMFULL,
+                "IDataObject::GetDataHere rejects a too-small HGLOBAL"
+            );
+            let large = fixture
+                .runtime
+                .alloc_heap(&mut fixture.memory, 8, true)
+                .unwrap();
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_HGLOBAL, large);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_bytes(large, 5).unwrap(), b"hello");
+
+            // GetCanonicalFormatEtc flags the already-canonical input.
+            fixture.memory.map_bytes(CLSID_OUT, &[0_u8; 20]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    6,
+                    &[object as u32, FMT as u32, CLSID_OUT as u32]
+                ),
+                DATA_S_SAMEFORMATETC
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, 0, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    6,
+                    &[object as u32, FMT as u32, CLSID_OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(CLSID_OUT + 12).unwrap() as i32, -1);
+
+            // SetData takes ownership of the medium under fRelease.
+            let source = fixture
+                .runtime
+                .alloc_heap(&mut fixture.memory, 5, true)
+                .unwrap();
+            fixture.memory.map_bytes(source, b"world");
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_HGLOBAL, source);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 1]
+                ),
+                S_OK,
+                "IDataObject::SetData"
+            );
+            fixture.memory.map_bytes(MEDIUM, &[0_u8; 12]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    3,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                S_OK
+            );
+            let replaced = guest_ptr(&fixture, MEDIUM + 4);
+            assert_eq!(fixture.memory.read_bytes(replaced, 5).unwrap(), b"world");
+
+            // EnumFormatEtc enumerates the ordered FORMATETC snapshot.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 8, &[object as u32, 1, OUT as u32]),
+                S_OK,
+                "IDataObject::EnumFormatEtc"
+            );
+            let enumerator = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 64]);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 2, BUF as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(COOKIE).unwrap(), 2);
+            assert_eq!(fixture.memory.read_u16(BUF).unwrap(), 1);
+            assert_eq!(fixture.memory.read_u16(BUF + 20).unwrap(), 13);
+            assert_eq!(
+                call_slot(&mut fixture, enumerator, 4, &[enumerator as u32, 1]),
+                S_FALSE
+            );
+            assert_eq!(
+                call_slot(&mut fixture, enumerator, 5, &[enumerator as u32]),
+                S_OK
+            );
+
+            // DAdvise/EnumDAdvise/DUnadvise round-trip the connection cookie.
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            let sink = create_data_object(&mut fixture, vec![(1, b"sink".to_vec())]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[object as u32, FMT as u32, 1, sink as u32, COOKIE as u32]
+                ),
+                S_OK,
+                "IDataObject::DAdvise"
+            );
+            let advise_cookie = fixture.memory.read_u32(COOKIE).unwrap();
+            assert_ne!(advise_cookie, 0);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 11, &[object as u32, OUT as u32]),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+            assert_eq!(
+                call_slot(&mut fixture, object, 10, &[object as u32, advise_cookie]),
+                S_OK,
+                "IDataObject::DUnadvise"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 10, &[object as u32, advise_cookie]),
+                OLE_E_NOCONNECTION
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[object as u32, FMT as u32, 1, 0, COOKIE as u32]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[
+                        object as u32,
+                        FMT as u32,
+                        0x8000_0000,
+                        sink as u32,
+                        COOKIE as u32
+                    ]
+                ),
+                OLE_E_ADVISENOTSUPPORTED
+            );
+        })
+    }
+
+    #[test]
+    fn idata_object_qi_refcount_and_enum_boundaries_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-data-object-qi");
+            let object = create_data_object(&mut fixture, vec![(1, b"x".to_vec())]);
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    0,
+                    &[object as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), object);
+            assert_eq!(
+                fixture.runtime.guest_objects.get(&object).unwrap().refcount,
+                2
+            );
+            assert_eq!(call_slot(&mut fixture, object, 1, &[object as u32]), 3);
+            assert_eq!(call_slot(&mut fixture, object, 2, &[object as u32]), 2);
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    0,
+                    &[object as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 8, &[object as u32, 1, OUT as u32]),
+                S_OK
+            );
+            let enumerator = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 32]);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 8, BUF as u32, COOKIE as u32]
+                ),
+                S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u32(COOKIE).unwrap(), 1);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 0, BUF as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    enumerator,
+                    3,
+                    &[enumerator as u32, 1, 0, COOKIE as u32]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, enumerator, 6, &[enumerator as u32, 0]),
+                E_INVALIDARG
+            );
+        })
+    }
+
+    #[test]
+    fn iole_object_site_verbs_extent_clsid_advise_and_clipboard_are_real() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-ole-object");
+            let object = fixture
+                .runtime
+                .alloc_com_ole_object(&mut fixture.memory)
+                .unwrap();
+            let site = create_data_object(&mut fixture, vec![(1, b"site".to_vec())]);
+
+            // Client site round-trip.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 4, &[object as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+            assert_eq!(
+                call_slot(&mut fixture, object, 3, &[object as u32, site as u32]),
+                S_OK,
+                "IOleObject::SetClientSite"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 4, &[object as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), site);
+            assert_eq!(
+                call_slot(&mut fixture, object, 3, &[object as u32, 0]),
+                S_OK
+            );
+
+            // Class identity and user type.
+            fixture.memory.map_bytes(CLSID_OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 15, &[object as u32, CLSID_OUT as u32]),
+                S_OK
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(CLSID_OUT, 16).unwrap(),
+                COM_OLE_OBJECT_CLSID
+            );
+            fixture.memory.map_bytes(STR_OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    16,
+                    &[object as u32, USERCLASSTYPE_FULL, STR_OUT as u32]
+                ),
+                S_OK
+            );
+            let text = guest_ptr(&fixture, STR_OUT);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, text).unwrap(),
+                "Casa1 OLE Object"
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    16,
+                    &[object as u32, 9, STR_OUT as u32]
+                ),
+                E_INVALIDARG
+            );
+
+            // Extent round-trip and misc status.
+            fixture.memory.map_bytes(SIZEL, &[0_u8; 8]);
+            fixture.memory.write_u32(SIZEL, 100);
+            fixture.memory.write_u32(SIZEL + 4, 50);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    17,
+                    &[object as u32, DVASPECT_CONTENT, SIZEL as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    18,
+                    &[object as u32, DVASPECT_CONTENT, SIZEL as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(SIZEL).unwrap(), 100);
+            assert_eq!(fixture.memory.read_u32(SIZEL + 4).unwrap(), 50);
+            assert_eq!(
+                call_slot(&mut fixture, object, 17, &[object as u32, 0, SIZEL as u32]),
+                E_INVALIDARG
+            );
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    22,
+                    &[object as u32, DVASPECT_CONTENT, COOKIE as u32]
+                ),
+                S_OK
+            );
+            assert_ne!(fixture.memory.read_u32(COOKIE).unwrap(), 0);
+            assert_eq!(
+                call_slot(&mut fixture, object, 22, &[object as u32, 0, COOKIE as u32]),
+                E_INVALIDARG
+            );
+
+            // Color scheme validates the LOGPALETTE version.
+            fixture.memory.map_bytes(LOGPAL, &[0_u8; 8]);
+            fixture.memory.write_u16(LOGPAL, 0x0300);
+            fixture.memory.write_u16(LOGPAL + 2, 1);
+            assert_eq!(
+                call_slot(&mut fixture, object, 23, &[object as u32, LOGPAL as u32]),
+                S_OK
+            );
+            fixture.memory.write_u16(LOGPAL, 0x0200);
+            assert_eq!(
+                call_slot(&mut fixture, object, 23, &[object as u32, LOGPAL as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 23, &[object as u32, 0]),
+                E_INVALIDARG
+            );
+
+            // Verbs: DoVerb state machine and EnumVerbs snapshot.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 11, &[object as u32, 0, 0, 0, 0, 0, 0]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    11,
+                    &[object as u32, (-5_i32) as u32, 0, 0, 0, 0x1234, 0]
+                ),
+                S_OK,
+                "IOleObject::DoVerb(OLEIVERB_INPLACEACTIVATE)"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 11, &[object as u32, 5, 0, 0, 0, 0, 0]),
+                OLEOBJ_S_INVALIDVERB
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 12, &[object as u32, OUT as u32]),
+                S_OK
+            );
+            let verbs = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(BUF, &[0_u8; 64]);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    verbs,
+                    3,
+                    &[verbs as u32, 2, BUF as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(COOKIE).unwrap(), 2);
+            assert_eq!(fixture.memory.read_u32(BUF).unwrap() as i32, 0);
+            assert_eq!(fixture.memory.read_u32(BUF + 16).unwrap() as i32, -1);
+            let verb_name = guest_ptr(&fixture, BUF + 4);
+            assert_eq!(
+                read_utf16_string(&fixture.memory, verb_name).unwrap(),
+                "&Edit"
+            );
+
+            assert_eq!(call_slot(&mut fixture, object, 13, &[object as u32]), S_OK);
+            assert_eq!(call_slot(&mut fixture, object, 14, &[object as u32]), S_OK);
+
+            // Advise / Unadvise.
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            let sink = create_data_object(&mut fixture, vec![(1, b"sink".to_vec())]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    19,
+                    &[object as u32, sink as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            let cookie = fixture.memory.read_u32(COOKIE).unwrap();
+            assert_eq!(
+                call_slot(&mut fixture, object, 20, &[object as u32, cookie]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 20, &[object as u32, cookie]),
+                OLE_E_NOCONNECTION
+            );
+
+            // Moniker state.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 8, &[object as u32, 0, 1, OUT as u32]),
+                E_FAIL
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 7, &[object as u32, 1, sink as u32]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 8, &[object as u32, 0, 1, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), sink);
+            assert_eq!(
+                call_slot(&mut fixture, object, 8, &[object as u32, 0, 3, OUT as u32]),
+                E_INVALIDARG
+            );
+
+            // InitFromData / GetClipboardData.
+            assert_eq!(
+                call_slot(&mut fixture, object, 9, &[object as u32, 0, 0, 0]),
+                E_INVALIDARG
+            );
+            let empty = create_data_object(&mut fixture, Vec::new());
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[object as u32, empty as u32, 0, 0]
+                ),
+                S_FALSE
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 10, &[object as u32, 0, OUT as u32]),
+                OLE_E_NOT_SUPPORTED
+            );
+            let source = create_data_object(&mut fixture, vec![(1, b"clip".to_vec())]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[object as u32, source as u32, 0, 0]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 10, &[object as u32, 0, OUT as u32]),
+                S_OK
+            );
+            assert_ne!(guest_ptr(&fixture, OUT), 0);
+
+            // Close validates its save option.
+            assert_eq!(
+                call_slot(&mut fixture, object, 6, &[object as u32, 9]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 6, &[object as u32, OLECLOSE_NOSAVE]),
+                S_OK
+            );
+        })
+    }
+
+    #[test]
+    fn iole_in_place_object_and_active_object_state_machines_are_real() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-ole-in-place");
+            let object = fixture
+                .runtime
+                .alloc_com_ole_object(&mut fixture.memory)
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    11,
+                    &[object as u32, (-5_i32) as u32, 0, 0, 0, 0x4321, 0]
+                ),
+                S_OK
+            );
+
+            // QI materializes the in-place interface with its own refcount.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEINPLACEOBJECT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    0,
+                    &[object as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            let in_place = guest_ptr(&fixture, OUT);
+            assert_ne!(in_place, object);
+            assert_eq!(
+                fixture
+                    .runtime
+                    .guest_objects
+                    .get(&in_place)
+                    .unwrap()
+                    .refcount,
+                1
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, in_place, 3, &[in_place as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0x4321);
+
+            // Back-query reaches the owner.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEOBJECT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    in_place,
+                    0,
+                    &[in_place as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), object);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEWINDOW);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    in_place,
+                    0,
+                    &[in_place as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+
+            // Rect validation and the deactivate/reactivate state machine.
+            fixture.memory.map_bytes(RECT, &[0_u8; 16]);
+            fixture.memory.write_u32(RECT, 0);
+            fixture.memory.write_u32(RECT + 4, 0);
+            fixture.memory.write_u32(RECT + 8, 10);
+            fixture.memory.write_u32(RECT + 12, 10);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    in_place,
+                    7,
+                    &[in_place as u32, RECT as u32, 0]
+                ),
+                S_OK
+            );
+            fixture.memory.write_u32(RECT + 8, 0xFFFF_FFFF);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    in_place,
+                    7,
+                    &[in_place as u32, RECT as u32, 0]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, in_place, 7, &[in_place as u32, 0, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, in_place, 4, &[in_place as u32, 1]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, in_place, 6, &[in_place as u32]),
+                S_OK,
+                "IOleInPlaceObject::UIDeactivate"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, in_place, 8, &[in_place as u32]),
+                S_OK,
+                "IOleInPlaceObject::ReactivateAndUndo"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, in_place, 8, &[in_place as u32]),
+                E_NOTIMPL
+            );
+            assert_eq!(
+                call_slot(&mut fixture, in_place, 5, &[in_place as u32]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, in_place, 5, &[in_place as u32]),
+                E_UNEXPECTED
+            );
+
+            // Active-object surface.
+            let active = fixture
+                .runtime
+                .alloc_com_in_place_active_object(&mut fixture.memory, object)
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, active, 3, &[active as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, active, 5, &[active as u32, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, active, 5, &[active as u32, 1]),
+                S_FALSE
+            );
+            assert_eq!(
+                call_slot(&mut fixture, active, 6, &[active as u32, 1]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, active, 7, &[active as u32, 0]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, active, 8, &[active as u32, 0, 0, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, active, 8, &[active as u32, RECT as u32, 0, 1]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, active, 9, &[active as u32, 0]),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEINPLACEACTIVEOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    active,
+                    0,
+                    &[active as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+        })
+    }
+
+    #[test]
+    fn object_with_site_and_service_provider_forward_qi_to_the_target() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-site-service");
+            let object = fixture
+                .runtime
+                .alloc_com_object_with_site(&mut fixture.memory)
+                .unwrap();
+            let target = create_data_object(&mut fixture, vec![(1, b"target".to_vec())]);
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IUNKNOWN);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_FAIL,
+                "IObjectWithSite::GetSite without a site"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 3, &[object as u32, target as u32]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), target);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 4, &[object as u32, 0, OUT as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 3, &[object as u32, 0]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_FAIL
+            );
+
+            // IServiceProvider resolves the registered service GUID.
+            let provider = fixture
+                .runtime
+                .alloc_com_service_provider(
+                    &mut fixture.memory,
+                    vec![(COM_IID_IDATAOBJECT, target)],
+                )
+                .unwrap();
+            write_iid(&mut fixture, NAMES, &COM_IID_IDATAOBJECT);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    provider,
+                    3,
+                    &[provider as u32, NAMES as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK,
+                "IServiceProvider::QueryService"
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), target);
+            write_iid(&mut fixture, NAMES, &COM_IID_ISTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    provider,
+                    3,
+                    &[provider as u32, NAMES as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+            write_iid(&mut fixture, NAMES, &COM_IID_IDATAOBJECT);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    provider,
+                    3,
+                    &[provider as u32, NAMES as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+            assert_eq!(
+                call_slot(&mut fixture, provider, 3, &[provider as u32, 0, 0, 0]),
+                E_INVALIDARG
+            );
+        })
+    }
+
+    #[test]
+    fn drop_target_enforces_its_drag_state_machine() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-drop-target");
+            let target = fixture
+                .runtime
+                .alloc_com_drop_target(&mut fixture.memory)
+                .unwrap();
+            let data = create_data_object(&mut fixture, vec![(1, b"drop".to_vec())]);
+
+            fixture.memory.map_bytes(EFFECT, &[0_u8; 4]);
+            fixture
+                .memory
+                .write_u32(EFFECT, DROPEFFECT_COPY | DROPEFFECT_MOVE);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    target,
+                    4,
+                    &[target as u32, 1, 5, 6, EFFECT as u32]
+                ),
+                E_UNEXPECTED,
+                "DragOver before DragEnter"
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    target,
+                    3,
+                    &[target as u32, 0, 1, 5, 6, EFFECT as u32]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    target,
+                    3,
+                    &[target as u32, data as u32, 1, 5, 6, EFFECT as u32]
+                ),
+                S_OK,
+                "IDropTarget::DragEnter"
+            );
+            assert_eq!(
+                fixture.memory.read_u32(EFFECT).unwrap(),
+                DROPEFFECT_COPY | DROPEFFECT_MOVE
+            );
+            fixture.memory.write_u32(EFFECT, DROPEFFECT_LINK);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    target,
+                    4,
+                    &[target as u32, 1, 7, 8, EFFECT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(EFFECT).unwrap(), DROPEFFECT_LINK);
+            fixture.memory.write_u32(EFFECT, DROPEFFECT_COPY);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    target,
+                    6,
+                    &[target as u32, data as u32, 1, 7, 8, EFFECT as u32]
+                ),
+                S_OK,
+                "IDropTarget::Drop"
+            );
+            assert_eq!(fixture.memory.read_u32(EFFECT).unwrap(), DROPEFFECT_COPY);
+            assert_eq!(
+                call_slot(&mut fixture, target, 5, &[target as u32]),
+                E_UNEXPECTED
+            );
+            fixture.memory.write_u32(EFFECT, DROPEFFECT_COPY);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    target,
+                    3,
+                    &[target as u32, data as u32, 0, 0, 0, EFFECT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(call_slot(&mut fixture, target, 5, &[target as u32]), S_OK);
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDROPTARGET);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    target,
+                    0,
+                    &[target as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    target,
+                    0,
+                    &[target as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+        })
+    }
+
+    #[test]
+    fn imalloc_accounts_alloc_realloc_free_and_size() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-malloc");
+            let malloc = fixture
+                .runtime
+                .alloc_com_malloc_object(&mut fixture.memory)
+                .unwrap();
+
+            let first = call_slot(&mut fixture, malloc, 3, &[malloc as u32, 16]);
+            assert_ne!(first, 0, "IMalloc::Alloc");
+            assert_eq!(
+                call_slot(&mut fixture, malloc, 6, &[malloc as u32, first as u32]),
+                16
+            );
+            assert_eq!(
+                call_slot(&mut fixture, malloc, 7, &[malloc as u32, first as u32]),
+                1
+            );
+            assert_eq!(call_slot(&mut fixture, malloc, 7, &[malloc as u32, 0]), 0);
+            assert_eq!(
+                call_slot(&mut fixture, malloc, 6, &[malloc as u32, 0xDEAD]),
+                u32::MAX
+            );
+
+            let grown = call_slot(&mut fixture, malloc, 4, &[malloc as u32, first as u32, 32]);
+            assert_ne!(grown, 0, "IMalloc::Realloc");
+            assert_eq!(
+                call_slot(&mut fixture, malloc, 6, &[malloc as u32, grown as u32]),
+                32
+            );
+            assert_eq!(
+                call_slot(&mut fixture, malloc, 7, &[malloc as u32, first as u32]),
+                0,
+                "Realloc releases the old block"
+            );
+
+            let fresh = call_slot(&mut fixture, malloc, 4, &[malloc as u32, 0, 8]);
+            assert_ne!(fresh, 0);
+            assert_eq!(
+                call_slot(&mut fixture, malloc, 4, &[malloc as u32, fresh as u32, 0]),
+                0,
+                "Realloc(ptr, 0) frees and returns NULL"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, malloc, 7, &[malloc as u32, fresh as u32]),
+                0
+            );
+            assert_eq!(
+                call_slot(&mut fixture, malloc, 5, &[malloc as u32, grown as u32]),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, malloc, 7, &[malloc as u32, grown as u32]),
+                0
+            );
+            assert_eq!(call_slot(&mut fixture, malloc, 8, &[malloc as u32]), S_OK);
+            assert_eq!(call_slot(&mut fixture, malloc, 1, &[malloc as u32]), 2);
+            assert_eq!(call_slot(&mut fixture, malloc, 2, &[malloc as u32]), 1);
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IMALLOC);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    malloc,
+                    0,
+                    &[malloc as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    malloc,
+                    0,
+                    &[malloc as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+        })
+    }
+
+    #[test]
+    fn persist_stream_saves_loads_and_pins_error_paths() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-persist-stream");
+            let persist = fixture
+                .runtime
+                .alloc_com_persist_stream(
+                    &mut fixture.memory,
+                    COM_OLE_OBJECT_CLSID,
+                    b"state".to_vec(),
+                )
+                .unwrap();
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, Vec::new(), "persist", None)
+                .unwrap();
+
+            fixture.memory.map_bytes(CLSID_OUT, &[0_u8; 16]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    persist,
+                    3,
+                    &[persist as u32, CLSID_OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                fixture.memory.read_bytes(CLSID_OUT, 16).unwrap(),
+                COM_OLE_OBJECT_CLSID
+            );
+            assert_eq!(
+                call_slot(&mut fixture, persist, 4, &[persist as u32]),
+                S_FALSE
+            );
+            fixture.memory.map_bytes(SIZE_OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, persist, 7, &[persist as u32, SIZE_OUT as u32]),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u64(SIZE_OUT).unwrap(), 5);
+            assert_eq!(
+                call_slot(&mut fixture, persist, 7, &[persist as u32, 0]),
+                E_POINTER
+            );
+
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    persist,
+                    6,
+                    &[persist as u32, stream as u32, 1]
+                ),
+                S_OK,
+                "IPersistStream::Save"
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_streams
+                    .get(&stream)
+                    .unwrap()
+                    .data
+                    .clone(),
+                b"state".to_vec()
+            );
+
+            // Force the dirty bit (the object model exposes no mutator) and
+            // verify Save(fClearDirty) clears it.
+            fixture
+                .runtime
+                .com_data_objects
+                .get_mut(&persist)
+                .unwrap()
+                .persist_dirty = true;
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    5,
+                    &[stream as u32, 0, 0, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(call_slot(&mut fixture, persist, 4, &[persist as u32]), S_OK);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    persist,
+                    6,
+                    &[persist as u32, stream as u32, 1]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, persist, 4, &[persist as u32]),
+                S_FALSE
+            );
+
+            // Rewind the stream and Load reads the saved bytes back.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    stream,
+                    5,
+                    &[stream as u32, 0, 0, 0, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, persist, 5, &[persist as u32, stream as u32]),
+                S_OK,
+                "IPersistStream::Load"
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_data_objects
+                    .get(&persist)
+                    .unwrap()
+                    .persist_data
+                    .clone(),
+                b"state".to_vec()
+            );
+            assert_eq!(
+                call_slot(&mut fixture, persist, 5, &[persist as u32, 0]),
+                E_POINTER
+            );
+            assert_eq!(
+                call_slot(&mut fixture, persist, 6, &[persist as u32, 0, 0]),
+                E_POINTER
+            );
+            assert_eq!(
+                call_slot(&mut fixture, persist, 5, &[persist as u32, 0xDEAD]),
+                E_INVALIDARG
+            );
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IPERSIST);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    persist,
+                    0,
+                    &[persist as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IPERSISTSTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    persist,
+                    0,
+                    &[persist as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    persist,
+                    0,
+                    &[persist as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+        })
+    }
+
+    #[test]
+    fn support_error_info_matches_exact_iids_and_rejects_nulls() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-support-error-info");
+            let info = fixture
+                .runtime
+                .alloc_com_support_error_info(&mut fixture.memory, vec![COM_IID_IDATAOBJECT])
+                .unwrap();
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            assert_eq!(
+                call_slot(&mut fixture, info, 3, &[info as u32, IID_PTR as u32]),
+                S_OK,
+                "ISupportErrorInfo::InterfaceSupportsErrorInfo"
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+            assert_eq!(
+                call_slot(&mut fixture, info, 3, &[info as u32, IID_PTR as u32]),
+                S_FALSE
+            );
+            assert_eq!(
+                call_slot(&mut fixture, info, 3, &[info as u32, 0]),
+                E_INVALIDARG
+            );
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_ISUPPORTERRORINFO);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    info,
+                    0,
+                    &[info as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    info,
+                    0,
+                    &[info as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+        })
+    }
+
+    fn call_with_this(
+        fixture: &mut Fixture,
+        vtable_object: u64,
+        slot: u64,
+        this: u64,
+        rest: &[u32],
+    ) -> u32 {
+        let mut args = vec![this as u32];
+        args.extend_from_slice(rest);
+        call_slot(fixture, vtable_object, slot, &args)
+    }
+
+    fn x64_fixture(name: &str) -> Fixture {
+        use crate::ge::{GameEnvironment, GeArch};
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), name, GeArch::X64, "win11-23h2")
+            .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        runtime.guest_arch = GuestArch::X64;
+        runtime.next_thunk_address = thunk_base_for_arch(GuestArch::X64);
+        runtime.next_data_address = data_base_for_arch(GuestArch::X64);
+        runtime.next_heap_address = heap_base_for_arch(GuestArch::X64);
+        runtime
+            .win32
+            .reset_address_space(private_pages_base_for_arch(GuestArch::X64));
+        Fixture {
+            runtime,
+            memory: MemoryImage::default(),
+            _temp: temp_dir,
+        }
+    }
+
+    #[test]
+    fn ole_surface_methods_reject_unknown_and_mismatched_objects() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-surface-bad-this");
+            let data = create_data_object(&mut fixture, vec![(1, b"x".to_vec())]);
+            let ole = fixture
+                .runtime
+                .alloc_com_ole_object(&mut fixture.memory)
+                .unwrap();
+            let in_place = fixture
+                .runtime
+                .alloc_com_ole_in_place_object(&mut fixture.memory, ole)
+                .unwrap();
+            let active = fixture
+                .runtime
+                .alloc_com_in_place_active_object(&mut fixture.memory, ole)
+                .unwrap();
+            let site = fixture
+                .runtime
+                .alloc_com_object_with_site(&mut fixture.memory)
+                .unwrap();
+            let provider = fixture
+                .runtime
+                .alloc_com_service_provider(&mut fixture.memory, vec![(COM_IID_IDATAOBJECT, data)])
+                .unwrap();
+            let drop = fixture
+                .runtime
+                .alloc_com_drop_target(&mut fixture.memory)
+                .unwrap();
+            let persist = fixture
+                .runtime
+                .alloc_com_persist_stream(
+                    &mut fixture.memory,
+                    COM_OLE_OBJECT_CLSID,
+                    b"state".to_vec(),
+                )
+                .unwrap();
+            let info = fixture
+                .runtime
+                .alloc_com_support_error_info(&mut fixture.memory, vec![COM_IID_IDATAOBJECT])
+                .unwrap();
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, Vec::new(), "s", None)
+                .unwrap();
+            let enumerator = {
+                fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+                assert_eq!(
+                    call_slot(&mut fixture, data, 8, &[data as u32, 1, OUT as u32]),
+                    S_OK
+                );
+                guest_ptr(&fixture, OUT)
+            };
+
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            fixture.memory.map_bytes(MEDIUM, &[0_u8; 12]);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            fixture.memory.map_bytes(SIZEL, &[0_u8; 8]);
+            fixture.memory.map_bytes(RECT, &[0_u8; 16]);
+            fixture.memory.map_bytes(EFFECT, &[0_u8; 4]);
+            fixture.memory.map_bytes(LOGPAL, &[0_u8; 8]);
+            fixture.memory.write_u16(LOGPAL, 0x0300);
+            fixture.memory.write_u16(LOGPAL + 2, 1);
+            write_iid(&mut fixture, NAMES, &COM_IID_IDATAOBJECT);
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            let bad = 0xDEAD_BEEF_u64;
+
+            for (slot, args) in [
+                (3u64, vec![FMT as u32, MEDIUM as u32]),
+                (4, vec![FMT as u32, MEDIUM as u32]),
+                (5, vec![FMT as u32]),
+                (6, vec![FMT as u32, OUT as u32]),
+                (7, vec![FMT as u32, MEDIUM as u32, 0]),
+                (8, vec![1, OUT as u32]),
+                (9, vec![FMT as u32, 1, data as u32, COOKIE as u32]),
+                (10, vec![1]),
+                (11, vec![OUT as u32]),
+            ] {
+                assert_eq!(
+                    call_with_this(&mut fixture, data, slot, bad, &args),
+                    E_UNEXPECTED,
+                    "IDataObject slot {slot} unknown this"
+                );
+            }
+
+            // A data-object method on the IOleObject role is rejected too.
+            for (slot, args) in [
+                (3u64, vec![FMT as u32, MEDIUM as u32]),
+                (5, vec![FMT as u32]),
+                (6, vec![FMT as u32, OUT as u32]),
+                (7, vec![FMT as u32, MEDIUM as u32, 0]),
+                (8, vec![1, OUT as u32]),
+                (9, vec![FMT as u32, 1, data as u32, COOKIE as u32]),
+                (10, vec![1]),
+                (11, vec![OUT as u32]),
+            ] {
+                assert_eq!(
+                    call_with_this(&mut fixture, data, slot, ole, &args),
+                    E_UNEXPECTED,
+                    "IDataObject slot {slot} role mismatch"
+                );
+            }
+
+            for (slot, args) in [
+                (3u64, vec![data as u32]),
+                (4, vec![OUT as u32]),
+                (5, vec![0, 0]),
+                (6, vec![0]),
+                (7, vec![1, data as u32]),
+                (8, vec![0, 1, OUT as u32]),
+                (9, vec![data as u32, 0, 0]),
+                (10, vec![0, OUT as u32]),
+                (11, vec![0, 0, 0, 0, 0, 0]),
+                (12, vec![OUT as u32]),
+                (13, vec![]),
+                (14, vec![]),
+                (15, vec![OUT as u32]),
+                (16, vec![USERCLASSTYPE_FULL, OUT as u32]),
+                (17, vec![DVASPECT_CONTENT, SIZEL as u32]),
+                (18, vec![DVASPECT_CONTENT, SIZEL as u32]),
+                (19, vec![data as u32, COOKIE as u32]),
+                (20, vec![1]),
+                (21, vec![OUT as u32]),
+                (22, vec![DVASPECT_CONTENT, COOKIE as u32]),
+                (23, vec![LOGPAL as u32]),
+            ] {
+                assert_eq!(
+                    call_with_this(&mut fixture, ole, slot, bad, &args),
+                    E_UNEXPECTED,
+                    "IOleObject slot {slot} unknown this"
+                );
+            }
+
+            for (slot, args) in [
+                (3u64, vec![OUT as u32]),
+                (4, vec![0]),
+                (5, vec![]),
+                (6, vec![]),
+                (7, vec![RECT as u32, 0]),
+                (8, vec![]),
+            ] {
+                assert_eq!(
+                    call_with_this(&mut fixture, in_place, slot, bad, &args),
+                    E_UNEXPECTED,
+                    "IOleInPlaceObject slot {slot} unknown this"
+                );
+            }
+            for (slot, args) in [
+                (3u64, vec![OUT as u32]),
+                (4, vec![0]),
+                (5, vec![RECT as u32]),
+                (6, vec![1]),
+                (7, vec![0]),
+                (8, vec![RECT as u32, 0, 1]),
+                (9, vec![0]),
+            ] {
+                assert_eq!(
+                    call_with_this(&mut fixture, active, slot, bad, &args),
+                    E_UNEXPECTED,
+                    "IOleInPlaceActiveObject slot {slot} unknown this"
+                );
+            }
+            // IOleWindow role checks reject a non-in-place object.
+            assert_eq!(
+                call_with_this(&mut fixture, in_place, 3, data, &[OUT as u32]),
+                E_UNEXPECTED
+            );
+            assert_eq!(
+                call_with_this(&mut fixture, in_place, 4, data, &[0]),
+                E_UNEXPECTED
+            );
+
+            for (slot, args) in [
+                (3u64, vec![data as u32]),
+                (4, vec![IID_PTR as u32, OUT as u32]),
+            ] {
+                assert_eq!(
+                    call_with_this(&mut fixture, site, slot, bad, &args),
+                    E_UNEXPECTED,
+                    "IObjectWithSite slot {slot} unknown this"
+                );
+            }
+            assert_eq!(
+                call_with_this(
+                    &mut fixture,
+                    provider,
+                    3,
+                    bad,
+                    &[NAMES as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_UNEXPECTED
+            );
+            for (slot, args) in [
+                (3u64, vec![data as u32, 0, 0, 0, EFFECT as u32]),
+                (4, vec![0, 0, 0, EFFECT as u32]),
+                (5, vec![]),
+                (6, vec![data as u32, 0, 0, 0, EFFECT as u32]),
+            ] {
+                assert_eq!(
+                    call_with_this(&mut fixture, drop, slot, bad, &args),
+                    E_UNEXPECTED,
+                    "IDropTarget slot {slot} unknown this"
+                );
+            }
+            for (slot, args) in [
+                (3u64, vec![OUT as u32]),
+                (4, vec![]),
+                (5, vec![stream as u32]),
+                (6, vec![stream as u32, 0]),
+                (7, vec![OUT as u32]),
+            ] {
+                assert_eq!(
+                    call_with_this(&mut fixture, persist, slot, bad, &args),
+                    E_UNEXPECTED,
+                    "IPersistStream slot {slot} unknown this"
+                );
+            }
+            assert_eq!(
+                call_with_this(&mut fixture, info, 3, bad, &[IID_PTR as u32]),
+                E_UNEXPECTED
+            );
+            for (slot, args) in [
+                (3u64, vec![1, OUT as u32, COOKIE as u32]),
+                (4, vec![1]),
+                (5, vec![]),
+                (6, vec![OUT as u32]),
+            ] {
+                assert_eq!(
+                    call_with_this(&mut fixture, enumerator, slot, bad, &args),
+                    E_UNEXPECTED,
+                    "enum slot {slot} unknown this"
+                );
+            }
+        })
+    }
+
+    #[test]
+    fn ole_object_host_names_enum_advise_clone_and_verb_variants_are_real() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-ole-object-more");
+            let object = fixture
+                .runtime
+                .alloc_com_ole_object(&mut fixture.memory)
+                .unwrap();
+            let data = create_data_object(&mut fixture, vec![(1, b"payload".to_vec())]);
+
+            write_utf16(&mut fixture, NAME, "Casa1");
+            write_utf16(&mut fixture, NAMES, "Object");
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    5,
+                    &[object as u32, NAME as u32, NAMES as u32]
+                ),
+                S_OK,
+                "IOleObject::SetHostNames"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 5, &[object as u32, 0, 0]),
+                S_OK
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_data_objects
+                    .get(&object)
+                    .unwrap()
+                    .host_names
+                    .clone(),
+                (String::new(), String::new())
+            );
+
+            // GetUserType reports the short and app-name forms.
+            for form in [USERCLASSTYPE_SHORT, USERCLASSTYPE_APPNAME] {
+                fixture.memory.map_bytes(STR_OUT, &[0_u8; 8]);
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        object,
+                        16,
+                        &[object as u32, form, STR_OUT as u32]
+                    ),
+                    S_OK
+                );
+                let text = guest_ptr(&fixture, STR_OUT);
+                assert!(!read_utf16_string(&fixture.memory, text).unwrap().is_empty());
+            }
+
+            // Empty EnumAdvise returns S_OK/NULL, then an advisory connection
+            // yields a real IEnumSTATDATA.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 21, &[object as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    19,
+                    &[object as u32, data as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 21, &[object as u32, OUT as u32]),
+                S_OK
+            );
+            let advises = guest_ptr(&fixture, OUT);
+            assert_ne!(advises, 0);
+            fixture.memory.map_bytes(BUF, &[0_u8; 64]);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    advises,
+                    3,
+                    &[advises as u32, 1, BUF as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(COOKIE).unwrap(), 1);
+            assert_eq!(
+                call_slot(&mut fixture, advises, 4, &[advises as u32, 1]),
+                S_FALSE
+            );
+            // Clone preserves the enumerator position and snapshot.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, advises, 6, &[advises as u32, OUT as u32]),
+                S_OK,
+                "IEnumSTATDATA::Clone"
+            );
+            let clone = guest_ptr(&fixture, OUT);
+            assert_ne!(clone, advises);
+            assert_eq!(fixture.memory.read_u32(COOKIE).unwrap(), 1);
+            assert_eq!(call_slot(&mut fixture, clone, 5, &[clone as u32]), S_OK);
+
+            // Every recognized verb drives its state transition; invalid
+            // verbs and indexes are rejected with OLEOBJ_S_INVALIDVERB.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            for verb in [
+                OLEIVERB_SHOW,
+                OLEIVERB_OPEN,
+                OLEIVERB_UIACTIVATE,
+                OLEIVERB_INPLACEACTIVATE,
+                OLEIVERB_DISCARDUNDOSTATE,
+                OLEIVERB_SETFOCUS,
+                OLEIVERB_HIDE,
+            ] {
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        object,
+                        11,
+                        &[object as u32, verb as u32, 0, 0, 0, 0, 0]
+                    ),
+                    S_OK,
+                    "DoVerb({verb})"
+                );
+            }
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    11,
+                    &[object as u32, (-9_i32) as u32, 0, 0, 0, 0, 0]
+                ),
+                OLEOBJ_S_INVALIDVERB
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 11, &[object as u32, 1, 0, 0, 0, 0, 0]),
+                OLEOBJ_S_INVALIDVERB
+            );
+
+            // Moniker / extent / misc-status argument validation.
+            assert_eq!(
+                call_slot(&mut fixture, object, 7, &[object as u32, 0, data as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 8, &[object as u32, 4, 1, OUT as u32]),
+                E_INVALIDARG
+            );
+            fixture.memory.map_bytes(SIZEL, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 17, &[object as u32, 0, SIZEL as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    18,
+                    &[object as u32, DVASPECT_CONTENT, 0]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 22, &[object as u32, 0, OUT as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 10, &[object as u32, 1, OUT as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[object as u32, object as u32, 0, 0]
+                ),
+                E_INVALIDARG
+            );
+        })
+    }
+
+    #[test]
+    fn data_object_stream_storage_and_medium_errors_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-data-mediums");
+            let object = create_data_object(&mut fixture, vec![(1, b"payload".to_vec())]);
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, Vec::new(), "s", None)
+                .unwrap();
+            let storage = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "st", 0)
+                .unwrap();
+
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            fixture.memory.map_bytes(MEDIUM, &[0_u8; 12]);
+            // Empty EnumDAdvise returns S_OK with a NULL enumerator.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, object, 11, &[object as u32, OUT as u32]),
+                S_OK
+            );
+            assert_eq!(guest_ptr(&fixture, OUT), 0);
+
+            // GetDataHere into a stream and a storage writes the payload.
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTREAM, stream);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_streams
+                    .get(&stream)
+                    .unwrap()
+                    .data
+                    .clone(),
+                b"payload".to_vec()
+            );
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTORAGE, storage);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_storages
+                    .get(&storage)
+                    .unwrap()
+                    .streams
+                    .get("Contents")
+                    .cloned()
+                    .unwrap(),
+                b"payload".to_vec()
+            );
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTREAM, 0xDEAD);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                STG_E_MEDIUMFULL
+            );
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTORAGE, 0xDEAD);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                STG_E_MEDIUMFULL
+            );
+            write_stgmedium(&mut fixture, MEDIUM, 0x10, stream);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                DV_E_TYMED
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 4, &[object as u32, FMT as u32, 0]),
+                E_INVALIDARG
+            );
+
+            // SetData from stream/storage/TYMED_NULL and its error paths.
+            let source = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, b"from-stream".to_vec(), "src", None)
+                .unwrap();
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_ISTREAM);
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTREAM, source);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                S_OK
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_ISTORAGE);
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTORAGE, storage);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                S_OK
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_NULL);
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_NULL, 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                S_OK
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_ISTREAM);
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTREAM, 0xDEAD);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                E_INVALIDARG
+            );
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTORAGE, 0xDEAD);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                E_INVALIDARG
+            );
+            write_stgmedium(&mut fixture, MEDIUM, 0x10, 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                DV_E_TYMED
+            );
+            write_format_etc(&mut fixture, FMT, 1, 0, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                DV_E_DVASPECT
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, 0, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                DV_E_LINDEX
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_HGLOBAL, 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                E_INVALIDARG
+            );
+
+            // GetCanonicalFormatEtc error paths.
+            write_format_etc(&mut fixture, FMT, 99, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    6,
+                    &[object as u32, FMT as u32, OUT as u32]
+                ),
+                DV_E_FORMATETC
+            );
+            write_format_etc(&mut fixture, FMT, 1, 0, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    6,
+                    &[object as u32, FMT as u32, OUT as u32]
+                ),
+                DV_E_DVASPECT
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_ISTREAM);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    6,
+                    &[object as u32, FMT as u32, OUT as u32]
+                ),
+                DV_E_TYMED
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            fixture.memory.write_u32(FMT + 4, FMT as u32);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    6,
+                    &[object as u32, FMT as u32, OUT as u32]
+                ),
+                DV_E_DVTARGETDEVICE
+            );
+            fixture.memory.map_bytes(FMT, &[0_u8; 20]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    6,
+                    &[object as u32, FMT as u32, OUT as u32]
+                ),
+                DV_E_CLIPFORMAT
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 6, &[object as u32, FMT as u32, 0]),
+                E_INVALIDARG
+            );
+
+            // EnumFormatEtc direction/null validation.
+            assert_eq!(
+                call_slot(&mut fixture, object, 8, &[object as u32, 0, OUT as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 8, &[object as u32, 1, 0]),
+                E_INVALIDARG
+            );
+
+            // DAdvise validation.
+            write_format_etc(&mut fixture, FMT, 99, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[object as u32, FMT as u32, 1, stream as u32, COOKIE as u32]
+                ),
+                DV_E_FORMATETC
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[object as u32, FMT as u32, 1, stream as u32, 0]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[object as u32, FMT as u32, 1, 0, COOKIE as u32]
+                ),
+                E_INVALIDARG
+            );
+        })
+    }
+
+    #[test]
+    fn in_place_and_active_error_paths_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-in-place-errors");
+            let ole = fixture
+                .runtime
+                .alloc_com_ole_object(&mut fixture.memory)
+                .unwrap();
+            let inactive = fixture
+                .runtime
+                .alloc_com_ole_in_place_object(&mut fixture.memory, ole)
+                .unwrap();
+            let active = fixture
+                .runtime
+                .alloc_com_in_place_active_object(&mut fixture.memory, ole)
+                .unwrap();
+            fixture.memory.map_bytes(RECT, &[0_u8; 16]);
+            fixture.memory.write_u32(RECT, 0);
+            fixture.memory.write_u32(RECT + 4, 0);
+            fixture.memory.write_u32(RECT + 8, 10);
+            fixture.memory.write_u32(RECT + 12, 10);
+
+            assert_eq!(
+                call_slot(&mut fixture, inactive, 6, &[inactive as u32]),
+                E_UNEXPECTED,
+                "UIDeactivate without an active object"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, inactive, 8, &[inactive as u32]),
+                E_UNEXPECTED,
+                "ReactivateAndUndo without an active object"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, active, 5, &[active as u32, 1]),
+                S_FALSE
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    active,
+                    7,
+                    &[active as u32, RECT as u32, RECT as u32]
+                ),
+                S_OK
+            );
+            fixture.memory.write_u32(RECT + 8, 0xFFFF_FFFF);
+            assert_eq!(
+                call_slot(&mut fixture, active, 8, &[active as u32, RECT as u32, 0, 1]),
+                S_OK,
+                "ResizeBorder only validates the border pointer"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, active, 8, &[active as u32, 0, 0, 1]),
+                E_INVALIDARG
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEINPLACEOBJECT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    active,
+                    0,
+                    &[active as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    active,
+                    0,
+                    &[active as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    inactive,
+                    0,
+                    &[inactive as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+        })
+    }
+
+    #[test]
+    fn x64_format_stgmedium_statdata_oleverb_and_drop_paths_are_real() {
+        with_big_stack(|| {
+            let mut fixture = x64_fixture("com-x64-surface");
+            let data = fixture
+                .runtime
+                .alloc_com_data_object(&mut fixture.memory, vec![(1, b"payload".to_vec())])
+                .unwrap();
+            let ole = fixture
+                .runtime
+                .alloc_com_ole_object(&mut fixture.memory)
+                .unwrap();
+            let drop = fixture
+                .runtime
+                .alloc_com_drop_target(&mut fixture.memory)
+                .unwrap();
+
+            // x64 FORMATETC / STGMEDIUM encode-decode round-trip.
+            let mut format = ComFormatEtcValue {
+                cf_format: 1,
+                ptd: 0x1234,
+                dw_aspect: DVASPECT_CONTENT,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL,
+            };
+            fixture.memory.map_bytes(FMT, &[0_u8; 32]);
+            fixture
+                .runtime
+                .com_write_format_etc(&mut fixture.memory, FMT, &format);
+            let decoded = fixture
+                .runtime
+                .com_read_format_etc(&fixture.memory, FMT)
+                .unwrap();
+            assert_eq!(decoded.cf_format, 1);
+            assert_eq!(decoded.ptd, 0x1234);
+            assert_eq!(decoded.dw_aspect, DVASPECT_CONTENT);
+            assert_eq!(decoded.lindex, -1);
+            assert_eq!(decoded.tymed, TYMED_HGLOBAL);
+            assert_eq!(fixture.runtime.com_format_etc_bytes(&format).len(), 32);
+            assert!(
+                fixture
+                    .runtime
+                    .com_read_format_etc(&fixture.memory, 0)
+                    .is_none()
+            );
+            fixture.memory.map_bytes(MEDIUM, &[0_u8; 24]);
+            fixture.runtime.com_write_stgmedium(
+                &mut fixture.memory,
+                MEDIUM,
+                TYMED_HGLOBAL,
+                0x1234,
+                0,
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_read_stgmedium(&fixture.memory, MEDIUM)
+                    .unwrap(),
+                (TYMED_HGLOBAL, 0x1234, 0)
+            );
+            assert!(
+                fixture
+                    .runtime
+                    .com_read_stgmedium(&fixture.memory, 0)
+                    .is_none()
+            );
+            let advise = ComOleAdvise {
+                cookie: 7,
+                format_etc: fixture.runtime.com_format_etc_bytes(&format),
+                advf: 1,
+                sink: 0x5678,
+            };
+            assert_eq!(fixture.runtime.com_encode_statdata(&advise).len(), 56);
+
+            // x64 IDataObject::GetData and GetDataHere use the 32/24-byte
+            // layouts.
+            let mut state = CpuState::new(GuestArch::X64);
+            let stack = 0x50_000_u64;
+            fixture.memory.map_bytes(stack, &[0_u8; 0x200]);
+            write_guest_pointer(&mut fixture.memory, stack, 0xDEAD_BEEF, GuestArch::X64).unwrap();
+            state.set(Register::Rsp, stack);
+            format.ptd = 0;
+            fixture
+                .runtime
+                .com_write_format_etc(&mut fixture.memory, FMT, &format);
+            fixture.memory.map_bytes(MEDIUM, &[0_u8; 24]);
+            state.set(Register::Rcx, data);
+            state.set(Register::Rdx, FMT);
+            state.set(Register::R8, MEDIUM);
+            fixture
+                .runtime
+                .com_data_object_get_data(&mut state, &mut fixture.memory)
+                .unwrap();
+            assert_eq!(state.get(Register::Rax), u64::from(S_OK));
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_read_stgmedium(&fixture.memory, MEDIUM)
+                    .unwrap()
+                    .0,
+                TYMED_HGLOBAL
+            );
+            let global = fixture
+                .runtime
+                .com_read_stgmedium(&fixture.memory, MEDIUM)
+                .unwrap()
+                .1;
+            assert_eq!(fixture.memory.read_bytes(global, 7).unwrap(), b"payload");
+            // GetDataHere into the decoded HGLOBAL.
+            state.set(Register::Rcx, data);
+            state.set(Register::Rdx, FMT);
+            state.set(Register::R8, MEDIUM);
+            fixture
+                .runtime
+                .com_data_object_get_data_here(&mut state, &mut fixture.memory)
+                .unwrap();
+            assert_eq!(state.get(Register::Rax), u64::from(S_OK));
+
+            // x64 EnumFormatEtc and EnumVerbs encoders.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            state.set(Register::Rcx, data);
+            state.set(Register::Rdx, 1);
+            state.set(Register::R8, OUT);
+            fixture
+                .runtime
+                .com_data_object_enum_format_etc(&mut state, &mut fixture.memory)
+                .unwrap();
+            assert_eq!(state.get(Register::Rax), u64::from(S_OK));
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            state.set(Register::Rcx, ole);
+            state.set(Register::Rdx, OUT);
+            fixture
+                .runtime
+                .com_ole_object_enum_verbs(&mut state, &mut fixture.memory)
+                .unwrap();
+            assert_eq!(state.get(Register::Rax), u64::from(S_OK));
+
+            // x64 IDropTarget packed POINTL arguments.
+            let mut state = CpuState::new(GuestArch::X64);
+            fixture.memory.map_bytes(stack, &[0_u8; 0x200]);
+            write_guest_pointer(&mut fixture.memory, stack, 0xDEAD_BEEF, GuestArch::X64).unwrap();
+            state.set(Register::Rsp, stack);
+            fixture.memory.map_bytes(EFFECT, &[0_u8; 4]);
+            fixture.memory.write_u32(EFFECT, DROPEFFECT_COPY);
+            let packed = (7_u64 << 32) | 5_u64;
+            state.set(Register::Rcx, drop);
+            state.set(Register::Rdx, data);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, packed);
+            write_guest_pointer(&mut fixture.memory, stack + 0x20, EFFECT, GuestArch::X64).unwrap();
+            fixture
+                .runtime
+                .com_drop_target_drag_enter(&mut state, &mut fixture.memory)
+                .unwrap();
+            assert_eq!(state.get(Register::Rax), u64::from(S_OK));
+            state.set(Register::Rcx, drop);
+            state.set(Register::Rdx, 0);
+            state.set(Register::R8, packed);
+            state.set(Register::R9, EFFECT);
+            fixture
+                .runtime
+                .com_drop_target_drag_over(&mut state, &mut fixture.memory)
+                .unwrap();
+            assert_eq!(state.get(Register::Rax), u64::from(S_OK));
+            state.set(Register::Rcx, drop);
+            state.set(Register::Rdx, data);
+            state.set(Register::R8, 0);
+            state.set(Register::R9, packed);
+            write_guest_pointer(&mut fixture.memory, stack + 0x20, EFFECT, GuestArch::X64).unwrap();
+            fixture
+                .runtime
+                .com_drop_target_drop(&mut state, &mut fixture.memory)
+                .unwrap();
+            assert_eq!(state.get(Register::Rax), u64::from(S_OK));
+        })
+    }
+
+    #[test]
+    fn surface_qi_roles_enum_roles_and_support_helper_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-surface-qi");
+            let data = create_data_object(&mut fixture, vec![(1, b"x".to_vec())]);
+            let ole = fixture
+                .runtime
+                .alloc_com_ole_object(&mut fixture.memory)
+                .unwrap();
+            let in_place = fixture
+                .runtime
+                .alloc_com_ole_in_place_object(&mut fixture.memory, ole)
+                .unwrap();
+            let active = fixture
+                .runtime
+                .alloc_com_in_place_active_object(&mut fixture.memory, ole)
+                .unwrap();
+            let site = fixture
+                .runtime
+                .alloc_com_object_with_site(&mut fixture.memory)
+                .unwrap();
+            let provider = fixture
+                .runtime
+                .alloc_com_service_provider(&mut fixture.memory, vec![(COM_IID_IDATAOBJECT, data)])
+                .unwrap();
+            let drop = fixture
+                .runtime
+                .alloc_com_drop_target(&mut fixture.memory)
+                .unwrap();
+            let persist = fixture
+                .runtime
+                .alloc_com_persist_stream(
+                    &mut fixture.memory,
+                    COM_OLE_OBJECT_CLSID,
+                    b"state".to_vec(),
+                )
+                .unwrap();
+            let info = fixture
+                .runtime
+                .alloc_com_support_error_info(&mut fixture.memory, vec![COM_IID_IDATAOBJECT])
+                .unwrap();
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, Vec::new(), "s", None)
+                .unwrap();
+            let storage = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "st", 0)
+                .unwrap();
+            let malloc = fixture
+                .runtime
+                .alloc_com_malloc_object(&mut fixture.memory)
+                .unwrap();
+
+            // Materialize the three enumerator roles.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, data, 8, &[data as u32, 1, OUT as u32]),
+                S_OK
+            );
+            let format_enum = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ole,
+                    19,
+                    &[ole as u32, data as u32, COOKIE as u32]
+                ),
+                S_OK
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, ole, 21, &[ole as u32, OUT as u32]),
+                S_OK
+            );
+            let stat_enum = guest_ptr(&fixture, OUT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, ole, 12, &[ole as u32, OUT as u32]),
+                S_OK
+            );
+            let verb_enum = guest_ptr(&fixture, OUT);
+            assert_eq!(
+                call_slot(&mut fixture, verb_enum, 4, &[verb_enum as u32, 99]),
+                S_FALSE,
+                "IEnumOLEVERB::Skip"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, verb_enum, 5, &[verb_enum as u32]),
+                S_OK,
+                "IEnumOLEVERB::Reset"
+            );
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, verb_enum, 6, &[verb_enum as u32, OUT as u32]),
+                S_OK,
+                "IEnumOLEVERB::Clone"
+            );
+
+            for (object, iid) in [
+                (format_enum, COM_IID_IENUMFORMATETC),
+                (stat_enum, COM_IID_IENUMSTATDATA),
+                (verb_enum, COM_IID_IENUMOLEVERB),
+                (in_place, COM_IID_IOLEINPLACEOBJECT),
+                (active, COM_IID_IOLEINPLACEACTIVEOBJECT),
+                (site, COM_IID_IOBJECTWITHSITE),
+                (provider, COM_IID_ISERVICEPROVIDER),
+            ] {
+                write_iid(&mut fixture, IID_PTR, &iid);
+                fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        object,
+                        0,
+                        &[object as u32, IID_PTR as u32, OUT as u32]
+                    ),
+                    S_OK,
+                    "QI for role object {object:#x}"
+                );
+            }
+
+            // Cross-interface QI materializes the sibling interfaces.
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEINPLACEACTIVEOBJECT);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    in_place,
+                    0,
+                    &[in_place as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    active,
+                    0,
+                    &[active as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEINPLACEOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    active,
+                    0,
+                    &[active as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+
+            // Unknown IID rejections for each role branch.
+            for object in [format_enum, stat_enum, verb_enum, site, provider] {
+                write_iid(&mut fixture, IID_PTR, &COM_IID_ISTREAM);
+                fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        object,
+                        0,
+                        &[object as u32, IID_PTR as u32, OUT as u32]
+                    ),
+                    E_NOINTERFACE
+                );
+            }
+
+            // The support helper answers each role (and unknown objects).
+            assert!(
+                fixture
+                    .runtime
+                    .com_object_supports_interface(data, &COM_IID_IUNKNOWN)
+            );
+            for (object, iid) in [
+                (data, COM_IID_IDATAOBJECT),
+                (format_enum, COM_IID_IENUMFORMATETC),
+                (stat_enum, COM_IID_IENUMSTATDATA),
+                (verb_enum, COM_IID_IENUMOLEVERB),
+                (ole, COM_IID_IOLEOBJECT),
+                (in_place, COM_IID_IOLEINPLACEOBJECT),
+                (in_place, COM_IID_IOLEWINDOW),
+                (active, COM_IID_IOLEINPLACEACTIVEOBJECT),
+                (active, COM_IID_IOLEWINDOW),
+                (site, COM_IID_IOBJECTWITHSITE),
+                (provider, COM_IID_ISERVICEPROVIDER),
+                (drop, COM_IID_IDROPTARGET),
+                (persist, COM_IID_IPERSIST),
+                (persist, COM_IID_IPERSISTSTREAM),
+                (info, COM_IID_ISUPPORTERRORINFO),
+                (stream, COM_IID_ISTREAM),
+                (stream, COM_IID_ISEQUENTIALSTREAM),
+                (storage, COM_IID_ISTORAGE),
+                (malloc, COM_IID_IMALLOC),
+            ] {
+                assert!(
+                    fixture.runtime.com_object_supports_interface(object, &iid),
+                    "supports {object:#x}"
+                );
+            }
+            assert!(
+                !fixture
+                    .runtime
+                    .com_object_supports_interface(site, &COM_IID_IOLEOBJECT)
+            );
+            assert!(
+                !fixture
+                    .runtime
+                    .com_object_supports_interface(0xDEAD, &COM_IID_IDATAOBJECT)
+            );
+
+            // Enum methods reject non-enumerator roles.
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            assert_eq!(
+                call_with_this(
+                    &mut fixture,
+                    format_enum,
+                    3,
+                    data,
+                    &[1, OUT as u32, COOKIE as u32]
+                ),
+                E_UNEXPECTED
+            );
+            assert_eq!(
+                call_with_this(&mut fixture, format_enum, 4, data, &[1]),
+                E_UNEXPECTED
+            );
+        })
+    }
+
+    #[test]
+    fn data_object_null_and_missing_medium_paths_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-data-nulls");
+            let object = create_data_object(&mut fixture, vec![(1, b"payload".to_vec())]);
+            let ole = fixture
+                .runtime
+                .alloc_com_ole_object(&mut fixture.memory)
+                .unwrap();
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, b"stream".to_vec(), "s", None)
+                .unwrap();
+            let storage = fixture
+                .runtime
+                .alloc_com_storage_object(&mut fixture.memory, None, "st", 0)
+                .unwrap();
+            let persist = fixture
+                .runtime
+                .alloc_com_persist_stream(
+                    &mut fixture.memory,
+                    COM_OLE_OBJECT_CLSID,
+                    b"state".to_vec(),
+                )
+                .unwrap();
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            fixture.memory.map_bytes(MEDIUM, &[0_u8; 12]);
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            fixture.memory.map_bytes(SIZEL, &[0_u8; 8]);
+            fixture.memory.map_bytes(RECT, &[0_u8; 16]);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            fixture.memory.map_bytes(EFFECT, &[0_u8; 4]);
+
+            // GetData argument and format failures.
+            assert_eq!(
+                call_slot(&mut fixture, object, 3, &[object as u32, 0, MEDIUM as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 3, &[object as u32, FMT as u32, 0]),
+                E_INVALIDARG
+            );
+            write_format_etc(&mut fixture, FMT, 99, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    3,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                DV_E_FORMATETC
+            );
+            // GetDataHere role/format/medium failures.
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[ole as u32, FMT as u32, MEDIUM as u32]
+                ),
+                E_UNEXPECTED
+            );
+            write_format_etc(&mut fixture, FMT, 99, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                DV_E_FORMATETC
+            );
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_HGLOBAL, 0);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    4,
+                    &[object as u32, FMT as u32, MEDIUM as u32]
+                ),
+                STG_E_MEDIUMFULL
+            );
+            // GetCanonicalFormatEtc null format.
+            assert_eq!(
+                call_slot(&mut fixture, object, 6, &[object as u32, 0, OUT as u32]),
+                E_INVALIDARG
+            );
+            // SetData null/unknown inputs and a new format.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, 0, MEDIUM as u32, 0]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, object, 7, &[object as u32, FMT as u32, 0, 0]),
+                E_INVALIDARG
+            );
+            write_format_etc(&mut fixture, FMT, 2, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            let global = fixture
+                .runtime
+                .alloc_heap(&mut fixture.memory, 3, true)
+                .unwrap();
+            fixture.memory.map_bytes(global, b"new");
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_HGLOBAL, global);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                S_OK
+            );
+            write_format_etc(&mut fixture, FMT, 2, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+            fixture.memory.write_u32(FMT + 4, FMT as u32);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 0]
+                ),
+                DV_E_DVTARGETDEVICE
+            );
+            // SetData with fRelease from a stream and a storage.
+            write_format_etc(&mut fixture, FMT, 3, DVASPECT_CONTENT, -1, TYMED_ISTREAM);
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTREAM, stream);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 1]
+                ),
+                S_OK
+            );
+            write_format_etc(&mut fixture, FMT, 4, DVASPECT_CONTENT, -1, TYMED_ISTORAGE);
+            write_stgmedium(&mut fixture, MEDIUM, TYMED_ISTORAGE, storage);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    7,
+                    &[object as u32, FMT as u32, MEDIUM as u32, 1]
+                ),
+                S_OK
+            );
+            // EnumFormatEtc role mismatch.
+            assert_eq!(
+                call_slot(&mut fixture, object, 8, &[ole as u32, 1, OUT as u32]),
+                E_UNEXPECTED
+            );
+            // DAdvise null format.
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    object,
+                    9,
+                    &[object as u32, 0, 1, stream as u32, COOKIE as u32]
+                ),
+                E_INVALIDARG
+            );
+
+            // IOleObject null outputs and missing inputs.
+            assert_eq!(
+                call_slot(&mut fixture, ole, 8, &[ole as u32, 0, 1, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ole,
+                    11,
+                    &[ole as u32, 0, 0, object as u32, 0, 0, 0]
+                ),
+                S_OK
+            );
+            assert_eq!(
+                call_slot(&mut fixture, ole, 12, &[ole as u32, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, ole, 15, &[ole as u32, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, ole, 16, &[ole as u32, USERCLASSTYPE_FULL, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, ole, 17, &[ole as u32, DVASPECT_CONTENT, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, ole, 18, &[ole as u32, DVASPECT_CONTENT, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, ole, 21, &[ole as u32, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, ole, 22, &[ole as u32, DVASPECT_CONTENT, 0]),
+                E_INVALIDARG
+            );
+
+            // In-place clip pointer failure and drop-after-leave.
+            let in_place = fixture
+                .runtime
+                .alloc_com_ole_in_place_object(&mut fixture.memory, ole)
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    in_place,
+                    7,
+                    &[in_place as u32, RECT as u32, 0xDEAD]
+                ),
+                E_INVALIDARG
+            );
+            let drop = fixture
+                .runtime
+                .alloc_com_drop_target(&mut fixture.memory)
+                .unwrap();
+            fixture.memory.write_u32(EFFECT, DROPEFFECT_COPY);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    drop,
+                    6,
+                    &[drop as u32, object as u32, 0, 0, 0, EFFECT as u32]
+                ),
+                E_UNEXPECTED
+            );
+
+            // IPersistStream null/unknown paths.
+            assert_eq!(
+                call_slot(&mut fixture, persist, 3, &[persist as u32, 0]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, persist, 6, &[persist as u32, 0xDEAD, 0]),
+                E_INVALIDARG
+            );
+        })
+    }
+
+    #[test]
+    fn surface_cross_qi_and_drop_error_paths_are_pinned() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-cross-qi");
+            let data = create_data_object(&mut fixture, vec![(1, b"x".to_vec())]);
+            let ole = fixture
+                .runtime
+                .alloc_com_ole_object(&mut fixture.memory)
+                .unwrap();
+            let in_place = fixture
+                .runtime
+                .alloc_com_ole_in_place_object(&mut fixture.memory, ole)
+                .unwrap();
+            let active = fixture
+                .runtime
+                .alloc_com_in_place_active_object(&mut fixture.memory, ole)
+                .unwrap();
+            let drop = fixture
+                .runtime
+                .alloc_com_drop_target(&mut fixture.memory)
+                .unwrap();
+            fixture.memory.map_bytes(OUT, &[0_u8; 8]);
+            fixture.memory.map_bytes(RECT, &[0_u8; 16]);
+            fixture.memory.map_bytes(EFFECT, &[0_u8; 4]);
+            fixture.memory.map_bytes(MEDIUM, &[0_u8; 12]);
+            fixture.memory.map_bytes(COOKIE, &[0_u8; 4]);
+            write_format_etc(&mut fixture, FMT, 1, DVASPECT_CONTENT, -1, TYMED_HGLOBAL);
+
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IOLEOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ole,
+                    0,
+                    &[ole as u32, IID_PTR as u32, OUT as u32]
+                ),
+                S_OK
+            );
+            write_iid(&mut fixture, IID_PTR, &COM_IID_IDATAOBJECT);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    ole,
+                    0,
+                    &[ole as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    in_place,
+                    0,
+                    &[in_place as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    active,
+                    0,
+                    &[active as u32, IID_PTR as u32, OUT as u32]
+                ),
+                E_NOINTERFACE
+            );
+
+            // A non-NULL clip rectangle is read and validated.
+            fixture.memory.write_u32(RECT, 0);
+            fixture.memory.write_u32(RECT + 4, 0);
+            fixture.memory.write_u32(RECT + 8, 4);
+            fixture.memory.write_u32(RECT + 12, 4);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    in_place,
+                    7,
+                    &[in_place as u32, RECT as u32, RECT as u32]
+                ),
+                S_OK
+            );
+
+            // Unreadable effect pointers and wrong-role calls.
+            fixture.memory.write_u32(EFFECT, DROPEFFECT_COPY);
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    drop,
+                    3,
+                    &[drop as u32, data as u32, 0, 0, 0, 0xDEAD]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, drop, 4, &[drop as u32, 0, 0, 0, 0xDEAD]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, drop, 4, &[0xDEAD, 0, 0, 0, EFFECT as u32]),
+                E_UNEXPECTED
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    drop,
+                    6,
+                    &[drop as u32, data as u32, 0, 0, 0, 0xDEAD]
+                ),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    drop,
+                    6,
+                    &[0xDEAD, data as u32, 0, 0, 0, EFFECT as u32]
+                ),
+                E_UNEXPECTED
+            );
+
+            // IOleObject::Advise null arguments.
+            assert_eq!(
+                call_slot(&mut fixture, ole, 19, &[ole as u32, 0, COOKIE as u32]),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                call_slot(&mut fixture, ole, 19, &[ole as u32, data as u32, 0]),
+                E_INVALIDARG
             );
         })
     }

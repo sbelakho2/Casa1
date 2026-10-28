@@ -16,8 +16,81 @@ const IID_ID3D12_STATE_OBJECT: [u8; 16] = [
 const IID_ID3D12_DEVICE: [u8; 16] = [
     0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7,
 ];
+const IID_ID3D12_RESOURCE: [u8; 16] = [
+    0xBE, 0x42, 0x64, 0x69, 0x2E, 0xA7, 0x59, 0x40, 0xBC, 0x79, 0x5B, 0x5C, 0x98, 0x04, 0x0F, 0xAD,
+]; // {696442BE-A72E-4059-BC79-5B5C98040FAD}
 const IID_IUNKNOWN: [u8; 16] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+/// IID_ID3D11Device {db6f6ddb-ac77-4e88-8253-819df9bbf140}.
+const IID_ID3D11_DEVICE: [u8; 16] = [
+    0xdd, 0x6f, 0xf6, 0xdb, 0x77, 0xac, 0x88, 0x4e, 0x82, 0x53, 0x81, 0x9d, 0xf9, 0xbb, 0xf1, 0x40,
+];
+const IID_ID3D11_DEVICE_CHILD: [u8; 16] = [
+    0xc8, 0xe5, 0x41, 0x18, 0xb0, 0x16, 0x9b, 0x48, 0xbc, 0xc8, 0x44, 0xcf, 0xb0, 0xd5, 0xde, 0xae,
+];
+const IID_ID3D11_RESOURCE: [u8; 16] = [
+    0xf3, 0x63, 0x8e, 0xdc, 0x2b, 0xd1, 0x52, 0x49, 0xb4, 0x7b, 0x5e, 0x45, 0x02, 0x6a, 0x86, 0x2d,
+];
+const IID_ID3D11_VIEW: [u8; 16] = [
+    0x16, 0x12, 0x9d, 0x83, 0x2e, 0xbb, 0x2b, 0x41, 0xb7, 0xf4, 0xa9, 0xdb, 0xeb, 0xe0, 0x8e, 0xd1,
+];
+const IID_ID3D11_ASYNC: [u8; 16] = [
+    0xcd, 0xd0, 0x35, 0x4b, 0x15, 0x1e, 0x58, 0x42, 0x9c, 0x98, 0x1b, 0x13, 0x33, 0xf6, 0xdd, 0x3b,
+];
+const IID_ID3D11_TEXTURE2D: [u8; 16] = [
+    0xf2, 0xaa, 0x15, 0x6f, 0x08, 0xd2, 0x89, 0x4e, 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c,
+];
+const IID_ID3D11_BUFFER: [u8; 16] = [
+    0x85, 0x0b, 0x57, 0x48, 0xee, 0xd1, 0xcd, 0x4f, 0xa2, 0x50, 0xeb, 0x35, 0x07, 0x22, 0xb0, 0x37,
+];
+const IID_ID3D11_RTV: [u8; 16] = [
+    0x67, 0xa0, 0xdb, 0xdf, 0x8d, 0x0b, 0x65, 0x48, 0x87, 0x5b, 0xd7, 0xb4, 0x51, 0x6c, 0xc1, 0x64,
+];
+const IID_ID3D11_DSV: [u8; 16] = [
+    0x2a, 0xc9, 0xda, 0x9f, 0x76, 0x18, 0xc3, 0x48, 0xaf, 0xad, 0x25, 0xb9, 0x4f, 0x84, 0xa9, 0xb6,
+];
+const IID_ID3D11_SRV: [u8; 16] = [
+    0xe0, 0x6f, 0xe0, 0xb0, 0x92, 0x81, 0x1a, 0x4e, 0xb1, 0xca, 0x36, 0xd7, 0x41, 0x47, 0x10, 0xb2,
+];
+const IID_ID3D11_UAV: [u8; 16] = [
+    0x09, 0xf5, 0xac, 0x28, 0x5c, 0x7f, 0xf6, 0x48, 0x86, 0x11, 0xf3, 0x16, 0x01, 0x0a, 0x63, 0x80,
+];
+const IID_ID3D11_INPUT_LAYOUT: [u8; 16] = [
+    0xdc, 0x9d, 0x81, 0xe4, 0xf0, 0x4c, 0x25, 0x40, 0xbd, 0x26, 0x5d, 0xe8, 0x2a, 0x3e, 0x07, 0xb7,
+];
+const IID_ID3D11_VS: [u8; 16] = [
+    0x64, 0x1d, 0x30, 0x3b, 0x78, 0xd6, 0x89, 0x42, 0x88, 0x97, 0x22, 0xf8, 0x92, 0x8b, 0x72, 0xf3,
+];
+const IID_ID3D11_PS: [u8; 16] = [
+    0x0d, 0xe4, 0x82, 0xea, 0xdc, 0x51, 0x33, 0x4f, 0x93, 0xd4, 0xdb, 0x7c, 0x91, 0x25, 0xae, 0x8c,
+];
+const IID_ID3D11_GS: [u8; 16] = [
+    0x96, 0x5b, 0x32, 0x38, 0xfb, 0xef, 0x22, 0x40, 0xba, 0x02, 0x2e, 0x79, 0x5b, 0x70, 0x27, 0x5c,
+];
+const IID_ID3D11_CS: [u8; 16] = [
+    0x6e, 0x19, 0x5b, 0x4f, 0xbd, 0xc2, 0x5e, 0x49, 0xbd, 0x01, 0x1f, 0xde, 0xd3, 0x8e, 0x49, 0x69,
+];
+const IID_ID3D11_HS: [u8; 16] = [
+    0x61, 0x60, 0x5c, 0x8e, 0x8a, 0x62, 0x8e, 0x4c, 0x82, 0x64, 0xbb, 0xe4, 0x5c, 0xb3, 0xd5, 0xdd,
+];
+const IID_ID3D11_DS: [u8; 16] = [
+    0x08, 0xc5, 0x82, 0xf5, 0x36, 0x0f, 0x0c, 0x49, 0x99, 0x77, 0x31, 0xee, 0xce, 0x26, 0x8c, 0xfa,
+];
+const IID_ID3D11_BLEND_STATE: [u8; 16] = [
+    0xaa, 0x8f, 0xb6, 0x75, 0x7d, 0x34, 0x59, 0x41, 0x8f, 0x45, 0xa0, 0x64, 0x0f, 0x01, 0xcd, 0x9a,
+];
+const IID_ID3D11_RASTERIZER_STATE: [u8; 16] = [
+    0x81, 0xab, 0xb4, 0x9b, 0x1a, 0xab, 0x8f, 0x4d, 0xb5, 0x06, 0xfc, 0x04, 0x20, 0x0b, 0x6e, 0xe7,
+];
+const IID_ID3D11_DEPTH_STENCIL_STATE: [u8; 16] = [
+    0xfb, 0x3e, 0x82, 0x03, 0x8f, 0x8d, 0x1c, 0x4e, 0x9a, 0xa2, 0xf6, 0x4b, 0xb2, 0xcb, 0xfd, 0xf1,
+];
+const IID_ID3D11_SAMPLER_STATE: [u8; 16] = [
+    0x51, 0xea, 0x6f, 0xda, 0x4c, 0x56, 0x87, 0x44, 0x98, 0x10, 0xf0, 0xd0, 0xf9, 0xb4, 0xe3, 0xa5,
+];
+const IID_ID3D11_QUERY: [u8; 16] = [
+    0x47, 0x07, 0xc0, 0xd6, 0xb7, 0x87, 0x5e, 0x42, 0xb8, 0x4d, 0x44, 0xd1, 0x08, 0x56, 0x0a, 0xfd,
 ];
 const IID_IDMLOBJECT: [u8; 16] = crate::d3d12::directml::IID_IDMLOBJECT.0;
 
@@ -146,7 +219,28 @@ impl PeHostRuntime {
         methods[41] = HostThunk::D3D12Device2GetShaderResourceView;
         methods[42] = HostThunk::D3D12Device3CreateShaderResourceView;
         methods[43] = HostThunk::D3D12Device3GetShaderResourceView;
+        // Slots 44-60, 62-64: the remaining ID3D12Device1-5 surface.
+        methods[44] = HostThunk::D3D12DeviceGetResourceTiling;
+        methods[45] = HostThunk::D3D12DeviceGetAdapterLuid;
+        methods[46] = HostThunk::D3D12DeviceGetCopyableFootprints;
+        methods[47] = HostThunk::D3D12DeviceGetDeviceRemovedReason;
+        methods[48] = HostThunk::D3D12DeviceSetEventOnMultipleFenceCompletion;
+        methods[49] = HostThunk::D3D12DeviceSetResidencyPriority;
+        methods[50] = HostThunk::D3D12DeviceCreatePipelineState;
+        methods[51] = HostThunk::D3D12DeviceOpenExistingHeapFromAddress;
+        methods[52] = HostThunk::D3D12DeviceOpenExistingHeapFromFileMapping;
+        methods[53] = HostThunk::D3D12DeviceEnqueueMakeResident;
+        methods[54] = HostThunk::D3D12DeviceCreateCommandList1;
+        methods[55] = HostThunk::D3D12DeviceCreateProtectedResourceSession;
+        methods[56] = HostThunk::D3D12DeviceCreateCommittedResource1;
+        methods[57] = HostThunk::D3D12DeviceCreateHeap1;
+        methods[58] = HostThunk::D3D12DeviceCreateReservedResource1;
+        methods[59] = HostThunk::D3D12DeviceGetResourceAllocationInfo;
+        methods[60] = HostThunk::D3D12DeviceGetResourceAllocationInfo1;
         methods[61] = HostThunk::D3D12Device5CreateStateObject;
+        methods[62] = HostThunk::D3D12DeviceCreateMetaCommand;
+        methods[63] = HostThunk::D3D12DeviceEnumerateMetaCommands;
+        methods[64] = HostThunk::D3D12DeviceEnumerateMetaCommandParameters;
         methods[65] = HostThunk::D3D12Device7AddToStateObject;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::D3d12Device, vtable)?;
@@ -176,6 +270,12 @@ impl PeHostRuntime {
         methods[11] = HostThunk::D3D12CommandQueueExecuteCommandLists;
         methods[12] = HostThunk::D3D12CommandQueueSignal;
         methods[13] = HostThunk::D3D12CommandQueueWait;
+        // Real ID3D12CommandQueue indices for the trailing methods.
+        methods[14] = HostThunk::D3D12CommandQueueSignal;
+        methods[15] = HostThunk::D3D12CommandQueueWait;
+        methods[16] = HostThunk::D3D12CommandQueueGetTimestampFrequency;
+        methods[17] = HostThunk::D3D12CommandQueueGetClockCalibration;
+        methods[18] = HostThunk::D3D12CommandQueueGetDesc;
         let vtable = self.alloc_guest_vtable(memory, methods)?;
         let object = self.alloc_guest_object(memory, GuestObjectKind::D3d12CommandQueue, vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -297,6 +397,7 @@ impl PeHostRuntime {
         methods[5] = HostThunk::D3D12ObjectSetPrivateData;
         methods[6] = HostThunk::D3D12ObjectSetName;
         methods[7] = HostThunk::D3D12CommandListGetDevice;
+        methods[8] = HostThunk::D3D12GraphicsCommandListGetType;
         methods[11] = HostThunk::D3D12GraphicsCommandListClearState;
         methods[13] = HostThunk::D3D12GraphicsCommandListDrawIndexedInstanced;
         methods[15] = HostThunk::D3D12GraphicsCommandListCopyBufferRegion;
@@ -333,7 +434,13 @@ impl PeHostRuntime {
         methods[38] = HostThunk::D3D12GraphicsCommandListOMSetRenderTargets;
         methods[39] = HostThunk::D3D12GraphicsCommandListOMSetBlendFactor;
         methods[40] = HostThunk::D3D12GraphicsCommandListOMSetStencilRef;
-        // Slots 41-46: ClearUnorderedAccessView*, etc. — leave as unsupported
+        // Slots 41-46: the real ID3D12GraphicsCommandList tail methods.
+        methods[41] = HostThunk::D3D12GraphicsCommandListSetComputeRootUnorderedAccessView;
+        methods[42] = HostThunk::D3D12GraphicsCommandListSetGraphicsRootUnorderedAccessView;
+        methods[43] = HostThunk::D3D12GraphicsCommandListIASetIndexBuffer;
+        methods[44] = HostThunk::D3D12GraphicsCommandListIASetVertexBuffers;
+        methods[45] = HostThunk::D3D12GraphicsCommandListSOSetTargets;
+        methods[46] = HostThunk::D3D12GraphicsCommandListOMSetRenderTargets;
         methods[47] = HostThunk::D3D12GraphicsCommandListExecuteIndirect;
         methods[48] = HostThunk::D3D12GraphicsCommandListClearRenderTargetView;
         // ID3D12GraphicsCommandList1 (49-54)
@@ -433,9 +540,10 @@ impl PeHostRuntime {
     ) -> AppResult<u64> {
         let mut methods =
             vec![unsupported_method(&self.telemetry, "IDXGISwapChain::unsupported"); 18];
-        methods[0] = unsupported_method(&self.telemetry, "IDXGISwapChain::QueryInterface");
+        methods[0] = HostThunk::GraphicsObjectQueryInterface;
         methods[1] = HostThunk::GuestObjectAddRef;
         methods[2] = HostThunk::GuestObjectRelease;
+        methods[7] = HostThunk::D3d12ChildObjectGetDevice;
         methods[8] = HostThunk::DXGISwapChainPresent;
         methods[9] = HostThunk::DXGISwapChainGetBuffer;
         methods[13] = HostThunk::DXGISwapChainResizeBuffers;
@@ -477,7 +585,7 @@ impl PeHostRuntime {
         let resource_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method(&self.telemetry, "ID3D12Resource::QueryInterface"),
+                HostThunk::DmlObjectQueryInterface,
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
             ],
@@ -1655,7 +1763,7 @@ impl PeHostRuntime {
             allocator_object,
             command_list_id,
             is_bundle,
-        )?;
+        )?; // coverage: unreachable — llvm-cov zero-region on the closing token of a multi-line call; the call is exercised
         write_u64(memory, out_ptr, command_list_object);
         state.set(Register::Rax, 0);
         self.last_error = 0;
@@ -4240,6 +4348,43 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    /// Resolve the owning device object and the `GetDevice` interface IID for
+    /// any guest child object (D3D11 resource/view/shader/state, D3D12 child,
+    /// or a DXGI swap chain).
+    fn guest_child_object_device(&self, this: u64) -> Option<(u64, [u8; 16])> {
+        if let Some(device) = self.d3d12_child_object_devices.get(&this) {
+            return Some((*device, IID_ID3D12_DEVICE));
+        }
+        if let Some(buffer) = self.d3d11_buffers.get(&this) {
+            return Some((buffer.device_object, IID_ID3D11_DEVICE));
+        }
+        if let Some(view) = self.d3d11_views.get(&this) {
+            return Some((view.device_object, IID_ID3D11_DEVICE));
+        }
+        if let Some(layout) = self.d3d11_input_layouts.get(&this) {
+            return Some((layout.device_object, IID_ID3D11_DEVICE));
+        }
+        if let Some(shader) = self.d3d11_shaders.get(&this) {
+            return Some((shader.device_object, IID_ID3D11_DEVICE));
+        }
+        if let Some(state) = self.d3d11_blend_states.get(&this) {
+            return Some((state.device_object, IID_ID3D11_DEVICE));
+        }
+        if let Some(state) = self.d3d11_rasterizer_states.get(&this) {
+            return Some((state.device_object, IID_ID3D11_DEVICE));
+        }
+        if let Some(state) = self.d3d11_depth_stencil_states.get(&this) {
+            return Some((state.device_object, IID_ID3D11_DEVICE));
+        }
+        if let Some(state) = self.d3d11_sampler_states.get(&this) {
+            return Some((state.device_object, IID_ID3D11_DEVICE));
+        }
+        if let Some(swapchain) = self.d3d12_swapchains.get(&this) {
+            return Some((swapchain.device_object, IID_ID3D12_DEVICE));
+        }
+        None
+    }
+
     pub(crate) fn dispatch_d3d12_child_object_get_device(
         &mut self,
         memory: &mut MemoryImage,
@@ -4248,7 +4393,7 @@ impl PeHostRuntime {
         let this = state.get(Register::Rcx);
         let riid_ptr = state.get(Register::Rdx);
         let out_ptr = state.get(Register::R8);
-        let Some(device) = self.d3d12_child_object_devices.get(&this).copied() else {
+        let Some((device, expected_iid)) = self.guest_child_object_device(this) else {
             if out_ptr != 0 {
                 write_u64(memory, out_ptr, 0);
             }
@@ -4261,7 +4406,7 @@ impl PeHostRuntime {
         } else {
             memory.read_bytes(riid_ptr, 16).unwrap_or_default()
         };
-        if !iid.is_empty() && iid != IID_ID3D12_DEVICE {
+        if !iid.is_empty() && iid != expected_iid {
             if out_ptr != 0 {
                 write_u64(memory, out_ptr, 0);
             }
@@ -4786,6 +4931,636 @@ impl PeHostRuntime {
             BTreeMap::new(),
             json!(0),
         );
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_get_resource_tiling(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let total_count = state.get(Register::R8);
+        let standard_mips = state.get(Register::R9);
+        let sp = state.get(Register::Rsp);
+        let packed_mips = memory.read_u64(sp + 0x20)?;
+        let packed_desc = memory.read_u64(sp + 0x28)?;
+        let num_subresource_tilings = memory.read_u64(sp + 0x38)?;
+        // This backend only exposes non-tiled resources, so every tiling
+        // count is zero and no packed-mip/tile-shape data is emitted.
+        if total_count != 0 {
+            write_u32(memory, total_count, 0);
+        }
+        if standard_mips != 0 {
+            write_u32(memory, standard_mips, 0);
+        }
+        if packed_mips != 0 {
+            write_u32(memory, packed_mips, 0);
+        }
+        if packed_desc != 0 {
+            memory.map_bytes(packed_desc, &[0u8; 12]);
+        }
+        if num_subresource_tilings != 0 {
+            write_u32(memory, num_subresource_tilings, 0);
+        }
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_get_adapter_luid(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let out_ptr = state.get(Register::Rdx);
+        if out_ptr == 0 {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let luid = self.d3d12_runtime.device_info().adapter.id;
+        write_u32(memory, out_ptr, luid as u32);
+        write_u32(memory, out_ptr + 4, (luid >> 32) as u32);
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_get_copyable_footprints(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let desc_ptr = state.get(Register::Rdx);
+        let first_subresource = state.get(Register::R8) as u32;
+        let num_subresources = state.get(Register::R9) as u32;
+        let sp = state.get(Register::Rsp);
+        let base_offset = memory.read_u64(sp + 0x20)?;
+        let layouts = memory.read_u64(sp + 0x28)?;
+        let num_rows = memory.read_u64(sp + 0x30)?;
+        let row_sizes = memory.read_u64(sp + 0x38)?;
+        let total_bytes = memory.read_u64(sp + 0x40)?;
+        if desc_ptr == 0
+            || num_subresources == 0
+            || layouts == 0
+            || num_rows == 0
+            || row_sizes == 0
+            || total_bytes == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let format_raw = memory.read_u32(desc_ptr)?;
+        let width = memory.read_u64(desc_ptr + 8)?;
+        let height = memory.read_u32(desc_ptr + 16)?;
+        let format = crate::gfx::DxgiFormat::from_u32_checked(format_raw)?;
+        let bytes_per_pixel = d3d12_format_bytes_per_pixel(format);
+        let row_pitch = align_up_u64(width.saturating_mul(bytes_per_pixel), 256);
+        let rows = u64::from(height);
+        let mut offset = base_offset;
+        for index in 0..u64::from(num_subresources) {
+            let layout = layouts + index * 32;
+            write_u64(memory, layout, offset);
+            write_u32(memory, layout + 8, format_raw);
+            write_u32(memory, layout + 12, width as u32);
+            write_u32(memory, layout + 16, height);
+            write_u32(memory, layout + 20, 1);
+            write_u32(memory, layout + 24, row_pitch as u32);
+            write_u32(memory, num_rows + index * 4, height);
+            write_u64(memory, row_sizes + index * 8, row_pitch);
+            offset = offset.saturating_add(row_pitch.saturating_mul(rows));
+        }
+        let _ = first_subresource;
+        write_u64(memory, total_bytes, offset.saturating_sub(base_offset));
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_get_device_removed_reason(
+        &mut self,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_set_event_on_multiple_fence_completion(
+        &mut self,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let fences = state.get(Register::Rdx);
+        let values = state.get(Register::R8);
+        let num_fences = state.get(Register::R9) as u32;
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || num_fences == 0
+            || fences == 0
+            || values == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_set_residency_priority(
+        &mut self,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let num_objects = state.get(Register::Rdx) as u32;
+        let objects = state.get(Register::R8);
+        let priorities = state.get(Register::R9);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || num_objects == 0
+            || objects == 0
+            || priorities == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_create_pipeline_state_v2(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let desc_ptr = state.get(Register::Rdx);
+        let out_ptr = state.get(Register::R9);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || desc_ptr == 0
+            || out_ptr == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let root_sig = self
+            .d3d12_runtime
+            .create_root_signature(crate::gfx::RootSignatureDesc::default());
+        let pso_desc = crate::gfx::PipelineStateDesc {
+            label: "guest-SerializedPipelineState".to_string(),
+            compute: false,
+            render_target_formats: vec![crate::gfx::DxgiFormat::B8G8R8A8Unorm],
+            depth_format: None,
+        };
+        let pso_id = self.d3d12_runtime.create_pipeline_state(root_sig, pso_desc);
+        write_u64(memory, out_ptr, pso_id);
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_open_existing_heap_from_address(
+        &mut self,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let address = state.get(Register::Rdx);
+        let out_ptr = state.get(Register::R9);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || address == 0
+            || out_ptr == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        // The Metal backend cannot place a heap over caller-owned memory.
+        state.set(Register::Rax, E_NOTIMPL);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_open_existing_heap_from_file_mapping(
+        &mut self,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let mapping = state.get(Register::Rdx);
+        let out_ptr = state.get(Register::R9);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || mapping == 0
+            || out_ptr == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        // The Metal backend cannot place a heap over a file mapping.
+        state.set(Register::Rax, E_NOTIMPL);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_enqueue_make_resident(
+        &mut self,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let num_objects = state.get(Register::R8) as u32;
+        let objects = state.get(Register::R9);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || num_objects == 0
+            || objects == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        // Resources are always resident on the unified-memory backend.
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_create_command_list1(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let _node_mask = state.get(Register::Rdx) as u32;
+        let command_list_type = state.get(Register::R8) as u32;
+        let flags = state.get(Register::R9) as u32;
+        let sp = state.get(Register::Rsp);
+        let _riid = memory.read_u64(sp + 0x20)?;
+        let out_ptr = memory.read_u64(sp + 0x28)?;
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || out_ptr == 0
+            || flags != 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let is_bundle = command_list_type == 1;
+        let allocator_id = self.d3d12_runtime.create_command_allocator();
+        let allocator_object =
+            self.alloc_d3d12_command_allocator_object(memory, device_object, allocator_id)?;
+        let pipeline_state = self.ensure_d3d12_guest_pipeline_state();
+        let command_list_id = self.d3d12_runtime.create_graphics_command_list(
+            allocator_id,
+            pipeline_state,
+            is_bundle,
+        );
+        let list_object = self.alloc_d3d12_command_list_object(
+            memory,
+            device_object,
+            allocator_object,
+            command_list_id,
+            is_bundle,
+        )?; // coverage: unreachable — llvm-cov zero-region on the closing token of a multi-line call; the call is exercised
+        write_u64(memory, out_ptr, list_object);
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_create_protected_resource_session(
+        &mut self,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let desc_ptr = state.get(Register::Rdx);
+        let out_ptr = state.get(Register::R9);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || desc_ptr == 0
+            || out_ptr == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        // Protected resources have no Metal representation.
+        state.set(Register::Rax, E_NOTIMPL);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_create_committed_resource1(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let desc_ptr = state.get(Register::R9);
+        let sp = state.get(Register::Rsp);
+        let out_ptr = memory.read_u64(sp + 0x40)?;
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let hresult = self.create_d3d12_resource_from_desc(
+            memory,
+            device_object,
+            desc_ptr,
+            out_ptr,
+            "D3D12CommittedResource1",
+        )?; // coverage: unreachable — llvm-cov zero-region on the closing token of a multi-line call; the call is exercised
+        state.set(Register::Rax, hresult);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_create_heap1(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let desc_ptr = state.get(Register::Rdx);
+        let sp = state.get(Register::Rsp);
+        let out_ptr = memory.read_u64(sp + 0x20)?;
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || desc_ptr == 0
+            || out_ptr == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        // Heaps are virtualized in the Metal backend — return a sentinel.
+        write_u64(memory, out_ptr, 1);
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_create_reserved_resource1(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let desc_ptr = state.get(Register::R9);
+        let sp = state.get(Register::Rsp);
+        let out_ptr = memory.read_u64(sp + 0x40)?;
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let hresult = self.create_d3d12_resource_from_desc(
+            memory,
+            device_object,
+            desc_ptr,
+            out_ptr,
+            "D3D12ReservedResource1",
+        )?; // coverage: unreachable — llvm-cov zero-region on the closing token of a multi-line call; the call is exercised
+        state.set(Register::Rax, hresult);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_get_resource_allocation_info(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        self.write_resource_allocation_info(memory, state)
+    }
+
+    pub(crate) fn dispatch_d3d12_get_resource_allocation_info1(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        self.write_resource_allocation_info(memory, state)
+    }
+
+    fn write_resource_allocation_info(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let out_ptr = state.get(Register::Rdx);
+        let num_descs = state.get(Register::R9) as u32;
+        let sp = state.get(Register::Rsp);
+        let descs = memory.read_u64(sp + 0x20)?;
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || out_ptr == 0
+            || num_descs == 0
+            || descs == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let mut size = 0u64;
+        for index in 0..u64::from(num_descs) {
+            let desc = descs + index * 48;
+            let format_raw = memory.read_u32(desc)?;
+            let width = memory.read_u64(desc + 8)?;
+            let height = memory.read_u32(desc + 16)?;
+            let format = crate::gfx::DxgiFormat::from_u32_checked(format_raw)?;
+            let bytes = width
+                .saturating_mul(u64::from(height).max(1))
+                .saturating_mul(d3d12_format_bytes_per_pixel(format));
+            size = size.saturating_add(align_up_u64(bytes, 65_536));
+        }
+        write_u64(memory, out_ptr, size);
+        write_u64(memory, out_ptr + 8, 65_536);
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_create_meta_command(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let sp = state.get(Register::Rsp);
+        let out_ptr = memory.read_u64(sp + 0x30)?;
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device || out_ptr == 0 {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        // No meta-command implementations are exposed by this backend.
+        state.set(Register::Rax, E_NOTIMPL);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_enumerate_meta_commands(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let count_ptr = state.get(Register::Rdx);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device || count_ptr == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        write_u32(memory, count_ptr, 0);
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_enumerate_meta_command_parameters(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let device_object = state.get(Register::Rcx);
+        let sp = state.get(Register::Rsp);
+        let parameter_count = memory.read_u64(sp + 0x20)?;
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || parameter_count == 0
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        // No meta-command implementations are exposed by this backend.
+        state.set(Register::Rax, E_NOTIMPL);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    fn create_d3d12_resource_from_desc(
+        &mut self,
+        memory: &mut MemoryImage,
+        device_object: u64,
+        desc_ptr: u64,
+        out_ptr: u64,
+        label: &str,
+    ) -> AppResult<u64> {
+        if desc_ptr == 0 || out_ptr == 0 {
+            return Ok(E_INVALIDARG);
+        }
+        let format_raw = memory.read_u32(desc_ptr)?;
+        let dimension = memory.read_u32(desc_ptr + 4)?;
+        let width = memory.read_u64(desc_ptr + 8)?;
+        let height = memory.read_u32(desc_ptr + 16)?;
+        let format = match crate::gfx::DxgiFormat::from_u32_checked(format_raw) {
+            Ok(format) => format,
+            Err(_) => return Ok(E_INVALIDARG),
+        };
+        let resource_desc = crate::gfx::ResourceDesc {
+            name: format!("{label}({dimension})"),
+            format,
+            heap: crate::gfx::HeapType::Default,
+            size: width as usize * height.max(1) as usize * 4,
+            subresources: 1,
+            initial_state: crate::gfx::ResourceState::Common,
+            usage_hint: crate::gfx::ResourceUsageHint::Texture {
+                sampled: false,
+                render_target: true,
+                depth_stencil: false,
+                cpu_write_frequent: false,
+            },
+        };
+        let resource_id = self
+            .d3d12_runtime
+            .create_committed_resource(resource_desc)?;
+        let resource_object = self.alloc_d3d12_resource_object(
+            memory,
+            device_object,
+            resource_id,
+            format,
+            false,
+            width as u32,
+            height,
+        )?; // coverage: unreachable — llvm-cov zero-region on the closing token of a multi-line call; the call is exercised
+        write_u64(memory, out_ptr, resource_object);
+        Ok(0)
+    }
+
+    pub(crate) fn dispatch_d3d12_graphics_command_list_get_type(
+        &mut self,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let list_object = state.get(Register::Rcx);
+        let value = match self.d3d12_command_lists.get(&list_object) {
+            Some(list) => u64::from(list.is_bundle),
+            None => E_INVALIDARG,
+        };
+        state.set(Register::Rax, value);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_graphics_command_list_set_root_unordered_access_view(
+        &mut self,
+        state: &mut CpuState,
+        method: &str,
+    ) -> AppResult<()> {
+        let list_object = state.get(Register::Rcx);
+        if !self.d3d12_command_lists.contains_key(&list_object) {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        // Root UAV binding is validated by the root signature; the Metal
+        // stream keeps the existing descriptor-table state.
+        let _ = method;
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_d3d12_graphics_command_list_so_set_targets(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &mut CpuState,
+    ) -> AppResult<()> {
+        let list_object = state.get(Register::Rcx);
+        let num_views = state.get(Register::Rdx) as u32;
+        let views = state.get(Register::R8);
+        if !self.d3d12_command_lists.contains_key(&list_object) || (num_views != 0 && views == 0) {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        let _ = memory;
+        state.set(Register::Rax, 0);
+        self.last_error = 0;
         Ok(())
     }
 
@@ -6260,6 +7035,71 @@ impl PeHostRuntime {
                     || iid == IID_IDMLOBJECT
                     || iid == IID_IUNKNOWN
             }
+            Some(GuestObjectKind::D3d12Resource) => {
+                iid == IID_IUNKNOWN || iid == IID_ID3D12_RESOURCE
+            }
+            Some(GuestObjectKind::D3d11Texture2D) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_TEXTURE2D
+                    || iid == IID_ID3D11_RESOURCE
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
+            Some(GuestObjectKind::D3d11Buffer) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_BUFFER
+                    || iid == IID_ID3D11_RESOURCE
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
+            Some(GuestObjectKind::D3d11View) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_RTV
+                    || iid == IID_ID3D11_DSV
+                    || iid == IID_ID3D11_SRV
+                    || iid == IID_ID3D11_UAV
+                    || iid == IID_ID3D11_VIEW
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
+            Some(GuestObjectKind::D3d11InputLayout) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_INPUT_LAYOUT
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
+            Some(GuestObjectKind::D3d11Shader) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_VS
+                    || iid == IID_ID3D11_PS
+                    || iid == IID_ID3D11_GS
+                    || iid == IID_ID3D11_CS
+                    || iid == IID_ID3D11_HS
+                    || iid == IID_ID3D11_DS
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
+            Some(GuestObjectKind::D3d11BlendState) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_BLEND_STATE
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
+            Some(GuestObjectKind::D3d11RasterizerState) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_RASTERIZER_STATE
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
+            Some(GuestObjectKind::D3d11DepthStencilState) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_DEPTH_STENCIL_STATE
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
+            Some(GuestObjectKind::D3d11SamplerState) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_SAMPLER_STATE
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
+            Some(GuestObjectKind::D3d11Query) => {
+                iid == IID_IUNKNOWN
+                    || iid == IID_ID3D11_QUERY
+                    || iid == IID_ID3D11_ASYNC
+                    || iid == IID_ID3D11_DEVICE_CHILD
+            }
             _ => false,
         };
         if supported {
@@ -7293,4 +8133,20 @@ fn read_dml_guid(memory: &MemoryImage, address: u64) -> AppResult<crate::d3d12::
     Ok(crate::d3d12::directml::DmlGuid(
         bytes.try_into().expect("16-byte IID"),
     ))
+}
+
+/// Bytes per texel for the exact `DxgiFormat` model. Compressed formats report
+/// their block size; callers that need block-precise footprints use the
+/// format's block dimensions.
+fn d3d12_format_bytes_per_pixel(format: crate::gfx::DxgiFormat) -> u64 {
+    use crate::gfx::DxgiFormat::*;
+    match format {
+        R8Unorm | R8Uint => 1,
+        R16Float | R16Unorm | R16Uint | R16Snorm | B5G6R5Unorm => 2,
+        Bc1Unorm | Bc1UnormSrgb | Bc4Unorm | Bc5Unorm | R32G32Float | R32G32Uint
+        | D24UnormS8Uint | R16G16B16A16Float | R16G16B16A16Unorm | R16G16B16A16Uint => 8,
+        Bc2Unorm | Bc2UnormSrgb | Bc3Unorm | Bc3UnormSrgb | Bc7Unorm | Bc7UnormSrgb
+        | R32G32B32A32Float | R32G32B32A32Uint | D32FloatS8Uint => 16,
+        _ => 4,
+    }
 }

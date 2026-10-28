@@ -8,6 +8,9 @@ const D3D11_DEVICE_IID: [u8; 16] = [
 const D3D11_CONTEXT_IID: [u8; 16] = [
     0xf0, 0xa0, 0xbf, 0xc1, 0x33, 0x51, 0xe0, 0x4a, 0xbb, 0xc4, 0xf1, 0x11, 0x43, 0x5b, 0x09, 0xaf,
 ];
+const D3D12_DEVICE_IID: [u8; 16] = [
+    0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7,
+];
 const D3D12_QUEUE_IID: [u8; 16] = [
     0xa6, 0x70, 0x08, 0x0e, 0x7e, 0x5d, 0x22, 0x4c, 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed,
 ];
@@ -17,6 +20,10 @@ const D3D12_HEAP_IID: [u8; 16] = [
 const D3D12_FENCE_IID: [u8; 16] = [
     0xcf, 0xdc, 0x53, 0x0a, 0xd8, 0xc4, 0x91, 0x4b, 0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76,
 ];
+const D3D12_RESOURCE_IID: [u8; 16] = [
+    0xBE, 0x42, 0x64, 0x69, 0x2E, 0xA7, 0x59, 0x40, 0xBC, 0x79, 0x5B, 0x5C, 0x98, 0x04, 0x0F, 0xAD,
+]; // {696442BE-A72E-4059-BC79-5B5C98040FAD}
+
 const D3D12_LIST_IID: [u8; 16] = [
     0x0f, 0x16, 0x0d, 0x5b, 0x1b, 0xac, 0x85, 0x41, 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x57,
 ];
@@ -27,6 +34,9 @@ const DXGI_SWAPCHAIN_IID: [u8; 16] = [
     0xa0, 0x36, 0x0d, 0x31, 0xe7, 0xd2, 0x0a, 0x4c, 0xaa, 0x04, 0x6a, 0x9d, 0x23, 0xb8, 0x88, 0x6a,
 ];
 const METHOD_TEST_UNKNOWN_IID: [u8; 16] = [0xab; 16];
+const IID_IUNKNOWN: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
 const DXGI_ERROR_UNSUPPORTED: u64 = 0x887A_0004;
 
 fn vtable_slot_thunk(memory: &MemoryImage, object: u64, slot: usize) -> AppResult<u64> {
@@ -1804,9 +1814,40 @@ fn d3d11_resource_and_query_methods_reject_invalid_input_and_pin_vtable_outputs(
         );
         let query = memory.read_u64(query_out).expect("query");
 
+        let child_iid = base + 0x1850;
+        let child_out = base + 0x1860;
+        memory.map_bytes(child_iid, &IID_IUNKNOWN);
+        memory.map_bytes(child_out, &[0u8; 8]);
         for object in [
             buffer, texture, view, layout, shader, states[0], states[1], states[2], states[3],
+            query,
         ] {
+            memory.map_bytes(child_out, &[0u8; 8]);
+            assert_eq!(
+                try_vtable_call(
+                    &mut runtime,
+                    &mut memory,
+                    object,
+                    0,
+                    &[object, child_iid, child_out]
+                )
+                .expect("DeviceChild QueryInterface IUnknown"),
+                0
+            );
+            assert_eq!(memory.read_u64(child_out).expect("QI object"), object);
+            memory.map_bytes(child_iid, &METHOD_TEST_UNKNOWN_IID);
+            assert_eq!(
+                try_vtable_call(
+                    &mut runtime,
+                    &mut memory,
+                    object,
+                    0,
+                    &[object, child_iid, child_out]
+                )
+                .expect("DeviceChild QueryInterface unknown"),
+                E_NOINTERFACE
+            );
+            memory.map_bytes(child_iid, &IID_IUNKNOWN);
             assert_ne!(
                 try_vtable_call(&mut runtime, &mut memory, object, 1, &[object])
                     .expect("DeviceChild AddRef"),
@@ -1817,10 +1858,90 @@ fn d3d11_resource_and_query_methods_reject_invalid_input_and_pin_vtable_outputs(
             assert_ne!(released, u64::MAX);
         }
 
-        assert!(try_vtable_call(&mut runtime, &mut memory, buffer, 0, &[buffer, 0, 0]).is_err());
-        assert!(try_vtable_call(&mut runtime, &mut memory, texture, 0, &[texture, 0, 0]).is_err());
-        assert!(try_vtable_call(&mut runtime, &mut memory, view, 0, &[view, 0, 0]).is_err());
-        assert!(try_vtable_call(&mut runtime, &mut memory, query, 0, &[query, 0, 0]).is_err());
+        memory.map_bytes(child_iid, &D3D11_DEVICE_IID);
+        for object in [
+            buffer, view, layout, shader, states[0], states[1], states[2], states[3],
+        ] {
+            memory.map_bytes(child_out, &[0u8; 8]);
+            assert_eq!(
+                try_vtable_call(
+                    &mut runtime,
+                    &mut memory,
+                    object,
+                    3,
+                    &[object, child_iid, child_out]
+                )
+                .expect("DeviceChild GetDevice"),
+                0
+            );
+            assert_eq!(
+                memory.read_u64(child_out).expect("child device"),
+                device_object
+            );
+        }
+        memory.map_bytes(child_iid, &METHOD_TEST_UNKNOWN_IID);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                buffer,
+                3,
+                &[buffer, child_iid, child_out]
+            )
+            .expect("DeviceChild GetDevice unknown IID"),
+            E_NOINTERFACE
+        );
+        // A device is not one of the child maps: GetDevice reports the exact
+        // missing-child error instead of a fabricated device pointer.
+        memory.map_bytes(child_iid, &D3D11_DEVICE_IID);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device_object,
+                3,
+                &[device_object, child_iid, child_out]
+            )
+            .expect("GetDevice on a non-child"),
+            E_INVALIDARG
+        );
+
+        let child_guid = base + 0x1870;
+        memory.map_bytes(child_guid, &[0x77; 16]);
+        let child_data = base + 0x1890;
+        memory.map_bytes(child_data, b"child");
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                buffer,
+                4,
+                &[buffer, child_guid, 0, 0]
+            )
+            .expect("DeviceChild GetPrivateData absent"),
+            0x8007_004e
+        );
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            buffer,
+            5,
+            &[buffer, child_guid, 5, child_data],
+        );
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            buffer,
+            4,
+            &[buffer, child_guid, child_data, 0],
+        );
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            buffer,
+            6,
+            &[buffer, child_guid, 0],
+        );
 
         assert_ne!(
             try_vtable_call(&mut runtime, &mut memory, query, 1, &[query]).expect("query AddRef"),
@@ -2039,8 +2160,11 @@ fn d3d12_device_methods_reject_invalid_input_and_pin_vtable_outputs() {
         );
         let _ = try_vtable_call(&mut runtime, &mut memory, resource, 2, &[resource])
             .expect("D3D12Resource Release");
-        assert!(
-            try_vtable_call(&mut runtime, &mut memory, resource, 0, &[resource, 0, 0]).is_err()
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, resource, 0, &[resource, 0, 0])
+                .expect("D3D12Resource QueryInterface with null iid"),
+            0x8000_4003,
+            "a null IID returns E_POINTER through the vtable"
         );
 
         let depth_resource_desc = base + 0x1f00;
@@ -2272,17 +2396,6 @@ fn d3d12_device_methods_reject_invalid_input_and_pin_vtable_outputs() {
                 0,
             ],
         );
-        assert_eq!(
-            try_vtable_call(
-                &mut runtime,
-                &mut memory,
-                device,
-                16,
-                &[device, 0, 0, 0, 0, 0, 0, 0],
-            )
-            .expect("CopyDescriptors empty ranges"),
-            E_INVALIDARG
-        );
         vtable_ok(
             &mut runtime,
             &mut memory,
@@ -2407,6 +2520,533 @@ fn d3d12_device_methods_reject_invalid_input_and_pin_vtable_outputs() {
             vtable_ok(&mut runtime, &mut memory, device, slot, &[device, 0, out]);
             assert_eq!(memory.read_u64(out).expect("versioned srv"), 0);
         }
+
+        // ── Slots 44-60, 62-64: ID3D12Device1-5 remainder ──────────────
+        let not_device = runtime
+            .alloc_dxgi_factory_object(&mut memory)
+            .expect("non-device factory");
+        let tile_count = base + 0x3000;
+        let tile_mips = base + 0x3004;
+        let packed_mips = base + 0x3008;
+        let packed_desc = base + 0x3010;
+        let tile_sub_count = base + 0x3020;
+        memory.map_bytes(tile_count, &[0xAA; 4]);
+        memory.map_bytes(tile_mips, &[0xAA; 4]);
+        memory.map_bytes(packed_mips, &[0xAA; 4]);
+        memory.map_bytes(packed_desc, &[0xAA; 12]);
+        memory.map_bytes(tile_sub_count, &[0xAA; 4]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            44,
+            &[
+                device,
+                resource,
+                tile_count,
+                tile_mips,
+                packed_mips,
+                packed_desc,
+                0,
+                tile_sub_count,
+            ],
+        );
+        assert_eq!(read_guest_u32(&memory, tile_count).expect("tile count"), 0);
+        assert_eq!(
+            read_guest_u32(&memory, tile_mips).expect("standard mips"),
+            0
+        );
+        assert_eq!(
+            read_guest_u32(&memory, packed_mips).expect("packed mips"),
+            0
+        );
+        assert_eq!(
+            read_guest_u32(&memory, tile_sub_count).expect("subresource tilings"),
+            0
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, device, 44, &[not_device])
+                .expect("GetResourceTiling non-device"),
+            E_INVALIDARG
+        );
+
+        let luid_out = base + 0x3030;
+        memory.map_bytes(luid_out, &[0u8; 8]);
+        vtable_ok(&mut runtime, &mut memory, device, 45, &[device, luid_out]);
+        let expected_luid = runtime.d3d12_runtime.device_info().adapter.id;
+        assert_eq!(
+            read_guest_u32(&memory, luid_out).expect("luid low"),
+            expected_luid as u32
+        );
+        assert_eq!(
+            read_guest_u32(&memory, luid_out + 4).expect("luid high"),
+            (expected_luid >> 32) as u32
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, device, 45, &[device, 0])
+                .expect("GetAdapterLuid null"),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                45,
+                &[not_device, luid_out]
+            )
+            .expect("GetAdapterLuid non-device"),
+            E_INVALIDARG
+        );
+
+        let footprint_desc = base + 0x3040;
+        let footprint_layouts = base + 0x3080;
+        let footprint_rows = base + 0x30c0;
+        let footprint_row_sizes = base + 0x30d0;
+        let footprint_total = base + 0x30e0;
+        for raw_format in [61u32, 54, 71, 74, 28] {
+            memory.map_bytes(footprint_desc, &[0u8; 48]);
+            write_u32(&mut memory, footprint_desc, raw_format);
+            write_u32(&mut memory, footprint_desc + 4, 3);
+            write_u64(&mut memory, footprint_desc + 8, 4);
+            write_u32(&mut memory, footprint_desc + 16, 2);
+            write_u16(&mut memory, footprint_desc + 20, 1);
+            write_u16(&mut memory, footprint_desc + 24, 1);
+            memory.map_bytes(footprint_layouts, &[0u8; 32]);
+            memory.map_bytes(footprint_rows, &[0u8; 4]);
+            memory.map_bytes(footprint_row_sizes, &[0u8; 8]);
+            memory.map_bytes(footprint_total, &[0u8; 8]);
+            vtable_ok(
+                &mut runtime,
+                &mut memory,
+                device,
+                46,
+                &[
+                    device,
+                    footprint_desc,
+                    0,
+                    1,
+                    0,
+                    footprint_layouts,
+                    footprint_rows,
+                    footprint_row_sizes,
+                    footprint_total,
+                ],
+            );
+            assert_eq!(
+                read_guest_u32(&memory, footprint_rows).expect("footprint rows"),
+                2
+            );
+            assert_eq!(
+                memory
+                    .read_u64(footprint_row_sizes)
+                    .expect("footprint row size"),
+                256
+            );
+            assert_eq!(
+                memory.read_u64(footprint_total).expect("footprint total"),
+                512
+            );
+            assert_eq!(
+                read_guest_u32(&memory, footprint_layouts + 12).expect("layout width"),
+                4
+            );
+            assert_eq!(
+                read_guest_u32(&memory, footprint_layouts + 24).expect("layout pitch"),
+                256
+            );
+        }
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                46,
+                &[
+                    device,
+                    0,
+                    0,
+                    1,
+                    0,
+                    footprint_layouts,
+                    footprint_rows,
+                    footprint_row_sizes,
+                    footprint_total
+                ],
+            )
+            .expect("GetCopyableFootprints null desc"),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                46,
+                &[
+                    not_device,
+                    footprint_desc,
+                    0,
+                    1,
+                    0,
+                    footprint_layouts,
+                    footprint_rows,
+                    footprint_row_sizes,
+                    footprint_total
+                ],
+            )
+            .expect("GetCopyableFootprints non-device"),
+            E_INVALIDARG
+        );
+
+        vtable_ok(&mut runtime, &mut memory, device, 47, &[device]);
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, device, 47, &[not_device])
+                .expect("GetDeviceRemovedReason non-device"),
+            E_INVALIDARG
+        );
+
+        let fence_list = base + 0x3100;
+        let fence_values = base + 0x3110;
+        let residency_objects = base + 0x3120;
+        let residency_priorities = base + 0x3130;
+        let make_resident_objects = base + 0x3140;
+        write_u64(&mut memory, fence_list, resource);
+        write_u64(&mut memory, fence_values, 1);
+        write_u64(&mut memory, residency_objects, resource);
+        write_u32(&mut memory, residency_priorities, 2);
+        write_u64(&mut memory, make_resident_objects, resource);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            48,
+            &[device, fence_list, fence_values, 1, 0, 0],
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                48,
+                &[device, 0, fence_values, 0, 0, 0]
+            )
+            .expect("SetEventOnMultipleFenceCompletion empty"),
+            E_INVALIDARG
+        );
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            49,
+            &[device, 1, residency_objects, residency_priorities],
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, device, 49, &[device, 0, 0, 0])
+                .expect("SetResidencyPriority empty"),
+            E_INVALIDARG
+        );
+
+        let serialized_desc = base + 0x3150;
+        memory.map_bytes(serialized_desc, &[0u8; 0x20]);
+        memory.map_bytes(out, &[0u8; 8]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            50,
+            &[device, serialized_desc, 0, out],
+        );
+        assert_ne!(memory.read_u64(out).expect("serialized pso"), 0);
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, device, 50, &[device, 0, 0, out])
+                .expect("CreatePipelineState null desc"),
+            E_INVALIDARG
+        );
+
+        let external_address = base + 0x3180;
+        memory.map_bytes(out, &[0u8; 8]);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                51,
+                &[device, external_address, 0, out]
+            )
+            .expect("OpenExistingHeapFromAddress"),
+            E_NOTIMPL
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                51,
+                &[device, external_address, 0, 0]
+            )
+            .expect("OpenExistingHeapFromAddress null out"),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                52,
+                &[device, 0x44, 0, out]
+            )
+            .expect("OpenExistingHeapFromFileMapping"),
+            E_NOTIMPL
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, device, 52, &[device, 0, 0, out])
+                .expect("OpenExistingHeapFromFileMapping null mapping"),
+            E_INVALIDARG
+        );
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            53,
+            &[device, 0, 1, make_resident_objects, 0, 0],
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                53,
+                &[device, 0, 0, 0, 0, 0]
+            )
+            .expect("EnqueueMakeResident empty"),
+            E_INVALIDARG
+        );
+
+        memory.map_bytes(out, &[0u8; 8]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            54,
+            &[device, 0, 0, 0, 0, out],
+        );
+        assert_eq!(
+            runtime
+                .guest_object_kind(memory.read_u64(out).expect("list1"))
+                .expect("list1 kind"),
+            GuestObjectKind::D3d12GraphicsCommandList
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                54,
+                &[device, 0, 0, 0, 0, 0]
+            )
+            .expect("CreateCommandList1 null out"),
+            E_INVALIDARG
+        );
+
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                55,
+                &[device, serialized_desc, 0, out]
+            )
+            .expect("CreateProtectedResourceSession"),
+            E_NOTIMPL
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, device, 55, &[device, 0, 0, 0])
+                .expect("CreateProtectedResourceSession null desc"),
+            E_INVALIDARG
+        );
+
+        memory.map_bytes(out, &[0u8; 8]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            56,
+            &[device, 0, 0, resource_desc, 0, 0, 0, 0, out],
+        );
+        assert_ne!(memory.read_u64(out).expect("committed1"), 0);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                56,
+                &[device, 0, 0, 0, 0, 0, 0, 0, out],
+            )
+            .expect("CreateCommittedResource1 null desc"),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                56,
+                &[not_device, 0, 0, resource_desc, 0, 0, 0, 0, out],
+            )
+            .expect("CreateCommittedResource1 non-device"),
+            E_INVALIDARG
+        );
+        let bad_format_desc = base + 0x31c0;
+        memory.map_bytes(bad_format_desc, &[0u8; 48]);
+        write_u32(&mut memory, bad_format_desc, 0xffff);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                56,
+                &[device, 0, 0, bad_format_desc, 0, 0, 0, 0, out],
+            )
+            .expect("CreateCommittedResource1 unsupported format"),
+            E_INVALIDARG
+        );
+
+        let heap1_desc = base + 0x3200;
+        memory.map_bytes(heap1_desc, &[0u8; 32]);
+        memory.map_bytes(out, &[0u8; 8]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            57,
+            &[device, heap1_desc, 0, 0, out],
+        );
+        assert_eq!(memory.read_u64(out).expect("heap1"), 1);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                57,
+                &[device, 0, 0, 0, out]
+            )
+            .expect("CreateHeap1 null desc"),
+            E_INVALIDARG
+        );
+
+        memory.map_bytes(out, &[0u8; 8]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            58,
+            &[device, 0, 0, resource_desc, 0, 0, 0, 0, out],
+        );
+        assert_ne!(memory.read_u64(out).expect("reserved1"), 0);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                58,
+                &[not_device, 0, 0, resource_desc, 0, 0, 0, 0, out],
+            )
+            .expect("CreateReservedResource1 non-device"),
+            E_INVALIDARG
+        );
+
+        for slot in [59usize, 60] {
+            let allocation_out = base + 0x3240;
+            memory.map_bytes(allocation_out, &[0u8; 16]);
+            vtable_ok(
+                &mut runtime,
+                &mut memory,
+                device,
+                slot,
+                &[device, allocation_out, 0, 1, resource_desc],
+            );
+            assert_ne!(memory.read_u64(allocation_out).expect("allocation size"), 0);
+            assert_eq!(
+                memory
+                    .read_u64(allocation_out + 8)
+                    .expect("allocation alignment"),
+                65_536
+            );
+            assert_eq!(
+                try_vtable_call(
+                    &mut runtime,
+                    &mut memory,
+                    device,
+                    slot,
+                    &[device, 0, 0, 1, resource_desc]
+                )
+                .expect("GetResourceAllocationInfo null out"),
+                E_INVALIDARG
+            );
+        }
+
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                62,
+                &[device, 0, 0, 0, 16, 0, out]
+            )
+            .expect("CreateMetaCommand"),
+            E_NOTIMPL
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                62,
+                &[device, 0, 0, 0, 16, 0, 0]
+            )
+            .expect("CreateMetaCommand null out"),
+            E_INVALIDARG
+        );
+        let meta_count = base + 0x3260;
+        memory.map_bytes(meta_count, &[0xAA; 4]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            device,
+            63,
+            &[device, meta_count, 0],
+        );
+        assert_eq!(read_guest_u32(&memory, meta_count).expect("meta count"), 0);
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, device, 63, &[device, 0, 0])
+                .expect("EnumerateMetaCommands null"),
+            E_INVALIDARG
+        );
+        let meta_param_count = base + 0x3270;
+        memory.map_bytes(meta_param_count, &[0u8; 8]);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                64,
+                &[device, 0, 0, 0, meta_param_count, 0]
+            )
+            .expect("EnumerateMetaCommandParameters"),
+            E_NOTIMPL
+        );
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                device,
+                64,
+                &[device, 0, 0, 0, 0, 0]
+            )
+            .expect("EnumerateMetaCommandParameters null"),
+            E_INVALIDARG
+        );
     });
 }
 
@@ -2580,6 +3220,43 @@ fn d3d12_queue_heap_and_fence_methods_reject_invalid_input_and_pin_vtable_output
         );
         vtable_ok(&mut runtime, &mut memory, queue, 12, &[queue, fence, 1]);
         vtable_ok(&mut runtime, &mut memory, queue, 13, &[queue, fence, 1]);
+        // Real ID3D12CommandQueue indices for the trailing methods.
+        vtable_ok(&mut runtime, &mut memory, queue, 14, &[queue, fence, 1]);
+        vtable_ok(&mut runtime, &mut memory, queue, 15, &[queue, fence, 1]);
+        memory.map_bytes(frequency_out, &[0u8; 8]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            queue,
+            16,
+            &[queue, frequency_out],
+        );
+        assert_eq!(
+            memory.read_u64(frequency_out).expect("frequency 16"),
+            1_000_000_000
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, queue, 16, &[queue, 0])
+                .expect("GetTimestampFrequency 16 null out"),
+            E_INVALIDARG
+        );
+        memory.map_bytes(gpu_out, &[0u8; 8]);
+        memory.map_bytes(cpu_out, &[0u8; 8]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            queue,
+            17,
+            &[queue, gpu_out, cpu_out],
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, queue, 17, &[queue, 0, cpu_out])
+                .expect("GetClockCalibration 17 null out"),
+            E_INVALIDARG
+        );
+        memory.map_bytes(desc_out, &[0u8; 16]);
+        vtable_ok(&mut runtime, &mut memory, queue, 18, &[queue, desc_out]);
+        assert_eq!(read_guest_u32(&memory, desc_out).expect("queue type 18"), 3);
         assert!(
             vtable_err(&mut runtime, &mut memory, queue, 12, &[queue, 0, 1])
                 .message
@@ -2797,6 +3474,26 @@ fn d3d12_graphics_command_list_methods_reject_invalid_input_and_pin_vtable_outpu
             *slot = memory.read_u64(out).expect("resource");
         }
         let [resource_a, resource_b] = resources;
+        let resource_iid = base + 0x1b00;
+        let resource_qi_out = base + 0x1b10;
+        memory.map_bytes(resource_iid, &D3D12_RESOURCE_IID);
+        memory.map_bytes(resource_qi_out, &[0u8; 8]);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                resource_a,
+                0,
+                &[resource_a, resource_iid, resource_qi_out],
+            )
+            .expect("ID3D12Resource QueryInterface"),
+            0
+        );
+        assert_eq!(
+            memory.read_u64(resource_qi_out).expect("resource QI"),
+            resource_a
+        );
+        let _ = try_vtable_call(&mut runtime, &mut memory, resource_a, 2, &[resource_a]);
         vtable_ok(
             &mut runtime,
             &mut memory,
@@ -2855,6 +3552,31 @@ fn d3d12_graphics_command_list_methods_reject_invalid_input_and_pin_vtable_outpu
         memory.map_bytes(destinations_ptr, &[0u8; 16]);
         let predication_ptr = base + 0x1860;
         memory.map_bytes(predication_ptr, &[0u8; 8]);
+
+        // Slots previously left unproven: each now runs with valid resources.
+        vtable_ok(&mut runtime, &mut memory, list, 11, &[list]); // ClearState
+        vtable_ok(&mut runtime, &mut memory, list, 13, &[list, 0, 1, 0, 0, 0]); // DrawIndexedInstanced
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            list,
+            15,
+            &[list, resource_a, 0, resource_b, 0, 0],
+        ); // CopyBufferRegion (zero size)
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            list,
+            18,
+            &[list, resource_a, 0, 0, resource_b, 0, 0],
+        ); // CopyTiles (empty region)
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            list,
+            19,
+            &[list, resource_a, 0, resource_b, 0, 4],
+        ); // ResolveSubresource
 
         memory.map_bytes(iid_ptr, &D3D12_LIST_IID);
         memory.map_bytes(qi_out, &[0u8; 8]);
@@ -3003,6 +3725,50 @@ fn d3d12_graphics_command_list_methods_reject_invalid_input_and_pin_vtable_outpu
         );
         vtable_ok(&mut runtime, &mut memory, list, 39, &[list, constants_ptr]);
         vtable_ok(&mut runtime, &mut memory, list, 40, &[list, 0]);
+        // Slot 8 GetType and the real ID3D12GraphicsCommandList tail.
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, list, 8, &[list])
+                .expect("list GetType direct"),
+            0
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, bundle, 8, &[bundle])
+                .expect("list GetType bundle"),
+            1
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, list, 8, &[device])
+                .expect("list GetType non-list"),
+            E_INVALIDARG
+        );
+        vtable_ok(&mut runtime, &mut memory, list, 41, &[list, 0, 0]);
+        vtable_ok(&mut runtime, &mut memory, list, 42, &[list, 0, 0]);
+        vtable_ok(&mut runtime, &mut memory, list, 43, &[list, index_ptr]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            list,
+            44,
+            &[list, 0, 1, vertex_ptr],
+        );
+        vtable_ok(&mut runtime, &mut memory, list, 45, &[list, 0, 0]);
+        vtable_ok(
+            &mut runtime,
+            &mut memory,
+            list,
+            46,
+            &[list, 1, rtv_array, 0, 0],
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, list, 41, &[device, 0, 0])
+                .expect("SetComputeRootUnorderedAccessView non-list"),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            try_vtable_call(&mut runtime, &mut memory, list, 45, &[list, 1, 0])
+                .expect("SOSetTargets null views"),
+            E_INVALIDARG
+        );
 
         assert_eq!(
             try_vtable_call(
@@ -3530,7 +4296,8 @@ fn dxgi_swapchain_methods_reject_invalid_input_and_pin_vtable_outputs() {
         }
 
         memory.map_bytes(iid_ptr, &DXGI_SWAPCHAIN_IID);
-        assert!(
+        memory.map_bytes(qi_out, &[0u8; 8]);
+        assert_eq!(
             try_vtable_call(
                 &mut runtime,
                 &mut memory,
@@ -3538,7 +4305,47 @@ fn dxgi_swapchain_methods_reject_invalid_input_and_pin_vtable_outputs() {
                 0,
                 &[swapchain, iid_ptr, qi_out],
             )
-            .is_err()
+            .expect("swapchain QueryInterface"),
+            0
+        );
+        assert_eq!(memory.read_u64(qi_out).expect("swapchain QI"), swapchain);
+        memory.map_bytes(iid_ptr, &METHOD_TEST_UNKNOWN_IID);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                swapchain,
+                0,
+                &[swapchain, iid_ptr, qi_out],
+            )
+            .expect("swapchain QueryInterface unknown"),
+            E_NOINTERFACE
+        );
+        memory.map_bytes(iid_ptr, &D3D12_DEVICE_IID);
+        memory.map_bytes(qi_out, &[0u8; 8]);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                swapchain,
+                7,
+                &[swapchain, iid_ptr, qi_out],
+            )
+            .expect("swapchain GetDevice"),
+            0
+        );
+        assert_eq!(memory.read_u64(qi_out).expect("swapchain device"), device);
+        memory.map_bytes(iid_ptr, &METHOD_TEST_UNKNOWN_IID);
+        assert_eq!(
+            try_vtable_call(
+                &mut runtime,
+                &mut memory,
+                swapchain,
+                7,
+                &[swapchain, iid_ptr, qi_out],
+            )
+            .expect("swapchain GetDevice unknown IID"),
+            E_NOINTERFACE
         );
         assert_ne!(
             try_vtable_call(&mut runtime, &mut memory, swapchain, 1, &[swapchain])

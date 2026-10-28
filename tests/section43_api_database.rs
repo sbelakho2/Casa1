@@ -793,7 +793,7 @@ fn record_workload_dedups_and_reports_found() {
 fn ledger_counts_include_method_level_deviations_without_error() {
     let database = ApiDatabase::from_thunk_metadata();
     let method_count = database.interface_methods().len();
-    assert_eq!(method_count, 810);
+    assert_eq!(method_count, 889);
     let ledger = database.compatibility_limitations_markdown();
     assert_eq!(ledger.contains("Method-level accounting:"), true);
     assert_eq!(

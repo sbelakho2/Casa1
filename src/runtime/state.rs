@@ -612,12 +612,133 @@ pub(crate) struct ComStorageState {
     pub(crate) name: String,
 }
 
-/// State for a guest IDataObject (drag-and-drop payload holder).
+/// One advisory connection registered on an IDataObject or IOleObject.
 #[derive(Debug, Clone)]
+pub(crate) struct ComOleAdvise {
+    /// The connection cookie returned to the caller.
+    pub(crate) cookie: u32,
+    /// The FORMATETC the advice was registered for (DataObject only).
+    pub(crate) format_etc: Vec<u8>,
+    /// ADVF_* flags supplied by the caller.
+    pub(crate) advf: u32,
+    /// The IAdviseSink the notification would be delivered to.
+    pub(crate) sink: u64,
+}
+
+/// Which OLE surface a `ComDataObject`-tagged guest object carries.  The
+/// runtime reuses one guest-object tag for the closely related ole32
+/// interfaces; the role selects the vtable shape and the QI answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ComOleSurfaceRole {
+    /// A real IDataObject over its FORMATETC payload table.
+    #[default]
+    DataObject,
+    /// An IEnumFORMATETC snapshot enumerator.
+    EnumFormatEtc,
+    /// An IEnumSTATDATA snapshot enumerator.
+    EnumStatData,
+    /// An IEnumOLEVERB snapshot enumerator.
+    EnumOleVerb,
+    /// An IOleObject.
+    OleObject,
+    /// An IOleInPlaceObject.
+    InPlaceObject,
+    /// An IOleInPlaceActiveObject.
+    InPlaceActiveObject,
+    /// An IObjectWithSite.
+    ObjectWithSite,
+    /// An IServiceProvider.
+    ServiceProvider,
+    /// An IDropTarget.
+    DropTarget,
+    /// An IPersistStream (also answering IPersist).
+    PersistStream,
+    /// An ISupportErrorInfo.
+    SupportErrorInfo,
+}
+
+/// State for a guest IDataObject (drag-and-drop payload holder) and the
+/// sibling ole32 surfaces that share its guest-object tag.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ComDataObjectState {
+    /// The surface this object serves.
+    pub(crate) role: ComOleSurfaceRole,
     /// Format (CF_*) -> payload bytes.
-    #[allow(dead_code)] // COM object state (consumed by the ole32/MF thunk paths)
     pub(crate) formats: HashMap<u32, Vec<u8>>,
+    /// Format insertion order (IEnumFORMATETC enumeration).
+    pub(crate) format_order: Vec<u32>,
+    /// Advisory connections on an IDataObject.
+    pub(crate) data_advises: Vec<ComOleAdvise>,
+    /// Next advisory connection cookie.
+    pub(crate) next_advise_cookie: u32,
+    /// Enumerator snapshot items (role-dependent encoded records).
+    pub(crate) enum_items: Vec<Vec<u8>>,
+    /// Enumerator position.
+    pub(crate) enum_index: usize,
+
+    // ── IOleObject ────────────────────────────────────────────────────────
+    /// The client site (IOleClientSite) last set by the container.
+    pub(crate) client_site: u64,
+    /// Application and object names set by IOleObject::SetHostNames.
+    pub(crate) host_names: (String, String),
+    /// The moniker set by IOleObject::SetMoniker.
+    pub(crate) moniker: u64,
+    /// Whether IOleObject::Close already ran.
+    pub(crate) closed: bool,
+    /// The object's CLSID (GetUserClassID / IPersist::GetClassID).
+    pub(crate) class_id: [u8; 16],
+    /// Draw aspect and extent stored by SetExtent/GetExtent.
+    pub(crate) extent: (u32, i32, i32),
+    /// The LOGPALETTE bytes stored by SetColorScheme.
+    pub(crate) color_scheme: Vec<u8>,
+    /// Advisory connections on an IOleObject.
+    pub(crate) ole_advises: Vec<ComOleAdvise>,
+    /// Next OLE advisory connection cookie.
+    pub(crate) next_ole_cookie: u32,
+
+    // ── IOleInPlaceObject / IOleInPlaceActiveObject ───────────────────────
+    /// The IOleObject that owns this in-place interface (0 for a standalone).
+    pub(crate) owner: u64,
+    /// The in-place window handle.
+    pub(crate) hwnd: u64,
+    /// Whether the object is in-place active.
+    pub(crate) in_place_active: bool,
+    /// Whether the object is UI active.
+    pub(crate) ui_active: bool,
+    /// Whether reactivation can be undone (a UIDeactivate ran).
+    pub(crate) undo_available: bool,
+    /// Position rectangle (left, top, right, bottom).
+    pub(crate) pos_rect: [i32; 4],
+    /// Clip rectangle (left, top, right, bottom).
+    pub(crate) clip_rect: [i32; 4],
+
+    // ── IObjectWithSite / IServiceProvider ────────────────────────────────
+    /// The site pointer stored by IObjectWithSite::SetSite.
+    pub(crate) site: u64,
+    /// Service GUID string -> object pointer.
+    pub(crate) services: HashMap<String, u64>,
+
+    // ── IDropTarget ───────────────────────────────────────────────────────
+    /// Whether a drag operation is in progress.
+    pub(crate) dragging: bool,
+    /// The data object of the current drag operation.
+    pub(crate) drop_object: u64,
+    /// The current (masked) drop effect.
+    pub(crate) drop_effect: u32,
+    /// The last drag point.
+    pub(crate) drop_point: (i32, i32),
+    /// Whether a drop completed.
+    pub(crate) dropped: bool,
+
+    // ── IPersistStream ────────────────────────────────────────────────────
+    /// The persisted bytes.
+    pub(crate) persist_data: Vec<u8>,
+    /// Whether the persisted state differs from the saved stream.
+    pub(crate) persist_dirty: bool,
+
+    // ── ISupportErrorInfo ─────────────────────────────────────────────────
+    /// The interfaces this object reports as supporting error info.
+    pub(crate) error_info_iids: Vec<[u8; 16]>,
 }
 
 /// State for a guest IConnectionPoint (OLE sink connection point) or the

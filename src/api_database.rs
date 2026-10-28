@@ -913,7 +913,6 @@ impl ApiDatabase {
                         ImplementationLevel::Implemented
                     }
                     MethodDispatch::Dispatched => ImplementationLevel::Partial,
-                    MethodDispatch::Missing => ImplementationLevel::Unsupported,
                 };
                 let (fidelity, capability, coverage) = (
                     SemanticFidelity::Restricted,
@@ -2463,7 +2462,7 @@ static COM_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         "IPersist",
         ImplementationLevel::Implemented,
         false,
-        "No IPersist dispatch in the runtime.",
+        "IPersistStream vtable dispatch (GetClassID + stream persistence) in runtime/dispatch/com.rs.",
     ),
     interface_skeleton(
         "ole32.dll",
@@ -2484,35 +2483,35 @@ static COM_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         "IMalloc",
         ImplementationLevel::Implemented,
         false,
-        "No IMalloc dispatch in the runtime.",
+        "Real IMalloc vtable over the COM task allocator in runtime/dispatch/com.rs.",
     ),
     interface_skeleton(
         "ole32.dll",
         "IDropTarget",
         ImplementationLevel::Implemented,
         false,
-        "RegisterDragDrop/DoDragDrop exist, but no IDropTarget vtable dispatch in the runtime.",
+        "Real IDropTarget drag-state vtable in runtime/dispatch/com.rs.",
     ),
     interface_skeleton(
         "ole32.dll",
         "IDataObject",
         ImplementationLevel::Implemented,
         false,
-        "No IDataObject dispatch in the runtime.",
+        "Real IDataObject FORMATETC/STGMEDIUM/advise vtable in runtime/dispatch/com.rs.",
     ),
     interface_skeleton(
         "ole32.dll",
         "IOleObject",
         ImplementationLevel::Implemented,
         false,
-        "OleInitialize is implemented, but no IOleObject dispatch in the runtime.",
+        "Real IOleObject client-site/moniker/verb/advise vtable in runtime/dispatch/com.rs.",
     ),
     interface_skeleton(
         "ole32.dll",
         "IOleInPlaceObject",
         ImplementationLevel::Implemented,
         false,
-        "No IOleInPlaceObject dispatch in the runtime.",
+        "Real IOleInPlaceObject activation/rect vtable in runtime/dispatch/com.rs.",
     ),
     interface_skeleton(
         "shdocvw.dll",
@@ -2526,14 +2525,14 @@ static COM_INTERFACE_SURFACE: &[SkeletonEntry] = &[
         "IObjectWithSite",
         ImplementationLevel::Implemented,
         false,
-        "No IObjectWithSite dispatch in the runtime.",
+        "Real IObjectWithSite SetSite/GetSite vtable in runtime/dispatch/com.rs.",
     ),
     interface_skeleton(
         "ole32.dll",
         "IServiceProvider",
         ImplementationLevel::Implemented,
         false,
-        "No IServiceProvider dispatch in the runtime.",
+        "Real IServiceProvider::QueryService vtable in runtime/dispatch/com.rs.",
     ),
 ];
 
@@ -2831,8 +2830,6 @@ enum MethodDispatch {
     /// The slot is assigned a real `HostThunk` (possibly a documented
     /// partial implementation).
     Dispatched,
-    /// The slot is the runtime's `unsupported_method` telemetry fallthrough.
-    Missing,
 }
 
 /// One method-level seed row (derived from a runtime vtable allocation).
@@ -2858,18 +2855,6 @@ const fn optional(method: &'static str, detail: &'static str) -> MethodSeed { //
     MethodSeed { method, required: false, dispatch: MethodDispatch::Dispatched, detail } // coverage: unreachable
 } // coverage: unreachable
 
-/// A required method whose vtable slot is the unsupported fallthrough.
-#[rustfmt::skip]
-const fn missing(method: &'static str, detail: &'static str) -> MethodSeed { // coverage: unreachable
-    MethodSeed { method, required: true, dispatch: MethodDispatch::Missing, detail } // coverage: unreachable
-} // coverage: unreachable
-
-/// An optional interface-version extension with no dispatch.
-#[rustfmt::skip]
-const fn optional_missing(method: &'static str, detail: &'static str) -> MethodSeed { // coverage: unreachable
-    MethodSeed { method, required: false, dispatch: MethodDispatch::Missing, detail } // coverage: unreachable
-} // coverage: unreachable
-
 /// One COM-style interface's vtable method list.
 struct InterfaceMethodSurface {
     dll: &'static str,
@@ -2879,32 +2864,29 @@ struct InterfaceMethodSurface {
 
 const DISPATCHED_METHOD: &str =
     "vtable slot carries a real host-thunk dispatch; no method-level semantic proof yet";
-const MISSING_METHOD: &str =
-    "vtable slot is the unsupported_method telemetry fallthrough (no real dispatch)";
 
-/// D3D11 `ID3D11DeviceChild` methods (the resource/view/shader/state vtables
-/// allocate `unsupported_method` for these slots; only AddRef/Release are
-/// real).
+/// D3D11 `ID3D11DeviceChild` methods (every resource/view/shader/state
+/// vtable shares the real host-thunk preamble).
 const D3D11_DEVICE_CHILD_METHODS: &[MethodSeed] = &[
-    missing("QueryInterface", MISSING_METHOD),
+    method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
-    missing("GetDevice", MISSING_METHOD),
-    missing("GetPrivateData", MISSING_METHOD),
-    missing("SetPrivateData", MISSING_METHOD),
-    missing("SetPrivateDataInterface", MISSING_METHOD),
+    method("GetDevice", DISPATCHED_METHOD),
+    method("GetPrivateData", DISPATCHED_METHOD),
+    method("SetPrivateData", DISPATCHED_METHOD),
+    method("SetPrivateDataInterface", DISPATCHED_METHOD),
 ];
 
 /// D3D11 resource texture vtable (3 slots).
 const D3D11_TEXTURE_METHODS: &[MethodSeed] = &[
-    missing("QueryInterface", MISSING_METHOD),
+    method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
 ];
 
 /// D3D12 resource vtable (3 slots).
 const D3D12_RESOURCE_METHODS: &[MethodSeed] = &[
-    missing("QueryInterface", MISSING_METHOD),
+    method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
 ];
@@ -3035,7 +3017,7 @@ const D3D11_CONTEXT_METHODS: &[MethodSeed] = &[
 /// D3D11 query/asynchronous vtable
 /// (`runtime/mod.rs::D3D11DeviceCreateQuery`).
 const D3D11_QUERY_METHODS: &[MethodSeed] = &[
-    missing("QueryInterface", MISSING_METHOD),
+    method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
     method("GetDevice", DISPATCHED_METHOD),
@@ -3044,8 +3026,8 @@ const D3D11_QUERY_METHODS: &[MethodSeed] = &[
     method("GetDesc", DISPATCHED_METHOD),
 ];
 
-/// D3D12 `ID3D12Device` vtable (66 slots; slots 38-43, 61 and 65 are
-/// interface-version extensions; 44-60 and 62-64 are unsupported slots).
+/// D3D12 `ID3D12Device` vtable (66 slots; slots 38-43, 44-64 and 65 are
+/// interface-version extensions carrying real host-thunk dispatches).
 const D3D12_DEVICE_METHODS: &[MethodSeed] = &[
     method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
@@ -3091,31 +3073,32 @@ const D3D12_DEVICE_METHODS: &[MethodSeed] = &[
     optional("GetShaderResourceView2", DISPATCHED_METHOD),
     optional("CreateShaderResourceView3", DISPATCHED_METHOD),
     optional("GetShaderResourceView3", DISPATCHED_METHOD),
-    optional_missing("UnsupportedSlot44", MISSING_METHOD),
-    optional_missing("UnsupportedSlot45", MISSING_METHOD),
-    optional_missing("UnsupportedSlot46", MISSING_METHOD),
-    optional_missing("UnsupportedSlot47", MISSING_METHOD),
-    optional_missing("UnsupportedSlot48", MISSING_METHOD),
-    optional_missing("UnsupportedSlot49", MISSING_METHOD),
-    optional_missing("UnsupportedSlot50", MISSING_METHOD),
-    optional_missing("UnsupportedSlot51", MISSING_METHOD),
-    optional_missing("UnsupportedSlot52", MISSING_METHOD),
-    optional_missing("UnsupportedSlot53", MISSING_METHOD),
-    optional_missing("UnsupportedSlot54", MISSING_METHOD),
-    optional_missing("UnsupportedSlot55", MISSING_METHOD),
-    optional_missing("UnsupportedSlot56", MISSING_METHOD),
-    optional_missing("UnsupportedSlot57", MISSING_METHOD),
-    optional_missing("UnsupportedSlot58", MISSING_METHOD),
-    optional_missing("UnsupportedSlot59", MISSING_METHOD),
-    optional_missing("UnsupportedSlot60", MISSING_METHOD),
+    optional("GetResourceTiling", DISPATCHED_METHOD),
+    optional("GetAdapterLuid", DISPATCHED_METHOD),
+    optional("GetCopyableFootprints", DISPATCHED_METHOD),
+    optional("GetDeviceRemovedReason", DISPATCHED_METHOD),
+    optional("SetEventOnMultipleFenceCompletion", DISPATCHED_METHOD),
+    optional("SetResidencyPriority", DISPATCHED_METHOD),
+    optional("CreatePipelineState", DISPATCHED_METHOD),
+    optional("OpenExistingHeapFromAddress", DISPATCHED_METHOD),
+    optional("OpenExistingHeapFromFileMapping", DISPATCHED_METHOD),
+    optional("EnqueueMakeResident", DISPATCHED_METHOD),
+    optional("CreateCommandList1", DISPATCHED_METHOD),
+    optional("CreateProtectedResourceSession", DISPATCHED_METHOD),
+    optional("CreateCommittedResource1", DISPATCHED_METHOD),
+    optional("CreateHeap1", DISPATCHED_METHOD),
+    optional("CreateReservedResource1", DISPATCHED_METHOD),
+    optional("GetResourceAllocationInfo", DISPATCHED_METHOD),
+    optional("GetResourceAllocationInfo1", DISPATCHED_METHOD),
     optional("CreateStateObject", DISPATCHED_METHOD),
-    optional_missing("UnsupportedSlot62", MISSING_METHOD),
-    optional_missing("UnsupportedSlot63", MISSING_METHOD),
-    optional_missing("UnsupportedSlot64", MISSING_METHOD),
+    optional("CreateMetaCommand", DISPATCHED_METHOD),
+    optional("EnumerateMetaCommands", DISPATCHED_METHOD),
+    optional("EnumerateMetaCommandParameters", DISPATCHED_METHOD),
     optional("AddToStateObject", DISPATCHED_METHOD),
 ];
 
-/// D3D12 `ID3D12CommandQueue` vtable (19 slots; 14-18 unsupported).
+/// D3D12 `ID3D12CommandQueue` vtable (19 slots; 14-18 are the allocator's
+/// real trailing methods).
 const D3D12_COMMAND_QUEUE_METHODS: &[MethodSeed] = &[
     method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
@@ -3131,11 +3114,11 @@ const D3D12_COMMAND_QUEUE_METHODS: &[MethodSeed] = &[
     method("ExecuteCommandLists", DISPATCHED_METHOD),
     method("Signal", DISPATCHED_METHOD),
     method("Wait", DISPATCHED_METHOD),
-    optional_missing("UnsupportedSlot14", MISSING_METHOD),
-    optional_missing("UnsupportedSlot15", MISSING_METHOD),
-    optional_missing("UnsupportedSlot16", MISSING_METHOD),
-    optional_missing("UnsupportedSlot17", MISSING_METHOD),
-    optional_missing("UnsupportedSlot18", MISSING_METHOD),
+    optional("Signal", DISPATCHED_METHOD),
+    optional("Wait", DISPATCHED_METHOD),
+    optional("GetTimestampFrequency", DISPATCHED_METHOD),
+    optional("GetClockCalibration", DISPATCHED_METHOD),
+    optional("GetDesc", DISPATCHED_METHOD),
 ];
 
 /// D3D12 `ID3D12DescriptorHeap` vtable (11 slots).
@@ -3169,7 +3152,7 @@ const D3D12_FENCE_METHODS: &[MethodSeed] = &[
 ];
 
 /// D3D12 `ID3D12GraphicsCommandList` vtable (75 slots; slots 41-46 and 62
-/// are unsupported base slots).
+/// carry the real host-thunk tail).
 const D3D12_GRAPHICS_COMMAND_LIST_METHODS: &[MethodSeed] = &[
     method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
@@ -3179,6 +3162,7 @@ const D3D12_GRAPHICS_COMMAND_LIST_METHODS: &[MethodSeed] = &[
     method("SetPrivateDataInterface", DISPATCHED_METHOD),
     method("SetName", DISPATCHED_METHOD),
     method("GetDevice", DISPATCHED_METHOD),
+    method("GetType", DISPATCHED_METHOD),
     method("Close", DISPATCHED_METHOD),
     method("Reset", DISPATCHED_METHOD),
     method("ClearState", DISPATCHED_METHOD),
@@ -3211,12 +3195,12 @@ const D3D12_GRAPHICS_COMMAND_LIST_METHODS: &[MethodSeed] = &[
     method("OMSetRenderTargets", DISPATCHED_METHOD),
     method("OMSetBlendFactor", DISPATCHED_METHOD),
     method("OMSetStencilRef", DISPATCHED_METHOD),
-    missing("UnsupportedSlot41", MISSING_METHOD),
-    missing("UnsupportedSlot42", MISSING_METHOD),
-    missing("UnsupportedSlot43", MISSING_METHOD),
-    missing("UnsupportedSlot44", MISSING_METHOD),
-    missing("UnsupportedSlot45", MISSING_METHOD),
-    missing("UnsupportedSlot46", MISSING_METHOD),
+    method("SetComputeRootUnorderedAccessView", DISPATCHED_METHOD),
+    method("SetGraphicsRootUnorderedAccessView", DISPATCHED_METHOD),
+    method("IASetIndexBuffer", DISPATCHED_METHOD),
+    method("IASetVertexBuffers", DISPATCHED_METHOD),
+    method("SOSetTargets", DISPATCHED_METHOD),
+    method("OMSetRenderTargets", DISPATCHED_METHOD),
     method("ExecuteIndirect", DISPATCHED_METHOD),
     method("ClearRenderTargetView", DISPATCHED_METHOD),
     method("AtomicCopyBufferUINT", DISPATCHED_METHOD),
@@ -3232,7 +3216,10 @@ const D3D12_GRAPHICS_COMMAND_LIST_METHODS: &[MethodSeed] = &[
     method("InitializeMetaCommand", DISPATCHED_METHOD),
     method("ExecuteMetaCommand", DISPATCHED_METHOD),
     method("BuildRaytracingAccelerationStructure", DISPATCHED_METHOD),
-    missing("UnsupportedSlot62", MISSING_METHOD),
+    method(
+        "EmitRaytracingAccelerationStructurePostbuildInfo",
+        DISPATCHED_METHOD,
+    ),
     method("CopyRaytracingAccelerationStructure", DISPATCHED_METHOD),
     method("SetPipelineState1", DISPATCHED_METHOD),
     method("DispatchRays", DISPATCHED_METHOD),
@@ -3280,14 +3267,14 @@ const DXGI_FACTORY_METHODS: &[MethodSeed] = &[
 /// DXGI `IDXGISwapChain` vtable (18 slots; the D3D12 allocator is the
 /// superset of the D3D11 14-slot swapchain).
 const DXGI_SWAPCHAIN_METHODS: &[MethodSeed] = &[
-    missing("QueryInterface", MISSING_METHOD),
+    method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
     method("GetPrivateData", DISPATCHED_METHOD),
     method("SetPrivateData", DISPATCHED_METHOD),
     method("SetPrivateDataInterface", DISPATCHED_METHOD),
     method("SetName", DISPATCHED_METHOD),
-    missing("GetDevice", MISSING_METHOD),
+    method("GetDevice", DISPATCHED_METHOD),
     method("Present", DISPATCHED_METHOD),
     method("GetBuffer", DISPATCHED_METHOD),
     method("SetFullscreenState", DISPATCHED_METHOD),
@@ -3444,15 +3431,15 @@ const IDATA_OBJECT_METHODS: &[MethodSeed] = &[
     method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
-    missing("GetData", MISSING_METHOD),
-    missing("GetDataHere", MISSING_METHOD),
-    missing("QueryGetData", MISSING_METHOD),
-    missing("GetCanonicalFormatEtc", MISSING_METHOD),
-    missing("SetData", MISSING_METHOD),
-    missing("EnumFormatEtc", MISSING_METHOD),
-    missing("DAdvise", MISSING_METHOD),
-    missing("DUnadvise", MISSING_METHOD),
-    missing("EnumDAdvise", MISSING_METHOD),
+    method("GetData", DISPATCHED_METHOD),
+    method("GetDataHere", DISPATCHED_METHOD),
+    method("QueryGetData", DISPATCHED_METHOD),
+    method("GetCanonicalFormatEtc", DISPATCHED_METHOD),
+    method("SetData", DISPATCHED_METHOD),
+    method("EnumFormatEtc", DISPATCHED_METHOD),
+    method("DAdvise", DISPATCHED_METHOD),
+    method("DUnadvise", DISPATCHED_METHOD),
+    method("EnumDAdvise", DISPATCHED_METHOD),
 ];
 
 /// OLE `IOleObject` vtable.
@@ -3460,27 +3447,27 @@ const IOLE_OBJECT_METHODS: &[MethodSeed] = &[
     method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
-    missing("SetClientSite", MISSING_METHOD),
-    missing("GetClientSite", MISSING_METHOD),
-    missing("SetHostNames", MISSING_METHOD),
-    missing("Close", MISSING_METHOD),
-    missing("SetMoniker", MISSING_METHOD),
-    missing("GetMoniker", MISSING_METHOD),
-    missing("InitFromData", MISSING_METHOD),
-    missing("GetClipboardData", MISSING_METHOD),
-    missing("DoVerb", MISSING_METHOD),
-    missing("EnumVerbs", MISSING_METHOD),
-    missing("Update", MISSING_METHOD),
-    missing("IsUpToDate", MISSING_METHOD),
-    missing("GetUserClassID", MISSING_METHOD),
-    missing("GetUserType", MISSING_METHOD),
-    missing("SetExtent", MISSING_METHOD),
-    missing("GetExtent", MISSING_METHOD),
-    missing("Advise", MISSING_METHOD),
-    missing("Unadvise", MISSING_METHOD),
-    missing("EnumAdvise", MISSING_METHOD),
-    missing("GetMiscStatus", MISSING_METHOD),
-    missing("SetColorScheme", MISSING_METHOD),
+    method("SetClientSite", DISPATCHED_METHOD),
+    method("GetClientSite", DISPATCHED_METHOD),
+    method("SetHostNames", DISPATCHED_METHOD),
+    method("Close", DISPATCHED_METHOD),
+    method("SetMoniker", DISPATCHED_METHOD),
+    method("GetMoniker", DISPATCHED_METHOD),
+    method("InitFromData", DISPATCHED_METHOD),
+    method("GetClipboardData", DISPATCHED_METHOD),
+    method("DoVerb", DISPATCHED_METHOD),
+    method("EnumVerbs", DISPATCHED_METHOD),
+    method("Update", DISPATCHED_METHOD),
+    method("IsUpToDate", DISPATCHED_METHOD),
+    method("GetUserClassID", DISPATCHED_METHOD),
+    method("GetUserType", DISPATCHED_METHOD),
+    method("SetExtent", DISPATCHED_METHOD),
+    method("GetExtent", DISPATCHED_METHOD),
+    method("Advise", DISPATCHED_METHOD),
+    method("Unadvise", DISPATCHED_METHOD),
+    method("EnumAdvise", DISPATCHED_METHOD),
+    method("GetMiscStatus", DISPATCHED_METHOD),
+    method("SetColorScheme", DISPATCHED_METHOD),
 ];
 
 /// OLE `IOleInPlaceObject` vtable.
@@ -3488,12 +3475,12 @@ const IOLE_IN_PLACE_OBJECT_METHODS: &[MethodSeed] = &[
     method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
-    missing("GetWindow", MISSING_METHOD),
-    missing("ContextSensitiveHelp", MISSING_METHOD),
-    missing("InPlaceDeactivate", MISSING_METHOD),
-    missing("UIDeactivate", MISSING_METHOD),
-    missing("SetObjectRects", MISSING_METHOD),
-    missing("ReactivateAndUndo", MISSING_METHOD),
+    method("GetWindow", DISPATCHED_METHOD),
+    method("ContextSensitiveHelp", DISPATCHED_METHOD),
+    method("InPlaceDeactivate", DISPATCHED_METHOD),
+    method("UIDeactivate", DISPATCHED_METHOD),
+    method("SetObjectRects", DISPATCHED_METHOD),
+    method("ReactivateAndUndo", DISPATCHED_METHOD),
 ];
 
 /// OLE `IObjectWithSite` vtable.
@@ -3501,8 +3488,8 @@ const IOBJECT_WITH_SITE_METHODS: &[MethodSeed] = &[
     method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
-    missing("SetSite", MISSING_METHOD),
-    missing("GetSite", MISSING_METHOD),
+    method("SetSite", DISPATCHED_METHOD),
+    method("GetSite", DISPATCHED_METHOD),
 ];
 
 /// OLE `IServiceProvider` vtable.
@@ -3510,7 +3497,117 @@ const ISERVICE_PROVIDER_METHODS: &[MethodSeed] = &[
     method("QueryInterface", DISPATCHED_METHOD),
     method("AddRef", DISPATCHED_METHOD),
     method("Release", DISPATCHED_METHOD),
-    missing("QueryService", MISSING_METHOD),
+    method("QueryService", DISPATCHED_METHOD),
+];
+
+/// OLE `IOleInPlaceActiveObject` vtable (10 slots).
+const IOLE_IN_PLACE_ACTIVE_OBJECT_METHODS: &[MethodSeed] = &[
+    method("QueryInterface", DISPATCHED_METHOD),
+    method("AddRef", DISPATCHED_METHOD),
+    method("Release", DISPATCHED_METHOD),
+    method("GetWindow", DISPATCHED_METHOD),
+    method("ContextSensitiveHelp", DISPATCHED_METHOD),
+    method("TranslateAccelerator", DISPATCHED_METHOD),
+    method("OnFrameWindowActivate", DISPATCHED_METHOD),
+    method("OnDocWindowActivate", DISPATCHED_METHOD),
+    method("ResizeBorder", DISPATCHED_METHOD),
+    method("EnableModeless", DISPATCHED_METHOD),
+];
+
+/// OLE `IPersistStream` vtable (8 slots; inherits `IPersist::GetClassID`).
+const IPERSIST_STREAM_METHODS: &[MethodSeed] = &[
+    method("QueryInterface", DISPATCHED_METHOD),
+    method("AddRef", DISPATCHED_METHOD),
+    method("Release", DISPATCHED_METHOD),
+    method("GetClassID", DISPATCHED_METHOD),
+    method("IsDirty", DISPATCHED_METHOD),
+    method("Load", DISPATCHED_METHOD),
+    method("Save", DISPATCHED_METHOD),
+    method("GetSizeMax", DISPATCHED_METHOD),
+];
+
+/// OLE `ISupportErrorInfo` vtable (4 slots).
+const ISUPPORT_ERROR_INFO_METHODS: &[MethodSeed] = &[
+    method("QueryInterface", DISPATCHED_METHOD),
+    method("AddRef", DISPATCHED_METHOD),
+    method("Release", DISPATCHED_METHOD),
+    method("InterfaceSupportsErrorInfo", DISPATCHED_METHOD),
+];
+
+/// OLE `IEnumFORMATETC` snapshot enumerator (7 slots).
+const IENUM_FORMAT_ETC_METHODS: &[MethodSeed] = &[
+    method("QueryInterface", DISPATCHED_METHOD),
+    method("AddRef", DISPATCHED_METHOD),
+    method("Release", DISPATCHED_METHOD),
+    method("Next", DISPATCHED_METHOD),
+    method("Skip", DISPATCHED_METHOD),
+    method("Reset", DISPATCHED_METHOD),
+    method("Clone", DISPATCHED_METHOD),
+];
+
+/// OLE `IEnumSTATDATA` snapshot enumerator (7 slots).
+const IENUM_STAT_DATA_METHODS: &[MethodSeed] = &[
+    method("QueryInterface", DISPATCHED_METHOD),
+    method("AddRef", DISPATCHED_METHOD),
+    method("Release", DISPATCHED_METHOD),
+    method("Next", DISPATCHED_METHOD),
+    method("Skip", DISPATCHED_METHOD),
+    method("Reset", DISPATCHED_METHOD),
+    method("Clone", DISPATCHED_METHOD),
+];
+
+/// OLE `IEnumOLEVERB` snapshot enumerator (7 slots).
+const IENUM_OLE_VERB_METHODS: &[MethodSeed] = &[
+    method("QueryInterface", DISPATCHED_METHOD),
+    method("AddRef", DISPATCHED_METHOD),
+    method("Release", DISPATCHED_METHOD),
+    method("Next", DISPATCHED_METHOD),
+    method("Skip", DISPATCHED_METHOD),
+    method("Reset", DISPATCHED_METHOD),
+    method("Clone", DISPATCHED_METHOD),
+];
+
+/// OLE Automation `ITypeInfo` vtable (22 slots).
+const ITYPE_INFO_METHODS: &[MethodSeed] = &[
+    method("QueryInterface", DISPATCHED_METHOD),
+    method("AddRef", DISPATCHED_METHOD),
+    method("Release", DISPATCHED_METHOD),
+    method("GetTypeAttr", DISPATCHED_METHOD),
+    method("GetTypeComp", DISPATCHED_METHOD),
+    method("GetFuncDesc", DISPATCHED_METHOD),
+    method("GetVarDesc", DISPATCHED_METHOD),
+    method("GetNames", DISPATCHED_METHOD),
+    method("GetRefTypeOfImplType", DISPATCHED_METHOD),
+    method("GetImplTypeFlags", DISPATCHED_METHOD),
+    method("GetIDsOfNames", DISPATCHED_METHOD),
+    method("Invoke", DISPATCHED_METHOD),
+    method("GetDocumentation", DISPATCHED_METHOD),
+    method("GetDllEntry", DISPATCHED_METHOD),
+    method("GetRefTypeInfo", DISPATCHED_METHOD),
+    method("AddressOfMember", DISPATCHED_METHOD),
+    method("CreateInstance", DISPATCHED_METHOD),
+    method("GetMops", DISPATCHED_METHOD),
+    method("GetContainingTypeLib", DISPATCHED_METHOD),
+    method("ReleaseTypeAttr", DISPATCHED_METHOD),
+    method("ReleaseFuncDesc", DISPATCHED_METHOD),
+    method("ReleaseVarDesc", DISPATCHED_METHOD),
+];
+
+/// OLE Automation `ITypeLib` vtable (13 slots).
+const ITYPE_LIB_METHODS: &[MethodSeed] = &[
+    method("QueryInterface", DISPATCHED_METHOD),
+    method("AddRef", DISPATCHED_METHOD),
+    method("Release", DISPATCHED_METHOD),
+    method("GetTypeInfoCount", DISPATCHED_METHOD),
+    method("GetTypeInfo", DISPATCHED_METHOD),
+    method("GetTypeInfoType", DISPATCHED_METHOD),
+    method("GetTypeInfoOfGuid", DISPATCHED_METHOD),
+    method("GetLibAttr", DISPATCHED_METHOD),
+    method("GetTypeComp", DISPATCHED_METHOD),
+    method("GetDocumentation", DISPATCHED_METHOD),
+    method("FindName", DISPATCHED_METHOD),
+    method("IsName", DISPATCHED_METHOD),
+    method("ReleaseTLibAttr", DISPATCHED_METHOD),
 ];
 
 /// Shell `IShellLinkW` vtable (21 slots; all real host thunks).
@@ -3779,7 +3876,10 @@ const IMF_TRANSFORM_METHODS: &[MethodSeed] = &[
     method("ProcessInput", DISPATCHED_METHOD),
     method("ProcessOutput", DISPATCHED_METHOD),
     method("ProcessMessage", DISPATCHED_METHOD),
-    optional_missing("UnsupportedSlot19", MISSING_METHOD),
+    optional(
+        "UnsupportedSlot19",
+        "slot-19 host thunk returns MF_E_UNSUPPORTED_BYTESTREAM_TYPE (0xC00D36C4) exactly",
+    ),
 ];
 
 /// Media Foundation `IMFSinkWriter` vtable.
@@ -3953,6 +4053,11 @@ static INTERFACE_METHOD_SURFACE: &[InterfaceMethodSurface] = &[
     },
     InterfaceMethodSurface {
         dll: "ole32.dll",
+        interface: "IPersistStream",
+        methods: IPERSIST_STREAM_METHODS,
+    },
+    InterfaceMethodSurface {
+        dll: "ole32.dll",
         interface: "IStream",
         methods: ISTREAM_METHODS,
     },
@@ -3978,6 +4083,11 @@ static INTERFACE_METHOD_SURFACE: &[InterfaceMethodSurface] = &[
     },
     InterfaceMethodSurface {
         dll: "ole32.dll",
+        interface: "IOleInPlaceActiveObject",
+        methods: IOLE_IN_PLACE_ACTIVE_OBJECT_METHODS,
+    },
+    InterfaceMethodSurface {
+        dll: "ole32.dll",
         interface: "IObjectWithSite",
         methods: IOBJECT_WITH_SITE_METHODS,
     },
@@ -3995,6 +4105,36 @@ static INTERFACE_METHOD_SURFACE: &[InterfaceMethodSurface] = &[
         dll: "ole32.dll",
         interface: "IDataObject",
         methods: IDATA_OBJECT_METHODS,
+    },
+    InterfaceMethodSurface {
+        dll: "ole32.dll",
+        interface: "IEnumFORMATETC",
+        methods: IENUM_FORMAT_ETC_METHODS,
+    },
+    InterfaceMethodSurface {
+        dll: "ole32.dll",
+        interface: "IEnumSTATDATA",
+        methods: IENUM_STAT_DATA_METHODS,
+    },
+    InterfaceMethodSurface {
+        dll: "ole32.dll",
+        interface: "IEnumOLEVERB",
+        methods: IENUM_OLE_VERB_METHODS,
+    },
+    InterfaceMethodSurface {
+        dll: "ole32.dll",
+        interface: "ISupportErrorInfo",
+        methods: ISUPPORT_ERROR_INFO_METHODS,
+    },
+    InterfaceMethodSurface {
+        dll: "oleaut32.dll",
+        interface: "ITypeInfo",
+        methods: ITYPE_INFO_METHODS,
+    },
+    InterfaceMethodSurface {
+        dll: "oleaut32.dll",
+        interface: "ITypeLib",
+        methods: ITYPE_LIB_METHODS,
     },
     InterfaceMethodSurface {
         dll: "shell32.dll",
@@ -4444,7 +4584,7 @@ mod method_proof_tests {
     }
 
     #[test]
-    fn seeded_report_lists_missing_method_proof_and_bound_evidence() {
+    fn seeded_report_binds_every_method_to_compiled_evidence() {
         let database = ApiDatabase::from_thunk_metadata();
         let report = database.completeness_report();
 
@@ -4462,34 +4602,31 @@ mod method_proof_tests {
             "the method row must name the compiled contract that proves it"
         );
 
-        let unbound = report
-            .method_registry
-            .iter()
-            .find(|row| row.interface == "ID3D12GraphicsCommandList" && row.method == "ClearState")
-            .expect("ClearState row");
-        assert_eq!(unbound.semantic_test_coverage, CoverageLevel::None);
-        assert_eq!(unbound.evidence_id, None);
+        // The registry milestone: every seeded method is implemented and bound.
+        assert!(
+            report.method_registry.iter().all(|row| {
+                row.implementation == ImplementationLevel::Implemented
+                    && matches!(
+                        row.semantic_test_coverage,
+                        CoverageLevel::Conformance | CoverageLevel::Differential
+                    )
+                    && row.evidence_id.is_some()
+            }),
+            "every method row must carry implementation + compiled evidence"
+        );
+        assert_eq!(report.gate.unproven_method_count, 0);
 
         let interface = report
             .interface_registry
             .iter()
             .find(|row| row.dll == "d3d12.dll" && row.interface == "ID3D12GraphicsCommandList")
             .expect("ID3D12GraphicsCommandList aggregate");
-        assert_eq!(interface.proven, false);
-        assert!(
-            interface
-                .unproven_methods
-                .contains(&"ClearState".to_string()),
-            "the interface registry must list ClearState as unproven"
-        );
-        assert!(
-            report.gate.unproven_method_count >= interface.unproven_methods.len(),
-            "the gate count must include the interface's unproven methods"
-        );
+        assert_eq!(interface.proven, true);
+        assert!(interface.unproven_methods.is_empty());
 
         let summary = report.per_dll.get("d3d12.dll").expect("d3d12 summary");
         assert!(summary.method_proven >= 1);
-        assert!(summary.method_unproven >= 1);
+        assert_eq!(summary.method_unproven, 0);
 
         let value = serde_json::to_value(&report).expect("report serializes");
         assert!(value.get("interface_registry").is_some());

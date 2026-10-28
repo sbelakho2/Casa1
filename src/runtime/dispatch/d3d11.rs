@@ -196,7 +196,7 @@ impl PeHostRuntime {
         let texture_vtable = self.alloc_guest_vtable(
             memory,
             vec![
-                unsupported_method(&self.telemetry, "ID3D11Texture2D::QueryInterface"),
+                HostThunk::DmlObjectQueryInterface,
                 HostThunk::GuestObjectAddRef,
                 HostThunk::GuestObjectRelease,
             ],
@@ -223,21 +223,7 @@ impl PeHostRuntime {
         device_object: u64,
         resource_id: D3d11ResourceId,
     ) -> AppResult<u64> {
-        let buffer_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11Buffer::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
+        let buffer_vtable = self.alloc_guest_vtable(memory, d3d11_device_child_methods())?;
         let buffer_object =
             self.alloc_guest_object(memory, GuestObjectKind::D3d11Buffer, buffer_vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -258,21 +244,7 @@ impl PeHostRuntime {
         view_id: D3d11ViewId,
         kind: ViewKind,
     ) -> AppResult<u64> {
-        let view_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11View::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
+        let view_vtable = self.alloc_guest_vtable(memory, d3d11_device_child_methods())?;
         let view_object =
             self.alloc_guest_object(memory, GuestObjectKind::D3d11View, view_vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -293,21 +265,7 @@ impl PeHostRuntime {
         device_object: u64,
         layout_id: InputLayoutId,
     ) -> AppResult<u64> {
-        let layout_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11InputLayout::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
+        let layout_vtable = self.alloc_guest_vtable(memory, d3d11_device_child_methods())?;
         let layout_object =
             self.alloc_guest_object(memory, GuestObjectKind::D3d11InputLayout, layout_vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -328,21 +286,7 @@ impl PeHostRuntime {
         shader_id: u64,
         stage: D3d11ShaderStage,
     ) -> AppResult<u64> {
-        let shader_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
+        let shader_vtable = self.alloc_guest_vtable(memory, d3d11_device_child_methods())?;
         let shader_object =
             self.alloc_guest_object(memory, GuestObjectKind::D3d11Shader, shader_vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -363,21 +307,7 @@ impl PeHostRuntime {
         device_object: u64,
         state_id: u64,
     ) -> AppResult<u64> {
-        let state_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11BlendState::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
+        let state_vtable = self.alloc_guest_vtable(memory, d3d11_device_child_methods())?;
         let state_object =
             self.alloc_guest_object(memory, GuestObjectKind::D3d11BlendState, state_vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -397,21 +327,7 @@ impl PeHostRuntime {
         device_object: u64,
         state_id: u64,
     ) -> AppResult<u64> {
-        let state_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11RasterizerState::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
+        let state_vtable = self.alloc_guest_vtable(memory, d3d11_device_child_methods())?;
         let state_object =
             self.alloc_guest_object(memory, GuestObjectKind::D3d11RasterizerState, state_vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -431,21 +347,7 @@ impl PeHostRuntime {
         device_object: u64,
         state_id: u64,
     ) -> AppResult<u64> {
-        let state_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11DepthStencilState::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
+        let state_vtable = self.alloc_guest_vtable(memory, d3d11_device_child_methods())?;
         let state_object = self.alloc_guest_object(
             memory,
             GuestObjectKind::D3d11DepthStencilState,
@@ -468,21 +370,7 @@ impl PeHostRuntime {
         device_object: u64,
         state_id: u64,
     ) -> AppResult<u64> {
-        let state_vtable = self.alloc_guest_vtable(
-            memory,
-            vec![
-                unsupported_method(&self.telemetry, "ID3D11SamplerState::QueryInterface"),
-                HostThunk::GuestObjectAddRef,
-                HostThunk::GuestObjectRelease,
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetDevice"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::GetPrivateData"),
-                unsupported_method(&self.telemetry, "ID3D11DeviceChild::SetPrivateData"),
-                unsupported_method(
-                    &self.telemetry,
-                    "ID3D11DeviceChild::SetPrivateDataInterface",
-                ),
-            ],
-        )?;
+        let state_vtable = self.alloc_guest_vtable(memory, d3d11_device_child_methods())?;
         let state_object =
             self.alloc_guest_object(memory, GuestObjectKind::D3d11SamplerState, state_vtable)?;
         self.add_ref_guest_object(device_object)?;
@@ -2733,4 +2621,19 @@ impl PeHostRuntime {
         );
         Ok(())
     }
+}
+
+/// The real `ID3D11DeviceChild` preamble shared by every D3D11 resource,
+/// view, shader and state vtable: QueryInterface/AddRef/Release followed by
+/// GetDevice/GetPrivateData/SetPrivateData/SetPrivateDataInterface.
+fn d3d11_device_child_methods() -> Vec<HostThunk> {
+    vec![
+        HostThunk::DmlObjectQueryInterface,
+        HostThunk::GuestObjectAddRef,
+        HostThunk::GuestObjectRelease,
+        HostThunk::D3d12ChildObjectGetDevice,
+        HostThunk::D3D12ObjectGetPrivateData,
+        HostThunk::D3D12ObjectSetPrivateData,
+        HostThunk::DXGIFactorySetPrivateDataInterface,
+    ]
 }

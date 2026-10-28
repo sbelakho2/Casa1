@@ -1065,6 +1065,10 @@ pub(crate) enum MfAsyncOp {
     Read,
     /// `IMFByteStream::BeginWrite`.
     Write,
+    /// `IMFSourceResolver::BeginCreateObjectFromURL`.
+    CreateObjectFromUrl,
+    /// `IMFSourceResolver::BeginCreateObjectFromByteStream`.
+    CreateObjectFromByteStream,
 }
 
 /// A parked MF asynchronous request: the guest `IMFAsyncCallback` whose
@@ -1102,6 +1106,8 @@ pub(crate) struct MfAsyncCompletion {
     pub(crate) event_object: u64,
     /// Bytes read/written by a byte-stream completion.
     pub(crate) bytes: u32,
+    /// The resolved guest object a source-resolver completion produced.
+    pub(crate) object: u64,
 }
 
 type MfParkedMap = std::collections::HashMap<u32, Vec<MfParkedRequest>>;
@@ -1182,6 +1188,22 @@ pub(crate) fn record_mf_result(pid: u32, completion: MfAsyncCompletion) {
         .entry(pid)
         .or_default()
         .insert(completion.result, completion);
+}
+
+/// Cancel a queued/completed result: removes it from both the result table
+/// and the callback queue so its callback never fires.  Returns the
+/// completion when the result was still pending.
+pub(crate) fn cancel_mf_completion(pid: u32, result: u64) -> Option<MfAsyncCompletion> {
+    let taken = mf_registry(&MF_ASYNC_RESULTS)
+        .get_mut(&pid)
+        .and_then(|results| results.remove(&result));
+    let _ = mf_registry(&MF_COMPLETION_QUEUE)
+        .get_mut(&pid)
+        .map_or(false, |queue| {
+            queue.retain(|completion| completion.result != result);
+            true
+        });
+    taken
 }
 
 /// Pop the next completion awaiting callback delivery, if any.
@@ -4134,13 +4156,27 @@ impl SourceReader {
 // MFCreateSinkWriter
 // ===========================================================================
 
+/// One stream in a sink writer: the target (output) type supplied to
+/// `AddStream` and the input type supplied to `SetInputMediaType`.
+#[derive(Debug, Clone)]
+pub struct SinkWriterStream {
+    /// The stream's target media type (the output type).
+    pub target_type: ImfMediaType,
+    /// The stream's input media type; `None` until `SetInputMediaType`.
+    pub input_type: Option<ImfMediaType>,
+}
+
 /// Media Foundation Sink Writer.
 ///
-/// Writes encoded media samples to an output file.
-/// Mirrors IMFSinkWriter functionality.
+/// Writes encoded media samples to an output file.  Mirrors the real
+/// `IMFSinkWriter` stream table: every `AddStream` appends a stream, the
+/// input type is per stream, and writes are rejected until `BeginWriting`.
 pub struct SinkWriter {
     output_file: Option<String>,
-    input_type: Option<ImfMediaType>,
+    streams: Vec<SinkWriterStream>,
+    ended_streams: std::collections::HashSet<u32>,
+    writing: bool,
+    ended: bool,
     frame_count: u64,
     output_data: Vec<u8>,
     output_handle: Option<std::fs::File>,
@@ -4151,7 +4187,10 @@ impl SinkWriter {
     pub fn new() -> Self {
         Self {
             output_file: None,
-            input_type: None,
+            streams: Vec::new(),
+            ended_streams: std::collections::HashSet::new(),
+            writing: false,
+            ended: false,
             frame_count: 0,
             output_data: Vec::new(),
             output_handle: None,
@@ -4162,27 +4201,75 @@ impl SinkWriter {
     pub fn from_url(url: &str) -> AppResult<Self> {
         Ok(Self {
             output_file: Some(url.to_string()),
-            input_type: None,
-            frame_count: 0,
-            output_data: Vec::new(),
-            output_handle: None,
+            ..Self::new()
         })
     }
 
-    /// Set the input media type for a stream.
-    pub fn set_input_media_type(
-        &mut self,
-        _stream_index: u32,
-        media_type: ImfMediaType,
-    ) -> AppResult<()> {
-        self.input_type = Some(media_type);
-        Ok(())
+    /// Append a stream with `target_type` and return its zero-based index.
+    pub fn add_stream(&mut self, target_type: ImfMediaType) -> u32 {
+        let index = self.streams.len() as u32;
+        self.streams.push(SinkWriterStream {
+            target_type,
+            input_type: None,
+        });
+        index
+    }
+
+    /// The number of streams created by `AddStream`.
+    pub fn stream_count(&self) -> u32 {
+        self.streams.len() as u32
+    }
+
+    /// Whether `stream_index` names a real stream.
+    pub fn has_stream(&self, stream_index: u32) -> bool {
+        (stream_index as usize) < self.streams.len()
+    }
+
+    /// Set the input media type for a stream.  Returns false when the stream
+    /// index is out of range.
+    pub fn set_input_media_type(&mut self, stream_index: u32, media_type: ImfMediaType) -> bool {
+        let Some(stream) = self.streams.get_mut(stream_index as usize) else {
+            return false;
+        };
+        stream.input_type = Some(media_type);
+        true
+    }
+
+    /// Whether every added stream has an input media type.
+    pub fn all_inputs_set(&self) -> bool {
+        !self.streams.is_empty() && self.streams.iter().all(|s| s.input_type.is_some())
+    }
+
+    /// Mark a stream as no longer accepting samples.
+    pub fn notify_end_of_segment(&mut self, stream_index: u32) -> bool {
+        if !self.has_stream(stream_index) {
+            return false;
+        }
+        self.ended_streams.insert(stream_index);
+        true
+    }
+
+    /// Whether the stream's segment has ended.
+    pub fn stream_ended(&self, stream_index: u32) -> bool {
+        self.ended_streams.contains(&stream_index)
+    }
+
+    /// Whether `BeginWriting` has run (and `EndWriting` has not).
+    pub fn is_writing(&self) -> bool {
+        self.writing
+    }
+
+    /// Whether `EndWriting` has run.
+    pub fn is_ended(&self) -> bool {
+        self.ended
     }
 
     /// Begin writing (initialize output).
     pub fn begin_writing(&mut self) -> AppResult<()> {
         self.frame_count = 0;
         self.output_data.clear();
+        self.ended = false;
+        self.ended_streams.clear();
         // Open the target file up front so samples stream to disk instead of
         // accumulating in memory until `end_writing`.
         if let Some(path) = &self.output_file {
@@ -4194,20 +4281,16 @@ impl SinkWriter {
             })?;
             self.output_handle = Some(file);
         }
+        self.writing = true;
         Ok(())
     }
 
-    /// Write a sample to the output.
     /// The number of frames written so far.
     pub fn current_frame_count(&self) -> u64 {
         self.frame_count
     }
 
-    /// Set the input media type for the writer.
-    pub fn set_input_type(&mut self, media_type: ImfMediaType) {
-        self.input_type = Some(media_type);
-    }
-
+    /// Write a sample to the stream's output.
     pub fn write_sample(&mut self, _stream_index: u32, sample: &ImfSample) -> AppResult<()> {
         if let Some(file) = &mut self.output_handle {
             use std::io::Write;
@@ -4224,8 +4307,31 @@ impl SinkWriter {
         Ok(())
     }
 
+    /// Flush the output stream (`MF_SINK_WRITER_ALL_STREAMS` flushes all).
+    pub fn flush(&mut self, stream_index: u32) -> bool {
+        // MF_SINK_WRITER_ALL_STREAMS is 0xFFFF_FFFE (mfreadwrite.h).
+        if stream_index != 0xFFFF_FFFE && !self.has_stream(stream_index) {
+            return false;
+        }
+        use std::io::Write;
+        self.output_handle
+            .as_mut()
+            .map(|file| file.flush().is_ok())
+            .unwrap_or(true)
+    }
+
+    /// Install an output handle whose writes fail (the adversarial IO-error
+    /// path); test-only so production behavior is unchanged.
+    #[cfg(test)]
+    pub(crate) fn install_failing_output_for_test(&mut self, file: std::fs::File) {
+        self.output_handle = Some(file);
+        self.writing = true;
+    }
+
     /// Finalize writing and close the output file.
     pub fn end_writing(&mut self) -> AppResult<()> {
+        self.writing = false;
+        self.ended = true;
         if let Some(mut file) = self.output_handle.take() {
             use std::io::Write;
             file.flush().map_err(|e| {

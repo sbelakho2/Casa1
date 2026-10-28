@@ -2163,12 +2163,12 @@
   "(&*mapped, second.as_slice())"
  ],
  "d3d11_resource_and_query_methods_reject_invalid_input_and_pin_vtable_outputs": [
-  "( try_vtable_call(&mut runtime, &mut memory, query, 3, &[query]) .expect(\"query GetDevice placeholder\"), 0 )",
-  "( try_vtable_call(&mut runtime, &mut memory, query, 4, &[query]).expect(\"GetDataSize\"), 0 )",
-  "( try_vtable_call(&mut runtime, &mut memory, query, 5, &[query, 0, 0, 0]) .expect(\"GetData\"), 1 )",
-  "( try_vtable_call(&mut runtime, &mut memory, query, 6, &[query, desc_out]) .expect(\"GetDesc\"), 0 )",
-  "(read_guest_u32(&memory, desc_out).expect(\"query type\"), 0)",
-  "( read_guest_u32(&memory, desc_out + 4).expect(\"query misc\"), 0 )"
+  "( try_vtable_call( &mut runtime, &mut memory, object, 0, &[object, child_iid, child_out] ) .expect(\"DeviceChild QueryInterface IUnknown\"), 0 )",
+  "(memory.read_u64(child_out).expect(\"QI object\"), object)",
+  "( try_vtable_call( &mut runtime, &mut memory, object, 0, &[object, child_iid, child_out] ) .expect(\"DeviceChild QueryInterface unknown\"), E_NOINTERFACE )",
+  "( try_vtable_call( &mut runtime, &mut memory, object, 3, &[object, child_iid, child_out] ) .expect(\"DeviceChild GetDevice\"), 0 )",
+  "( memory.read_u64(child_out).expect(\"child device\"), device_object )",
+  "( try_vtable_call( &mut runtime, &mut memory, buffer, 3, &[buffer, child_iid, child_out] ) .expect(\"DeviceChild GetDevice unknown IID\"), E_NOINTERFACE )"
  ],
  "d3d12_add_to_state_object_rejects_parent_self_reference": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
@@ -2352,12 +2352,12 @@
   "(results.len(), 1)"
  ],
  "d3d12_graphics_command_list_methods_reject_invalid_input_and_pin_vtable_outputs": [
+  "( try_vtable_call( &mut runtime, &mut memory, resource_a, 0, &[resource_a, resource_iid, resource_qi_out], ) .expect(\"ID3D12Resource QueryInterface\"), 0 )",
+  "( memory.read_u64(resource_qi_out).expect(\"resource QI\"), resource_a )",
   "( try_vtable_call(&mut runtime, &mut memory, list, 0, &[list, iid_ptr, qi_out]) .expect(\"list QueryInterface\"), 0 )",
   "(memory.read_u64(qi_out).expect(\"list QI\"), list)",
   "( try_vtable_call(&mut runtime, &mut memory, list, 0, &[list, iid_ptr, qi_out]) .expect(\"list QueryInterface unknown\"), E_NOINTERFACE )",
-  "( try_vtable_call(&mut runtime, &mut memory, list, 3, &[list, guid, 0, 0]) .expect(\"list GetPrivateData\"), 0x8007_004e )",
-  "(memory.read_u64(device_out).expect(\"list device\"), device)",
-  "( try_vtable_call(&mut runtime, &mut memory, list, 12, &[list, 3, 1, 1, 0]) .expect(\"DrawInstanced non-zero start vertex\"), E_INVALIDARG )"
+  "( try_vtable_call(&mut runtime, &mut memory, list, 3, &[list, guid, 0, 0]) .expect(\"list GetPrivateData\"), 0x8007_004e )"
  ],
  "d3d12_guest_initial_data_rejects_window_edges_and_counts_zero_staging": [
   "(runtime.staging_bytes(), 0)",
@@ -2683,6 +2683,21 @@
   "( runtime.real_guest_frames, 1, \"a real D3D9 present must count exactly once\" )",
   "(live_frame.width, swapchain_width)",
   "(live_frame.height, swapchain_height)"
+ ],
+ "data_object_null_and_missing_medium_paths_are_pinned": [
+  "( call_slot(&mut fixture, object, 3, &[object as u32, 0, MEDIUM as u32]), E_INVALIDARG )",
+  "( call_slot(&mut fixture, object, 3, &[object as u32, FMT as u32, 0]), E_INVALIDARG )",
+  "( call_slot( &mut fixture, object, 3, &[object as u32, FMT as u32, MEDIUM as u32] ), DV_E_FORMATETC )",
+  "( call_slot( &mut fixture, object, 4, &[ole as u32, FMT as u32, MEDIUM as u32] ), E_UNEXPECTED )",
+  "( call_slot( &mut fixture, object, 4, &[object as u32, FMT as u32, MEDIUM as u32] ), DV_E_FORMATETC )",
+  "( call_slot( &mut fixture, object, 4, &[object as u32, FMT as u32, MEDIUM as u32] ), STG_E_MEDIUMFULL )"
+ ],
+ "data_object_stream_storage_and_medium_errors_are_pinned": [
+  "( call_slot(&mut fixture, object, 11, &[object as u32, OUT as u32]), S_OK )",
+  "(guest_ptr(&fixture, OUT), 0)",
+  "( call_slot( &mut fixture, object, 4, &[object as u32, FMT as u32, MEDIUM as u32] ), S_OK )",
+  "( fixture .runtime .com_streams .get(&stream) .unwrap() .data .clone(), b\"payload\".to_vec() )",
+  "( fixture .runtime .com_storages .get(&storage) .unwrap() .streams .get(\"Contents\") .cloned() .unwrap(), b\"payload\".to_vec() )"
  ],
  "database_seeds_from_thunk_metadata_with_levels": [
   "(create_file.dll, \"kernel32.dll\")",
@@ -3806,6 +3821,14 @@
   "(island.device_count(), 1)",
   "(island.casak_device_names(), vec![\"CasaTest\"])"
  ],
+ "drop_target_enforces_its_drag_state_machine": [
+  "( call_slot( &mut fixture, target, 4, &[target as u32, 1, 5, 6, EFFECT as u32] ), E_UNEXPECTED, \"DragOver before DragEnter\" )",
+  "( call_slot( &mut fixture, target, 3, &[target as u32, 0, 1, 5, 6, EFFECT as u32] ), E_INVALIDARG )",
+  "( call_slot( &mut fixture, target, 3, &[target as u32, data as u32, 1, 5, 6, EFFECT as u32] ), S_OK, \"IDropTarget::DragEnter\" )",
+  "( fixture.memory.read_u32(EFFECT).unwrap(), DROPEFFECT_COPY | DROPEFFECT_MOVE )",
+  "( call_slot( &mut fixture, target, 4, &[target as u32, 1, 7, 8, EFFECT as u32] ), S_OK )",
+  "(fixture.memory.read_u32(EFFECT).unwrap(), DROPEFFECT_LINK)"
+ ],
  "duplicate_allocation_and_invalid_allocation_handles_are_rejected": [
   "( subsystem .d3dkmt_create_allocation(CreateAllocationRequest { device: DeviceHandle(0xFFFF_FFFF), size: 1, segment: SEGMENT_LOCAL, resource_id: 1, shareable: false, owner_process: 7, }) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
   "( subsystem .d3dkmt_create_allocation(CreateAllocationRequest { device, size: 0, segment: SEGMENT_LOCAL, resource_id: 1, shareable: false, owner_process: 7, }) .unwrap_err() .status(), STATUS_INVALID_PARAMETER )",
@@ -3917,12 +3940,12 @@
   "(error.code, ReasonCode::RcGfxFormatUnsupported)"
  ],
  "dxgi_swapchain_methods_reject_invalid_input_and_pin_vtable_outputs": [
-  "( try_vtable_call( &mut runtime, &mut memory, swapchain, 3, &[swapchain, guid, 0, 0], ) .expect(\"swapchain GetPrivateData\"), 0x8007_004e )",
-  "( runtime .guest_object_kind(memory.read_u64(buffer_out).expect(\"backbuffer\")) .expect(\"backbuffer kind\"), GuestObjectKind::D3d12Resource )",
-  "( try_vtable_call( &mut runtime, &mut memory, swapchain, 9, &[swapchain, 0, 0, 0], ) .expect(\"GetBuffer null out\"), E_INVALIDARG )",
-  "( read_guest_u32(&memory, fullscreen_out).expect(\"fullscreen\"), 1 )",
-  "(read_guest_u32(&memory, desc_out).expect(\"width\"), 640)",
-  "(read_guest_u32(&memory, desc_out + 4).expect(\"height\"), 480)"
+  "( try_vtable_call( &mut runtime, &mut memory, swapchain, 0, &[swapchain, iid_ptr, qi_out], ) .expect(\"swapchain QueryInterface\"), 0 )",
+  "(memory.read_u64(qi_out).expect(\"swapchain QI\"), swapchain)",
+  "( try_vtable_call( &mut runtime, &mut memory, swapchain, 0, &[swapchain, iid_ptr, qi_out], ) .expect(\"swapchain QueryInterface unknown\"), E_NOINTERFACE )",
+  "( try_vtable_call( &mut runtime, &mut memory, swapchain, 7, &[swapchain, iid_ptr, qi_out], ) .expect(\"swapchain GetDevice\"), 0 )",
+  "(memory.read_u64(qi_out).expect(\"swapchain device\"), device)",
+  "( try_vtable_call( &mut runtime, &mut memory, swapchain, 7, &[swapchain, iid_ptr, qi_out], ) .expect(\"swapchain GetDevice unknown IID\"), E_NOINTERFACE )"
  ],
  "dxil_library_uses_documented_bytecode_offset": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
@@ -5736,6 +5759,22 @@
   "(table.lock().expect(\"lock\").metrics().patched, 8)",
   "(table.lock().expect(\"lock\").len(), 0)"
  ],
+ "idata_object_get_data_query_canonical_set_enum_and_advise_are_real": [
+  "( call_slot( &mut fixture, object, 3, &[object as u32, FMT as u32, MEDIUM as u32] ), S_OK, \"IDataObject::GetData\" )",
+  "(fixture.memory.read_u32(MEDIUM).unwrap(), TYMED_HGLOBAL)",
+  "(fixture.memory.read_bytes(global, 5).unwrap(), b\"hello\")",
+  "( call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]), S_OK )",
+  "( call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]), DV_E_FORMATETC )",
+  "( call_slot(&mut fixture, object, 5, &[object as u32, FMT as u32]), DV_E_CLIPFORMAT )"
+ ],
+ "idata_object_qi_refcount_and_enum_boundaries_are_pinned": [
+  "( call_slot( &mut fixture, object, 0, &[object as u32, IID_PTR as u32, OUT as u32] ), S_OK )",
+  "(guest_ptr(&fixture, OUT), object)",
+  "( fixture.runtime.guest_objects.get(&object).unwrap().refcount, 2 )",
+  "(call_slot(&mut fixture, object, 1, &[object as u32]), 3)",
+  "(call_slot(&mut fixture, object, 2, &[object as u32]), 2)",
+  "( call_slot( &mut fixture, object, 0, &[object as u32, IID_PTR as u32, OUT as u32] ), E_NOINTERFACE )"
+ ],
  "idispatch_assigns_dispids_and_invokes_the_same_state_as_the_vtable": [
   "( call_slot( &mut fixture, server, 5, &[server as u32, 0, NAMES as u32, 3, 0, IDS as u32] ), DISP_E_UNKNOWNNAME, \"GetIDsOfNames reports the unknown name\" )",
   "(fixture.memory.read_u32(IDS).unwrap(), 1, \"Value\")",
@@ -5760,6 +5799,14 @@
   "(wic_decode_image_frame(&jpeg, 0).unwrap().width, 2)",
   "( wic_decode_image_frame(&jpeg, 1).unwrap_err(), WINCODEC_ERR_FRAMEMISSING )"
  ],
+ "imalloc_accounts_alloc_realloc_free_and_size": [
+  "( call_slot(&mut fixture, malloc, 6, &[malloc as u32, first as u32]), 16 )",
+  "( call_slot(&mut fixture, malloc, 7, &[malloc as u32, first as u32]), 1 )",
+  "(call_slot(&mut fixture, malloc, 7, &[malloc as u32, 0]), 0)",
+  "( call_slot(&mut fixture, malloc, 6, &[malloc as u32, 0xDEAD]), u32::MAX )",
+  "( call_slot(&mut fixture, malloc, 6, &[malloc as u32, grown as u32]), 32 )",
+  "( call_slot(&mut fixture, malloc, 7, &[malloc as u32, first as u32]), 0, \"Realloc releases the old block\" )"
+ ],
  "implemented_without_coverage_fails_both_gates": [
   "(shipping.len(), 1)",
   "( shipping[0].kind, ApiGateViolationKind::ImplementedWithoutCoverage )",
@@ -5776,6 +5823,14 @@
   "(image.imports[0].imports.len(), 2)",
   "(image.delay_imports[0].dll_name, \"kernel32.dll\")",
   "(image.delay_imports[0].imports.len(), 1)"
+ ],
+ "in_place_and_active_error_paths_are_pinned": [
+  "( call_slot(&mut fixture, inactive, 6, &[inactive as u32]), E_UNEXPECTED, \"UIDeactivate without an active object\" )",
+  "( call_slot(&mut fixture, inactive, 8, &[inactive as u32]), E_UNEXPECTED, \"ReactivateAndUndo without an active object\" )",
+  "( call_slot(&mut fixture, active, 5, &[active as u32, 1]), S_FALSE )",
+  "( call_slot( &mut fixture, active, 7, &[active as u32, RECT as u32, RECT as u32] ), S_OK )",
+  "( call_slot(&mut fixture, active, 8, &[active as u32, RECT as u32, 0, 1]), S_OK, \"ResizeBorder only validates the border pointer\" )",
+  "( call_slot(&mut fixture, active, 8, &[active as u32, 0, 0, 1]), E_INVALIDARG )"
  ],
  "inc_flags_does_not_affect_carry": [
   "(state.get(Register::Rax), 0)"
@@ -6049,6 +6104,21 @@
   "(counters.timeout_expirations, 1)",
   "(counters.packets_dequeued, 0)",
   "(CompletionPortWaitError::TimedOut.last_error(), WAIT_TIMEOUT)"
+ ],
+ "iole_in_place_object_and_active_object_state_machines_are_real": [
+  "( call_slot( &mut fixture, object, 11, &[object as u32, (-5_i32) as u32, 0, 0, 0, 0x4321, 0] ), S_OK )",
+  "( call_slot( &mut fixture, object, 0, &[object as u32, IID_PTR as u32, OUT as u32] ), S_OK )",
+  "( fixture .runtime .guest_objects .get(&in_place) .unwrap() .refcount, 1 )",
+  "( call_slot(&mut fixture, in_place, 3, &[in_place as u32, OUT as u32]), S_OK )",
+  "(guest_ptr(&fixture, OUT), 0x4321)",
+  "( call_slot( &mut fixture, in_place, 0, &[in_place as u32, IID_PTR as u32, OUT as u32] ), S_OK )"
+ ],
+ "iole_object_site_verbs_extent_clsid_advise_and_clipboard_are_real": [
+  "( call_slot(&mut fixture, object, 4, &[object as u32, OUT as u32]), S_OK )",
+  "(guest_ptr(&fixture, OUT), 0)",
+  "( call_slot(&mut fixture, object, 3, &[object as u32, site as u32]), S_OK, \"IOleObject::SetClientSite\" )",
+  "(guest_ptr(&fixture, OUT), site)",
+  "( call_slot(&mut fixture, object, 3, &[object as u32, 0]), S_OK )"
  ],
  "iosurface_present_channel_reports_read_and_texture_failures": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
@@ -7546,7 +7616,7 @@
   "( session.pending_dll_main_calls(), vec![(handle, 0x1000, 1), (handle, 0x1000, 0)], \"the load queued ATTACH; the last unload appends DllMain(DLL_PROCESS_DETACH)\" )"
  ],
  "ledger_counts_include_method_level_deviations_without_error": [
-  "(method_count, 810)",
+  "(method_count, 889)",
   "(ledger.contains(\"Method-level accounting:\"), true)",
   "( ledger.contains(&format!( \"{method_count} method rows, {method_count} deviate from exact/full\" )), true, \"the generated ledger must count every method-level deviation\" )",
   "(report.gate.method_deviations, method_count)"
@@ -8201,6 +8271,14 @@
   "( dispatch_x86_thunk( &mut runtime, &mut memory, begin, &[graph.byte_stream as u32, buffer as u32, 8, 0, 0] ), 0, \"S_OK without a callback\" )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, begin, &[ graph.byte_stream as u32, buffer as u32, 16, MF_CB_OBJECT as u32, 0x99 ] ), u64::from(0x8000_000A_u32) )"
  ],
+ "mf_byte_stream_begin_write_callback_and_double_end_are_exact": [
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create, &[3, 2, 0, path as u32, stream_out as u32] ), 0 )",
+  "( call_mf_slot( &mut runtime, &mut memory, stream, 13, &[buffer as u32, 3, MF_CB_OBJECT as u32, 0] ), u64::from(E_PENDING), \"BeginWrite with a callback reports the pending contract\" )",
+  "(mf_callback_count(&memory), 0)",
+  "(mf_callback_count(&memory), 1)",
+  "( call_mf_slot( &mut runtime, &mut memory, stream, 14, &[result as u32, written_out as u32] ), 0 )",
+  "(read_guest_u32(&memory, written_out).unwrap(), 3)"
+ ],
  "mf_create_file_byte_stream_reads_writes_and_seeks_real_files": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create, &[1, 0, 0, url as u32, stream_out as u32] ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create, &[1, 0, 0, missing as u32, stream_out as u32] ), 0x8007_0002 )",
@@ -8291,6 +8369,22 @@
   "( dispatch_x86_thunk( &mut runtime, &mut memory, set_topology, &[session as u32, 0, 0] ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, set_topology, &[bad_this, 0, topology as u32] ), u64::from(E_NOINTERFACE) )"
  ],
+ "mf_query_interface_each_interface_accepts_own_iid_and_rejects_foreign": [
+  "( call_mf_slot( &mut runtime, &mut memory, object, 0, &[iid as u32, out as u32] ), 0, \"QI {kind:?} must accept its own IID\" )",
+  "( read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), object )",
+  "( runtime.guest_objects.get(&object).unwrap().refcount, before + 1, \"a successful QI returns a referenced interface\" )",
+  "( call_mf_slot( &mut runtime, &mut memory, object, 0, &[iid as u32, out as u32] ), u64::from(E_NOINTERFACE), \"QI {kind:?} must reject a foreign IID\" )",
+  "( read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0, \"a rejected QI clears the output\" )",
+  "( call_mf_slot(&mut runtime, &mut memory, object, 0, &[iid as u32, 0]), u64::from(E_POINTER), \"QI {kind:?} requires the output pointer\" )"
+ ],
+ "mf_sink_writer_streams_samples_and_invalid_state_are_exact": [
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create, &[0, 0, 0, sink_out as u32] ), u64::from(E_INVALIDARG), \"MFCreateSinkWriterFromURL requires a URL\" )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create, &[empty_url as u32, 0, 0, sink_out as u32] ), u64::from(E_INVALIDARG) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create, &[network_url as u32, 0, 0, sink_out as u32] ), u64::from(MF_E_UNSUPPORTED_BYTESTREAM_TYPE) )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create, &[url as u32, 0, 0, sink_out as u32] ), 0 )",
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, create_type, &[mt0_out as u32]), 0 )",
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, create_type, &[mt1_out as u32]), 0 )"
+ ],
  "mf_source_reader_from_url_builds_real_byte_stream_and_source": [
   "(source.state(), crate::media::MfSourceState::Stopped)",
   "(source.readers(), &[graph.reader])",
@@ -8306,6 +8400,22 @@
   "(runtime.mf_samples.get(&sample).unwrap().buffer, b\"DATA\")",
   "(read_guest_u32(&memory, flags_out).unwrap() & 0x4, 0)"
  ],
+ "mf_source_resolver_async_begin_end_cancel_state_is_exact": [
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, create, &[resolver_out as u32]), 0 )",
+  "( call_mf_slot( &mut runtime, &mut memory, resolver, 3, &[ url as u32, MF_RESOLUTION_MEDIASOURCE, 0, cookie as u32, 0, 0 ] ), 0 )",
+  "( runtime.guest_object_kind(first).unwrap(), GuestObjectKind::ImfAsyncResult )",
+  "( call_mf_slot( &mut runtime, &mut memory, resolver, 5, &[first as u32, type_out as u32, object_out as u32] ), 0 )",
+  "( read_guest_u32(&memory, type_out).unwrap(), MF_OBJECT_MEDIASOURCE )",
+  "( call_mf_slot( &mut runtime, &mut memory, resolver, 5, &[first as u32, type_out as u32, object_out as u32] ), u64::from(E_INVALIDARG), \"a result is handed out exactly once\" )"
+ ],
+ "mf_source_resolver_creates_real_objects_and_rejects_invalid_forms": [
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, create, &[resolver_out as u32]), 0 )",
+  "( call_mf_slot( &mut runtime, &mut memory, resolver, 8, &[ url as u32, MF_RESOLUTION_MEDIASOURCE, 0, type_out as u32, object_out as u32 ] ), 0 )",
+  "( read_guest_u32(&memory, type_out).unwrap(), MF_OBJECT_MEDIASOURCE )",
+  "( runtime.guest_object_kind(source).unwrap(), GuestObjectKind::ImfMediaSource )",
+  "( call_mf_slot( &mut runtime, &mut memory, resolver, 8, &[ url as u32, MF_RESOLUTION_BYTESTREAM, 0, type_out as u32, object_out as u32 ] ), 0 )",
+  "( read_guest_u32(&memory, type_out).unwrap(), MF_OBJECT_BYTESTREAM )"
+ ],
  "mf_topology_source_graph_resolves_descriptor_and_drives_the_source": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create_topology, &[topology_out as u32] ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create_node, &[1, node_out as u32] // MF_TOPOLOGY_SOURCESTREAM_NODE ), 0 )",
@@ -8313,6 +8423,29 @@
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create_session, &[0, session_out as u32] ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, set_topology, &[session as u32, 0, topology as u32] ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, get_descriptor, &[session as u32, topology as u32, descriptor_out as u32] ), MF_E_UNSUPPORTED_REPRESENTATION as u64 )"
+ ],
+ "mf_transform_slot_19_is_present_and_rejects_extra_method": [
+  "(methods.len(), 20, \"IUnknown + 17 IMFTransform methods\")",
+  "( call_mf_slot( &mut runtime, &mut memory, transform, 0, &[iid as u32, out as u32] ), 0 )",
+  "( read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), transform )",
+  "( call_mf_slot( &mut runtime, &mut memory, transform, 0, &[iid as u32, out as u32] ), u64::from(E_NOINTERFACE) )",
+  "( call_mf_slot(&mut runtime, &mut memory, transform, 19, &[0, 0]), 0xC00D_36C4, \"slot 19 is the model's unsupported transform method\" )"
+ ],
+ "mf_vtable_preamble_and_registry_slot_counts_reject_wrong_layout": [
+  "(attributes.len(), 33, \"IMFAttributes registry slots\")",
+  "(media_type.len(), 38, \"IMFMediaType registry slots\")",
+  "(buffer.len(), 8, \"IMFMediaBuffer registry slots\")",
+  "(sample.len(), 17, \"IMFSample registry slots\")",
+  "(session.len(), 14, \"IMFMediaSession registry slots\")",
+  "( source_resolver.len(), 10, \"IMFSourceResolver registry slots\" )"
+ ],
+ "mf_vtable_slots_dispatch_in_order_and_reject_wrong_object_kind": [
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, create_type, &[type_out as u32]), 0 )",
+  "( call_mf_slot(&mut runtime, &mut memory, media_type, 1, &[]), 2, \"slot 1 is AddRef\" )",
+  "( call_mf_slot(&mut runtime, &mut memory, media_type, 2, &[]), 1, \"slot 2 is Release\" )",
+  "( call_mf_slot( &mut runtime, &mut memory, media_type, 3, &[key as u32, value as u32] ), u64::from(MF_E_ATTRIBUTENOTFOUND), \"slot 3 is IMFAttributes::GetItem, not a preamble slot\" )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create_resolver, &[resolver_out as u32] ), 0 )",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create_sink, &[0, 0, sink_out as u32] ), 0 )"
  ],
  "minidump_with_modules_and_memory": [
   "(sig, MINIDUMP_SIGNATURE)",
@@ -9082,6 +9215,13 @@
   "( object_type_index(crate::win32::ObjectType::DirectorySearch), 3 )",
   "( unique.len(), distinct.len(), \"no two distinct kernel types may share an index\" )"
  ],
+ "object_with_site_and_service_provider_forward_qi_to_the_target": [
+  "( call_slot( &mut fixture, object, 4, &[object as u32, IID_PTR as u32, OUT as u32] ), E_FAIL, \"IObjectWithSite::GetSite without a site\" )",
+  "( call_slot(&mut fixture, object, 3, &[object as u32, target as u32]), S_OK )",
+  "( call_slot( &mut fixture, object, 4, &[object as u32, IID_PTR as u32, OUT as u32] ), S_OK )",
+  "(guest_ptr(&fixture, OUT), target)",
+  "( call_slot( &mut fixture, object, 4, &[object as u32, IID_PTR as u32, OUT as u32] ), E_NOINTERFACE )"
+ ],
  "old_report_json_missing_method_fields_still_deserializes": [
   "(report.method_registry.len(), 0)",
   "(report.gate.interface_violation_count, 0)",
@@ -9100,6 +9240,22 @@
   "( dispatch_x86(&mut fixture, HostThunk::OleGetRunningObjectTable, &[0, 0]), u64::from(E_POINTER) )",
   "( dispatch_x86(&mut fixture, HostThunk::OleLoadTypeLib, &[0, 0]), u64::from(E_POINTER) )",
   "( dispatch_x86( &mut fixture, HostThunk::OleLoadTypeLib, &[0xDEAD_0000, OUT as u32] ), u64::from(TYPE_E_CANTLOADLIBRARY) )"
+ ],
+ "ole_object_host_names_enum_advise_clone_and_verb_variants_are_real": [
+  "( call_slot( &mut fixture, object, 5, &[object as u32, NAME as u32, NAMES as u32] ), S_OK, \"IOleObject::SetHostNames\" )",
+  "( call_slot(&mut fixture, object, 5, &[object as u32, 0, 0]), S_OK )",
+  "( fixture .runtime .com_data_objects .get(&object) .unwrap() .host_names .clone(), (String::new(), String::new()) )",
+  "( call_slot( &mut fixture, object, 16, &[object as u32, form, STR_OUT as u32] ), S_OK )",
+  "( call_slot(&mut fixture, object, 21, &[object as u32, OUT as u32]), S_OK )",
+  "(guest_ptr(&fixture, OUT), 0)"
+ ],
+ "ole_surface_methods_reject_unknown_and_mismatched_objects": [
+  "( call_slot(&mut fixture, data, 8, &[data as u32, 1, OUT as u32]), S_OK )",
+  "( call_with_this(&mut fixture, data, slot, bad, &args), E_UNEXPECTED, \"IDataObject slot {slot} unknown this\" )",
+  "( call_with_this(&mut fixture, data, slot, ole, &args), E_UNEXPECTED, \"IDataObject slot {slot} role mismatch\" )",
+  "( call_with_this(&mut fixture, ole, slot, bad, &args), E_UNEXPECTED, \"IOleObject slot {slot} unknown this\" )",
+  "( call_with_this(&mut fixture, in_place, slot, bad, &args), E_UNEXPECTED, \"IOleInPlaceObject slot {slot} unknown this\" )",
+  "( call_with_this(&mut fixture, active, slot, bad, &args), E_UNEXPECTED, \"IOleInPlaceActiveObject slot {slot} unknown this\" )"
  ],
  "oleaut32_null_arguments_report_e_invalidarg_dispatch": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, clear, &[0]), 0x8007_0057, \"VariantClear(NULL) reports E_INVALIDARG\" )",
@@ -9557,6 +9713,14 @@
  ],
  "performance_profile_disables_debug": [
   "(profile.instruction_budget, 0)"
+ ],
+ "persist_stream_saves_loads_and_pins_error_paths": [
+  "( call_slot( &mut fixture, persist, 3, &[persist as u32, CLSID_OUT as u32] ), S_OK )",
+  "( fixture.memory.read_bytes(CLSID_OUT, 16).unwrap(), COM_OLE_OBJECT_CLSID )",
+  "( call_slot(&mut fixture, persist, 4, &[persist as u32]), S_FALSE )",
+  "( call_slot(&mut fixture, persist, 7, &[persist as u32, SIZE_OUT as u32]), S_OK )",
+  "(fixture.memory.read_u64(SIZE_OUT).unwrap(), 5)",
+  "( call_slot(&mut fixture, persist, 7, &[persist as u32, 0]), E_POINTER )"
  ],
  "persistence_corruption_is_rejected_and_never_reset": [
   "(rc(&run(&mut tpm, &startup())), TPM_RC_SUCCESS)",
@@ -11126,13 +11290,6 @@
   "(aggregate.subsystem_capability, SubsystemCapability::Partial)",
   "( database.interface_completeness_gate().len(), 0, \"seeded aggregates must never overstate their method children\" )"
  ],
- "seeded_report_lists_missing_method_proof_and_bound_evidence": [
-  "(bound.semantic_test_coverage, CoverageLevel::Conformance)",
-  "( bound.evidence_id.as_deref(), Some( \"casa1-conformance:d3d11_device_methods_reject_invalid_input_and_pin_vtable_outputs\" ), \"the method row must name the compiled contract that proves it\" )",
-  "(unbound.semantic_test_coverage, CoverageLevel::None)",
-  "(unbound.evidence_id, None)",
-  "(interface.proven, false)"
- ],
  "self_modifying_code_basic_invalidation": [
   "(rt.blocks_compiled, 1, \"exactly one block compiled\")",
   "( invalidated, vec![0x1000], \"block 0x1000 should be invalidated\" )",
@@ -11836,6 +11993,29 @@
   "(first.fence_value, 1)",
   "(first.submission_id, 1)",
   "(first.effective_priority, 5)"
+ ],
+ "support_error_info_matches_exact_iids_and_rejects_nulls": [
+  "( call_slot(&mut fixture, info, 3, &[info as u32, IID_PTR as u32]), S_OK, \"ISupportErrorInfo::InterfaceSupportsErrorInfo\" )",
+  "( call_slot(&mut fixture, info, 3, &[info as u32, IID_PTR as u32]), S_FALSE )",
+  "( call_slot(&mut fixture, info, 3, &[info as u32, 0]), E_INVALIDARG )",
+  "( call_slot( &mut fixture, info, 0, &[info as u32, IID_PTR as u32, OUT as u32] ), S_OK )",
+  "( call_slot( &mut fixture, info, 0, &[info as u32, IID_PTR as u32, OUT as u32] ), E_NOINTERFACE )"
+ ],
+ "surface_cross_qi_and_drop_error_paths_are_pinned": [
+  "( call_slot( &mut fixture, ole, 0, &[ole as u32, IID_PTR as u32, OUT as u32] ), S_OK )",
+  "( call_slot( &mut fixture, ole, 0, &[ole as u32, IID_PTR as u32, OUT as u32] ), E_NOINTERFACE )",
+  "( call_slot( &mut fixture, in_place, 0, &[in_place as u32, IID_PTR as u32, OUT as u32] ), E_NOINTERFACE )",
+  "( call_slot( &mut fixture, active, 0, &[active as u32, IID_PTR as u32, OUT as u32] ), E_NOINTERFACE )",
+  "( call_slot( &mut fixture, in_place, 7, &[in_place as u32, RECT as u32, RECT as u32] ), S_OK )",
+  "( call_slot( &mut fixture, drop, 3, &[drop as u32, data as u32, 0, 0, 0, 0xDEAD] ), E_INVALIDARG )"
+ ],
+ "surface_qi_roles_enum_roles_and_support_helper_are_pinned": [
+  "( call_slot(&mut fixture, data, 8, &[data as u32, 1, OUT as u32]), S_OK )",
+  "( call_slot( &mut fixture, ole, 19, &[ole as u32, data as u32, COOKIE as u32] ), S_OK )",
+  "( call_slot(&mut fixture, ole, 21, &[ole as u32, OUT as u32]), S_OK )",
+  "( call_slot(&mut fixture, ole, 12, &[ole as u32, OUT as u32]), S_OK )",
+  "( call_slot(&mut fixture, verb_enum, 4, &[verb_enum as u32, 99]), S_FALSE, \"IEnumOLEVERB::Skip\" )",
+  "( call_slot(&mut fixture, verb_enum, 5, &[verb_enum as u32]), S_OK, \"IEnumOLEVERB::Reset\" )"
  ],
  "surface_writes_reject_overflow_and_missing_channels": [
   "(runtime.iosurface_channels.len(), 2)",
@@ -15241,6 +15421,14 @@
   "(wsa_error_to_dos_error(10038), ERROR_INVALID_HANDLE)",
   "(wsa_error_to_dos_error(10060), ERROR_TIMEOUT)",
   "(wsa_error_to_dos_error(99999), ERROR_INVALID_PARAMETER)"
+ ],
+ "x64_format_stgmedium_statdata_oleverb_and_drop_paths_are_real": [
+  "(decoded.cf_format, 1)",
+  "(decoded.ptd, 0x1234)",
+  "(decoded.dw_aspect, DVASPECT_CONTENT)",
+  "(decoded.lindex, -1)",
+  "(decoded.tymed, TYMED_HGLOBAL)",
+  "(fixture.runtime.com_format_etc_bytes(&format).len(), 32)"
  ],
  "x86_extended_process_information_uses_the_real_32_bit_layout_and_rejects_invalid_unbacked_fields": [
   "(SYSTEM_PROCESS_INFORMATION_FIXED_SIZE_X86, 0xB8)",
