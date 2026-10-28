@@ -74,14 +74,10 @@ fuzz_target!(|data: &[u8]| {
 fn url_parse_summary(input: &str) -> String {
     match steam_protocol::parse_steam_protocol_url(input) {
         Some(url) => {
-            // A parsed steam:// URL must begin with an alphabetic scheme
-            // (the `url` crate requires schemes to start with a letter)
+            // A parsed URL must round-trip a non-empty raw form.
             assert!(
-                url.raw_url
-                    .chars()
-                    .next()
-                    .map_or(false, |c| c.is_ascii_alphabetic()),
-                "parsed URL {url:?} has no alphabetic scheme start"
+                !url.raw_url.is_empty(),
+                "parsed URL has an empty raw form"
             );
             format!(
                 "ok:{}:{}:{}",

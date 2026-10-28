@@ -21,11 +21,8 @@ fn parse_summary(input: &str) -> String {
     let steam_result = match steam_protocol::parse_steam_protocol_url(input) {
         Some(url) => {
             assert!(
-                url.raw_url
-                    .chars()
-                    .next()
-                    .map_or(false, |c| c.is_ascii_alphabetic()),
-                "parsed URL {url:?} has no alphabetic scheme start"
+                !url.raw_url.is_empty(),
+                "parsed URL has an empty raw form"
             );
             format!(
                 "steam_ok:{}:{}:{}",

@@ -65,6 +65,7 @@ jobs:
           # Homebrew prefix stays as the fallback so only one GITHUB_ENV
           # assignment exists (a later assignment would drop the 7.x path).
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "FFMPEG_DIR=$(brew --prefix ffmpeg@7)" >> "$GITHUB_ENV"
       - name: Run Clippy (all features)
         run: cargo clippy --all-targets --features angle,dev-insecure-tls,ffmpeg,ffmpeg-next,moltenvk,nightly_alloc_error_hook,opengl,proptest,tungstenite,vulkan,websocket -- -D warnings -A future-incompatible
 

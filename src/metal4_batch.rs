@@ -589,7 +589,50 @@ fn metal4_supported(device: &metal::DeviceRef) -> bool {
 /// binary, and it reports the same "unsupported" answer a real runtime falls
 /// back on.
 pub fn batch_creation_succeeds() -> bool {
-    Metal4Batch::new().is_ok()
+    #[cfg(test)]
+    {
+        thread_local! {
+            static PROBED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        }
+        if std::env::var_os("CI").is_some() {
+            // CI virtual GPUs advertise the selectors but raise on first use.
+            return false;
+        }
+        PROBED.with(|slot| {
+            if let Some(value) = slot.get() {
+                return value;
+            }
+            let value = functional_probe();
+            slot.set(Some(value));
+            value
+        })
+    }
+    #[cfg(not(test))]
+    {
+        Metal4Batch::new().is_ok()
+    }
+}
+
+#[cfg(test)]
+fn functional_probe() -> bool {
+    let Some(device) = metal::Device::system_default() else {
+        return false;
+    };
+    let Ok(mut batch) = Metal4Batch::with_device(device.clone()) else {
+        return false;
+    };
+    let buffer = device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+    let plan = Metal4ListPlan::new(0).with_op(Metal4BatchOp::FillBuffer {
+        buffer: buffer.clone(),
+        offset: 0,
+        value: 0x5A,
+        size: 4,
+    });
+    if batch.execute_plans(&[plan]).is_err() {
+        return false;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, 4) };
+    bytes == [0x5A; 4]
 }
 
 #[cfg(test)]
@@ -642,10 +685,10 @@ mod tests {
     use super::*;
 
     fn device() -> Option<metal::Device> {
-        let metal = crate::metal_backend::MetalDevice::system_default().ok()?;
-        if !Metal4Queue::is_supported(metal.metal_device()) {
+        if !Metal4Batch::batch_creation_succeeds() {
             return None;
         }
+        let metal = crate::metal_backend::MetalDevice::system_default().ok()?;
         Some(metal.metal_device_owned())
     }
 
