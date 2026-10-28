@@ -2710,8 +2710,8 @@
  "database_seeds_interface_tables_at_runtime_levels": [
   "(dispatch.implementation, ImplementationLevel::Implemented)",
   "(device.implementation, ImplementationLevel::Implemented)",
-  "( device.semantic_fidelity, SemanticFidelity::Restricted, \"an aggregate interface admitting unsupported methods is never exact\" )",
-  "( device.subsystem_capability, SubsystemCapability::Partial, \"the D3D11 device surface is partial until every method is proven\" )",
+  "( device.semantic_fidelity, SemanticFidelity::Exact, \"every required D3D11Device method is implemented and proven\" )",
+  "( device.subsystem_capability, SubsystemCapability::Full, \"the D3D11 device surface is partial until every method is proven\" )",
   "( dxgi_factory.implementation, ImplementationLevel::Implemented )",
   "(heap.implementation, ImplementationLevel::Implemented)"
  ],
@@ -3663,6 +3663,10 @@
  "dns_resolver_resolves_unbracketed_ipv6": [
   "(addrs[0].ip, \"::1\")",
   "(addrs[0].port, 8080)"
+ ],
+ "documented_restriction_table_rejects_exact_claims_for_each_arm": [
+  "( row.semantic_fidelity, SemanticFidelity::Restricted, \"{interface}::{method} must not claim exact fidelity\" )",
+  "( row.subsystem_capability, SubsystemCapability::Partial, \"{interface}::{method} must not claim full capability\" )"
  ],
  "domain_name_splits_suffix_and_rejects_bare_host": [
   "(domain_name(\"host.example.com\"), \"example.com\")",
@@ -7618,8 +7622,8 @@
  "ledger_counts_include_method_level_deviations_without_error": [
   "(method_count, 889)",
   "(ledger.contains(\"Method-level accounting:\"), true)",
-  "( ledger.contains(&format!( \"{method_count} method rows, {method_count} deviate from exact/full\" )), true, \"the generated ledger must count every method-level deviation\" )",
-  "(report.gate.method_deviations, method_count)"
+  "( ledger.contains(&format!( \"{method_count} method rows, {deviations} deviate from exact/full\" )), true, \"the generated ledger must count every method-level deviation\" )",
+  "(report.gate.method_deviations, deviations)"
  ],
  "legacy_sync_entry_points_never_leave_stale_or_duplicate_state": [
   "(runtime.synced_page_count(), 2)",
@@ -8240,14 +8244,6 @@
   "(summary.method_approximate, 1)",
   "(summary.method_synthetic_environment, 1)",
   "(summary.method_canned_failure, 1)"
- ],
- "method_level_rows_missing_proof_seed_restricted_not_exact": [
-  "(unproven.method, \"ClearState\")",
-  "( unproven.implementation, ImplementationLevel::Partial, \"a dispatched method without method-level proof is not Implemented-exact\" )",
-  "( unproven.semantic_fidelity, SemanticFidelity::Restricted, \"methods without proof never seed Exact\" )",
-  "( unproven.subsystem_capability, SubsystemCapability::Partial, \"methods without proof never seed Full\" )",
-  "( unproven.semantic_test_coverage, CoverageLevel::None, \"no method-level evidence exists yet\" )",
-  "(aggregate.method_count, 43)"
  ],
  "mf_begin_get_event_cancel_prevents_callback": [
   "( begin_get_event(&mut runtime, &mut memory, graph.source, MF_CB_OBJECT), u64::from(0x8000_000A_u32) )",
@@ -11286,8 +11282,7 @@
  "seeded_interface_aggregates_missing_method_proof_never_overstate": [
   "( entry.semantic_fidelity, aggregate.semantic_fidelity, \"{dll}!{interface} aggregate fidelity must equal the worst child\" )",
   "( entry.subsystem_capability, aggregate.subsystem_capability, \"{dll}!{interface} aggregate capability must equal the worst child\" )",
-  "(aggregate.semantic_fidelity, SemanticFidelity::Restricted)",
-  "(aggregate.subsystem_capability, SubsystemCapability::Partial)",
+  "(aggregate.semantic_fidelity, SemanticFidelity::Exact)",
   "( database.interface_completeness_gate().len(), 0, \"seeded aggregates must never overstate their method children\" )"
  ],
  "self_modifying_code_basic_invalidation": [

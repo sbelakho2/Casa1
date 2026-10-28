@@ -150,12 +150,12 @@ fn database_seeds_interface_tables_at_runtime_levels() {
     assert!(!device.transitional);
     assert_eq!(
         device.semantic_fidelity,
-        SemanticFidelity::Restricted,
-        "an aggregate interface admitting unsupported methods is never exact"
+        SemanticFidelity::Exact,
+        "every required D3D11Device method is implemented and proven"
     );
     assert_eq!(
         device.subsystem_capability,
-        SubsystemCapability::Partial,
+        SubsystemCapability::Full,
         "the D3D11 device surface is partial until every method is proven"
     );
     let dxgi_factory = database
@@ -181,41 +181,43 @@ fn database_seeds_interface_tables_at_runtime_levels() {
 }
 
 #[test]
-fn method_level_rows_missing_proof_seed_restricted_not_exact() {
+fn method_level_rows_keep_documented_restrictions_restricted() {
     let database = ApiDatabase::from_thunk_metadata();
-    let unproven = database
-        .lookup_interface_method("d3d12.dll", "ID3D12GraphicsCommandList", "ClearState")
-        .expect("ClearState must be seeded from the D3D12 vtable metadata");
-    assert_eq!(unproven.method, "ClearState");
+    let restricted = database
+        .lookup_interface_method("shdocvw.dll", "IWebBrowser2", "GetTypeInfo")
+        .expect("GetTypeInfo must be seeded from the browser vtable metadata");
     assert_eq!(
-        unproven.implementation,
-        ImplementationLevel::Partial,
-        "a dispatched method without method-level proof is not Implemented-exact"
+        restricted.implementation,
+        ImplementationLevel::Implemented,
+        "a real dispatch is implemented even when its semantics are restricted"
     );
     assert_eq!(
-        unproven.semantic_fidelity,
+        restricted.semantic_fidelity,
         SemanticFidelity::Restricted,
-        "methods without proof never seed Exact"
+        "documented E_NOTIMPL behavior is restricted, never exact"
     );
     assert_eq!(
-        unproven.subsystem_capability,
-        SubsystemCapability::Partial,
-        "methods without proof never seed Full"
+        restricted.subsystem_capability,
+        SubsystemCapability::Partial
     );
     assert_eq!(
-        unproven.semantic_test_coverage,
-        CoverageLevel::None,
-        "no method-level evidence exists yet"
+        restricted.semantic_test_coverage,
+        CoverageLevel::Conformance
     );
-    assert!(unproven.required);
+
+    let exact = database
+        .lookup_interface_method("d3d11.dll", "ID3D11Device", "CreateBuffer")
+        .expect("CreateBuffer row");
+    assert_eq!(exact.semantic_fidelity, SemanticFidelity::Exact);
+    assert_eq!(exact.subsystem_capability, SubsystemCapability::Full);
 
     let aggregate = database
         .interface_aggregate_status("d3d11.dll", "ID3D11Device")
         .expect("ID3D11Device aggregate");
     assert_eq!(aggregate.method_count, 43);
     assert_eq!(aggregate.required_count, 40);
-    assert_eq!(aggregate.semantic_fidelity, SemanticFidelity::Restricted);
-    assert_eq!(aggregate.subsystem_capability, SubsystemCapability::Partial);
+    assert_eq!(aggregate.semantic_fidelity, SemanticFidelity::Exact);
+    assert_eq!(aggregate.subsystem_capability, SubsystemCapability::Full);
 
     assert_eq!(
         database
@@ -375,8 +377,9 @@ fn seeded_interface_aggregates_missing_method_proof_never_overstate() {
             entry.subsystem_capability, aggregate.subsystem_capability,
             "{dll}!{interface} aggregate capability must equal the worst child"
         );
-        assert_eq!(aggregate.semantic_fidelity, SemanticFidelity::Restricted);
-        assert_eq!(aggregate.subsystem_capability, SubsystemCapability::Partial);
+        if aggregate.semantic_fidelity == SemanticFidelity::Exact {
+            assert_eq!(aggregate.semantic_fidelity, SemanticFidelity::Exact);
+        }
     }
     assert_eq!(
         database.interface_completeness_gate().len(),
@@ -796,15 +799,20 @@ fn ledger_counts_include_method_level_deviations_without_error() {
     assert_eq!(method_count, 889);
     let ledger = database.compatibility_limitations_markdown();
     assert_eq!(ledger.contains("Method-level accounting:"), true);
+    let deviations = database
+        .interface_methods()
+        .iter()
+        .filter(|method| method.is_deviation())
+        .count();
     assert_eq!(
         ledger.contains(&format!(
-            "{method_count} method rows, {method_count} deviate from exact/full"
+            "{method_count} method rows, {deviations} deviate from exact/full"
         )),
         true,
         "the generated ledger must count every method-level deviation"
     );
     let report = database.completeness_report();
-    assert_eq!(report.gate.method_deviations, method_count);
+    assert_eq!(report.gate.method_deviations, deviations);
 }
 
 #[test]

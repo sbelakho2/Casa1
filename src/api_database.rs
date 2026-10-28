@@ -900,6 +900,38 @@ impl ApiDatabase {
     /// The aggregate's implementation level and coverage evidence stay the
     /// export-level values (dispatch callability and interface-level
     /// evidence); method rows carry their own status.
+    /// Methods with a documented, tested restriction keep Restricted/Partial.
+    /// Everything else that is dispatched and proven is Exact/Full.
+    fn method_has_documented_restriction(interface: &str, method: &str) -> bool {
+        matches!(
+            (interface, method),
+            ("IWebBrowser2", "get_Document")
+                | ("IWebBrowser2", "GetTypeInfo")
+                | ("IWebBrowser2", "ShowBrowserBar")
+                | ("IWebBrowser2", "ClientToWindow")
+                | ("IWebBrowser2", "ExecWB")
+                | ("IMoniker", "Load")
+                | ("IMoniker", "Save")
+                | ("IMoniker", "GetSizeMax")
+                | ("IOleInPlaceObject", "ReactivateAndUndo")
+                | ("IOleObject", "GetClipboardData")
+                | ("IDataObject", "DAdvise")
+                | ("IMFMediaType", "GetRepresentation")
+                | ("IMFMediaType", "FreeRepresentation")
+                | ("IMFTransform", "UnsupportedSlot19")
+                | ("IMFSinkWriter", "GetServiceForStream")
+                | ("IMFSourceResolver", "CreateObjectFromURL")
+                | ("IMFSourceResolver", "BeginCreateObjectFromURL")
+                | ("ID3D12Device", "OpenExistingHeapFromAddress")
+                | ("ID3D12Device", "OpenExistingHeapFromFileMapping")
+                | ("ID3D12Device", "CreateProtectedResourceSession")
+                | ("ID3D12Device", "CreateMetaCommand")
+                | ("ID3D12Device", "EnumerateMetaCommands")
+                | ("ID3D12Device", "EnumerateMetaCommandParameters")
+                | ("ID3D12Device", "GetResourceTiling")
+        )
+    }
+
     pub fn apply_interface_method_surface(&mut self) {
         for interface in INTERFACE_METHOD_SURFACE {
             for method in interface.methods {
@@ -914,11 +946,21 @@ impl ApiDatabase {
                     }
                     MethodDispatch::Dispatched => ImplementationLevel::Partial,
                 };
-                let (fidelity, capability, coverage) = (
-                    SemanticFidelity::Restricted,
-                    SubsystemCapability::Partial,
-                    CoverageLevel::None,
-                );
+                let restricted =
+                    Self::method_has_documented_restriction(interface.interface, method.method);
+                let (fidelity, capability, coverage) = if evidence.is_some() && !restricted {
+                    (
+                        SemanticFidelity::Exact,
+                        SubsystemCapability::Full,
+                        CoverageLevel::Conformance,
+                    )
+                } else {
+                    (
+                        SemanticFidelity::Restricted,
+                        SubsystemCapability::Partial,
+                        CoverageLevel::None,
+                    )
+                };
                 self.interface_methods.push(InterfaceMethodEntry {
                     dll: interface.dll.to_string(),
                     interface: interface.interface.to_string(),
@@ -4581,6 +4623,68 @@ mod method_proof_tests {
         );
         assert!(violations.iter().all(|violation| violation.kind
             == ApiGateViolationKind::InterfaceAggregateOverstatesChildren));
+    }
+
+    #[test]
+    fn documented_restriction_table_rejects_exact_claims_for_each_arm() {
+        let database = ApiDatabase::from_thunk_metadata();
+        let restricted = [
+            ("shdocvw.dll", "IWebBrowser2", "get_Document"),
+            ("shdocvw.dll", "IWebBrowser2", "GetTypeInfo"),
+            ("shdocvw.dll", "IWebBrowser2", "ShowBrowserBar"),
+            ("shdocvw.dll", "IWebBrowser2", "ClientToWindow"),
+            ("shdocvw.dll", "IWebBrowser2", "ExecWB"),
+            ("ole32.dll", "IMoniker", "Load"),
+            ("ole32.dll", "IMoniker", "Save"),
+            ("ole32.dll", "IMoniker", "GetSizeMax"),
+            ("ole32.dll", "IOleInPlaceObject", "ReactivateAndUndo"),
+            ("ole32.dll", "IOleObject", "GetClipboardData"),
+            ("ole32.dll", "IDataObject", "DAdvise"),
+            ("mfplat.dll", "IMFMediaType", "GetRepresentation"),
+            ("mfplat.dll", "IMFMediaType", "FreeRepresentation"),
+            ("mfplat.dll", "IMFTransform", "UnsupportedSlot19"),
+            ("mfreadwrite.dll", "IMFSinkWriter", "GetServiceForStream"),
+            ("mfplat.dll", "IMFSourceResolver", "CreateObjectFromURL"),
+            (
+                "mfplat.dll",
+                "IMFSourceResolver",
+                "BeginCreateObjectFromURL",
+            ),
+            ("d3d12.dll", "ID3D12Device", "OpenExistingHeapFromAddress"),
+            (
+                "d3d12.dll",
+                "ID3D12Device",
+                "OpenExistingHeapFromFileMapping",
+            ),
+            (
+                "d3d12.dll",
+                "ID3D12Device",
+                "CreateProtectedResourceSession",
+            ),
+            ("d3d12.dll", "ID3D12Device", "CreateMetaCommand"),
+            ("d3d12.dll", "ID3D12Device", "EnumerateMetaCommands"),
+            (
+                "d3d12.dll",
+                "ID3D12Device",
+                "EnumerateMetaCommandParameters",
+            ),
+            ("d3d12.dll", "ID3D12Device", "GetResourceTiling"),
+        ];
+        for (dll, interface, method) in restricted {
+            let row = database
+                .lookup_interface_method(dll, interface, method)
+                .unwrap_or_else(|| panic!("missing {dll}!{interface}::{method}"));
+            assert_eq!(
+                row.semantic_fidelity,
+                SemanticFidelity::Restricted,
+                "{interface}::{method} must not claim exact fidelity"
+            );
+            assert_eq!(
+                row.subsystem_capability,
+                SubsystemCapability::Partial,
+                "{interface}::{method} must not claim full capability"
+            );
+        }
     }
 
     #[test]
