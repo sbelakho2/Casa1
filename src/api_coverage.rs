@@ -43,6 +43,28 @@ pub struct ApiCoverageEvidence {
     pub evidence_id: &'static str,
 }
 
+/// One piece of coverage evidence for a single `(DLL, interface, method)`
+/// vtable row.
+///
+/// Method-level proof is stricter than export-level evidence: the named
+/// contract must genuinely exercise that method (through the vtable or the
+/// interface object), not merely resolve the interface identity.  The
+/// evidence id follows the same naming rules as [`ApiCoverageEvidence`]:
+/// `casa1-conformance:<suite>` names a compiled test file or test function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodCoverageEvidence {
+    /// Exporting DLL (lowercase, with extension).
+    pub dll: &'static str,
+    /// COM/OLE interface name.
+    pub interface: &'static str,
+    /// Method name within the interface vtable.
+    pub method: &'static str,
+    /// Proven semantic coverage level for the method.
+    pub level: CoverageLevel,
+    /// The compiled contract that proves the method's observable behavior.
+    pub evidence_id: &'static str,
+}
+
 /// Convenience constructor for registry rows (any arch, any Windows version).
 const fn evidence(
     dll: &'static str,
@@ -12082,33 +12104,501 @@ pub fn coverage_evidence_for(
     })
 }
 
-#[cfg(test)]
-/// Resolve a `casa1-conformance:<suite>` evidence id to a REAL test
-/// target: either a test file `tests/<suite>.rs` or a test function
-/// `fn <suite>(` inside the crate sources.  Returns the unresolved ids.
+/// Convenience constructor for method-level conformance rows.
+const fn method_evidence(
+    dll: &'static str,
+    interface: &'static str,
+    method: &'static str,
+    evidence_id: &'static str,
+) -> MethodCoverageEvidence {
+    MethodCoverageEvidence {
+        dll,
+        interface,
+        method,
+        level: CoverageLevel::Conformance,
+        evidence_id,
+    }
+}
+
+/// The static method-level coverage-evidence registry.
 ///
-/// KNOWN_SUITES is documentation only — it NEVER bypasses this check
-/// (a registry row must name something that exists and runs).
-fn unresolved_conformance_suites(rows: &[ApiCoverageEvidence]) -> Vec<String> {
+/// Every row is keyed by `(DLL, interface, method)` and names a compiled
+/// contract that genuinely drives that method.  The Media Foundation and
+/// D3D/DXGI rows reuse the existing export-level conformance contracts
+/// (`COVERAGE_EVIDENCE`) because those suites exercise the vtable method
+/// itself; the COM/OLE rows name the section28 COM suite or the
+/// `positive_regression` COM round-trip test file.  Methods with no row are
+/// genuinely unproven — absence is deliberate, not an oversight.
+pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
+    // Media Foundation: the attributes/sample/session suite drives these
+    // methods on a real IMFMediaType/IMFAttributes/IMFSample/IMFMediaSession.
+    method_evidence(
+        "mfplat.dll",
+        "IMFAttributes",
+        "GetItem",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFAttributes",
+        "GetItemType",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFAttributes",
+        "SetItem",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFAttributes",
+        "SetString",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFAttributes",
+        "GetAllocatedString",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFAttributes",
+        "LockStore",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFAttributes",
+        "GetCount",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFAttributes",
+        "DeleteAllItems",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFMediaType",
+        "GetItem",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFMediaType",
+        "GetItemType",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFMediaType",
+        "SetItem",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFMediaType",
+        "SetString",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFMediaType",
+        "GetAllocatedString",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFMediaType",
+        "LockStore",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFMediaType",
+        "GetCount",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFMediaType",
+        "DeleteAllItems",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFSample",
+        "SetSampleFlags",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFSample",
+        "GetSampleFlags",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFSample",
+        "GetTotalLength",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFSample",
+        "CopyToBuffer",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFSample",
+        "ConvertToContiguousBuffer",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mf.dll",
+        "IMFMediaSession",
+        "SetTopology",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mf.dll",
+        "IMFMediaSession",
+        "GetSessionCapabilities",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    method_evidence(
+        "mf.dll",
+        "IMFMediaSession",
+        "GetFullTopology",
+        "casa1-conformance:evidence_mf_attributes_full_surface",
+    ),
+    // The transform pipeline suite drives the accepting/buffered/output and
+    // flush transitions on a real IMFTransform.
+    method_evidence(
+        "mfplat.dll",
+        "IMFTransform",
+        "SetInputType",
+        "casa1-conformance:evidence_mf_transform_pipeline",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFTransform",
+        "SetOutputType",
+        "casa1-conformance:evidence_mf_transform_pipeline",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFTransform",
+        "GetInputStatus",
+        "casa1-conformance:evidence_mf_transform_pipeline",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFTransform",
+        "GetOutputStatus",
+        "casa1-conformance:evidence_mf_transform_pipeline",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFTransform",
+        "ProcessInput",
+        "casa1-conformance:evidence_mf_transform_pipeline",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFTransform",
+        "ProcessOutput",
+        "casa1-conformance:evidence_mf_transform_pipeline",
+    ),
+    method_evidence(
+        "mfplat.dll",
+        "IMFTransform",
+        "ProcessMessage",
+        "casa1-conformance:evidence_mf_transform_pipeline",
+    ),
+    // COM/OLE: the section28 suite proves IUnknown refcounting/QI and the
+    // IShellLink state accessors; the positive-regression COM round trip
+    // proves IClassFactory::CreateInstance, IStream Read/Write/Seek and
+    // IMoniker::GetDisplayName through the guest-facing objects.
+    method_evidence(
+        "ole32.dll",
+        "IUnknown",
+        "QueryInterface",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "ole32.dll",
+        "IUnknown",
+        "AddRef",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "ole32.dll",
+        "IUnknown",
+        "Release",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "ole32.dll",
+        "IClassFactory",
+        "CreateInstance",
+        "casa1-conformance:positive_regression",
+    ),
+    method_evidence(
+        "ole32.dll",
+        "IStream",
+        "Read",
+        "casa1-conformance:positive_regression",
+    ),
+    method_evidence(
+        "ole32.dll",
+        "IStream",
+        "Write",
+        "casa1-conformance:positive_regression",
+    ),
+    method_evidence(
+        "ole32.dll",
+        "IStream",
+        "Seek",
+        "casa1-conformance:positive_regression",
+    ),
+    method_evidence(
+        "ole32.dll",
+        "IMoniker",
+        "GetDisplayName",
+        "casa1-conformance:positive_regression",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "GetPath",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "SetPath",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "GetArguments",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "SetArguments",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "GetDescription",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "SetDescription",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "GetWorkingDirectory",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "SetWorkingDirectory",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "GetIconLocation",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "SetIconLocation",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "GetShowCmd",
+        "casa1-conformance:section28_com",
+    ),
+    method_evidence(
+        "shell32.dll",
+        "IShellLink",
+        "SetShowCmd",
+        "casa1-conformance:section28_com",
+    ),
+    // D3D11: the pixel-shader thunk test dispatches CreatePixelShader and
+    // PSSetShader through the real device/context vtables.
+    method_evidence(
+        "d3d11.dll",
+        "ID3D11Device",
+        "CreatePixelShader",
+        "casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil",
+    ),
+    method_evidence(
+        "d3d11.dll",
+        "ID3D11DeviceContext",
+        "PSSetShader",
+        "casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil",
+    ),
+    // DXGI/D3D12: the swapchain/command-list test dispatches each of these
+    // through the allocated vtables and pins the guest-visible outcome.
+    method_evidence(
+        "dxgi.dll",
+        "IDXGIFactory",
+        "CreateSwapChainForHwnd",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "dxgi.dll",
+        "IDXGIFactory",
+        "EnumAdapters1",
+        "casa1-conformance:pe_runtime_dxgi_adapter_enumeration_exposes_vendor_compatible_descriptors",
+    ),
+    method_evidence(
+        "dxgi.dll",
+        "IDXGISwapChain",
+        "ResizeBuffers",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "dxgi.dll",
+        "IDXGISwapChain",
+        "GetBuffer",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "dxgi.dll",
+        "IDXGISwapChain",
+        "Present",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12Device",
+        "CreateCommandQueue",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12Device",
+        "CreateCommandAllocator",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12Device",
+        "CreateCommandList",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12Device",
+        "CreateDescriptorHeap",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12Device",
+        "CreateRenderTargetView",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12CommandQueue",
+        "ExecuteCommandLists",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12DescriptorHeap",
+        "GetCpuHandleForHeapStart",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12GraphicsCommandList",
+        "ResourceBarrier",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12GraphicsCommandList",
+        "ClearRenderTargetView",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12GraphicsCommandList",
+        "DrawInstanced",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+    method_evidence(
+        "d3d12.dll",
+        "ID3D12GraphicsCommandList",
+        "Close",
+        "casa1-conformance:pe_runtime_d3d12_swapchain_and_command_list_thunks_submit_and_present",
+    ),
+];
+
+/// Normalize a DLL name for method-evidence keying: trimmed, lowercase, and
+/// `.dll`-suffix tolerant.
+fn method_dll_key(dll: &str) -> String {
+    let lower = dll.trim().to_ascii_lowercase();
+    lower.strip_suffix(".dll").unwrap_or(&lower).to_string()
+}
+
+/// Look up the method-level evidence row for a `(DLL, interface, method)`
+/// key.  Matching is case-insensitive and tolerates the `.dll` suffix.  When
+/// several rows match, the strongest level wins.
+pub fn method_coverage_evidence_for(
+    dll: &str,
+    interface: &str,
+    method: &str,
+) -> Option<&'static MethodCoverageEvidence> {
+    let dll_key = method_dll_key(dll);
+    METHOD_COVERAGE_EVIDENCE
+        .iter()
+        .filter(|row| {
+            method_dll_key(row.dll) == dll_key
+                && row.interface.eq_ignore_ascii_case(interface)
+                && row.method.eq_ignore_ascii_case(method)
+        })
+        .max_by_key(|row| row.level)
+}
+
+/// Whether a `casa1-conformance:<suite>` names a REAL compiled test target:
+/// a test file `tests/<suite>.rs` or a test function `fn <suite>(` in the
+/// crate sources.
+fn suite_binds_compiled_test(suite: &str) -> bool {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut unresolved = Vec::new();
-    for row in rows {
-        let Some(suite) = row.evidence_id.strip_prefix("casa1-conformance:") else {
-            continue;
-        };
-        if manifest_dir
-            .join("tests")
-            .join(format!("{suite}.rs"))
-            .is_file()
-        {
-            continue;
-        }
-        let mut found = false;
-        let mut stack = vec![manifest_dir.join("src")];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
+    if manifest_dir
+        .join("tests")
+        .join(format!("{suite}.rs"))
+        .is_file()
+    {
+        return true;
+    }
+    let mut stack = vec![manifest_dir.join("src")];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
@@ -12117,18 +12607,62 @@ fn unresolved_conformance_suites(rows: &[ApiCoverageEvidence]) -> Vec<String> {
                     && std::fs::read_to_string(&path)
                         .is_ok_and(|text| text.contains(&format!("fn {suite}(")))
                 {
-                    found = true;
-                    break;
+                    return true;
                 }
             }
-            if found {
-                break;
-            }
-        }
-        if !found {
-            unresolved.push(row.evidence_id.to_string());
         }
     }
+    false
+}
+
+/// Resolve a method evidence id: either an existing export-level contract
+/// (`COVERAGE_EVIDENCE`) or a `casa1-conformance:<suite>` that names a real
+/// compiled test.  Nothing else counts as proof.
+fn method_evidence_id_resolves(evidence_id: &str) -> bool {
+    if COVERAGE_EVIDENCE
+        .iter()
+        .any(|row| row.evidence_id == evidence_id)
+    {
+        return true;
+    }
+    evidence_id
+        .strip_prefix("casa1-conformance:")
+        .is_some_and(suite_binds_compiled_test)
+}
+
+/// Return the method evidence ids that do not bind to a compiled contract.
+///
+/// This is the machine check for the registry: an unknown suite or a test
+/// function that is not compiled into the crate is not evidence and must be
+/// reported rather than silently trusted.
+pub fn unresolved_method_evidence(rows: &[MethodCoverageEvidence]) -> Vec<String> {
+    let mut unresolved: Vec<String> = rows
+        .iter()
+        .filter(|row| !method_evidence_id_resolves(row.evidence_id))
+        .map(|row| row.evidence_id.to_string())
+        .collect();
+    unresolved.sort();
+    unresolved.dedup();
+    unresolved
+}
+
+#[cfg(test)]
+/// Resolve a `casa1-conformance:<suite>` evidence id to a REAL test
+/// target: either a test file `tests/<suite>.rs` or a test function
+/// `fn <suite>(` inside the crate sources.  Returns the unresolved ids.
+///
+/// KNOWN_SUITES is documentation only — it NEVER bypasses this check
+/// (a registry row must name something that exists and runs).
+fn unresolved_conformance_suites(rows: &[ApiCoverageEvidence]) -> Vec<String> {
+    let mut unresolved: Vec<String> = rows
+        .iter()
+        .filter(|row| {
+            row.evidence_id
+                .strip_prefix("casa1-conformance:")
+                .is_some_and(|suite| !suite_binds_compiled_test(suite))
+        })
+        .map(|row| row.evidence_id.to_string())
+        .collect();
     unresolved.sort();
     unresolved.dedup();
     unresolved
@@ -12321,6 +12855,60 @@ mod tests {
         assert!(
             missing.is_empty(),
             "conformance suites must bind to compiled test executables;              not found in `cargo test -- --list`: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn method_evidence_rejects_uncompiled_binding_and_resolves_real_tests() {
+        // The registry must never trust an evidence name that does not bind
+        // to a real compiled contract.
+        let rows = [
+            method_evidence(
+                "d3d11.dll",
+                "ID3D11Device",
+                "RealFunctionTest",
+                "casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil",
+            ),
+            method_evidence(
+                "ole32.dll",
+                "IStream",
+                "RealFileTest",
+                "casa1-conformance:positive_regression",
+            ),
+            method_evidence(
+                "x.dll",
+                "IFake",
+                "Unknown",
+                "casa1-conformance:this_method_test_does_not_exist",
+            ),
+        ];
+        let unresolved = unresolved_method_evidence(&rows);
+        assert_eq!(
+            unresolved,
+            vec!["casa1-conformance:this_method_test_does_not_exist".to_string()],
+            "only the uncompiled binding may be unresolved"
+        );
+        assert_eq!(
+            unresolved_method_evidence(METHOD_COVERAGE_EVIDENCE),
+            Vec::<String>::new(),
+            "every shipped method evidence row must bind to a compiled test"
+        );
+
+        let found = method_coverage_evidence_for("D3D11.DLL", "id3d11device", "createpixelshader")
+            .expect("the D3D11 method evidence row must resolve case-insensitively");
+        assert_eq!(
+            found.evidence_id,
+            "casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil"
+        );
+        assert_eq!(
+            found.level,
+            CoverageLevel::Conformance,
+            "method proof is conformance-level evidence"
+        );
+        assert_eq!(
+            method_coverage_evidence_for("d3d11.dll", "ID3D11Device", "NoSuchMethod"),
+            None,
+            "an unbound method must not resolve"
         );
     }
 }

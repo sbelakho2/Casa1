@@ -9,6 +9,10 @@
 //! api-completeness.json report shape, and the `casa1-oracle api-report
 //! --gate` enforcement.
 
+use casa1::api_coverage::{
+    METHOD_COVERAGE_EVIDENCE, MethodCoverageEvidence, method_coverage_evidence_for,
+    unresolved_method_evidence,
+};
 use casa1::api_database::{
     ApiCompletenessReport, ApiDatabase, ApiEntry, ApiGateViolationKind, CompatibilityTier,
     CoverageLevel, InterfaceMethodEntry, SemanticFidelity, SubsystemCapability, WindowsVersion,
@@ -848,6 +852,18 @@ fn old_report_json_missing_method_fields_still_deserializes() {
             .method_total,
         0
     );
+    assert_eq!(
+        report.interface_registry.len(),
+        0,
+        "the additive interface registry defaults to empty"
+    );
+    assert_eq!(
+        report.gate.unproven_method_count, 0,
+        "the additive unproven method count defaults to zero"
+    );
+    let old_summary = report.per_dll.get("kernel32.dll").expect("per-DLL summary");
+    assert_eq!(old_summary.method_proven, 0);
+    assert_eq!(old_summary.method_unproven, 0);
 }
 
 #[test]
@@ -1053,5 +1069,148 @@ fn coverage_for_pe_produces_generic_binary_import_entries() {
                 .iter()
                 .all(|entry| entry.source == ImportSource::Static),
         "delay-load imports must be attributed as DelayLoad when present"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (j) Method-level compatibility evidence
+// ---------------------------------------------------------------------------
+
+#[test]
+fn method_evidence_resolves_real_test_and_rejects_uncompiled_binding() {
+    let bound = method_coverage_evidence_for("D3D11.DLL", "id3d11device", "createpixelshader")
+        .expect("the seeded D3D11 method evidence must resolve");
+    assert_eq!(
+        bound.evidence_id,
+        "casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil"
+    );
+    assert_eq!(bound.level, CoverageLevel::Conformance);
+    assert_eq!(
+        method_coverage_evidence_for("d3d11.dll", "ID3D11Device", "NoSuchMethod"),
+        None,
+        "an unbound method must not resolve"
+    );
+
+    let fabricated = MethodCoverageEvidence {
+        dll: "d3d11.dll",
+        interface: "ID3D11Device",
+        method: "Fabricated",
+        level: CoverageLevel::Conformance,
+        evidence_id: "casa1-conformance:this_method_suite_is_not_compiled",
+    };
+    let unresolved = unresolved_method_evidence(&[fabricated]);
+    assert_eq!(
+        unresolved,
+        vec!["casa1-conformance:this_method_suite_is_not_compiled".to_string()],
+        "an uncompiled evidence id must fail validation"
+    );
+    assert_eq!(
+        unresolved_method_evidence(METHOD_COVERAGE_EVIDENCE),
+        Vec::<String>::new(),
+        "every shipped method evidence row must bind to a compiled test"
+    );
+}
+
+#[test]
+fn aggregate_coverage_recomputes_and_reports_missing_method_proof() {
+    let mut unproven = ApiDatabase::new();
+    unproven.add_entry(ApiEntry::new(
+        "d3d11.dll",
+        "ID3D11Device",
+        ImplementationLevel::Implemented,
+    ));
+    unproven.add_interface_method(InterfaceMethodEntry::new(
+        "d3d11.dll",
+        "ID3D11Device",
+        "CreateBuffer",
+        true,
+        ImplementationLevel::Partial,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        CoverageLevel::None,
+    ));
+    let aggregate = unproven
+        .interface_aggregate_status("d3d11.dll", "ID3D11Device")
+        .expect("unproven aggregate");
+    assert_eq!(aggregate.proven, false);
+    assert_eq!(
+        aggregate.unproven_methods,
+        vec!["CreateBuffer".to_string()],
+        "the aggregate must report the method that lacks proof"
+    );
+
+    let mut proven = ApiDatabase::new();
+    proven.add_entry(ApiEntry::new(
+        "d3d11.dll",
+        "ID3D11Device",
+        ImplementationLevel::Implemented,
+    ));
+    proven.add_interface_method(InterfaceMethodEntry::new(
+        "d3d11.dll",
+        "ID3D11Device",
+        "CreateBuffer",
+        true,
+        ImplementationLevel::Implemented,
+        SemanticFidelity::Exact,
+        SubsystemCapability::Full,
+        CoverageLevel::Conformance,
+    ));
+    let aggregate = proven
+        .interface_aggregate_status("d3d11.dll", "ID3D11Device")
+        .expect("proven aggregate");
+    assert_eq!(aggregate.proven, true);
+    assert_eq!(aggregate.semantic_test_coverage, CoverageLevel::Conformance);
+    assert!(aggregate.unproven_methods.is_empty());
+}
+
+#[test]
+fn interface_gate_rejects_exact_or_full_claim_with_missing_method_proof() {
+    let mut exact = ApiDatabase::new();
+    exact.add_entry(ApiEntry::new(
+        "dxgi.dll",
+        "IDXGIFactory",
+        ImplementationLevel::Implemented,
+    ));
+    exact.add_interface_method(InterfaceMethodEntry::new(
+        "dxgi.dll",
+        "IDXGIFactory",
+        "EnumAdapters",
+        true,
+        ImplementationLevel::Implemented,
+        SemanticFidelity::Exact,
+        SubsystemCapability::Full,
+        CoverageLevel::None,
+    ));
+    let violations = exact.interface_completeness_gate();
+    assert_eq!(violations.len(), 1);
+    assert_eq!(
+        violations[0].kind,
+        ApiGateViolationKind::InterfaceClaimsUnprovenMethods
+    );
+    assert!(
+        violations[0].message.contains("EnumAdapters"),
+        "the violation must name the unproven method"
+    );
+
+    let mut partial = ApiDatabase::new();
+    let mut partial_entry =
+        ApiEntry::new("dxgi.dll", "IDXGIFactory", ImplementationLevel::Implemented);
+    partial_entry.semantic_fidelity = SemanticFidelity::Restricted;
+    partial_entry.subsystem_capability = SubsystemCapability::Partial;
+    partial.add_entry(partial_entry);
+    partial.add_interface_method(InterfaceMethodEntry::new(
+        "dxgi.dll",
+        "IDXGIFactory",
+        "EnumAdapters",
+        true,
+        ImplementationLevel::Partial,
+        SemanticFidelity::Restricted,
+        SubsystemCapability::Partial,
+        CoverageLevel::None,
+    ));
+    assert_eq!(
+        partial.interface_completeness_gate().len(),
+        0,
+        "a documented partial interface must not fail merely for unproven methods"
     );
 }

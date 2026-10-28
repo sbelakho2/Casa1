@@ -71,7 +71,7 @@
 //! every `Stub`/`Unsupported` must be declared deliberately unsupported with
 //! a guest-visible compatibility consequence.
 
-use crate::api_coverage::COVERAGE_EVIDENCE;
+use crate::api_coverage::{COVERAGE_EVIDENCE, method_coverage_evidence_for};
 use crate::compatibility_profile::CompatibilityProfile;
 use crate::host_thunks::THUNK_METADATA;
 use crate::host_thunks::{ImplementationLevel, SupportPolicy};
@@ -358,6 +358,9 @@ pub struct InterfaceMethodEntry {
     /// unsupported).
     #[serde(default)]
     pub detail: Option<String>,
+    /// The compiled contract that proved this method, when one exists.
+    #[serde(default)]
+    pub evidence_id: Option<String>,
 }
 
 impl InterfaceMethodEntry {
@@ -383,6 +386,7 @@ impl InterfaceMethodEntry {
             subsystem_capability,
             semantic_test_coverage,
             detail: None,
+            evidence_id: None,
         }
     }
 
@@ -394,7 +398,7 @@ impl InterfaceMethodEntry {
 }
 
 /// The aggregate status computed from an interface's required method rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceAggregateStatus {
     /// Number of method rows belonging to the interface.
     pub method_count: usize,
@@ -409,6 +413,14 @@ pub struct InterfaceAggregateStatus {
     pub subsystem_capability: SubsystemCapability,
     /// Weakest semantic test coverage across the considered methods.
     pub semantic_test_coverage: CoverageLevel,
+    /// `true` only when every considered method is semantically proven
+    /// (Differential or Conformance coverage).  This is the interface's
+    /// method-level proof state, independent of its worst-child
+    /// fidelity/capability.
+    pub proven: bool,
+    /// Required methods that still lack semantic proof, in vtable order.
+    /// Empty when [`InterfaceAggregateStatus::proven`] is `true`.
+    pub unproven_methods: Vec<String>,
 }
 
 /// Severity ordering for [`ImplementationLevel`] (higher is worse).
@@ -421,12 +433,24 @@ const fn implementation_severity(level: ImplementationLevel) -> u8 {
     }
 }
 
+/// Whether a method carries real semantic proof (not merely unit or
+/// scenario coverage).
+fn has_semantic_proof(method: &InterfaceMethodEntry) -> bool {
+    matches!(
+        method.semantic_test_coverage,
+        CoverageLevel::Differential | CoverageLevel::Conformance
+    )
+}
+
 /// Compute the worst child status over an interface's method rows.
 ///
 /// Required methods define the aggregate when any exist; interfaces whose
 /// rows are all optional fall back to every row.  Fidelity and capability are
 /// the worst (highest-ordinal) child value, coverage the weakest
 /// (lowest-ordinal) value, and implementation the most severe child level.
+/// The aggregate is `proven` only when every considered method has
+/// Differential/Conformance proof; otherwise the unproven method names are
+/// reported.
 fn aggregate_interface_status(
     methods: &[&InterfaceMethodEntry],
 ) -> Option<InterfaceAggregateStatus> {
@@ -462,6 +486,11 @@ fn aggregate_interface_status(
             semantic_test_coverage = method.semantic_test_coverage;
         }
     }
+    let unproven_methods: Vec<String> = considered
+        .iter()
+        .filter(|method| !has_semantic_proof(method))
+        .map(|method| method.method.clone())
+        .collect();
     Some(InterfaceAggregateStatus {
         method_count: methods.len(),
         required_count,
@@ -469,6 +498,8 @@ fn aggregate_interface_status(
         semantic_fidelity,
         subsystem_capability,
         semantic_test_coverage,
+        proven: unproven_methods.is_empty(),
+        unproven_methods,
     })
 }
 
@@ -505,6 +536,9 @@ pub enum ApiGateViolationKind {
     InterfaceMethodRowsMissing,
     /// A method row names an interface that has no seeded vtable method list.
     InterfaceUnknown,
+    /// An interface still claims Exact fidelity and/or Full capability while
+    /// at least one required method has no Differential/Conformance proof.
+    InterfaceClaimsUnprovenMethods,
 }
 
 /// One gate violation: a (DLL, export) that must not ship quietly.
@@ -799,7 +833,9 @@ impl ApiDatabase {
                 });
                 continue;
             };
-            if entry.semantic_fidelity < aggregate.semantic_fidelity {
+            let fidelity_overstated = entry.semantic_fidelity < aggregate.semantic_fidelity;
+            let capability_overstated = entry.subsystem_capability < aggregate.subsystem_capability;
+            if fidelity_overstated {
                 violations.push(ApiGateViolation {
                     dll: entry.dll.clone(),
                     export: entry.export.clone(),
@@ -814,7 +850,7 @@ impl ApiDatabase {
                     ),
                 });
             }
-            if entry.subsystem_capability < aggregate.subsystem_capability {
+            if capability_overstated {
                 violations.push(ApiGateViolation {
                     dll: entry.dll.clone(),
                     export: entry.export.clone(),
@@ -826,6 +862,27 @@ impl ApiDatabase {
                         entry.export,
                         entry.subsystem_capability,
                         aggregate.subsystem_capability
+                    ),
+                });
+            }
+            let claims_exact_or_full = entry.semantic_fidelity == SemanticFidelity::Exact
+                || entry.subsystem_capability == SubsystemCapability::Full;
+            if !fidelity_overstated
+                && !capability_overstated
+                && claims_exact_or_full
+                && !aggregate.proven
+            {
+                violations.push(ApiGateViolation {
+                    dll: entry.dll.clone(),
+                    export: entry.export.clone(),
+                    kind: ApiGateViolationKind::InterfaceClaimsUnprovenMethods,
+                    message: format!(
+                        "{}!{} claims exact/full semantics but {} required method(s) lack \
+                         semantic proof: {}",
+                        entry.dll,
+                        entry.export,
+                        aggregate.unproven_methods.len(),
+                        aggregate.unproven_methods.join(", ")
                     ),
                 });
             }
@@ -860,6 +917,8 @@ impl ApiDatabase {
                         CoverageLevel::None,
                     ),
                 };
+                let evidence =
+                    method_coverage_evidence_for(interface.dll, interface.interface, method.method);
                 self.interface_methods.push(InterfaceMethodEntry {
                     dll: interface.dll.to_string(),
                     interface: interface.interface.to_string(),
@@ -868,8 +927,9 @@ impl ApiDatabase {
                     implementation,
                     semantic_fidelity: fidelity,
                     subsystem_capability: capability,
-                    semantic_test_coverage: coverage,
+                    semantic_test_coverage: evidence.map(|row| row.level).unwrap_or(coverage),
                     detail: Some(method.detail.to_string()),
+                    evidence_id: evidence.map(|row| row.evidence_id.to_string()),
                 });
             }
             let methods: Vec<&InterfaceMethodEntry> = self
@@ -1447,11 +1507,46 @@ impl ApiDatabase {
             } else {
                 summary.method_covered += 1;
             }
+            if has_semantic_proof(method) {
+                summary.method_proven += 1;
+            } else {
+                summary.method_unproven += 1;
+            }
             if method.is_deviation() {
                 summary.method_deviations += 1;
                 method_deviations += 1;
             }
         }
+
+        let mut interface_registry: Vec<ApiInterfaceCoverageRow> = Vec::new();
+        let mut interface_keys: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+        for method in &self.interface_methods {
+            interface_keys
+                .entry((
+                    normalize_dll(&method.dll),
+                    method.interface.to_ascii_lowercase(),
+                ))
+                .or_insert_with(|| (method.dll.clone(), method.interface.clone()));
+        }
+        for (dll, interface) in interface_keys.into_values() {
+            let methods: Vec<&InterfaceMethodEntry> =
+                self.methods_for_interface(&dll, &interface).collect();
+            let aggregate = aggregate_interface_status(&methods)
+                .expect("every grouped interface has at least one method row");
+            interface_registry.push(ApiInterfaceCoverageRow {
+                dll,
+                interface,
+                method_count: aggregate.method_count,
+                required_count: aggregate.required_count,
+                semantic_test_coverage: aggregate.semantic_test_coverage,
+                proven: aggregate.proven,
+                unproven_methods: aggregate.unproven_methods,
+            });
+        }
+        let unproven_method_count = interface_registry
+            .iter()
+            .map(|interface| interface.unproven_methods.len())
+            .sum();
 
         let shipping_violations = self.shipping_gate();
         // The report's completeness evaluation runs the full native
@@ -1474,6 +1569,7 @@ impl ApiDatabase {
                 interface_violations,
                 interface_violation_count,
                 method_deviations,
+                unproven_method_count,
             },
             registry: self
                 .entries
@@ -1502,8 +1598,10 @@ impl ApiDatabase {
                     semantic_fidelity: method.semantic_fidelity,
                     subsystem_capability: method.subsystem_capability,
                     detail: method.detail.clone(),
+                    evidence_id: method.evidence_id.clone(),
                 })
                 .collect(),
+            interface_registry,
         }
     }
 
@@ -4070,6 +4168,12 @@ pub struct DllCompletenessSummary {
     /// Method rows with no proven semantic coverage.
     #[serde(default)]
     pub method_uncovered: usize,
+    /// Method rows with Differential/Conformance semantic proof.
+    #[serde(default)]
+    pub method_proven: usize,
+    /// Method rows without Differential/Conformance semantic proof.
+    #[serde(default)]
+    pub method_unproven: usize,
     /// Method rows that deviate from exact/full semantics.
     #[serde(default)]
     pub method_deviations: usize,
@@ -4099,6 +4203,10 @@ pub struct ApiGateSummary {
     /// Method-level rows that deviate from exact/full semantics.
     #[serde(default)]
     pub method_deviations: usize,
+    /// Required methods that still lack Differential/Conformance proof,
+    /// summed over every interface.
+    #[serde(default)]
+    pub unproven_method_count: usize,
 }
 
 /// One per-entry registry row in the report (the regression baseline unit:
@@ -4149,6 +4257,29 @@ pub struct ApiMethodRegistryRow {
     /// Per-method documentation note.
     #[serde(default)]
     pub detail: Option<String>,
+    /// The compiled contract proving this method, when one exists.
+    #[serde(default)]
+    pub evidence_id: Option<String>,
+}
+
+/// Per-interface method-proof aggregate in the report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiInterfaceCoverageRow {
+    /// Exporting DLL name (lowercase, with extension).
+    pub dll: String,
+    /// COM/OLE interface name.
+    pub interface: String,
+    /// Number of method rows belonging to the interface.
+    pub method_count: usize,
+    /// Number of required methods the aggregate is computed from.
+    pub required_count: usize,
+    /// Weakest semantic coverage across the considered methods.
+    pub semantic_test_coverage: CoverageLevel,
+    /// `true` only when every considered method has semantic proof.
+    pub proven: bool,
+    /// Required methods still lacking semantic proof, in vtable order.
+    #[serde(default)]
+    pub unproven_methods: Vec<String>,
 }
 
 /// The `api-completeness.json` report shape.
@@ -4167,6 +4298,10 @@ pub struct ApiCompletenessReport {
     /// in older reports).
     #[serde(default)]
     pub method_registry: Vec<ApiMethodRegistryRow>,
+    /// Per-interface method-proof aggregates and unproven method lists
+    /// (additive field; absent in older reports).
+    #[serde(default)]
+    pub interface_registry: Vec<ApiInterfaceCoverageRow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4187,4 +4322,180 @@ pub static API_DATABASE: LazyLock<Mutex<ApiDatabase>> =
 /// Access the process-global compatibility database.
 pub fn global_database() -> &'static Mutex<ApiDatabase> {
     &API_DATABASE
+}
+
+#[cfg(test)]
+mod method_proof_tests {
+    use super::*;
+
+    #[test]
+    fn interface_gate_rejects_exact_claim_with_missing_method_proof() {
+        let mut exact = ApiDatabase::new();
+        exact.add_entry(ApiEntry::new(
+            "dxgi.dll",
+            "IDXGIFactory",
+            ImplementationLevel::Implemented,
+        ));
+        exact.add_interface_method(InterfaceMethodEntry::new(
+            "dxgi.dll",
+            "IDXGIFactory",
+            "EnumAdapters",
+            true,
+            ImplementationLevel::Implemented,
+            SemanticFidelity::Exact,
+            SubsystemCapability::Full,
+            CoverageLevel::None,
+        ));
+        let aggregate = exact
+            .interface_aggregate_status("dxgi.dll", "IDXGIFactory")
+            .expect("aggregate");
+        assert_eq!(aggregate.proven, false);
+        assert_eq!(
+            aggregate.unproven_methods,
+            vec!["EnumAdapters".to_string()],
+            "the unproven required method must be reported"
+        );
+        let violations = exact.interface_completeness_gate();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0].kind,
+            ApiGateViolationKind::InterfaceClaimsUnprovenMethods
+        );
+        assert!(
+            violations[0].message.contains("1 required method(s)"),
+            "the violation must carry the unproven count: {}",
+            violations[0].message
+        );
+
+        let mut proven = ApiDatabase::new();
+        proven.add_entry(ApiEntry::new(
+            "dxgi.dll",
+            "IDXGIFactory",
+            ImplementationLevel::Implemented,
+        ));
+        proven.add_interface_method(InterfaceMethodEntry::new(
+            "dxgi.dll",
+            "IDXGIFactory",
+            "EnumAdapters",
+            true,
+            ImplementationLevel::Implemented,
+            SemanticFidelity::Exact,
+            SubsystemCapability::Full,
+            CoverageLevel::Conformance,
+        ));
+        let aggregate = proven
+            .interface_aggregate_status("dxgi.dll", "IDXGIFactory")
+            .expect("aggregate");
+        assert_eq!(aggregate.proven, true);
+        assert!(aggregate.unproven_methods.is_empty());
+        assert_eq!(
+            proven.interface_completeness_gate().len(),
+            0,
+            "a fully proven exact/full interface passes"
+        );
+
+        let mut partial = ApiDatabase::new();
+        let mut partial_entry =
+            ApiEntry::new("dxgi.dll", "IDXGIFactory", ImplementationLevel::Implemented);
+        partial_entry.semantic_fidelity = SemanticFidelity::Restricted;
+        partial_entry.subsystem_capability = SubsystemCapability::Partial;
+        partial.add_entry(partial_entry);
+        partial.add_interface_method(InterfaceMethodEntry::new(
+            "dxgi.dll",
+            "IDXGIFactory",
+            "EnumAdapters",
+            true,
+            ImplementationLevel::Partial,
+            SemanticFidelity::Restricted,
+            SubsystemCapability::Partial,
+            CoverageLevel::None,
+        ));
+        assert_eq!(
+            partial.interface_completeness_gate().len(),
+            0,
+            "a documented partial interface must not fail merely for unproven methods"
+        );
+
+        let mut overstated = ApiDatabase::new();
+        overstated.add_entry(ApiEntry::new(
+            "dxgi.dll",
+            "IDXGIFactory",
+            ImplementationLevel::Implemented,
+        ));
+        overstated.add_interface_method(InterfaceMethodEntry::new(
+            "dxgi.dll",
+            "IDXGIFactory",
+            "EnumAdapters",
+            true,
+            ImplementationLevel::Partial,
+            SemanticFidelity::Restricted,
+            SubsystemCapability::Partial,
+            CoverageLevel::None,
+        ));
+        let violations = overstated.interface_completeness_gate();
+        assert_eq!(
+            violations.len(),
+            2,
+            "an already-overstated aggregate reports its two axis violations, not a duplicate proof violation"
+        );
+        assert!(violations.iter().all(|violation| violation.kind
+            == ApiGateViolationKind::InterfaceAggregateOverstatesChildren));
+    }
+
+    #[test]
+    fn seeded_report_lists_missing_method_proof_and_bound_evidence() {
+        let database = ApiDatabase::from_thunk_metadata();
+        let report = database.completeness_report();
+
+        let bound = report
+            .method_registry
+            .iter()
+            .find(|row| row.interface == "ID3D11Device" && row.method == "CreatePixelShader")
+            .expect("CreatePixelShader row");
+        assert_eq!(bound.semantic_test_coverage, CoverageLevel::Conformance);
+        assert_eq!(
+            bound.evidence_id.as_deref(),
+            Some("casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil"),
+            "the method row must name the compiled contract that proves it"
+        );
+
+        let unbound = report
+            .method_registry
+            .iter()
+            .find(|row| row.interface == "ID3D11Device" && row.method == "CreateBuffer")
+            .expect("CreateBuffer row");
+        assert_eq!(unbound.semantic_test_coverage, CoverageLevel::None);
+        assert_eq!(unbound.evidence_id, None);
+
+        let interface = report
+            .interface_registry
+            .iter()
+            .find(|row| row.dll == "d3d11.dll" && row.interface == "ID3D11Device")
+            .expect("ID3D11Device aggregate");
+        assert_eq!(interface.proven, false);
+        assert!(
+            interface
+                .unproven_methods
+                .contains(&"CreateBuffer".to_string()),
+            "the interface registry must list CreateBuffer as unproven"
+        );
+        assert!(
+            report.gate.unproven_method_count >= interface.unproven_methods.len(),
+            "the gate count must include the interface's unproven methods"
+        );
+
+        let summary = report.per_dll.get("d3d11.dll").expect("d3d11 summary");
+        assert!(summary.method_proven >= 1);
+        assert!(summary.method_unproven >= 1);
+
+        let value = serde_json::to_value(&report).expect("report serializes");
+        assert!(value.get("interface_registry").is_some());
+        assert!(value["gate"].get("unproven_method_count").is_some());
+        assert!(value["per_dll"]["d3d11.dll"].get("method_proven").is_some());
+        assert!(
+            value["per_dll"]["d3d11.dll"]
+                .get("method_unproven")
+                .is_some()
+        );
+    }
 }
