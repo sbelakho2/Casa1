@@ -188,6 +188,15 @@ impl Metal4Batch {
         Self::with_device(device)
     }
 
+    /// Whether a batch can actually be constructed on this host.
+    ///
+    /// See [`batch_creation_succeeds`]: some hosts advertise the Metal 4
+    /// selectors but raise on the first real message, and an Objective-C
+    /// exception cannot be caught by Rust.
+    pub fn batch_creation_succeeds() -> bool {
+        Self::new().is_ok()
+    }
+
     /// Create a batch executor for an explicit device (used by GPU tests).
     pub fn with_device(device: metal::Device) -> AppResult<Self> {
         if !metal4_supported(&device) {
@@ -570,14 +579,27 @@ fn metal4_supported(device: &metal::DeviceRef) -> bool {
     Metal4Queue::is_supported(device)
 }
 
-#[cfg(test)]
-pub(crate) fn force_submission_failure(force: bool) {
-    test_faults::force_submission_failure(force);
+/// Whether a [`Metal4Batch`] can actually be constructed on this host.
+///
+/// `Metal4Queue::is_supported` only proves the device *advertises* the Metal 4
+/// selectors. On some hosts (notably CI virtual GPUs) the selector is present
+/// but the first real Objective-C message raises an exception, which Rust
+/// cannot catch and which aborts the process. Probing construction here keeps
+/// that host limitation contained to this probe instead of killing a test
+/// binary, and it reports the same "unsupported" answer a real runtime falls
+/// back on.
+pub fn batch_creation_succeeds() -> bool {
+    Metal4Batch::new().is_ok()
 }
 
 #[cfg(test)]
 pub(crate) fn force_unsupported(force: bool) {
     test_faults::force_unsupported(force);
+}
+
+#[cfg(test)]
+pub(crate) fn force_submission_failure(force: bool) {
+    test_faults::force_submission_failure(force);
 }
 
 #[cfg(test)]

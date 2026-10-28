@@ -1165,7 +1165,7 @@ impl GuestSliceMemory {
             let bits = ((value >> (done * 8)) & mask) << (offset * 8);
             let field_mask = mask << (offset * 8);
             self.atomic_word(word_base)
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
                     Some((old & !field_mask) | bits)
                 })
                 .expect("atomic guest-word update never fails");
@@ -1219,7 +1219,7 @@ impl GuestSliceMemory {
                 word.fetch_add(field_bits, Ordering::SeqCst)
             } else {
                 let mut previous = 0_u64;
-                word.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                word.try_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
                     previous = old;
                     let field = (old >> (offset * 8)) & mask;
                     let next = field.wrapping_add(field_bits) & mask;

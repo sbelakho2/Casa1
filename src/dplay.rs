@@ -2564,7 +2564,7 @@ fn map_bind_error(error: &io::Error) -> u32 {
 /// relay and termination — all over the session's real UDP socket.
 fn consume_drop(counter: &AtomicU32) -> bool {
     counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
             remaining.checked_sub(1)
         })
         .is_ok()

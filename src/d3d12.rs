@@ -14331,10 +14331,9 @@ entry:
 
     #[test]
     fn d3d12_execute_command_lists_metal4_parallel_batch_preserves_plan_and_fence() {
-        let Some(device) = metal::Device::system_default() else {
-            return;
-        };
-        if !crate::metal_backend::Metal4Queue::is_supported(&device) {
+        // Skip on hosts that cannot exercise MTL4 end-to-end (e.g. CI runners
+        // whose virtual GPU advertises the selectors but raises on first use).
+        if !metal4_batch::batch_creation_succeeds() {
             return;
         }
         let mut runtime = D3d12Runtime::new();
@@ -14433,10 +14432,9 @@ entry:
 
     #[test]
     fn d3d12_execute_command_lists_metal4_failure_falls_back_with_counter() {
-        let Some(device) = metal::Device::system_default() else {
-            return;
-        };
-        if !crate::metal_backend::Metal4Queue::is_supported(&device) {
+        // Skip on hosts that cannot exercise MTL4 end-to-end (e.g. CI runners
+        // whose virtual GPU advertises the selectors but raises on first use).
+        if !metal4_batch::batch_creation_succeeds() {
             return;
         }
         let mut runtime = D3d12Runtime::new();
