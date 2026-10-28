@@ -62,6 +62,7 @@ pub const STATUS_PRIVILEGE_NOT_HELD: NtStatus = 0xC000_0061u32 as NtStatus;
 pub const STATUS_THREAD_IS_TERMINATING: NtStatus = 0xC000_004Bu32 as NtStatus;
 pub const STATUS_UNSUCCESSFUL: NtStatus = 0xC000_0001u32 as NtStatus;
 pub const STATUS_DELETE_PENDING: NtStatus = 0xC000_0056u32 as NtStatus;
+pub const STATUS_DEVICE_BUSY: NtStatus = 0x8000_0011u32 as NtStatus;
 
 /// Returns `true` for a successful or informational status (bit 31 clear).
 pub const fn is_success(status: NtStatus) -> bool {
