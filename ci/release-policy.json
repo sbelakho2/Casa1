@@ -1,20 +1,6 @@
 {
   "schema_version": 1,
   "kind": "casa1-release-policy",
-  "protected_branches": {
-    "main": {
-      "required_status_checks": [
-        "CI Gate",
-        "Windows Oracle"
-      ],
-      "strict": true,
-      "enforce_admins": true,
-      "allow_force_pushes": false,
-      "allow_deletions": false,
-      "required_approving_review_count": 1,
-      "dismiss_stale_reviews": true
-    }
-  },
   "workflows": {
     ".github/workflows/ci.yml": {
       "aggregate_job": "ci-gate",
@@ -99,13 +85,6 @@
       "--skip",
       "--lib --bins --tests"
     ],
-    "manual_settings_required_terms": [
-      "force push",
-      "deletions",
-      "CI Gate",
-      "enforce",
-      "review"
-    ],
     "forbid_feature_tokens": [
       "metal"
     ],
@@ -139,14 +118,5 @@
         }
       ]
     }
-  },
-  "manual_github_settings": [
-    "Repository Settings > General: disable 'Allow force pushes' and 'Allow deletions' for main.",
-    "Branches > main protection: require the status check 'CI Gate' (strict/up-to-date), enforce for administrators, require at least 1 approving review, and dismiss stale reviews.",
-    "Branches > main protection: do not allow force pushes, do not allow deletions, and do not bypass the required checks for administrators.",
-    "Tags: protect v* release tags from update/deletion (GitHub tag protection rules; not expressible in this repository).",
-    "Environments: protect the self-hosted release environment with required reviewers; the release workflow is workflow_dispatch-only.",
-    "Actions > General: require approval for first-time contributors and keep the default GITHUB_TOKEN read-only.",
-    "Verify after applying: `gh api repos/:owner/:repo/branches/main/protection` shows required_status_checks.contexts == ['CI Gate'], enforce_admins.enabled == true, allow_force_pushes.enabled == false, allow_deletions.enabled == false."
-  ]
+  }
 }

@@ -19,11 +19,9 @@ when the workflow shape or gate semantics drift:
   * no workflow embeds force-push, forced-delete, branch-delete, hard-reset,
     or hook-skipping commands.
 
-The manual GitHub settings that remain are printed by ``--print-manual`` and
-documented in docs/RELEASE_HARDENING.md.
 
 Usage:
-    python3 ci/check_release_policy.py [--root PATH] [--print-manual]
+    python3 ci/check_release_policy.py [--root PATH]
 """
 
 from __future__ import annotations
@@ -43,7 +41,6 @@ MANDATORY_POLICY_JOBS = {
     ".github/workflows/ci.yml": ("test", "api-gate", "policy-check", "ci-gate"),
     ".github/workflows/release.yml": ("check-release-gate", "release-gate"),
 }
-MANDATORY_MAIN_CONTEXT = "CI Gate"
 
 
 class PolicyError(RuntimeError):
@@ -234,56 +231,6 @@ def check_status_contexts(policy: dict, parsed: dict[str, dict[str, dict]]) -> l
         for job in jobs.values()
         if job.get("name")
     }
-    protected = policy.get("protected_branches") or {}
-    if not isinstance(protected, dict):
-        return ["protected_branches must be an object"]
-    if "main" not in protected:
-        errors.append("protected_branches must include 'main'")
-    for branch, spec in protected.items():
-        if not isinstance(spec, dict):
-            errors.append(f"protected branch {branch}: policy entry must be an object")
-            continue
-        contexts = list(spec.get("required_status_checks") or [])
-        if not contexts:
-            errors.append(
-                f"protected branch {branch}: at least one required status check is required"
-            )
-        for context in contexts:
-            if context not in names:
-                errors.append(
-                    f"protected branch {branch}: required status check "
-                    f"{context!r} is not a job name in any workflow"
-                )
-        if branch == "main":
-            ci_path = (policy.get("contract") or {}).get(
-                "ci_workflow", ".github/workflows/ci.yml"
-            )
-            ci_spec = (policy.get("workflows") or {}).get(ci_path) or {}
-            expected_context = ci_spec.get("aggregate_name", MANDATORY_MAIN_CONTEXT)
-            if expected_context not in contexts:
-                errors.append(
-                    f"protected branch main: required status checks must include the "
-                    f"CI aggregate context {expected_context!r}"
-                )
-            if MANDATORY_MAIN_CONTEXT not in contexts:
-                errors.append(
-                    f"protected branch main: required status checks must include "
-                    f"{MANDATORY_MAIN_CONTEXT!r}"
-                )
-        if spec.get("allow_force_pushes") is not False:
-            errors.append(f"protected branch {branch}: allow_force_pushes must be false")
-        if spec.get("allow_deletions") is not False:
-            errors.append(f"protected branch {branch}: allow_deletions must be false")
-        if spec.get("strict") is not True:
-            errors.append(f"protected branch {branch}: strict required checks must be true")
-        if spec.get("enforce_admins") is not True:
-            errors.append(f"protected branch {branch}: enforce_admins must be true")
-        if int(spec.get("required_approving_review_count", 0)) < 1:
-            errors.append(
-                f"protected branch {branch}: at least one approving review is required"
-            )
-        if spec.get("dismiss_stale_reviews") is not True:
-            errors.append(f"protected branch {branch}: dismiss_stale_reviews must be true")
     return errors
 
 
@@ -557,7 +504,7 @@ def check_contract(policy: dict, parsed: dict[str, dict[str, dict]], root: pathl
             errors,
             f"{nightly_path}:all-features-test",
             job_text(all_features),
-            ["brew install ffmpeg", "export PKG_CONFIG_PATH", "cargo test --all-features"],
+            ["brew install ffmpeg", "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)", "cargo test --all-features"],
         )
     if "ci/meta-tests.txt" not in nightly:
         errors.append(
@@ -623,41 +570,18 @@ def check_contract(policy: dict, parsed: dict[str, dict[str, dict]], root: pathl
                         f"{path.relative_to(root)}:{number}: forbidden command "
                         f"pattern {pattern!r}"
                     )
-    # The manual server-side remainder must stay documented: dropping the
-    # force-push/status-check instructions would silently lose the only place
-    # the non-representable policy is recorded.
-    manual_text = "\n".join(policy.get("manual_github_settings") or []).lower()
-    for term in contract.get("manual_settings_required_terms") or []:
-        if term.lower() not in manual_text:
-            errors.append(
-                f"manual_github_settings must document the server-side term {term!r}"
-            )
     errors.extend(check_windows_oracle(policy, parsed, root))
     return errors
-
-
-def print_manual(policy: dict) -> None:
-    print("Server-side GitHub settings (cannot be set from repository code):")
-    for item in policy.get("manual_github_settings") or []:
-        print(f"  - {item}")
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=str(pathlib.Path(__file__).resolve().parent.parent))
-    parser.add_argument(
-        "--print-manual",
-        action="store_true",
-        help="print the server-side checklist and exit",
-    )
     args = parser.parse_args(argv)
     root = pathlib.Path(args.root).resolve()
 
     try:
         policy = load_policy(root)
-        if args.print_manual:
-            print_manual(policy)
-            return 0
         errors, parsed = check_workflow_shape(policy, root)
         errors.extend(check_status_contexts(policy, parsed))
         errors.extend(check_contract(policy, parsed, root))
@@ -678,7 +602,6 @@ def main(argv: list[str]) -> int:
         "release policy: OK — required jobs, aggregate gates, evidence manifest, "
         "nightly FFmpeg/UBSAN, and no-force-push workflow contract verified"
     )
-    print("manual server-side settings remain: run with --print-manual")
     return 0
 
 

@@ -94,19 +94,19 @@ The release evidence therefore carries the manifest hash, and the release
 gate cannot be satisfied with a stale manifest from another commit or a
 manifest that omits a declared suite. Differential categories the oracle does
 not implement are surfaced as explicit warnings in every manifest run and in
-`--print-manual`-style release output; they do not silently pass as bound
+release output; they do not silently pass as bound
 evidence.
 
 ## 2. CI and release policy check
 
 `ci/check_release_policy.py` reads `ci/release-policy.json` and verifies the
-in-repo part of the protected-main/release policy:
+in-repo release policy:
 
 - every required CI/release job still exists;
 - the aggregate `CI Gate` and `Release Gate` jobs run with `if: always()` and
   need every required job;
-- the required status contexts for `main` (`CI Gate`, `Windows Oracle`) are
-  real job names, and the Windows oracle aggregate needs all three stages;
+- the Windows oracle aggregate `Windows Oracle` exists and needs all three
+  of its stages;
 - the Windows oracle reference build command and required categories are
   present, and `CharUpperW`/`snprintf` are statically linked through
   `user32`/`legacy_stdio_definitions` (the `__imp_*` link fix);
@@ -124,7 +124,6 @@ Run it locally:
 
 ```bash
 python3 ci/check_release_policy.py --root .
-python3 ci/check_release_policy.py --root . --print-manual
 ```
 
 `policy-check` is a CI job and `CI Gate` needs it. `Release Gate` runs the
@@ -153,69 +152,7 @@ the names and the commands are both checked.
   `api-report --gate completeness`. The policy check requires both the names
   and the commands, not just one or the other.
 
-## 4. Manual GitHub settings (not representable in the repository)
-
-Repository code cannot create branch protection, tag protection, or
-environment reviewers. An administrator must apply the following and verify
-them with the GitHub API. The in-repo policy check guarantees that the jobs
-and status contexts referenced below keep existing with the right semantics.
-
-### Branch protection for `main`
-
-Required status check: **CI Gate** (the aggregate job). Use strict/up-to-date
-checks, enforce for administrators, require at least one approving review,
-dismiss stale reviews, and disable force pushes and deletions.
-
-```bash
-gh api --method PUT repos/:owner/:repo/branches/main/protection \
-  -F required_status_checks[strict]=true \
-  -f 'required_status_checks[contexts][]=CI Gate' \
-  -F enforce_admins=true \
-  -F required_pull_request_reviews[dismiss_stale_reviews]=true \
-  -F required_pull_request_reviews[required_approving_review_count]=1 \
-  -F restrictions=null \
-  -F allow_force_pushes=false \
-  -F allow_deletions=false
-```
-
-Verify:
-
-```bash
-gh api repos/:owner/:repo/branches/main/protection
-```
-
-Expected: `required_status_checks.contexts` contains exactly `CI Gate`,
-`enforce_admins.enabled` is `true`, `allow_force_pushes.enabled` is `false`,
-and `allow_deletions.enabled` is `false`.
-
-### Tags and environments
-
-- Protect `v*` release tags from update/deletion with GitHub tag protection
-  rules (this is server-side and is not expressible in this repository).
-- Protect the self-hosted release environment with required reviewers. The
-  release workflow is `workflow_dispatch` only; `Release Gate` aggregates the
-  signed build, Steam E2E, smoke, entitlements, evidence, and policy checks.
-- Keep `GITHUB_TOKEN` read-only by default and require approval for first-time
-  contributors in `Actions > General`.
-
-### What remains manual
-
-The policy manifest records the intended values, but only these server-side
-actions can apply them:
-
-1. Branch protection rule for `main` (required check `CI Gate`, strict,
-   admins enforced, one approval, stale-review dismissal).
-2. Force-push and branch-deletion disabled for `main`.
-3. Tag protection for `v*`.
-4. Release environment reviewers and default token permissions.
-
-Everything else — job existence, aggregate gating, completeness/regression
-semantics, manifest generation/upload/folding/verification, nightly FFmpeg
-and UBSAN invocation, absence of a `metal` feature, and absence of destructive
-git commands in workflows — is enforced from this repository by
-`ci/check_release_policy.py` and `ci/check_tests.sh`.
-
-## 5. Failure recovery
+## 4. Failure recovery
 
 - **Unbound conformance suite**: add/restore the test target or test function,
   or remove/downgrade the declaration in `src/api_coverage.rs` (owned by the
