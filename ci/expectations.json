@@ -245,6 +245,12 @@
   "(records[2].class, DeviceClass::Serial)",
   "(records[2].id, serial_b.id)"
  ],
+ "aggregate_coverage_recomputes_and_reports_missing_method_proof": [
+  "(aggregate.proven, false)",
+  "( aggregate.unproven_methods, vec![\"CreateBuffer\".to_string()], \"the aggregate must report the method that lacks proof\" )",
+  "(aggregate.proven, true)",
+  "(aggregate.semantic_test_coverage, CoverageLevel::Conformance)"
+ ],
  "alertable_apcs_wake_wait_and_non_alertable_apcs_do_not": [
   "( manager.thread_state(created.id), Some(KernelThreadState::Ready) )",
   "(manager.take_wake_status(created.id), Some(STATUS_USER_APC))",
@@ -798,6 +804,14 @@
   "(registry.provider_count(), 0)",
   "( cannot_attest(&AttestationError::InvalidSignature), \"attestation failed\" )"
  ],
+ "audio_absent_endpoint_and_unsupported_stream_operation_are_exact": [
+  "( bridge.open_user_client(id).map(|_| ()), Err(DeviceError::DeviceMissing { id }) )",
+  "(client.device_id(), descriptor.id)",
+  "(client.class(), DeviceClass::Audio)",
+  "(bridge.class(), DeviceClass::Audio)",
+  "(bridge.operation_support(HostOperation::Enumerate), Ok(()))",
+  "( bridge.operation_support(HostOperation::AudioStream), Err(DeviceError::Unsupported { feature: \"audio stream open\" }) )"
+ ],
  "audio_client2_and_3_extension_methods_are_real": [
   "(hr, 0, \"GetSharedModeEnginePeriod succeeds\")",
   "(fundamental_frames, minimum_frames)",
@@ -831,6 +845,22 @@
   "( call(&mut session, HostThunk::GetMessageA, &[message, 0, 0, 0]), 1 )",
   "(read_u32(&session, marker), 1)",
   "( call( &mut session, HostThunk::AudioActivationOperationGetActivateResult, &[operation, activate_result, activate_interface], ), 0 )"
+ ],
+ "audio_format_mapping_and_duplicate_endpoints_are_exact": [
+  "(format.bits_per_sample(), bits)",
+  "(format.is_float(), float)",
+  "(format.as_str(), name)",
+  "(descriptor.formats.len(), 2)",
+  "(descriptor.formats[0].block_align, 4)",
+  "(descriptor.formats[1].block_align, 8)"
+ ],
+ "audio_hotplug_duplicate_apply_is_idempotent_and_removal_is_exact": [
+  "(bridge.refresh(), Ok(Vec::new()))",
+  "( bridge.apply(vec![descriptor.clone(), descriptor.clone()]), vec![HotplugEvent::Arrived(descriptor.record())] )",
+  "( bridge.apply(vec![descriptor.clone()]), Vec::<HotplugEvent>::new() )",
+  "( bridge.apply(Vec::new()), vec![HotplugEvent::Removed { record: descriptor.record() }] )",
+  "(bridge.records(), Vec::new())",
+  "(bridge.record(descriptor.id), None)"
  ],
  "auto_unavailable_host_and_deterministic_modes_fall_back": [
   "( crate::runtime::jit_construction_selected(&JitMode::Auto, false, false), false )",
@@ -5559,6 +5589,14 @@
   "(completion, Some((handle, context, S_OK)))",
   "( host.receive_from(Duration::from_secs(1)) .expect(\"self loopback\") .data, b\"self\" )"
  ],
+ "host_timer_and_work_facilities_reject_stopped_and_crashed_hosts": [
+  "( host.pump_timers(now).expect(\"pump\"), vec![TimerFired { id: timer, lateness: Duration::ZERO }] )",
+  "(host.timers().total_fires(), 1, \"timers() inspects the pump\")",
+  "( host.cancel_timer(armed).expect(\"cancel armed\"), true, \"cancelling an armed timer wins\" )",
+  "(host.drain_work(4).expect(\"drain\"), vec![work])",
+  "(host.work_queue().runs(work), 1)",
+  "( host.start_timer(now, None).expect_err(\"timer after stop\"), UmdfError::HostStopped )"
+ ],
  "host_unavailable_devices_never_report_synthetic_success": [
   "( manager.start_device(absent), Err(STATUS_DEVICE_HARDWARE_ERROR) )",
   "( manager.power_irp(absent, IRP_MN_SET_POWER, 1), Err(STATUS_DEVICE_NOT_READY) )",
@@ -5740,6 +5778,19 @@
   "(monitor.check_access(tcb, &descriptor, GENERIC_READ), Ok(()))",
   "( monitor.check_access(token_for_impersonation, &descriptor, GENERIC_WRITE), Err(STATUS_ACCESS_DENIED) )",
   "( monitor.check_access(token_for_impersonation, &descriptor, GENERIC_READ), Ok(()) )"
+ ],
+ "interface_gate_rejects_exact_claim_with_missing_method_proof": [
+  "(aggregate.proven, false)",
+  "( aggregate.unproven_methods, vec![\"EnumAdapters\".to_string()], \"the unproven required method must be reported\" )",
+  "(violations.len(), 1)",
+  "( violations[0].kind, ApiGateViolationKind::InterfaceClaimsUnprovenMethods )",
+  "(aggregate.proven, true)",
+  "( proven.interface_completeness_gate().len(), 0, \"a fully proven exact/full interface passes\" )"
+ ],
+ "interface_gate_rejects_exact_or_full_claim_with_missing_method_proof": [
+  "(violations.len(), 1)",
+  "( violations[0].kind, ApiGateViolationKind::InterfaceClaimsUnprovenMethods )",
+  "( partial.interface_completeness_gate().len(), 0, \"a documented partial interface must not fail merely for unproven methods\" )"
  ],
  "interface_gate_rejects_missing_method_rows": [
   "( violations.len(), 1, \"a known interface without method rows must fail once\" )",
@@ -6811,6 +6862,46 @@
   "(status, STATUS_CANCELLED)",
   "( memory.read_u32(outer + 0x30).unwrap(), STATUS_CANCELLED as u32 )"
  ],
+ "kmdf_child_list_arrival_removal_dispatch_pnp_transitions": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfChildListCreate, &[device, 0, 0, list_out], ) .expect(\"null enumerate\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfChildListCreate, &[device, 0, config, list_out], ) .expect(\"create child list\"), STATUS_SUCCESS )",
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfChildListGetChildCount, &[list], ) .expect(\"initial count\"), 0 )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfEvtChildListScanDispatch, &[list], ) .expect(\"empty scan\"), STATUS_SUCCESS )",
+  "( { memory.read_u32(enumerate_counter).unwrap() }, 1, \"EvtChildListEnumerateChildren ran\" )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCollectionCreate, &[0, 0, collection_out], ) .expect(\"scan collection\"), STATUS_SUCCESS )"
+ ],
+ "kmdf_child_scan_dead_handles_and_pdo_collision_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfChildListCreate, &[island.kmdf_driver_handle(), 0, config, list_out], ) .expect(\"child list on driver\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfChildListCreate, &[device, 0, config, list_out], ) .expect(\"child list create\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitAssignName, &[colliding_init, colliding_name], ) .expect(\"assign colliding name\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceCreate, &[colliding_init, 0, collide_out], ) .expect(\"colliding device\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfChildListGetFirst, &[list, 0], ) .expect(\"iterator null out\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfChildListGetChildCount, &[list], ) .expect(\"count after parentless seed\"), 1 )"
+ ],
+ "kmdf_cm_resource_list_out_of_range_descriptor_returns_null": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCmResourceListCreate, &[0, 0, list_out], ) .expect(\"zero descriptors\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCmResourceListCreate, &[0, 65, list_out], ) .expect(\"too many descriptors\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCmResourceListCreate, &[0, 2, list_out], ) .expect(\"create list\"), STATUS_SUCCESS )",
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfCmResourceListGetCount, &[list], ) .expect(\"count\"), 2 )",
+  "(memory.read_u8(descriptor0).unwrap(), 1)",
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfCmResourceListGetDescriptor, &[list, 2], ) .expect(\"descriptor oob\"), 0, \"out-of-range descriptor returns NULL\" )"
+ ],
+ "kmdf_collection_duplicate_add_and_stale_remove_reject_exact_status": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCollectionCreate, &[0, 0, collection_out], ) .expect(\"create collection\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCollectionAdd, &[driver, 0x1000], ) .expect(\"add on driver\"), STATUS_OBJECT_TYPE_MISMATCH )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCollectionAdd, &[0xDEAD_BEEF, 0x1000], ) .expect(\"add on missing\"), STATUS_INVALID_HANDLE )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCollectionAdd, &[collection, 0x1111], ) .expect(\"first add\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCollectionAdd, &[collection, 0x1111], ) .expect(\"duplicate add\"), STATUS_OBJECT_NAME_COLLISION )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCollectionAdd, &[collection, 0x2222], ) .expect(\"second add\"), STATUS_SUCCESS )"
+ ],
+ "kmdf_control_device_finish_rejects_double_and_symlink_resolves": [
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfControlDeviceInitAllocate, &[driver + 0x1000, 0], ) .expect(\"wrong driver\"), STATUS_INVALID_HANDLE as u64 )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceInitAssignName, &[init, name], ) .expect(\"assign name\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceCreate, &[init, 0, device_out], ) .expect(\"create control device\"), STATUS_SUCCESS )",
+  "(state.kmdf.symbolic_links_created, 1)",
+  "( nt_open_island_device(&runtime, &mut memory, \"\\\\??\\\\CasaCtlLink\", handle_ptr), Some(STATUS_SUCCESS) )",
+  "( nt_open_island_device( &runtime, &mut memory, \"\\\\DosDevices\\\\CasaCtlLink\", handle_ptr ), Some(STATUS_SUCCESS) )"
+ ],
  "kmdf_device_add_and_ioctl_complete_through_guest_callbacks": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS, \"WdfDriverCreate must drive EvtDriverDeviceAdd\" )",
   "(island.status(), STATUS_SUCCESS)",
@@ -6822,6 +6913,30 @@
  "kmdf_dispatch_arena_exhaustion_rejects_with_io_error": [
   "(error.code, ReasonCode::RcIo)",
   "( error.message.contains(\"driver island arena exhausted\"), true )"
+ ],
+ "kmdf_dispatch_next_power_guard_and_off_island_tick_are_safe": [
+  "( island .dispatch_pnp( &mut runtime, &mut memory, device_object, IRP_MN_START_DEVICE, ) .expect(\"start\") .0, STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[device, config, 0, queue_out], ) .expect(\"power queue\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceStopIdle, &[device, 1], ) .expect(\"stop idle\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceResumeIdle, &[device], ) .expect(\"resume into idle\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device, request_out], ) .expect(\"request\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceEnqueueRequest, &[device, request], ) .expect(\"enqueue while idle\"), STATUS_SUCCESS )"
+ ],
+ "kmdf_dma_profiles_and_phase_guards_reject_exact_status": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCreate, &[device, 0, 0x1, out], ) .expect(\"unmapped config\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCreate, &[device, 0, config, out], ) .expect(\"short size\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCreate, &[device, 0, config, out], ) .expect(\"long enabler\"), STATUS_SUCCESS )",
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCalculateMaximumTransferSize, &[long], ) .expect(\"long max\"), 0x40_0000, \"Long profile reports the configured maximum verbatim\" )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCreate, &[device, 0, config, out], ) .expect(\"scatter gather enabler\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaTransactionCreate, &[sg, 0, txn_out], ) .expect(\"sg transaction\"), STATUS_SUCCESS )"
+ ],
+ "kmdf_dma_transfer_scenarios_reject_uninitialized_and_oversized": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCreate, &[device, 0, config, enabler_out], ) .expect(\"bad profile\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCreate, &[device, 0, config, enabler_out], ) .expect(\"zero max\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCreate, &[device, 0, config, enabler_out], ) .expect(\"create enabler\"), STATUS_SUCCESS )",
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCalculateMaximumTransferSize, &[enabler], ) .expect(\"max transfer\"), 0x1_0000, \"Short profile caps single-segment transfers at 64 KB\" )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaTransactionCreate, &[enabler, 0, transaction_out], ) .expect(\"create transaction\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaTransactionExecute, &[transaction], ) .expect(\"execute uninitialized\"), STATUS_INVALID_DEVICE_STATE )"
  ],
  "kmdf_driver_and_device_shims_reject_invalid_arguments": [
   "( state .kmdf .objects .get(&first) .and_then(|object| object.parent), Some(second) )",
@@ -6859,6 +6974,14 @@
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS, \"staged service {service} must load\" )",
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS, \"staged x86 service {service} must load\" )"
  ],
+ "kmdf_forward_to_queue_defer_dispatch_and_missing_callback_paths": [
+  "( island .dispatch_pnp( &mut runtime, &mut memory, device_object, IRP_MN_START_DEVICE, ) .expect(\"start\") .0, STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[device, config, 0, queue_out], ) .expect(\"power-managed queue\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceStopIdle, &[device, 1], ) .expect(\"stop idle\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceResumeIdle, &[device], ) .expect(\"resume into idle\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device, request_out], ) .expect(\"request\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestForwardToIoQueue, &[request, pm_queue], ) .expect(\"forward to idle power queue\"), STATUS_SUCCESS, \"the forward defers onto the non-ready power queue\" )"
+ ],
  "kmdf_framework_dispatches_read_write_cleanup_close_and_ioctl": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS )",
   "(status, STATUS_SUCCESS)",
@@ -6874,6 +6997,34 @@
   "(state.kmdf.driver_init_flags, 0)",
   "(state.kmdf.devices.len(), 2)",
   "(state.kmdf.queues.len(), 2)"
+ ],
+ "kmdf_import_lookup_new_names_resolve_and_unknown_rejects": [
+  "( DriverShim::for_import(name), Some(shim), \"import {name} must resolve to {shim:?}\" )",
+  "( DriverShim::for_import(&upper), Some(shim), \"import {upper} must resolve case-insensitively\" )",
+  "( DriverShim::for_import(\"WdfNoSuchApiAtAll\"), None, \"an unknown import name must stay unresolved\" )"
+ ],
+ "kmdf_interrupt_config_edges_and_vector_collision_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptCreate, &[device, 0, 0, out], ) .expect(\"null config\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptCreate, &[device, 0, 0x1, out], ) .expect(\"unmapped config\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptCreate, &[device, 0, config, out], ) .expect(\"tiny size\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptCreate, &[device, 0, config, out], ) .expect(\"isr without dpc\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptQueueDpcForIsr, &[bare], ) .expect(\"queue dpc without config\"), STATUS_INVALID_DEVICE_REQUEST )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::IoConnectInterrupt, &[connect_out, isr, 0, 0, 0x31, 3, 3, 0, 0, 1, 0], ) .expect(\"wdm connect\"), STATUS_SUCCESS )"
+ ],
+ "kmdf_interrupt_disable_blocks_dispatch_and_lock_recursion_rejects": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptCreate, &[device, 0, config, interrupt_out], ) .expect(\"null isr\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptCreate, &[device, 0, config, interrupt_out], ) .expect(\"create interrupt\"), STATUS_SUCCESS )",
+  "( island .trigger_virtual_interrupt(&mut runtime, &mut memory, vector) .expect(\"trigger\"), 1, \"the ISR claimed the interrupt\" )",
+  "( { island.inner.borrow().kmdf.interrupts[&interrupt].dpc_queued }, 0, \"triggering the ISR alone does not queue the DPC\" )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptQueueDpcForIsr, &[interrupt], ) .expect(\"queue dpc\"), STATUS_SUCCESS )",
+  "( { memory.read_u32(dpc_counter).unwrap() }, 1, \"EvtInterruptDpc ran once\" )"
+ ],
+ "kmdf_interrupt_synchronize_runs_callback_at_sync_irql": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptCreate, &[device, 0, config, interrupt_out], ) .expect(\"create\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptSynchronize, &[interrupt, 0, 0], ) .expect(\"null sync callback\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptSynchronize, &[interrupt, sync, 0], ) .expect(\"synchronize\"), 1, \"synchronize on an enabled interrupt returns TRUE\" )",
+  "( { memory.read_u32(counter).unwrap() }, 1, \"the synchronize callback ran\" )",
+  "(state.kernel.irql, 0, \"IRQL restored after synchronize\")"
  ],
  "kmdf_ioctl_without_a_queue_fails_with_invalid_device_request": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS )",
@@ -6896,6 +7047,22 @@
   "( island .call_shim_for_test( &mut runtime, &mut memory, DriverShim::WdfIoTargetCreate, &[device_b, 0, target_b_out], ) .expect(\"target B\") as u32 as i32, STATUS_SUCCESS )",
   "( island .call_shim_for_test( &mut runtime, &mut memory, DriverShim::WdfIoTargetSendIoctlSynchronously, &[ target_b, 0, 0x0022_0004, input_descriptor, output_descriptor, 0, bytes_returned, ], ) .expect(\"send\") as u32 as i32, STATUS_SUCCESS )"
  ],
+ "kmdf_irp_dispatch_defers_on_idle_power_managed_queue": [
+  "( island .dispatch_pnp( &mut runtime, &mut memory, device_object, IRP_MN_START_DEVICE, ) .expect(\"start\") .0, STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[device, config, 0, queue_out], ) .expect(\"power queue\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceStopIdle, &[device, 1], ) .expect(\"stop idle\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceResumeIdle, &[device], ) .expect(\"resume into idle\"), STATUS_SUCCESS )",
+  "( status, STATUS_PENDING, \"an idle power-managed queue defers the IRP\" )",
+  "( island.kmdf_counters().2, defers_before + 1, \"the dispatch-time power defer bumps the counter\" )"
+ ],
+ "kmdf_lookaside_reuse_after_free_and_oversize_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfLookasideListCreate, &[0, 0, 0, 0, lookaside_out], ) .expect(\"zero size\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfLookasideListCreate, &[0, 0, 0x2_0000, 0, lookaside_out], ) .expect(\"oversize\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfLookasideListCreate, &[0, 2, 0x40, 0, lookaside_out], ) .expect(\"bad pool type\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfLookasideListCreate, &[0, 0, 0x40, 0, lookaside_out], ) .expect(\"create lookaside\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreateFromLookaside, &[lookaside, memory_out], ) .expect(\"first allocation\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfObjectDelete, &[first], ) .expect(\"delete memory\"), STATUS_SUCCESS )"
+ ],
  "kmdf_manual_queue_retrieval_and_cancellation": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS )",
   "(status, STATUS_SUCCESS)",
@@ -6912,8 +7079,32 @@
   "( island .call_shim_for_test( &mut runtime, &mut memory, DriverShim::WdfIoQueueRetrieveFoundRequest, &[queue, requests[1], found_out], ) .expect(\"retrieve found\") as u32 as i32, STATUS_SUCCESS )",
   "(memory.read_u64(found_out).unwrap(), requests[1])"
  ],
+ "kmdf_memory_copy_overlap_and_assign_overflow_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreatePreallocated, &[0, buffer_a, 0x80, out], ) .expect(\"prealloc A\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreatePreallocated, &[0, buffer_b, 0x80, out], ) .expect(\"prealloc B\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCopy, &[memory_a, memory_b, 0x81], ) .expect(\"overflow copy\"), STATUS_BUFFER_TOO_SMALL )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCopy, &[memory_a, memory_a, 0x40], ) .expect(\"overlap copy\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCopy, &[memory_a, memory_b, 0x80], ) .expect(\"valid copy\"), STATUS_SUCCESS )",
+  "(memory.read_u8(buffer_b).unwrap(), 0xAA)"
+ ],
  "kmdf_missing_framework_symbol_rejects_the_image": [
   "(error.code, ReasonCode::RcImportMissing)"
+ ],
+ "kmdf_new_shims_reject_stale_and_wrong_type_handles": [
+  "( call_island_shim(&island, &mut runtime, &mut memory, shim, &args) .unwrap_or_else(|error| panic!(\"{shim:?} host error: {error}\")), want, \"{shim:?} with a stale handle\" )",
+  "( call_island_shim(&island, &mut runtime, &mut memory, shim, &args) .unwrap_or_else(|error| panic!(\"{shim:?} host error: {error}\")), STATUS_OBJECT_TYPE_MISMATCH, \"{shim:?} with the driver handle\" )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestGetStatus, &[dead], ) .expect(\"get status stale\"), STATUS_INVALID_HANDLE )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestGetStatus, &[driver], ) .expect(\"get status wrong type\"), STATUS_OBJECT_TYPE_MISMATCH )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestMarkCancelable, &[dead, stub], ) .expect(\"mark cancelable stale\"), STATUS_INVALID_HANDLE )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestUnmarkCancelable, &[dead], ) .expect(\"unmark cancelable stale\"), STATUS_INVALID_HANDLE )"
+ ],
+ "kmdf_null_output_pointers_reject_exact_status": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCollectionCreate, &[0, 0, 0], ) .expect(\"collection null out\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfLookasideListCreate, &[0, 0, 0x40, 0, 0], ) .expect(\"lookaside null out\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfMemoryCreateFromLookaside, &[0, 0, 0], ) .expect(\"lookaside memory null out\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptCreate, &[device, 0, 0, 0], ) .expect(\"interrupt null out\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCreate, &[device, 0, config, 0], ) .expect(\"dma enabler null out\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, config, 0], ) .expect(\"usb null out\"), STATUS_INVALID_PARAMETER )"
  ],
  "kmdf_object_cascade_cancels_queued_requests_and_rejects_stale_objects": [
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device, out], ) .expect(\"cascade request\"), STATUS_SUCCESS )",
@@ -6946,6 +7137,14 @@
   "( island.inner.borrow().kmdf.objects.contains_key(&request), false )",
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoTargetCreate, &[device, attrs, target_out], ) .expect(\"iotarget with explicit parent\"), STATUS_SUCCESS )",
   "( island .inner .borrow() .kmdf .objects .get(&target) .expect(\"target object\") .parent, Some(device) )"
+ ],
+ "kmdf_object_reference_defers_delete_until_last_dereference": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfCollectionCreate, &[0, 0, collection_out], ) .expect(\"create collection\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfObjectReference, &[0xDEAD], ) .expect(\"reference missing\"), STATUS_INVALID_HANDLE )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfObjectReference, &[collection], ) .expect(\"reference 1\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfObjectReference, &[collection], ) .expect(\"reference 2\"), STATUS_SUCCESS )",
+  "( state.kmdf.objects[&collection].references, 2, \"two outstanding references\" )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfObjectDelete, &[collection], ) .expect(\"delete referenced object\"), STATUS_SUCCESS )"
  ],
  "kmdf_pe32_driver_executes_and_unloads": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS, \"the crafted PE32 KMDF DriverEntry must execute\" )",
@@ -7009,6 +7208,30 @@
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtReadFile, &[u64::from(handle), 0, 0, 0, iosb, buffer, 8, 0, 0], ), STATUS_SUCCESS )",
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtWriteFile, &[u64::from(handle), 0, 0, 0, iosb, buffer, 4, 0, 0], ), STATUS_SUCCESS )"
  ],
+ "kmdf_registry_create_key_and_invalid_paths_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRegistryCreateKey, &[0, absolute, 3, key_out], ) .expect(\"create absolute leaf\"), STATUS_SUCCESS )",
+  "( record.path, \"SYSTEM\\\\CurrentControlSet\\\\Services\\\\CasaKmdfK\\\\CoverageLeaf\", \"parents keep their stored case and the leaf keeps guest case\" )",
+  "(record.access, 3)",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRegistryCreateKey, &[leaf, relative, 3, key_out], ) .expect(\"create relative leaf\"), STATUS_SUCCESS )",
+  "( { let state = island.inner.borrow(); state.kmdf.registry_keys[&rel].path.clone() }, \"SYSTEM\\\\CurrentControlSet\\\\Services\\\\CasaKmdfK\\\\CoverageLeaf\\\\RelativeLeaf\" )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRegistryOpenKey, &[leaf, relative, 1, open_out], ) .expect(\"open relative child\"), STATUS_SUCCESS )"
+ ],
+ "kmdf_registry_value_type_mismatch_and_missing_key_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRegistryOpenKey, &[0, key_name, 3, key_out], ) .expect(\"open service key\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRegistryOpenKey, &[0, missing, 3, key_out], ) .expect(\"open missing\"), STATUS_OBJECT_NAME_NOT_FOUND )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRegistryOpenKey, &[0, bad_path, 3, key_out], ) .expect(\"open bad path\"), STATUS_OBJECT_PATH_INVALID )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRegistryQueryValue, &[key, value_name, buffer, 0x100, length_out, type_out], ) .expect(\"query ImagePath\"), STATUS_SUCCESS )",
+  "(memory.read_u32(type_out).unwrap(), 1, \"REG_SZ\")",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRegistryQueryValue, &[key, value_name, buffer, 1, length_out, type_out], ) .expect(\"query small buffer\"), STATUS_BUFFER_TOO_SMALL )"
+ ],
+ "kmdf_request_completed_impersonate_and_format_edges_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device, request_out], ) .expect(\"request\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestComplete, &[request, STATUS_SUCCESS as u64], ) .expect(\"complete\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestImpersonate, &[request, 2], ) .expect(\"impersonate completed\"), STATUS_INVALID_DEVICE_STATE )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device, request_out], ) .expect(\"request 2\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestFormatRequestForRead, &[request2, 0, descriptor, 4, file_out], ) .expect(\"format read\"), STATUS_SUCCESS )",
+  "(record.major, IrpMajorFunction::Read)"
+ ],
  "kmdf_request_format_cancel_and_status_reject_stale_transitions": [
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device, out], ) .expect(\"request create\"), STATUS_SUCCESS )",
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestFormatRequestForRead, &[request, device, descriptor, 4, 0], ) .expect(\"format read\"), STATUS_SUCCESS )",
@@ -7024,6 +7247,22 @@
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueStopSynchronously, &[local_queue], ) .expect(\"stop local queue\"), STATUS_SUCCESS )",
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, first, request_out], ) .expect(\"request create\"), STATUS_SUCCESS )",
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestForwardToIoQueue, &[request, cross_queue], ) .expect(\"cross-device forward\"), STATUS_INVALID_DEVICE_REQUEST )"
+ ],
+ "kmdf_request_forward_to_parent_rejects_completed_and_foreign_queue": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[parent, parent_queue_config, 0, parent_queue_out], ) .expect(\"parent manual queue\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceCreate, &[pdo_init, 0, child_out], ) .expect(\"create child\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, child, request_out], ) .expect(\"child request\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestForwardToParentDeviceIoQueue, &[request, parent_queue, 3], ) .expect(\"bad action\"), STATUS_INVALID_PARAMETER )",
+  "(status, STATUS_SUCCESS)",
+  "(state.kmdf.parent_queue_forwards, 1)"
+ ],
+ "kmdf_request_from_irp_impersonate_and_information_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreateFromIrp, &[0, irp, request_out], ) .expect(\"wrap irp\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreateFromIrp, &[0, irp, request_out], ) .expect(\"double wrap\"), STATUS_INVALID_DEVICE_REQUEST )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreateFromIrp, &[0, 0xBEEF, request_out], ) .expect(\"wrap fake irp\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfRequestWdmGetIrp, &[request], ) .expect(\"get irp\"), irp )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestImpersonate, &[request, 4], ) .expect(\"bad level\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestImpersonate, &[request, 2], ) .expect(\"unowned impersonate\"), STATUS_INVALID_DEVICE_REQUEST )"
  ],
  "kmdf_requests_and_iotargets_reject_bad_handles_and_buffers": [
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device_a, out], ) .expect(\"request a\"), STATUS_SUCCESS )",
@@ -7049,6 +7288,14 @@
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfSpinLockRelease, &[lock], ) .expect(\"release\"), STATUS_SUCCESS )",
   "(island.kmdf_spinlock_held(lock), Some(false))"
  ],
+ "kmdf_stop_and_power_after_surprise_reject_invalid_state": [
+  "( island .dispatch_pnp( &mut runtime, &mut memory, device_object, IRP_MN_START_DEVICE, ) .expect(\"start\") .0, STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[device, queue_config, 0, queue_out], ) .expect(\"cancel-callback queue\"), STATUS_SUCCESS )",
+  "( state.kmdf.queues[&cancel_queue].callbacks.canceled_on_queue, cancel_stub, \"cancel-on-queue callback parsed from config+0x38\" )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[device, queue_config, 0, queue_out], ) .expect(\"plain queue\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestCreate, &[0, device, request_out], ) .expect(\"queued request\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfRequestForwardToIoQueue, &[on_cancel_queue, cancel_queue], ) .expect(\"queue for cancel callback\"), STATUS_SUCCESS )"
+ ],
  "kmdf_surprise_removal_cancels_inflight_irp_and_rejects_repeat": [
   "( island .dispatch_pnp( &mut runtime, &mut memory, device_object, IRP_MN_START_DEVICE, ) .expect(\"start\") .0, STATUS_SUCCESS )",
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoQueueCreate, &[device, config, 0, queue_out], ) .expect(\"queue create\"), STATUS_SUCCESS )",
@@ -7056,6 +7303,22 @@
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDeviceEnqueueRequest, &[device, request], ) .expect(\"enqueue in flight\"), STATUS_PENDING )",
   "( island.kmdf_queue_state(queue), Some((0, 1, false, false, false)) )",
   "( island .dispatch_pnp( &mut runtime, &mut memory, device_object, IRP_MN_SURPRISE_REMOVAL, ) .expect(\"surprise removal\") .0, STATUS_SUCCESS )"
+ ],
+ "kmdf_usb_descriptor_validation_and_transfer_edges_reject": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, 0x1, out], ) .expect(\"unmapped config\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, config, out], ) .expect(\"short size\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, config, out], ) .expect(\"no descriptor pointer\"), STATUS_INVALID_DEVICE_STATE )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, 0, out], ) .expect(\"null config\"), STATUS_INVALID_DEVICE_STATE )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, config, out], ) .expect(\"unmapped descriptor\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, config, out], ) .expect(\"short interface\"), STATUS_INVALID_PARAMETER )"
+ ],
+ "kmdf_usb_endpoint_out_of_range_and_stall_reject_transfers": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, config, usb_out], ) .expect(\"create usb target\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, config, usb_bad_out], ) .expect(\"malformed descriptor\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, config, usb_bad_out], ) .expect(\"control endpoint as pipe\"), STATUS_INVALID_PARAMETER )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceGetInformation, &[usb, info_out], ) .expect(\"get info\"), STATUS_SUCCESS )",
+  "(memory.read_u16(info_out).unwrap(), 0x0200)",
+  "(memory.read_u16(info_out + 2).unwrap(), 0x1234)"
  ],
  "kmdf_wait_lock_blocks_with_timeout_and_wakes_waiters": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtLoadDriver, &[service_path], ), STATUS_SUCCESS )",
@@ -7080,6 +7343,14 @@
   "( island .inner .borrow() .kmdf .objects .get(&typed_lock) .and_then(|object| object.parent), Some(driver) )",
   "(ignored.evt_cleanup, 0)",
   "(ignored.evt_destroy, 0)"
+ ],
+ "kmdf_x86_config_width_branches_parse_reject_none": [
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfInterruptCreate, &[device, 0, config, out], ) .expect(\"x86 interrupt\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCreate, &[device, 0, config, enabler_out], ) .expect(\"x86 dma\"), STATUS_SUCCESS )",
+  "( call_island_shim_raw( &island, &mut runtime, &mut memory, DriverShim::WdfDmaEnablerCalculateMaximumTransferSize, &[x86_enabler], ) .expect(\"x86 short max\"), 0x1_0000, \"the x86 width read yields the Short-profile cap\" )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfChildListCreate, &[device, 0, child_config, list_out], ) .expect(\"x86 child list\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfUsbTargetDeviceCreate, &[device, 0, usb_config, usb_out], ) .expect(\"x86 usb target\"), STATUS_SUCCESS )",
+  "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfTimerCreate, &[x86_config, 0, x86_out], ) .expect(\"x86 timer\"), STATUS_SUCCESS )"
  ],
  "last_error_every_variant_is_mapped": [
   "(last_err, ERROR_SUCCESS, \"Success must map to ERROR_SUCCESS\")",
@@ -7322,6 +7593,14 @@
   "(rc(&short), TPM_RC_COMMAND_SIZE)",
   "(rc(&run(&mut tpm, &oversized)), TPM_RC_COMMAND_SIZE)",
   "(rc(&run(&mut tpm, &bad_tag)), TPM_RC_TAG)"
+ ],
+ "malformed_dictionary_values_are_rejected_without_synthesizing_ranges": [
+  "(dictionary_ranges(&PciCfValue::Dictionary(Vec::new())), None)",
+  "( dictionary_ranges(&PciCfValue::Array(vec![ PciCfValue::String(\"not-a-dictionary\".to_string()), PciCfValue::Dictionary(vec![ (\"address\".to_string(), PciCfValue::String(\"bad\".to_string())), (\"length\".to_string(), PciCfValue::Number(0x100)), ]), PciCfValue::Dictionary(vec![(\"address\".to_string(), PciCfValue::Number(0x1000)),]), dictionary(0x2000, 0x40), ])), Some(vec![(0x2000, 0x40)]) )",
+  "( dictionary_number( &[(\"address\".to_string(), PciCfValue::String(\"bad\".to_string()))], \"address\" ), None )",
+  "( dictionary_number( &[(\"address\".to_string(), PciCfValue::Number(-1))], \"address\" ), None )",
+  "( dictionary_number(&dictionary(7, 8).into_entries(), \"length\"), Some(8) )",
+  "( entitlement_strings(&PciCfValue::Array(vec![ PciCfValue::Array(vec![ PciCfValue::String(\"a\".to_string()), PciCfValue::Number(1), ]), PciCfValue::String(\"b\".to_string()), PciCfValue::Bool(false), ])), Some(vec![\"a\".to_string(), \"b\".to_string()]) )"
  ],
  "malformed_images_and_wrong_format_access_fail_with_real_hrs": [
   "( create_decoder_from_stream(&mut fixture, factory, stream).0, u64::from(WINCODEC_ERR_BADIMAGE) )",
@@ -7774,6 +8053,20 @@
   "(temporal.code, ReasonCode::RcUnsupportedPlatformApi)",
   "( temporal.message, \"MetalFX temporal: reactive masks require macOS 14.4 \\ (setReactiveMaskTextureEnabled: is unavailable)\" )"
  ],
+ "method_evidence_rejects_uncompiled_binding_and_resolves_real_tests": [
+  "( unresolved, vec![\"casa1-conformance:this_method_test_does_not_exist\".to_string()], \"only the uncompiled binding may be unresolved\" )",
+  "( unresolved_method_evidence(METHOD_COVERAGE_EVIDENCE), Vec::<String>::new(), \"every shipped method evidence row must bind to a compiled test\" )",
+  "( found.evidence_id, \"casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil\" )",
+  "( found.level, CoverageLevel::Conformance, \"method proof is conformance-level evidence\" )",
+  "( method_coverage_evidence_for(\"d3d11.dll\", \"ID3D11Device\", \"NoSuchMethod\"), None, \"an unbound method must not resolve\" )"
+ ],
+ "method_evidence_resolves_real_test_and_rejects_uncompiled_binding": [
+  "( bound.evidence_id, \"casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil\" )",
+  "(bound.level, CoverageLevel::Conformance)",
+  "( method_coverage_evidence_for(\"d3d11.dll\", \"ID3D11Device\", \"NoSuchMethod\"), None, \"an unbound method must not resolve\" )",
+  "( unresolved, vec![\"casa1-conformance:this_method_suite_is_not_compiled\".to_string()], \"an uncompiled evidence id must fail validation\" )",
+  "( unresolved_method_evidence(METHOD_COVERAGE_EVIDENCE), Vec::<String>::new(), \"every shipped method evidence row must bind to a compiled test\" )"
+ ],
  "method_level_deviations_are_counted_without_report_errors": [
   "(summary.method_total, 5)",
   "(summary.method_exact, 1)",
@@ -7948,9 +8241,9 @@
   "(DeviceClass::Hid.as_str(), \"hid\")",
   "(DeviceClass::Usb.as_str(), \"usb\")",
   "(DeviceClass::Serial.as_str(), \"serial\")",
-  "(id.as_u64(), 0x7817_8703_29fa_74f7)",
-  "(id.to_string(), \"7817870329fa74f7\")",
-  "(named.display_name(), \"Controller\")"
+  "(DeviceClass::Pci.as_str(), \"pci\")",
+  "(DeviceClass::Network.as_str(), \"network\")",
+  "(DeviceClass::Audio.as_str(), \"audio\")"
  ],
  "module_information_truncates_a_maximum_path_and_keeps_the_base_and_size_exact": [
   "(bytes.len(), 8 + SYSTEM_MODULE_ENTRY_SIZE * 2)",
@@ -8194,6 +8487,14 @@
  "msiexec_install_rolls_back_on_service_action": [
   "( engine.registry.get(\"hklm/software/app/version\"), Some(&\"1.0\".to_string()), \"original registry key should survive rollback\" )"
  ],
+ "multi_vcpu_spinlock_contention_is_busy_and_releases_reject_non_owner": [
+  "( MultiVcpuSpinLock::new(0).expect_err(\"zero vcpus\"), UmdfError::InvalidArgument )",
+  "(lock.owner(), Some(0))",
+  "( lock.acquire(1).expect_err(\"contention\"), UmdfError::Busy, \"contention from another vCPU is Busy, not a hang\" )",
+  "(lock.contentions(), 1)",
+  "( UmdfError::Busy.hresult(), HRESULT_FROM_WIN32_ERROR_BUSY, \"Busy maps to HRESULT_FROM_WIN32(ERROR_BUSY)\" )",
+  "( UmdfError::Busy.ntstatus(), STATUS_DEVICE_BUSY, \"Busy maps to STATUS_DEVICE_BUSY\" )"
+ ],
  "mutant_recursion_is_observable_and_delivery_rejects_unknown_thread": [
   "(executive.wait_any(&[mutant], 0, 4).unwrap().index, 0)",
   "( executive.query_object(mutant).unwrap(), DispatcherObject::Mutant { owner: Some(4), recursion: 2, abandoned: false } )",
@@ -8294,6 +8595,30 @@
   "(stored.computer_name, \"CASA1X\")",
   "(stored.lan_group, \"WORKGROUP1\")",
   "(stored.version_major, 10)"
+ ],
+ "network_absent_adapter_and_unsupported_operation_are_exact": [
+  "( bridge.open_user_client(id).map(|_| ()), Err(DeviceError::DeviceMissing { id }) )",
+  "(client.device_id(), adapter.id)",
+  "(client.class(), DeviceClass::Network)",
+  "(bridge.class(), DeviceClass::Network)",
+  "(bridge.operation_support(HostOperation::Enumerate), Ok(()))",
+  "( bridge.operation_support(HostOperation::LinkControl), Err(DeviceError::Unsupported { feature: \"network link control\" }) )"
+ ],
+ "network_hotplug_duplicate_apply_is_idempotent_and_ids_are_stable": [
+  "(bridge.refresh(), Ok(Vec::new()))",
+  "( bridge.apply(vec![adapter.clone(), adapter.clone()]), vec![HotplugEvent::Arrived(adapter.record())] )",
+  "(bridge.devices().len(), 1)",
+  "(bridge.table().len(), 1)",
+  "(bridge.device(adapter.id), Some(&adapter))",
+  "(bridge.adapters(), vec![adapter.windows_entry()])"
+ ],
+ "network_link_state_and_duplicate_records_are_exact": [
+  "(adapters.len(), 1)",
+  "(adapter.bsd_name, \"en0\")",
+  "(adapter.mac, Some([0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e]))",
+  "(adapter.ipv4, vec![(Ipv4Addr::new(10, 0, 2, 15), 24)])",
+  "(adapter.ipv6.len(), 1)",
+  "(adapter.oper_status, 1)"
  ],
  "network_stack_wsa_get_set_last_error": [
   "(network.wsa_get_last_error(), 0)",
@@ -8650,7 +8975,9 @@
   "(report.method_registry.len(), 0)",
   "(report.gate.interface_violation_count, 0)",
   "(report.gate.method_deviations, 0)",
-  "( report .per_dll .get(\"kernel32.dll\") .expect(\"per-DLL summary\") .method_total, 0 )"
+  "( report .per_dll .get(\"kernel32.dll\") .expect(\"per-DLL summary\") .method_total, 0 )",
+  "( report.interface_registry.len(), 0, \"the additive interface registry defaults to empty\" )",
+  "( report.gate.unproven_method_count, 0, \"the additive unproven method count defaults to zero\" )"
  ],
  "ole32_ole_initialize_uninitialize_dispatch": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, init, &[0, 0]), 0, \"OleInitialize returns S_OK\" )",
@@ -8793,6 +9120,101 @@
   "( dispatch_x86( &mut fixture, HostThunk::WicPaletteGetColors, &[target as u32, 2, COLORS_OUT as u32, 0] ), 0 )",
   "( read_guest_u32(&fixture.memory, COLORS_OUT).unwrap(), 0x1122_3344 )"
  ],
+ "parallel_api_classification_and_names_are_canonical": [
+  "( thunk_class(&HostThunk::GetTickCount64), ThunkConcurrency::Stateless )",
+  "( thunk_class(&HostThunk::GetVersion), ThunkConcurrency::ReadMostly )",
+  "( thunk_class(&HostThunk::CreateFileW), ThunkConcurrency::OwnerOnly )",
+  "( crate::host_thunks::classify_thunk_concurrency(\"GetLastError\"), ThunkConcurrency::Stateless )",
+  "( crate::host_thunks::classify_thunk_concurrency(\"GetSystemInfo\"), ThunkConcurrency::ReadMostly )",
+  "( crate::host_thunks::classify_thunk_concurrency(\"CreateFileW\"), ThunkConcurrency::OwnerOnly )"
+ ],
+ "parallel_api_deterministic_filetime_uses_guest_clock_exactly": [
+  "( invoke( &shared, &mut context, &memory, HostThunk::GetSystemTimeAsFileTime ), true )",
+  "(memory.load(0x1B00, 8), Some(expected))",
+  "(context.last_error, 0)"
+ ],
+ "parallel_api_invalid_arguments_boundary_outcomes_are_exact": [
+  "( invoke( &shared, &mut context, &memory, HostThunk::QueryPerformanceCounter ), true )",
+  "(context.state.get(Register::Rax), 0)",
+  "(context.last_error, ERROR_INVALID_PARAMETER)",
+  "( invoke( &shared, &mut context, &memory, HostThunk::QueryPerformanceFrequency ), true )"
+ ],
+ "parallel_api_last_error_isolation_under_concurrency": [
+  "( invoke(&shared, &mut context, &memory, HostThunk::SetLastError), true )",
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetLastError), true )",
+  "(context.state.get(Register::Rax), u64::from(expected))",
+  "(context.last_error, expected)",
+  "(metrics.parallel_dispatched, u64::from(THREADS * 2))",
+  "(metrics.barrier_calls, 0)"
+ ],
+ "parallel_api_missing_state_and_memory_fall_back_to_barrier": [
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetVersion), false )",
+  "(context.state.rip, thunk_address(&context))",
+  "( invoke(&shared, &mut context_w, &memory_w, HostThunk::GetVersionExW), false )",
+  "( invoke(&shared, &mut context_w, &memory_w, HostThunk::GetVersionExA), false )",
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetVersionExW), false )",
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetTickCount64), false )"
+ ],
+ "parallel_api_mixed_parallel_and_barrier_calls_no_deadlock": [
+  "( invoke( &shared, &mut context, &memory, HostThunk::GetCurrentThreadId ), true )",
+  "( invoke(&shared, &mut context, &memory, HostThunk::CreateFileW), false )",
+  "(started.elapsed() < std::time::Duration::from_secs(5), true)",
+  "(metrics.parallel_dispatched, u64::from(THREADS * ROUNDS))",
+  "(metrics.barrier_calls, u64::from(THREADS * ROUNDS))",
+  "(shared.process_operations(), u64::from(THREADS * ROUNDS))"
+ ],
+ "parallel_api_out_of_bounds_reads_and_writes_fail_closed": [
+  "(format!(\"{:?}\", ProcessShared::new()).is_empty(), false)",
+  "(shared.run_worker_api(&mut context, &memory, entry), false)",
+  "( super::invoke_parallel_api(&shared, &mut context, &memory, &barrier_only), false )"
+ ],
+ "parallel_api_owner_only_thunk_stays_on_barrier": [
+  "( invoke(&shared, &mut context, &memory, HostThunk::CreateFileW), false )",
+  "(context.state.get(Register::Rsp), STACK)",
+  "(context.state.rip, thunk_address(&context))",
+  "(metrics.parallel_dispatched, 0)",
+  "(metrics.barrier_calls, 1)"
+ ],
+ "parallel_api_read_mostly_readers_race_writer_consistency": [
+  "( invoke( &shared, &mut context, &memory, HostThunk::GetCurrentProcessId ), true )",
+  "(pid == 100 || pid == 101, true)",
+  "(reads.load(Ordering::Relaxed) > 0, true)"
+ ],
+ "parallel_api_stateless_hammer_has_exact_per_thread_results": [
+  "( invoke( &shared, &mut context, &memory, HostThunk::GetCurrentThreadId ), true )",
+  "(context.state.get(Register::Rax), 0x100 + thread as u64)",
+  "( invoke( &shared, &mut context, &memory, HostThunk::GetCurrentProcessId ), true )",
+  "(context.state.get(Register::Rax), 0x1234)",
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetVersion), true )",
+  "(context.state.get(Register::Rax), expected_version)"
+ ],
+ "parallel_api_unreadable_stack_arguments_fall_back_to_barrier": [
+  "( shared.run_worker_api(&mut context, &memory, address), false, \"an unreadable first argument must fall back to the barrier\" )",
+  "(shared.run_worker_api(&mut context, &memory, address), false)",
+  "( shared.run_worker_api(&mut context, &memory, address), false, \"an unreadable argument {index} must fall back to the barrier\" )"
+ ],
+ "parallel_api_worker_success_paths_have_exact_results": [
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetCurrentProcess), true )",
+  "(context.state.get(Register::Rax), 0x44)",
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetCurrentThread), true )",
+  "(context.state.get(Register::Rax), 0x800)",
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetTickCount), true )",
+  "( context.state.get(Register::Rax) <= u64::from(u32::MAX), true )"
+ ],
+ "parallel_api_write_faults_fall_back_to_barrier": [
+  "(memory.store(0x1B00, &0x11C_u32.to_le_bytes()), true)",
+  "(memory.store(0x1D00, &0x9C_u32.to_le_bytes()), true)",
+  "( saw_false, true, \"a write fault must fall back to the barrier (case {index}: {thunk:?})\" )",
+  "(shared.run_worker_api(&mut context, &failing, entry), false)"
+ ],
+ "parallel_api_x86_stdcall_cleanup_and_stack_args_are_exact": [
+  "( invoke(&shared, &mut context, &memory, HostThunk::SetLastError), true )",
+  "(context.last_error, 0xCAFE)",
+  "(context.state.get(Register::Rsp), STACK + 4)",
+  "(context.state.rip, RETURN_ADDRESS)",
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetSystemInfo), true )",
+  "(memory.load(0x1A00, 2), Some(0))"
+ ],
  "parallel_render_command_recording_two_child_encoders": [
   "( sample(16, 32), [0, 0, 255, 255], \"left half must be red (BGRA)\" )",
   "( sample(48, 32), [0, 255, 0, 255], \"right half must be green (BGRA)\" )"
@@ -8872,6 +9294,49 @@
  "path_resolution_cache_invalidate_prefix": [
   "(cache.entry_count(), 3)",
   "(cache.entry_count(), 1)"
+ ],
+ "pci_absent_device_and_stale_handle_report_exact_errors": [
+  "( bridge.open_user_client(id).map(|_| ()), Err(DeviceError::DeviceMissing { id }) )",
+  "(events.len(), 1)",
+  "(client.device_id(), id)",
+  "(client.class(), DeviceClass::Pci)",
+  "( client.read(PCI_VENDOR_ID_OFFSET, 4), Ok(vec![0x6b, 0x10, 0x01, 0x19]) )",
+  "( removed, vec![HotplugEvent::Removed { record: info().record() }] )"
+ ],
+ "pci_bar_request_malformed_and_entitlement_limited_are_exact": [
+  "( client.control(PCI_CONTROL_MAP_BAR, &[0]), Err(DeviceError::InvalidArgument { field: \"bar_request\", reason: \"expected 17 bytes\" }) )",
+  "( client.control(PCI_CONTROL_MAP_BAR, &bar_request(9, 0, 1)), Err(DeviceError::InvalidArgument { field: \"bar_index\", reason: \"no such BAR\" }) )",
+  "( client.control(PCI_CONTROL_MAP_BAR, &bar_request(0, 0, 0)), Err(DeviceError::InvalidArgument { field: \"length\", reason: \"must be non-zero\" }) )",
+  "( client.control(PCI_CONTROL_MAP_BAR, &bar_request(0, u64::MAX, 2)), Err(DeviceError::InvalidArgument { field: \"bar_offset\", reason: \"range overflows address space\" }) )",
+  "( client.control(PCI_CONTROL_MAP_BAR, &bar_request(0, 0x1_0000, 1)), Err(DeviceError::InvalidArgument { field: \"bar_offset\", reason: \"range exceeds BAR size\" }) )",
+  "( client.control(PCI_CONTROL_MAP_BAR, &bar_request(0, 0, 4)), Err(DeviceError::Unsupported { feature: \"pci BAR mapping requires DriverKit PCI transport entitlement\" }) )"
+ ],
+ "pci_config_space_malformed_and_permission_denied_are_exact": [
+  "( device.config_read(0, 0), Err(DeviceError::InvalidArgument { field: \"length\", reason: \"must be non-zero\" }) )",
+  "( device.config_read(1, usize::MAX), Err(DeviceError::InvalidArgument { field: \"config_offset\", reason: \"range overflows address space\" }) )",
+  "( device.config_read(0xff, 2), Err(DeviceError::InvalidArgument { field: \"config_offset\", reason: \"outside 256-byte config space\" }) )",
+  "( device.config_read(0x0c, 1), Err(DeviceError::PermissionDenied { operation: \"IOPCIDevice config space\" }) )",
+  "( device.config_read(PCI_REVISION_ID_OFFSET, 4), Ok(vec![0x02, 0x00, 0x20, 0x0d]) )",
+  "( device.config_read(PCI_SUBSYSTEM_VENDOR_OFFSET, 4), Ok(vec![0x6b, 0x10, 0x01, 0x19]) )"
+ ],
+ "pci_duplicate_ids_and_hotplug_refresh_are_idempotent": [
+  "(bridge.refresh(), Ok(Vec::new()))",
+  "( bridge.apply(vec![device.clone(), device.clone()]), vec![HotplugEvent::Arrived(device.record())] )",
+  "(bridge.devices().len(), 1)",
+  "(bridge.table().len(), 1)",
+  "(bridge.device(device.id), Some(&device))",
+  "(HostDeviceBridge::records(&bridge), vec![device.record()])"
+ ],
+ "pci_identity_parsing_and_bar_ranges_reject_malformed_input": [
+  "(parse_pcidebug(\"2:0:1\"), Some((2, 0, 1)))",
+  "(parse_pcidebug(\"0:0:0(1:128)\"), Some((0, 0, 0)))",
+  "(parse_pcidebug(\"2:0\"), None)",
+  "(parse_pcidebug(\"x:0:0\"), None)",
+  "(parse_pcidebug(\"2:0:0:1\"), None)",
+  "(with_debug, stable_pci_id(0x106b, 0x1901, Some(\"2:0:0\"), 99))"
+ ],
+ "pci_poisoned_live_registry_is_an_exact_io_error": [
+  "( client.read(PCI_VENDOR_ID_OFFSET, 1), Err(DeviceError::Io { operation: \"pci live registry\", os_code: 0 }) )"
  ],
  "pcr_boundary_indices_are_rejected_with_exact_rc": [
   "( rc(&run(&mut tpm, &out_of_range_extend)), rc_handle(TPM_RC_VALUE, 1) )",
@@ -9610,6 +10075,14 @@
   "( session.runtime.pending_guest_threads.len(), 0, \"the failed apply must not requeue a thread with no resume result\" )",
   "( SCHEDULER_COUNTERS.snapshot().completion_port_wakeups, before.completion_port_wakeups, \"a failed out-parameter write is not a packet handoff\" )"
  ],
+ "production_parallel_stateless_thunks_run_on_worker_without_barrier": [
+  "(runs.len(), 1)",
+  "( runs[0].context.state.rip, 0, \"the worker executes every safe thunk and returns through the guest ret\" )",
+  "(metrics.parallel_dispatched, CALLS as u64 + 1)",
+  "(metrics.barrier_calls, 0)",
+  "( trace_calls(&session, \"time\", \"GetTickCount64\"), before, \"the runtime owner never executes the safe thunk\" )",
+  "( session.read_guest(SYSTEM_INFO_OUT, 2), vec![0_u8, 0_u8], \"the worker writes the x86 system-info structure through the shared store\" )"
+ ],
  "production_port_close_race_wakes_with_abandoned_error_not_a_packet": [
   "( session.runtime.last_error, crate::win32::ERROR_ABANDONED_WAIT_0 )",
   "(read_u32_guest(&session, FLAG_PTR), 1)",
@@ -9736,7 +10209,7 @@
   "(after.poll_iterations, before.poll_iterations)"
  ],
  "production_thunk_serialization_stress_is_exactly_once_under_two_threads": [
-  "( trace_calls(&session, \"time\", \"GetTickCount64\"), before + 2 * iterations as usize, \"every guest call must dispatch its thunk exactly once\" )",
+  "( trace_calls(&session, \"time\", \"GetTimeZoneInformation\"), before + 2 * iterations as usize, \"every guest call must dispatch its thunk exactly once\" )",
   "(session.runtime.pending_guest_threads.len(), 0)"
  ],
  "production_two_parked_guest_threads_wake_simultaneously_without_deadlock": [
@@ -9756,8 +10229,8 @@
   "( reports[0].exit, GuestSliceExit::HostBarrier { rip: thunk }, \"the worker resolves the indirect call target and yields at the thunk\" )",
   "( reports[0].blocks_executed, 1, \"the call block runs natively; only the thunk itself is owner work\" )",
   "( reports[0].state.rip, thunk, \"RIP points at the unresolved host thunk, with the return address already pushed\" )",
-  "( trace_calls(&session, \"time\", \"GetTickCount64\"), before, \"a production worker must never run the host thunk\" )",
-  "( trace_calls(&session, \"time\", \"GetTickCount64\"), before + 1, \"the runtime owner executes the thunk exactly once\" )"
+  "( trace_calls(&session, \"time\", \"GetTimeZoneInformation\"), before, \"a production worker must never run the host thunk\" )",
+  "( trace_calls(&session, \"time\", \"GetTimeZoneInformation\"), before + 1, \"the runtime owner executes the thunk exactly once\" )"
  ],
  "production_worker_call_return_chain_no_races_matches_cooperative_exactly": [
   "( read_u32_guest(&cooperative, SLICE_CALL_COUNTER), iterations, \"cooperative call/ret loop must finish in {rounds} rounds\" )",
@@ -10525,6 +10998,13 @@
   "(aggregate.semantic_fidelity, SemanticFidelity::Restricted)",
   "(aggregate.subsystem_capability, SubsystemCapability::Partial)",
   "( database.interface_completeness_gate().len(), 0, \"seeded aggregates must never overstate their method children\" )"
+ ],
+ "seeded_report_lists_missing_method_proof_and_bound_evidence": [
+  "(bound.semantic_test_coverage, CoverageLevel::Conformance)",
+  "( bound.evidence_id.as_deref(), Some(\"casa1-conformance:pe_runtime_d3d11_pixel_shader_thunks_translate_and_bind_dxil\"), \"the method row must name the compiled contract that proves it\" )",
+  "(unbound.semantic_test_coverage, CoverageLevel::None)",
+  "(unbound.evidence_id, None)",
+  "(interface.proven, false)"
  ],
  "self_modifying_code_basic_invalidation": [
   "(rt.blocks_compiled, 1, \"exactly one block compiled\")",
@@ -13288,12 +13768,28 @@
   "(timeout_100ns_to_ticks(10_001), Some(2))",
   "(timeout_100ns_to_ticks(1_000_000), Some(100))"
  ],
+ "timer_cancel_races_due_timer_and_periodic_overdue_rearms": [
+  "( pump.cancel(armed).expect(\"cancel armed\"), true, \"cancel before the deadline wins\" )",
+  "( pump.pump(base + Duration::from_millis(5)), vec![TimerFired { id: raced, lateness: Duration::ZERO }] )",
+  "( pump.cancel(raced).expect(\"cancel after fire\"), false, \"cancel after the fire loses\" )",
+  "( first, vec![TimerFired { id: periodic, lateness: Duration::from_millis(2) }] )",
+  "( second, vec![TimerFired { id: periodic, lateness: Duration::from_millis(11) }], \"overdue periodic fire reports lateness past the re-armed deadline\" )",
+  "(pump.fire_count(periodic), 2)"
+ ],
  "timer_deadline_cache_recomputes_after_earliest_replace_and_kill_race": [
   "(user32.next_timer_timeout(), None)",
   "( user32.kill_timer(1, 42), false, \"killing a missing timer must report false\" )",
   "( user32.next_timer_timeout(), None, \"window destruction must refresh the timer cache\" )",
   "(user32.next_timer_timeout(), Some(std::time::Duration::ZERO))",
   "( user32.next_timer_timeout(), None, \"the window timer must be cached\" )"
+ ],
+ "timer_pump_zero_due_fires_immediately_and_overdue_reports_exact_lateness": [
+  "(pump.pump(start), Vec::new())",
+  "( pump.pump(base), vec![TimerFired { id: zero, lateness: Duration::ZERO }] )",
+  "( pump.pump(now), vec![TimerFired { id: late, lateness: Duration::from_millis(15) }] )",
+  "( pump.last_lateness(late), Some(Duration::from_millis(15)), \"overdue lateness is exact\" )",
+  "(pump.total_fires(), 2)",
+  "(pump.len(), 2, \"both timers remain in the pump\")"
  ],
  "timers_fire_in_deadline_order_and_cancel_is_exact": [
   "(executive.timer_count(), 3)",
@@ -13511,6 +14007,14 @@
  ],
  "unsupported_instruction_returns_rc_unimpl_insn": [
   "( e.code, ReasonCode::RcUnimplInsn, \"Unimplemented instruction should return RcUnimplInsn, got {:?}\", e.code )"
+ ],
+ "unsupported_operations_have_exact_features_and_user_client_defaults": [
+  "(client.device_id(), id)",
+  "(client.class(), DeviceClass::Network)",
+  "( client.read(0, 1), Err(DeviceError::Unsupported { feature: \"host user client read\" }) )",
+  "( client.write(0, &[1]), Err(DeviceError::Unsupported { feature: \"host user client write\" }) )",
+  "( client.control(7, &[]), Err(DeviceError::Unsupported { feature: \"host user client control\" }) )",
+  "(operation.feature(), feature)"
  ],
  "unsupported_swapchain_format_uses_counted_fallback": [
   "(device.nv12_fallback_count(), 1)",
@@ -13934,6 +14438,14 @@
  "waits_enforce_synchronize_access": [
   "(err.code, ReasonCode::RcHelperPermissionDenied)",
   "( win32 .wait_for_single_object(with_sync, 0, false, None) .expect(\"wait\"), WaitStatus::Object0 )"
+ ],
+ "watchdog_restarts_crashed_host_with_exact_status_and_preserves_others": [
+  "( HostSupervisor::new(0).err(), Some(UmdfError::InvalidArgument), \"zero restart budget is rejected exactly\" )",
+  "( supervisor .add_host(initialized_host(91)) .expect_err(\"duplicate host id\"), UmdfError::InvalidState )",
+  "(first.len(), 1, \"only the crashed host restarts\")",
+  "(first[0].host, HostId(91))",
+  "( first[0].crash_status, UmdfError::NotSupported.ntstatus(), \"restart records the exact crash NTSTATUS\" )",
+  "(first[0].generation, 2)"
  ],
  "wave_format_parsing_accepts_real_pcm_shape": [
   "(parsed.wave_format_tag, WAVE_FORMAT_PCM)",
@@ -14443,6 +14955,21 @@
   "( both_limits.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] output 0 sets both MaxRecords and \\ MaxRecordsSharedWithOutputIndex\" )",
   "( zero_limit.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] output 0 MaxRecords is zero\" )",
   "( self_share.validate().unwrap_err().message, \"work graph node \\\"n0\\\"[0] output 0 shares records with itself\" )"
+ ],
+ "work_queue_double_enqueue_race_is_invalid_state": [
+  "( queue.enqueue(item), Err(UmdfError::InvalidState), \"double enqueue is a rejected transition\" )",
+  "(queue.drain(1), vec![item])",
+  "(queue.runs(item), 1)",
+  "(queue.runs(item), 2)",
+  "( queue.run_one(), None, \"drained queue reports no runnable work\" )"
+ ],
+ "work_queue_serialization_preserves_group_order_and_rejects_overfill": [
+  "( WorkQueue::new(0).err(), Some(UmdfError::InvalidArgument), \"zero depth is rejected exactly\" )",
+  "(queue.group(a1), Some(Some(1)))",
+  "(queue.group(b1), Some(Some(2)))",
+  "(queue.group(999), None, \"unknown item has no group\")",
+  "( queue.enqueue(a1), Err(UmdfError::InvalidState), \"re-enqueue while queued is rejected exactly like KMDF\" )",
+  "( UmdfError::InvalidState.ntstatus(), STATUS_INVALID_DEVICE_STATE, \"double enqueue keeps the exact NTSTATUS\" )"
  ],
  "worker_chained_code_safepoint_and_smc_stop_before_the_next_block": [
   "(report.stop, SliceStop::Budget)",
