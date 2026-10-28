@@ -83,6 +83,94 @@ pub enum Subsystem {
 }
 
 // ---------------------------------------------------------------------------
+// Concurrency classification
+// ---------------------------------------------------------------------------
+
+/// How a host thunk may run alongside other guest threads.
+///
+/// The classification is the scheduling contract for the concurrent guest
+/// runtime: a worker may execute a `Stateless` (worker-local) or
+/// `ReadMostly` (process state behind an `RwLock`) thunk directly against
+/// [`crate::runtime::shared::ProcessShared`]; every other thunk stays on the
+/// runtime owner's serialized host-barrier path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ThunkConcurrency {
+    /// Pure/worker-local: reads only the calling thread's context or
+    /// constant data.  No process-wide lock is required.
+    Stateless,
+    /// Reads process-wide state that is published under an `RwLock`;
+    /// concurrent readers are allowed, the owner is the only writer.
+    ReadMostly,
+    /// Mutates process-wide state (loader, registry, handles, allocation,
+    /// GPU, COM, TPM, driver island) and must run on the runtime owner under
+    /// the process gate.
+    OwnerOnly,
+}
+
+impl ThunkConcurrency {
+    /// `true` when a guest worker may execute the thunk directly.
+    pub const fn allows_worker_execution(self) -> bool {
+        matches!(self, Self::Stateless | Self::ReadMostly)
+    }
+}
+
+/// APIs whose worker execution touches only thread-local/constant state.
+///
+/// Keep this list conservative: an API belongs here only when the runtime's
+/// worker implementation is identical to the owner implementation and has no
+/// process-wide side effect beyond guest memory writes.
+pub static STATELESS_THUNKS: &[&str] = &[
+    "CharNextW",
+    "CharPrevW",
+    "GetCurrentProcess",
+    "GetCurrentProcessId",
+    "GetCurrentThread",
+    "GetCurrentThreadId",
+    "GetLastError",
+    "GetSystemTimeAsFileTime",
+    "GetSystemTimePreciseAsFileTime",
+    "GetTickCount",
+    "GetTickCount64",
+    "IsProcessorFeaturePresent",
+    "QueryPerformanceCounter",
+    "QueryPerformanceFrequency",
+    "SetLastError",
+    "StrFromTimeIntervalW",
+];
+
+/// APIs that read process-wide state published behind an `RwLock`.
+pub static READ_MOSTLY_THUNKS: &[&str] = &[
+    "GetNativeSystemInfo",
+    "GetSystemInfo",
+    "GetVersion",
+    "GetVersionExA",
+    "GetVersionExW",
+    "GlobalMemoryStatusEx",
+    "IsWow64Process",
+];
+
+/// Classify an API by its canonical export name.
+///
+/// Unknown names are conservatively [`ThunkConcurrency::OwnerOnly`]: a thunk
+/// can only leave the barrier when this table says its worker execution is
+/// safe.
+pub fn classify_thunk_concurrency(api: &str) -> ThunkConcurrency {
+    if STATELESS_THUNKS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(api))
+    {
+        ThunkConcurrency::Stateless
+    } else if READ_MOSTLY_THUNKS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(api))
+    {
+        ThunkConcurrency::ReadMostly
+    } else {
+        ThunkConcurrency::OwnerOnly
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Last-error behavior
 // ---------------------------------------------------------------------------
 

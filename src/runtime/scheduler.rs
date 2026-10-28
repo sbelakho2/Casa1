@@ -3175,13 +3175,55 @@ impl PeHostRuntime {
             .collect())
     }
 
+    /// Publish the read-mostly process state and the thunk classification
+    /// table a worker needs to service stateless/read-mostly host thunks
+    /// without crossing the owner barrier.  The owner is the sole writer.
+    fn publish_worker_environment(&mut self) {
+        let process_handle = self.win32.current_process_handle();
+        let version = guest_version_info_from_profile(&self.win32.ge().config.winver)
+            .ok()
+            .map(|version| WorkerVersion {
+                major: version.major,
+                minor: version.minor,
+                build: version.build,
+                service_pack_major: version.service_pack_major,
+                service_pack_minor: version.service_pack_minor,
+                suite_mask: version.suite_mask,
+                product_type: version.product_type,
+            });
+        let (total_phys, avail_phys, total_page, avail_page) = host_memory_status();
+        self.process_shared.publish_environment(WorkerEnvironment {
+            identity: WorkerIdentity {
+                process_id: self.win32.current_process_id(),
+                process_handle,
+            },
+            clock: WorkerClock {
+                clock: Arc::clone(&self.anticheat.clock),
+                dtm: self.win32.is_dtm(),
+                deterministic_tick_ms: self.win32.get_tick_count64(),
+            },
+            version,
+            memory_status: Some(WorkerMemoryStatus {
+                total_phys,
+                avail_phys,
+                total_page,
+                avail_page,
+            }),
+        });
+        self.process_shared.publish_parallel_thunks(
+            self.host_thunks
+                .iter()
+                .map(|(address, thunk)| (*address, thunk)),
+        );
+    }
+
     /// Execute one round of concurrent guest slices for explicit per-thread
     /// contexts.  This is the real concurrency entry point: the owner compiles
     /// the reachable blocks once, publishes the immutable program on
     /// [`ProcessShared`], and every context runs on a native worker against
     /// the shared canonical memory.  Worker completions are applied (and
-    /// stale SMC pages invalidated) by the owner; no host thunk ever runs on a
-    /// worker.
+    /// stale SMC pages invalidated) by the owner; concurrency-safe host
+    /// thunks run on the worker, everything else stays a barrier.
     pub(crate) fn dispatch_parallel_thread_contexts(
         &mut self,
         memory: &mut MemoryImage,
@@ -3194,6 +3236,7 @@ impl PeHostRuntime {
         if self.production_scheduler.is_none() {
             return Ok(Vec::new());
         }
+        self.publish_worker_environment();
         for context in &contexts {
             self.ensure_slice_blocks_for(memory, context.state.rip)?;
         }
@@ -6903,7 +6946,7 @@ mod tests {
             let _guard = test_guard();
             let (_temp_dir, mut session) = test_session();
             install_jit(&mut session);
-            let thunk = session.alloc_thunk(HostThunk::GetTickCount64);
+            let thunk = session.alloc_thunk(HostThunk::GetTimeZoneInformation);
             assert!(
                 thunk <= u64::from(u32::MAX),
                 "x86 thunk address fits 32 bits"
@@ -6922,7 +6965,7 @@ mod tests {
                     .runtime
                     .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
             );
-            let before = trace_calls(&session, "time", "GetTickCount64");
+            let before = trace_calls(&session, "time", "GetTimeZoneInformation");
             let request = GuestSliceRequest {
                 thread_id: 0xB1,
                 priority: 0,
@@ -6947,7 +6990,7 @@ mod tests {
                 "RIP points at the unresolved host thunk, with the return address already pushed"
             );
             assert_eq!(
-                trace_calls(&session, "time", "GetTickCount64"),
+                trace_calls(&session, "time", "GetTimeZoneInformation"),
                 before,
                 "a production worker must never run the host thunk"
             );
@@ -6958,12 +7001,98 @@ mod tests {
                 assert!(rounds < 64, "the cooperative owner must finish the thread");
             }
             assert_eq!(
-                trace_calls(&session, "time", "GetTickCount64"),
+                trace_calls(&session, "time", "GetTimeZoneInformation"),
                 before + 1,
                 "the runtime owner executes the thunk exactly once"
             );
             assert_eq!(session.runtime.pending_guest_threads.len(), 0);
+            let metrics = session.runtime.process_shared.api_dispatch_metrics();
+            assert_eq!(metrics.parallel_dispatched, 0);
+            assert_eq!(metrics.barrier_calls, 1);
         });
+    }
+
+    #[test]
+    fn production_parallel_stateless_thunks_run_on_worker_without_barrier() {
+        let _guard = test_guard();
+        let (_temp_dir, mut session) = test_session();
+        install_jit(&mut session);
+        let thunk = session.alloc_thunk(HostThunk::GetTickCount64);
+        assert!(
+            thunk <= u64::from(u32::MAX),
+            "x86 thunk address fits 32 bits"
+        );
+        let system_thunk = session.alloc_thunk(HostThunk::GetNativeSystemInfo);
+        assert!(
+            system_thunk <= u64::from(u32::MAX),
+            "x86 thunk address fits 32 bits"
+        );
+        const CALLS: usize = 32;
+        const SYSTEM_INFO_OUT: u64 = 0x19_000;
+        let mut code = Vec::new();
+        // GetNativeSystemInfo(out) exercises the worker's guest-memory write
+        // path; the stdcall callee pops its argument.
+        code.push(0x68);
+        code.extend_from_slice(&(SYSTEM_INFO_OUT as u32).to_le_bytes());
+        code.extend_from_slice(&[0xFF, 0x15]);
+        code.extend_from_slice(&((SLICE_THUNK_SLOT + 4) as u32).to_le_bytes());
+        for _ in 0..CALLS {
+            code.extend_from_slice(&[0xFF, 0x15]);
+            code.extend_from_slice(&(SLICE_THUNK_SLOT as u32).to_le_bytes());
+        }
+        code.push(0xC3);
+        session.map_guest(SLICE_CODE_2, &code);
+        session.map_guest(SLICE_THUNK_SLOT, &(thunk as u32).to_le_bytes());
+        session.map_guest(SLICE_THUNK_SLOT + 4, &(system_thunk as u32).to_le_bytes());
+        session.map_guest(SYSTEM_INFO_OUT, &[0_u8; 0x1000]);
+        session.map_guest(SLICE_STACK_A - 0x100, &[0_u8; 0x200]);
+        session.memory.write_u32(SLICE_STACK_A, 0);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = SLICE_CODE_2;
+        state.set(Register::Rsp, SLICE_STACK_A);
+        let context = GuestThreadContext::new(0xB2, state);
+        assert!(
+            session
+                .runtime
+                .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
+        );
+        let before = trace_calls(&session, "time", "GetTickCount64");
+        let runs = session
+            .runtime
+            .dispatch_parallel_thread_contexts(&mut session.memory, vec![context], 64)
+            .expect("dispatch stateless thunk round");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].context.state.rip, 0,
+            "the worker executes every safe thunk and returns through the guest ret"
+        );
+        let metrics = session.runtime.process_shared.api_dispatch_metrics();
+        assert_eq!(metrics.parallel_dispatched, CALLS as u64 + 1);
+        assert_eq!(metrics.barrier_calls, 0);
+        assert_eq!(
+            trace_calls(&session, "time", "GetTickCount64"),
+            before,
+            "the runtime owner never executes the safe thunk"
+        );
+        assert_eq!(
+            session.read_guest(SYSTEM_INFO_OUT, 2),
+            vec![0_u8, 0_u8],
+            "the worker writes the x86 system-info structure through the shared store"
+        );
+
+        // A zero block budget stops before executing any guest block.
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = SLICE_CODE_2;
+        state.set(Register::Rsp, SLICE_STACK_A);
+        let runs = session
+            .runtime
+            .dispatch_parallel_thread_contexts(
+                &mut session.memory,
+                vec![GuestThreadContext::new(0xB3, state)],
+                0,
+            )
+            .expect("dispatch zero-budget round");
+        assert_eq!(runs[0].exit, GuestSliceExit::Budget);
     }
 
     #[test]
@@ -7370,7 +7499,7 @@ mod tests {
             let _guard = test_guard();
             let (_temp_dir, mut session) = test_session();
             install_jit(&mut session);
-            let thunk = session.alloc_thunk(HostThunk::GetTickCount64);
+            let thunk = session.alloc_thunk(HostThunk::GetTimeZoneInformation);
             assert!(thunk <= u64::from(u32::MAX));
             // call [slot]; sub ecx,1; cmp ecx,0; jnz call; ret
             let mut code = vec![0xFF, 0x15];
@@ -7400,13 +7529,13 @@ mod tests {
                     .runtime
                     .set_scheduler_mode(SchedulerMode::Production { workers: 2 })
             );
-            let before = trace_calls(&session, "time", "GetTickCount64");
+            let before = trace_calls(&session, "time", "GetTimeZoneInformation");
             let mut rounds = 0;
             while pump_once(&mut session) && rounds < 1_000 {
                 rounds += 1;
             }
             assert_eq!(
-                trace_calls(&session, "time", "GetTickCount64"),
+                trace_calls(&session, "time", "GetTimeZoneInformation"),
                 before + 2 * iterations as usize,
                 "every guest call must dispatch its thunk exactly once"
             );
@@ -7662,7 +7791,7 @@ mod tests {
             "a runtime without a JIT cannot produce worker slices"
         );
         install_jit(&mut session);
-        let thunk = session.alloc_thunk(HostThunk::GetTickCount64);
+        let thunk = session.alloc_thunk(HostThunk::GetTimeZoneInformation);
         assert_eq!(
             session
                 .runtime
