@@ -8501,6 +8501,14 @@
   "( call_slot( &mut fixture, enumerator, 0, &[enumerator as u32, IID_PTR as u32, OUT as u32] ), S_OK )",
   "(guest_ptr(&fixture, OUT), enumerator)"
  ],
+ "moniker_load_save_size_and_malformed_stream_are_exact": [
+  "( call_slot( &mut fixture, moniker, 6, &[moniker as u32, stream as u32, 1] ), 0, \"Save\" )",
+  "( call_slot(&mut fixture, moniker, 7, &[moniker as u32, size_ptr as u32]), 0, \"GetSizeMax\" )",
+  "( call_slot(&mut fixture, stream, 5, &[stream as u32, 0, 0, 0, 0]), 0, \"rewind stream\" )",
+  "( call_slot(&mut fixture, moniker, 5, &[moniker as u32, corrupt as u32]), E_FAIL, \"malformed moniker stream\" )",
+  "( call_slot(&mut fixture, moniker, 5, &[moniker as u32, stream as u32]), 0, \"Load\" )",
+  "( fixture .runtime .com_monikers .get(&moniker) .expect(\"moniker state\") .display_name, \"file:C:\\\\game\\\\app.exe\" )"
+ ],
  "moniker_parses_binds_and_reports_real_state": [
   "( dispatch_x86( &mut fixture, HostThunk::MkParseDisplayName, &[0, NAME as u32, COOKIE as u32, OUT as u32] ), 0, \"MkParseDisplayName(file:)\" )",
   "( fixture.memory.read_u32(COOKIE).unwrap(), display.encode_utf16().count() as u32 )",

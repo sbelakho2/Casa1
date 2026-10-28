@@ -2488,10 +2488,9 @@ impl PeHostRuntime {
                 state.set(Register::Rax, u64::from(S_FALSE));
                 Ok(())
             }
-            ComMethod::MonikerLoad | ComMethod::MonikerSave | ComMethod::MonikerGetSizeMax => {
-                state.set(Register::Rax, u64::from(E_NOTIMPL));
-                Ok(())
-            }
+            ComMethod::MonikerLoad => self.com_moniker_load(state, memory),
+            ComMethod::MonikerSave => self.com_moniker_save(state, memory),
+            ComMethod::MonikerGetSizeMax => self.com_moniker_get_size_max(state, memory),
             ComMethod::MonikerIsEqual => self.com_moniker_is_equal(state, memory),
             ComMethod::MonikerParseDisplayName => {
                 self.com_moniker_parse_display_name(state, memory)
@@ -9490,6 +9489,131 @@ impl PeHostRuntime {
 
     /// `IMoniker::IsEqual` — two monikers are equal when they model the same
     /// kind and display name (the runtime's moniker identity).
+    fn moniker_serialized(&self, object: u64) -> Vec<u8> {
+        let Some(state) = self.com_monikers.get(&object) else {
+            return Vec::new(); // coverage: unreachable — callers validate the moniker object first
+        };
+        let kind = match state.kind {
+            crate::runtime::state::ComMonikerKind::File => 0_u8,
+            crate::runtime::state::ComMonikerKind::Class => 1,
+            crate::runtime::state::ComMonikerKind::Url => 2,
+        };
+        let mut bytes = vec![kind];
+        for field in [
+            Some(state.display_name.as_str()),
+            Some(state.payload.as_str()),
+            state.host_path.as_deref(),
+        ] {
+            match field {
+                Some(text) => {
+                    bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                    bytes.extend_from_slice(text.as_bytes());
+                }
+                None => bytes.extend_from_slice(&u32::MAX.to_le_bytes()),
+            }
+        }
+        bytes
+    }
+
+    fn com_moniker_save(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let stream = guest_call_arg(state, memory, 1)?;
+        let _clear_dirty = guest_call_arg_u32(state, memory, 2)?;
+        if !self.com_monikers.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(entry) = self.com_streams.get(&stream) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let position = entry.position as usize;
+        let bytes = self.moniker_serialized(this);
+        if let Some(entry) = self.com_streams.get_mut(&stream) {
+            let end = position + bytes.len();
+            if entry.data.len() < end {
+                entry.data.resize(end, 0);
+            }
+            entry.data[position..end].copy_from_slice(&bytes);
+            entry.position = end as u64;
+            entry.dirty = true;
+        } // coverage: unreachable — llvm-cov zero-region on the closing token of the save block
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_moniker_load(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let stream = guest_call_arg(state, memory, 1)?;
+        if !self.com_monikers.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Some(entry) = self.com_streams.get(&stream) else {
+            state.set(Register::Rax, u64::from(STG_E_INVALIDPOINTER));
+            return Ok(());
+        };
+        let data = entry.data.clone();
+        let position = entry.position as usize;
+        let mut cursor = position;
+        let kind = match data.get(cursor) {
+            Some(0) => crate::runtime::state::ComMonikerKind::File,
+            Some(1) => crate::runtime::state::ComMonikerKind::Class,
+            Some(2) => crate::runtime::state::ComMonikerKind::Url,
+            _ => {
+                state.set(Register::Rax, u64::from(E_FAIL));
+                return Ok(());
+            }
+        };
+        cursor += 1;
+        let display_name = read_moniker_field(&data, &mut cursor);
+        let payload = read_moniker_field(&data, &mut cursor);
+        let host_path = read_moniker_field(&data, &mut cursor);
+        let (Some(Some(display_name)), Some(Some(payload))) = (display_name, payload) else {
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        };
+        if let Some(entry) = self.com_monikers.get_mut(&this) {
+            entry.kind = kind;
+            entry.display_name = display_name;
+            entry.payload = payload;
+            entry.host_path = host_path.flatten();
+        }
+        if let Some(entry) = self.com_streams.get_mut(&stream) {
+            entry.position = cursor as u64;
+        }
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
+    fn com_moniker_get_size_max(
+        &mut self,
+        state: &mut CpuState,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let this = guest_call_arg(state, memory, 0)?;
+        let out = guest_call_arg(state, memory, 1)?;
+        if !self.com_monikers.contains_key(&this) {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if out == 0 {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        write_u64(memory, out, self.moniker_serialized(this).len() as u64);
+        state.set(Register::Rax, u64::from(S_OK));
+        Ok(())
+    }
+
     fn com_moniker_is_equal(
         &mut self,
         state: &mut CpuState,
@@ -13838,6 +13962,26 @@ fn ole_embedded_clsid(bytes: &[u8]) -> Option<[u8; 16]> {
     Some(clsid)
 }
 
+/// Decode one length-prefixed moniker field. `None` = malformed; `Some(None)`
+/// = explicit null field (host path absent).
+fn read_moniker_field(data: &[u8], cursor: &mut usize) -> Option<Option<String>> {
+    if *cursor + 4 > data.len() {
+        return None;
+    }
+    let raw = u32::from_le_bytes(data[*cursor..*cursor + 4].try_into().ok()?);
+    *cursor += 4;
+    if raw == u32::MAX {
+        return Some(None);
+    }
+    let len = usize::try_from(raw).ok()?;
+    if *cursor + len > data.len() {
+        return None;
+    }
+    let text = String::from_utf8(data[*cursor..*cursor + len].to_vec()).ok()?;
+    *cursor += len;
+    Some(Some(text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{Fixture, dispatch_x86, with_big_stack, x86_fixture};
@@ -14596,9 +14740,10 @@ mod tests {
             );
             assert_eq!(
                 call_slot(&mut fixture, moniker, 7, &[moniker as u32, OUT as u32]),
-                E_NOTIMPL,
+                0,
                 "GetSizeMax"
             );
+            assert_ne!(fixture.memory.read_u64(OUT).unwrap(), 0);
             fixture.memory.map_bytes(OUT, &[0_u8; 8]);
             assert_eq!(
                 call_slot(
@@ -25051,20 +25196,29 @@ mod tests {
 
             let moniker = parse_moniker(&mut fixture, "file:C:\\method.bin");
             assert_eq!(
-                call_slot(&mut fixture, moniker, 5, &[moniker as u32, 0, 0]),
-                E_NOTIMPL
+                call_slot(&mut fixture, moniker, 5, &[moniker as u32, 0]),
+                STG_E_INVALIDPOINTER,
+                "Load requires a stream"
             );
             assert_eq!(
                 call_slot(&mut fixture, moniker, 6, &[moniker as u32, 0, 0]),
-                E_NOTIMPL
+                STG_E_INVALIDPOINTER,
+                "Save requires a stream"
             );
             assert_eq!(
-                call_slot(&mut fixture, moniker, 5, &[bad_this, 0, 0]),
-                E_NOTIMPL
+                call_slot(&mut fixture, moniker, 5, &[bad_this, 0]),
+                E_INVALIDARG,
+                "Load on a non-moniker object"
             );
             assert_eq!(
                 call_slot(&mut fixture, moniker, 6, &[bad_this, 0, 0]),
-                E_NOTIMPL
+                E_INVALIDARG,
+                "Save on a non-moniker object"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 7, &[bad_this, 0]),
+                E_INVALIDARG,
+                "GetSizeMax on a non-moniker object"
             );
         })
     }
@@ -28059,5 +28213,194 @@ mod tests {
                 E_INVALIDARG
             );
         })
+    }
+
+    #[test]
+    fn moniker_load_save_size_and_malformed_stream_are_exact() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("com-moniker-persist");
+            let moniker = fixture
+                .runtime
+                .alloc_com_moniker_object(
+                    &mut fixture.memory,
+                    crate::runtime::state::ComMonikerState {
+                        kind: crate::runtime::state::ComMonikerKind::File,
+                        display_name: "file:C:\\game\\app.exe".to_string(),
+                        payload: "C:\\game\\app.exe".to_string(),
+                        host_path: Some("C:\\game\\app.exe".to_string()),
+                    },
+                )
+                .unwrap();
+            let stream = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, Vec::new(), "moniker", None)
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    moniker,
+                    6,
+                    &[moniker as u32, stream as u32, 1]
+                ),
+                0,
+                "Save"
+            );
+            let size_ptr = OUT;
+            fixture.memory.map_bytes(size_ptr, &[0_u8; 8]);
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 7, &[moniker as u32, size_ptr as u32]),
+                0,
+                "GetSizeMax"
+            );
+            let size = guest_ptr(&fixture, size_ptr);
+            assert_ne!(size, 0, "serialized moniker has a nonzero size");
+            assert_eq!(
+                call_slot(&mut fixture, stream, 5, &[stream as u32, 0, 0, 0, 0]),
+                0,
+                "rewind stream"
+            );
+            // Corrupt the first byte (kind tag) and require a hard failure.
+            let corrupt = fixture
+                .runtime
+                .alloc_com_stream_object(
+                    &mut fixture.memory,
+                    vec![0xFF, 0, 0, 0],
+                    "bad-moniker",
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 5, &[moniker as u32, corrupt as u32]),
+                E_FAIL,
+                "malformed moniker stream"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 5, &[moniker as u32, stream as u32]),
+                0,
+                "Load"
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .com_monikers
+                    .get(&moniker)
+                    .expect("moniker state")
+                    .display_name,
+                "file:C:\\game\\app.exe"
+            );
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 6, &[moniker as u32, 0, 0]),
+                STG_E_INVALIDPOINTER
+            );
+            assert_eq!(
+                call_slot(&mut fixture, moniker, 7, &[moniker as u32, 0]),
+                E_POINTER
+            );
+
+            // Null host path round-trips; truncated/invalid-UTF-8 streams fail.
+            let no_host = fixture
+                .runtime
+                .alloc_com_moniker_object(
+                    &mut fixture.memory,
+                    crate::runtime::state::ComMonikerState {
+                        kind: crate::runtime::state::ComMonikerKind::File,
+                        display_name: "file:C:\\x".to_string(),
+                        payload: "C:\\x".to_string(),
+                        host_path: None,
+                    },
+                )
+                .unwrap();
+            let no_host_stream = fixture
+                .runtime
+                .alloc_com_stream_object(&mut fixture.memory, Vec::new(), "moniker2", None)
+                .unwrap();
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    no_host,
+                    6,
+                    &[no_host as u32, no_host_stream as u32, 1]
+                ),
+                0
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    no_host_stream,
+                    5,
+                    &[no_host_stream as u32, 0, 0, 0, 0]
+                ),
+                0
+            );
+            assert_eq!(
+                call_slot(
+                    &mut fixture,
+                    no_host,
+                    5,
+                    &[no_host as u32, no_host_stream as u32]
+                ),
+                0
+            );
+            for kind in [
+                crate::runtime::state::ComMonikerKind::Class,
+                crate::runtime::state::ComMonikerKind::Url,
+            ] {
+                let object = fixture
+                    .runtime
+                    .alloc_com_moniker_object(
+                        &mut fixture.memory,
+                        crate::runtime::state::ComMonikerState {
+                            kind,
+                            display_name: "clsid:00000000-0000-0000-0000-000000000000".to_string(),
+                            payload: "payload".to_string(),
+                            host_path: None,
+                        },
+                    )
+                    .unwrap();
+                let stream_obj = fixture
+                    .runtime
+                    .alloc_com_stream_object(&mut fixture.memory, Vec::new(), "kind", None)
+                    .unwrap();
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        object,
+                        6,
+                        &[object as u32, stream_obj as u32, 1]
+                    ),
+                    0
+                );
+                assert_eq!(
+                    call_slot(
+                        &mut fixture,
+                        stream_obj,
+                        5,
+                        &[stream_obj as u32, 0, 0, 0, 0]
+                    ),
+                    0
+                );
+                assert_eq!(
+                    call_slot(&mut fixture, object, 5, &[object as u32, stream_obj as u32]),
+                    0,
+                    "Load kind {kind:?}"
+                );
+            }
+            for bytes in [
+                vec![],
+                vec![0],
+                vec![0, 1, 0, 0, 0],
+                vec![0, 4, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF],
+            ] {
+                let bad = fixture
+                    .runtime
+                    .alloc_com_stream_object(&mut fixture.memory, bytes, "bad", None)
+                    .unwrap();
+                assert_eq!(
+                    call_slot(&mut fixture, moniker, 5, &[moniker as u32, bad as u32]),
+                    E_FAIL,
+                    "malformed moniker stream must fail"
+                );
+            }
+        });
     }
 }

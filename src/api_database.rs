@@ -910,9 +910,6 @@ impl ApiDatabase {
                 | ("IWebBrowser2", "ShowBrowserBar")
                 | ("IWebBrowser2", "ClientToWindow")
                 | ("IWebBrowser2", "ExecWB")
-                | ("IMoniker", "Load")
-                | ("IMoniker", "Save")
-                | ("IMoniker", "GetSizeMax")
                 | ("IOleInPlaceObject", "ReactivateAndUndo")
                 | ("IOleObject", "GetClipboardData")
                 | ("IDataObject", "DAdvise")
@@ -4634,9 +4631,6 @@ mod method_proof_tests {
             ("shdocvw.dll", "IWebBrowser2", "ShowBrowserBar"),
             ("shdocvw.dll", "IWebBrowser2", "ClientToWindow"),
             ("shdocvw.dll", "IWebBrowser2", "ExecWB"),
-            ("ole32.dll", "IMoniker", "Load"),
-            ("ole32.dll", "IMoniker", "Save"),
-            ("ole32.dll", "IMoniker", "GetSizeMax"),
             ("ole32.dll", "IOleInPlaceObject", "ReactivateAndUndo"),
             ("ole32.dll", "IOleObject", "GetClipboardData"),
             ("ole32.dll", "IDataObject", "DAdvise"),

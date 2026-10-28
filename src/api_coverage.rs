@@ -13006,7 +13006,7 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "ole32.dll",
         "IMoniker",
         "GetSizeMax",
-        "casa1-conformance:moniker_parses_binds_and_reports_real_state",
+        "casa1-conformance:moniker_load_save_size_and_malformed_stream_are_exact",
     ),
     method_evidence(
         "ole32.dll",
@@ -13072,13 +13072,13 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "ole32.dll",
         "IMoniker",
         "Load",
-        "casa1-conformance:com_method_evidence_class_factory_and_moniker_notimpl_edges",
+        "casa1-conformance:moniker_load_save_size_and_malformed_stream_are_exact",
     ),
     method_evidence(
         "ole32.dll",
         "IMoniker",
         "Save",
-        "casa1-conformance:com_method_evidence_class_factory_and_moniker_notimpl_edges",
+        "casa1-conformance:moniker_load_save_size_and_malformed_stream_are_exact",
     ),
     method_evidence(
         "ole32.dll",
