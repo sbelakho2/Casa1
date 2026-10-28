@@ -66,6 +66,10 @@ jobs:
           # assignment exists (a later assignment would drop the 7.x path).
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "FFMPEG_DIR=$(brew --prefix ffmpeg@7)" >> "$GITHUB_ENV"
+          # Drop cached build-script output from an older FFmpeg (rust-cache
+          # does not key on FFMPEG_DIR, so it can keep pointing at FFmpeg 8).
+          rm -rf target/debug/build/ffmpeg-sys-next-* target/debug/build/ffmpeg-next-*
+          cargo clean -p ffmpeg-sys-next -p ffmpeg-next || true
       - name: Run Clippy (all features)
         run: cargo clippy --all-targets --features angle,dev-insecure-tls,ffmpeg,ffmpeg-next,moltenvk,nightly_alloc_error_hook,opengl,proptest,tungstenite,vulkan,websocket -- -D warnings -A future-incompatible
 

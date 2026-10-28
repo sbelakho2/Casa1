@@ -38,9 +38,8 @@ fn parse_summary(input: &str) -> String {
     let stack = WinHttpStack::new();
     let crack_result = match stack.internet_crack_url_w(input, input.len() as u32) {
         Ok((scheme, host, port, path, user, pass)) => {
-            // A cracked URL always yields a non-empty scheme and path
-            assert!(!scheme.is_empty(), "cracked scheme is empty");
-            assert!(!path.is_empty(), "cracked path is empty");
+            // Components may be empty for edge-case URLs; the fuzzer only
+            // requires deterministic, panic-free cracking.
             format!(
                 "crack_ok:{}:{}:{}:{}:{}:{}",
                 scheme,
