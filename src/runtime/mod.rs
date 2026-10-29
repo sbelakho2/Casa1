@@ -956,6 +956,30 @@ const OPEN_EXISTING: u32 = 3;
 static LIVE_UI_DEBUG_EMISSIONS: AtomicUsize = AtomicUsize::new(0);
 static WINDOW_MSG_DEBUG_EMISSIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Bounded diagnostic: accumulate the guest's stderr chunks and print the
+/// completed lines (CASA1_ERR_TRACE=1).  The Steam CRT writes its
+/// `[libprotobuf ERROR ...]` banner one character at a time, so per-write
+/// printing would be unreadable.
+pub(crate) fn trace_guest_stderr(text: &str) {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static BUFFER: Mutex<String> = Mutex::new(String::new());
+    static LINES: AtomicU32 = AtomicU32::new(0);
+    if std::env::var_os("CASA1_ERR_TRACE").is_none() {
+        return;
+    }
+    let Ok(mut buffer) = BUFFER.lock() else {
+        return;
+    };
+    buffer.push_str(text);
+    if buffer.contains('\n') || buffer.len() >= 32 {
+        if LINES.fetch_add(1, Ordering::Relaxed) < 16 {
+            eprintln!("[guest-stderr] {buffer:?}");
+        }
+        buffer.clear();
+    }
+}
+
 fn emit_live_ui_debug(message: String) {
     if LIVE_UI_DEBUG_EMISSIONS.fetch_add(1, AtomicOrdering::Relaxed) < LIVE_UI_DEBUG_LIMIT {
         eprintln!("{message}");

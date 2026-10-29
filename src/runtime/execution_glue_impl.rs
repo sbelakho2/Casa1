@@ -372,6 +372,89 @@ impl PeHostRuntime {
     /// reached with ECX >= 0x8000_0000 writes past the heap block.  Record the
     /// block, count, source/dest, the bounded API history ring and the guest
     /// EBP chain — diagnostic only; the fault is still delivered.
+    /// Opt-in bounded `thiscall`/ECX trace (`CASA1_ECX_TRACE=1`).
+    ///
+    /// Records ECX (and the guest call site from [ESP]) at entry to the MSVC
+    /// `std::string` helpers and the protobuf parser, so a wrong `this`
+    /// pointer is attributable to the caller's `mov ecx,...`/`lea ecx,...`
+    /// rather than guessed.
+    fn maybe_trace_thiscall(&mut self, state: &CpuState, memory: &MemoryImage) {
+        use std::sync::atomic::Ordering;
+        static ECX_TRACE_REPORTS: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        const ECX_TRACE_LIMIT: u32 = 4096;
+        if self.guest_arch != GuestArch::X86 || std::env::var_os("CASA1_ECX_TRACE").is_none() {
+            return;
+        }
+        let rva = state.rip.saturating_sub(self.mapped_image_base);
+        let watched = matches!(
+            rva,
+            0x6cf90
+                | 0x76430
+                | 0x6d420
+                | 0x14e980
+                | 0x192c00
+                | 0x192c20
+                | 0x1a2980
+                | 0x1a2ae0
+                | 0x14ee00
+                | 0x14ee87
+        );
+        if !watched {
+            return;
+        }
+        if ECX_TRACE_REPORTS.fetch_add(1, Ordering::Relaxed) >= ECX_TRACE_LIMIT {
+            return;
+        }
+        let esp = state.get(Register::Rsp);
+        let return_address = crate::runtime::guest_memory::read_u32(memory, esp)
+            .ok()
+            .map(u64::from);
+        let mut args = Vec::new();
+        for slot in 0..4_u64 {
+            if let Ok(raw) = crate::runtime::guest_memory::read_u32(memory, esp + 4 + slot * 4) {
+                args.push(format!("{raw:#x}"));
+            }
+        }
+        let record = BTreeMap::from([
+            ("rva".to_string(), json!(format!("{rva:#x}"))),
+            (
+                "ecx".to_string(),
+                json!(format!("{:#x}", state.get(Register::Rcx))),
+            ),
+            (
+                "edx".to_string(),
+                json!(format!("{:#x}", state.get(Register::Rdx))),
+            ),
+            (
+                "eax".to_string(),
+                json!(format!("{:#x}", state.get(Register::Rax))),
+            ),
+            ("esp".to_string(), json!(format!("{esp:#x}"))),
+            (
+                "ebp".to_string(),
+                json!(format!("{:#x}", state.get(Register::Rbp))),
+            ),
+            (
+                "call_site_rva".to_string(),
+                json!(return_address.map(|value| {
+                    format!("{:#x}", value.saturating_sub(self.mapped_image_base))
+                })),
+            ),
+            ("stack_args".to_string(), json!(args)),
+        ]);
+        eprintln!(
+            "[thiscall] rva={rva:#x} ecx={:#x} call_site={} edx={:#x} eax={:#x}",
+            state.get(Register::Rcx),
+            return_address
+                .map(|value| format!("{:#x}", value.saturating_sub(self.mapped_image_base)))
+                .unwrap_or_else(|| "<none>".to_string()),
+            state.get(Register::Rdx),
+            state.get(Register::Rax),
+        );
+        self.push_trace("process", "ThiscallTrace", record, json!(null));
+    }
+
     fn maybe_report_huge_copy(&mut self, state: &CpuState, memory: &MemoryImage) {
         use std::sync::atomic::Ordering;
         static HUGE_COPY_REPORTS: std::sync::atomic::AtomicU32 =
@@ -494,6 +577,7 @@ impl PeHostRuntime {
         ir: &[crate::cpu::IrInstruction],
         label: &str,
     ) -> AppResult<bool> {
+        self.maybe_trace_thiscall(state, memory);
         self.maybe_report_huge_copy(state, memory);
         crate::jit::set_pe_runtime_pointer(self as *mut PeHostRuntime as *mut libc::c_void);
         let result = engine.execute_with_jit(state, memory, ir, self.jit_runtime.as_mut());

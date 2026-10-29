@@ -441,6 +441,90 @@ pub unsafe extern "C" fn jit_helper_set_flags(
     }
 }
 
+/// Exact x86 shift/rotate semantics shared by the JIT lowering.
+///
+/// `kind`: 0 = SHL, 1 = SHR, 2 = SAR, 3 = ROL, 4 = ROR.  The count is masked
+/// to 5 bits (8/16/32-bit operands) and a zero count leaves both the value
+/// and the flags unchanged, matching x86.  The result is width-masked; the
+/// caller merges it into the destination (preserving upper bits for 8/16-bit
+/// operands).
+///
+/// # Safety
+/// `state` must be null or point at a live `CpuState` owned by the executing
+/// block for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_helper_shift(
+    state: *mut CpuState,
+    value: u64,
+    count: u32,
+    width: u32,
+    kind: u32,
+) -> u64 {
+    if state.is_null() {
+        return value;
+    }
+    let s = unsafe { &mut *state };
+    let bits = u64::from(width) * 8;
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let shift = u64::from(count) & if bits == 64 { 63 } else { 31 };
+    if shift == 0 {
+        // x86 leaves the flags (and value) untouched for a zero count.
+        return value & mask;
+    }
+    let lhs = value & mask;
+    let sign_bit = 1u64 << (bits - 1);
+    let result = match kind {
+        0 => (lhs << shift) & mask,
+        1 => (lhs >> shift) & mask,
+        2 => {
+            let fill = if lhs & sign_bit != 0 {
+                !0u64 << (bits - shift)
+            } else {
+                0
+            };
+            ((lhs >> shift) | fill) & mask
+        }
+        3 => {
+            let rotate = shift % bits;
+            ((lhs << rotate) | (lhs >> (bits - rotate))) & mask
+        }
+        4 => {
+            let rotate = shift % bits;
+            ((lhs >> rotate) | (lhs << (bits - rotate))) & mask
+        }
+        _ => return value & mask,
+    };
+    let cf = match kind {
+        0 => ((lhs >> (bits - shift)) & 1) != 0,
+        1 | 2 => ((lhs >> (shift - 1)) & 1) != 0,
+        3 => (result & 1) != 0,
+        4 => (result & sign_bit) != 0,
+        _ => false,
+    };
+    let of = match kind {
+        0 => shift == 1 && ((lhs ^ result) & sign_bit) != 0,
+        1 => shift == 1 && (lhs & sign_bit) != 0,
+        2 => false,
+        3 => shift == 1 && ((result & sign_bit) != 0) != cf,
+        4 => shift == 1 && ((result & sign_bit) != 0) != ((result & (sign_bit >> 1)) != 0),
+        _ => false,
+    };
+    s.pending_flags = None;
+    s.flags = crate::cpu::Flags {
+        cf,
+        pf: parity_byte(result as u8),
+        af: false,
+        zf: result == 0,
+        sf: (result & sign_bit) != 0,
+        of,
+    };
+    result
+}
+
 /// Materialise any parked lazy flags before compiled code reads flag bytes.
 ///
 /// # Safety
@@ -2197,7 +2281,15 @@ impl JitCompiler {
         self.used_interpreter_helper = false;
         self.relocations.clear();
         let link_slots = LinkSlots::new();
-        self.link_slots = Some(link_slots.clone());
+        // Diagnostic-only (CASA1_JIT_NO_LINKS=1): disable native block
+        // chaining so every call/jump exits to the cooperative dispatcher.
+        // This makes the bounded thiscall/ECX trace see calls that would
+        // otherwise enter a linked block directly.
+        self.link_slots = if std::env::var_os("CASA1_JIT_NO_LINKS").is_some() {
+            None
+        } else {
+            Some(link_slots.clone())
+        };
 
         // Prologue: save callee-saved registers and set up frame
         self.emit_prologue(arch);
@@ -3180,6 +3272,66 @@ impl JitCompiler {
         self.emitter.mov_reg(2, 28); // restore MemoryImage ptr
     }
 
+    /// Emit an exact x86 shift/rotate through `jit_helper_shift`.
+    ///
+    /// `count_from_cl` reads the low byte of guest ECX (x5).  The result is
+    /// merged into the destination: 32-bit zero-extends, 8/16-bit preserves
+    /// the upper bits (x86 partial-register semantics).  Flags are written by
+    /// the helper, including the zero-count no-op and arithmetic SAR.
+    pub(super) fn emit_shift_helper(
+        &mut self,
+        dst: Register,
+        count: u64,
+        width: usize,
+        kind: u64,
+        count_from_cl: bool,
+        arch: GuestArch,
+    ) {
+        let arm_dst = regmap::guest_to_arm(dst.index());
+        // Capture value (and CL) before the guest-register spill.
+        self.emitter.mov_reg(regmap::X25, arm_dst);
+        if count_from_cl {
+            self.emitter
+                .uxtb(regmap::X26, regmap::guest_to_arm(Register::Rcx.index()));
+        } else {
+            self.emitter.mov_imm64(regmap::X26, count);
+        }
+        self.emitter.mov_reg(28, 2); // save MemoryImage ptr
+        self.emit_store_guest_registers(arch);
+        self.emitter.mov_reg(24, 0); // save CpuState
+        self.emitter.mov_reg(0, 24);
+        self.emitter.mov_reg(1, 25);
+        self.emitter.mov_reg(2, 26);
+        self.emitter.movz(3, width as u16, 0);
+        self.emitter.movz(4, kind as u16, 0);
+        self.emit_bl_to(AotHelper::Shift);
+        self.emitter.mov_reg(25, 0); // result
+        self.emitter.mov_reg(0, 24);
+        self.emit_load_guest_registers(arch);
+        self.emitter.mov_reg(2, 28); // restore MemoryImage ptr
+        match width {
+            4 => {
+                self.emitter.mov_reg(arm_dst, 25);
+                self.emitter.uxtw_reg(arm_dst, arm_dst);
+            }
+            2 => {
+                self.emitter.mov_imm64(22, 0xffff);
+                self.emitter.and_reg(25, 25, 22);
+                self.emitter.mov_imm64(22, !0xffffu64);
+                self.emitter.and_reg(arm_dst, arm_dst, 22);
+                self.emitter.orr_reg(arm_dst, arm_dst, 25);
+            }
+            1 => {
+                self.emitter.mov_imm64(22, 0xff);
+                self.emitter.and_reg(25, 25, 22);
+                self.emitter.mov_imm64(22, !0xffu64);
+                self.emitter.and_reg(arm_dst, arm_dst, 22);
+                self.emitter.orr_reg(arm_dst, arm_dst, 25);
+            }
+            _ => self.emitter.mov_reg(arm_dst, 25),
+        }
+    }
+
     /// Emit a native register/immediate-source ALU operation.
     /// op: 0=add, 1=sub, 2=and, 3=or, 4=xor.
     pub(super) fn emit_native_alu_reg(
@@ -3218,6 +3370,9 @@ impl JitCompiler {
             self.emitter.and_reg(dst_arm, dst_arm, regmap::X22);
             self.emitter.and_reg(src_arm, src_arm, regmap::X22);
         }
+        // Save the pre-operation LHS so the x86 flags are exact.
+        let lhs = regmap::X25;
+        self.emitter.mov_reg(lhs, dst_arm);
         match op {
             0 => self.emitter.add_reg(dst_arm, dst_arm, src_arm),
             1 => self.emitter.sub_reg(dst_arm, dst_arm, src_arm),
@@ -3235,6 +3390,7 @@ impl JitCompiler {
             self.emitter.mov_imm64(regmap::X22, 0xff);
             self.emitter.and_reg(dst_arm, dst_arm, regmap::X22);
         }
+        self.emit_set_flags(dst_arm, lhs, src_arm, op as u64, width as u64, arch);
     }
 
     /// Emit a Compare or Test instruction: evaluate operands, call set_flags.
@@ -3407,6 +3563,13 @@ impl JitCompiler {
             }
             IrInstruction::AddImm { dst, value, width } => {
                 let arm_dst = regmap::guest_to_arm(dst.index());
+                // Preserve the pre-operation LHS for the x86 flags.  The
+                // JIT's native ALU forms previously updated only the result
+                // and left `CpuState.flags` stale, so `sub ecx,1; jne`
+                // looped through zero (2,1,0,0xffffffff,...).  This is the
+                // root cause of the Steam CRT memcpy negative length.
+                self.emitter.mov_reg(regmap::X25, arm_dst);
+                self.emitter.mov_imm64(regmap::X26, *value);
                 if *value <= 0xfff {
                     self.emitter.add_imm(arm_dst, arm_dst, *value as u32);
                 } else {
@@ -3421,10 +3584,13 @@ impl JitCompiler {
                     // pointers and hanging counted loops forever.
                     self.emitter.uxtw_reg(arm_dst, arm_dst);
                 }
+                self.emit_set_flags(arm_dst, regmap::X25, regmap::X26, 0, *width as u64, arch);
             }
 
             IrInstruction::SubImm { dst, value, width } => {
                 let arm_dst = regmap::guest_to_arm(dst.index());
+                self.emitter.mov_reg(regmap::X25, arm_dst);
+                self.emitter.mov_imm64(regmap::X26, *value);
                 if *value <= 0xfff {
                     self.emitter.sub_imm(arm_dst, arm_dst, *value as u32);
                 } else {
@@ -3434,6 +3600,7 @@ impl JitCompiler {
                 if *width == 4 {
                     self.emitter.uxtw_reg(arm_dst, arm_dst);
                 }
+                self.emit_set_flags(arm_dst, regmap::X25, regmap::X26, 1, *width as u64, arch);
             }
 
             IrInstruction::AndImm { dst, value, width } => {
@@ -3467,31 +3634,35 @@ impl JitCompiler {
                 self.emitter.eor_reg(arm_dst, arm_dst, regmap::X21);
             }
 
-            IrInstruction::ShlImm {
-                dst,
-                count,
-                width: _,
-            } => {
-                let arm_dst = regmap::guest_to_arm(dst.index());
-                self.emitter.lsl_imm(arm_dst, arm_dst, *count as u32);
+            IrInstruction::ShlImm { dst, count, width } => {
+                self.emit_shift_helper(*dst, u64::from(*count), *width, 0, false, arch);
             }
-
-            IrInstruction::ShrImm {
-                dst,
-                count,
-                width: _,
-            } => {
-                let arm_dst = regmap::guest_to_arm(dst.index());
-                self.emitter.lsr_imm(arm_dst, arm_dst, *count as u32);
+            IrInstruction::ShrImm { dst, count, width } => {
+                self.emit_shift_helper(*dst, u64::from(*count), *width, 1, false, arch);
             }
-
-            IrInstruction::SarImm {
-                dst,
-                count,
-                width: _,
-            } => {
-                let arm_dst = regmap::guest_to_arm(dst.index());
-                self.emitter.asr_imm(arm_dst, arm_dst, *count as u32);
+            IrInstruction::SarImm { dst, count, width } => {
+                self.emit_shift_helper(*dst, u64::from(*count), *width, 2, false, arch);
+            }
+            IrInstruction::RolImm { dst, count, width } => {
+                self.emit_shift_helper(*dst, u64::from(*count), *width, 3, false, arch);
+            }
+            IrInstruction::RorImm { dst, count, width } => {
+                self.emit_shift_helper(*dst, u64::from(*count), *width, 4, false, arch);
+            }
+            IrInstruction::ShlCl { dst, width } => {
+                self.emit_shift_helper(*dst, 0, *width, 0, true, arch);
+            }
+            IrInstruction::ShrCl { dst, width } => {
+                self.emit_shift_helper(*dst, 0, *width, 1, true, arch);
+            }
+            IrInstruction::SarCl { dst, width } => {
+                self.emit_shift_helper(*dst, 0, *width, 2, true, arch);
+            }
+            IrInstruction::RolCl { dst, width } => {
+                self.emit_shift_helper(*dst, 0, *width, 3, true, arch);
+            }
+            IrInstruction::RorCl { dst, width } => {
+                self.emit_shift_helper(*dst, 0, *width, 4, true, arch);
             }
 
             IrInstruction::PushReg { src } => {

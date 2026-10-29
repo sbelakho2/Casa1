@@ -16187,6 +16187,12 @@
   "(decoded.tymed, TYMED_HGLOBAL)",
   "(fixture.runtime.com_format_etc_bytes(&format).len(), 32)"
  ],
+ "x86_counted_loop_boundary_sub_flags_stop_at_zero": [
+  "(state.rip, 0x1000, \"the only loop entry is 0x1000\")",
+  "(state.rip, 0x1005, \"the loop must fall through at ECX == 0\")",
+  "(run(false), 0, \"interpreter stops the count at zero\")",
+  "( run(true), 0, \"JIT must stop sub ecx,1/jne at zero (no 0xffffffff wrap)\" )"
+ ],
  "x86_effective_address_boundary_truncates_to_32_bits": [
   "( interpreted, 0x5a, \"interpreter reads the wrapped 32-bit address\" )",
   "( jitted, 0x5a, \"JIT must wrap [esi+edi] modulo 2^32, not fault at 0x1_73001e7c\" )"
@@ -16226,6 +16232,14 @@
   "( jitted.get(Register::Rax), 54, \"JIT must compute len+1 = 54, not 34 (the Steam _setenvp truncation)\" )",
   "(jitted.get(Register::Rcx), interpreted.get(Register::Rcx))",
   "(jitted.get(Register::Rsi), interpreted.get(Register::Rsi))"
+ ],
+ "x86_strlen_boundary_length_jit_matches_interpreter": [
+  "(state.rip, 0x1007, \"strlen loop must reach the NUL\")",
+  "( reference.get(Register::Rax), (length + 1) as u64, \"interpreter strlen length {length} (loop counts the NUL)\" )",
+  "( jitted.get(Register::Rax), reference.get(Register::Rax), \"JIT strlen length {length}\" )"
+ ],
+ "x86_sub_operand_boundary_value_and_flags_jit_matches_interpreter": [
+  "( jitted.get(Register::Rax), reference.get(Register::Rax), \"sub eax,ebx value {a:#x}-{b:#x}\" )"
  ],
  "xact_bad_indices_and_engine_errors_are_genuine": [
   "(eax, u64::from(crate::xact::XACTENGINE_E_NOTINITIALIZED))",

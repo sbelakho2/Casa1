@@ -21195,7 +21195,7 @@ impl PeHostRuntime {
                     let bytes = read_window(memory, buffer_ptr, length)?;
                     let text = String::from_utf8_lossy(&bytes);
                     if handle == STD_ERROR_HANDLE {
-                        self.stderr.push_str(&text);
+                        { crate::runtime::trace_guest_stderr(&text); self.stderr.push_str(&text); }
                     } else {
                         self.stdout.push_str(&text);
                     }
@@ -22836,7 +22836,7 @@ impl PeHostRuntime {
                 if self.crt_iob_index(stream).is_some() {
                     let text = String::from_utf8_lossy(&bytes);
                     if stream == self.globals.iob_streams[2] {
-                        self.stderr.push_str(&text);
+                        { crate::runtime::trace_guest_stderr(&text); self.stderr.push_str(&text); }
                     } else {
                         self.stdout.push_str(&text);
                     }
@@ -38514,7 +38514,7 @@ impl PeHostRuntime {
                 // EH_UNWINDING (0x02) means this is called during stack
                 // unwinding — it is a signal, not a dispatch.
                 if flags & 0x02 != 0 {
-                    emit_live_ui_debug(format!("RaiseException(code={code:#x}, flags={flags:#x})"));
+                emit_live_ui_debug(format!("RaiseException(code={code:#x}, flags={flags:#x})"));
                     state.set(Register::Rax, u64::from(code));
                     self.last_error = 0;
                     return Ok(None);
@@ -38531,6 +38531,94 @@ impl PeHostRuntime {
                             break;
                         }
                     }
+                }
+                    if code == 0xE06D_7363 && self.guest_arch == GuestArch::X86 {
+                    // MSVC C++ exception: params = [EH magic, object*, throw_info*].
+                    let object = raise_parameters.get(1).copied().unwrap_or(0);
+                    let mut dump = Vec::new();
+                    if object != 0
+                        && let Ok(bytes) = memory.read_bytes(u64::from(object), 128)
+                    {
+                        dump = bytes.to_vec();
+                    }
+                    let mut strings = Vec::new();
+                    let mut start = None;
+                    for (index, byte) in dump.iter().enumerate() {
+                        if byte.is_ascii_graphic() || *byte == b' ' {
+                            start.get_or_insert(index);
+                        } else if let Some(begin) = start.take() {
+                            if index - begin >= 4 {
+                                strings.push(String::from_utf8_lossy(&dump[begin..index]).into_owned());
+                            }
+                        }
+                    }
+                    if let Some(begin) = start {
+                        if dump.len() - begin >= 4 {
+                            strings.push(String::from_utf8_lossy(&dump[begin..]).into_owned());
+                        }
+                    }
+                    // Decode the MSVC ThrowInfo -> CatchableTypeArray ->
+                    // CatchableType -> TypeDescriptor chain to name the
+                    // thrown class (bounded, best-effort).
+                    let throw_info = raise_parameters.get(2).copied().unwrap_or(0);
+                    let mut type_name = String::new();
+                    if throw_info != 0
+                        && let Ok(info) = memory.read_bytes(u64::from(throw_info), 16)
+                    {
+                        let array_ptr = u32::from_le_bytes([info[12], info[13], info[14], info[15]]);
+                        if array_ptr != 0
+                            && let Ok(array) = memory.read_bytes(u64::from(array_ptr), 20)
+                        {
+                            let count = u32::from_le_bytes([array[0], array[1], array[2], array[3]]);
+                            if count > 0 {
+                                let ct = u32::from_le_bytes([array[4], array[5], array[6], array[7]]);
+                                if ct != 0
+                                    && let Ok(ct_bytes) = memory.read_bytes(u64::from(ct), 8)
+                                {
+                                    let p_type = u32::from_le_bytes([
+                                        ct_bytes[4],
+                                        ct_bytes[5],
+                                        ct_bytes[6],
+                                        ct_bytes[7],
+                                    ]);
+                                    if p_type != 0
+                                        && let Ok(td) = memory.read_bytes(u64::from(p_type), 96)
+                                    {
+                                        let name = &td[8..];
+                                        let end = name
+                                            .iter()
+                                            .position(|byte| *byte == 0)
+                                            .unwrap_or(name.len());
+                                        type_name = String::from_utf8_lossy(&name[..end]).into_owned();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[cxxthrow] code={code:#x} params={:x?} object={object:#x} type={type_name:?} strings={strings:?}",
+                        raise_parameters
+                    );
+                    self.push_trace(
+                        "process",
+                        "CxxThrow",
+                        BTreeMap::from([
+                            ("code".to_string(), json!(format!("{code:#x}"))),
+                            ("parameters".to_string(), json!(raise_parameters)),
+                            ("object".to_string(), json!(format!("{object:#x}"))),
+                            (
+                                "object_bytes".to_string(),
+                                json!(dump
+                                    .iter()
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect::<Vec<_>>()
+                                    .join("")),
+                            ),
+                            ("strings".to_string(), json!(strings)),
+                            ("type_name".to_string(), json!(type_name)),
+                        ]),
+                        json!(null),
+                    );
                 }
                 emit_live_ui_debug(format!("RaiseException(code={code:#x}, flags={flags:#x})"));
                 // Windows semantics: dispatch through the thread's SEH chain

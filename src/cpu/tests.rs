@@ -4094,3 +4094,467 @@ fn x86_effective_address_boundary_truncates_to_32_bits() {
         "JIT must wrap [esi+edi] modulo 2^32, not fault at 0x1_73001e7c"
     );
 }
+
+/// Regression for MSVC `memcpy`'s counted dword loop.  The guest executes
+/// `sub ecx,1; jne`; the JIT used to leave `CpuState.flags` stale, so the
+/// branch ran through zero (2,1,0,0xffffffff,...) and `memcpy` consumed a
+/// negative length.  The JIT and interpreter must both stop at ECX == 0.
+#[test]
+fn x86_counted_loop_boundary_sub_flags_stop_at_zero() {
+    let bytes = [
+        0x83, 0xe9, 0x01, // sub ecx, 1
+        0x75, 0xfb, // jne 0x1000
+        0xc3, // ret
+    ];
+    let run = |use_jit: bool| -> u64 {
+        let config = CpuEngineConfig::from_profile(GuestArch::X86, "test", "test", None)
+            .expect("cpu config");
+        let engine = CpuExecutionEngine::new(config);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = 0x1000;
+        state.set(Register::Rcx, 3);
+        state.set(Register::Rsp, 0x7000_0ff0);
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &bytes);
+        memory.map_bytes(0x7000_0000, &[0; 0x1000]);
+        memory.map_bytes(0x7000_0ff0, &0xDEAD_u32.to_le_bytes());
+        crate::jit::JIT_FAULT_STORM_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut jit = if use_jit {
+            Some(crate::jit::JitRuntime::new(GuestArch::X86))
+        } else {
+            None
+        };
+        let loop_ir =
+            lower_to_ir(&decode_block(&bytes[..5], 0x1000, GuestArch::X86).expect("decode loop"))
+                .expect("lower loop");
+        if let Some(jit) = jit.as_mut() {
+            jit.get_or_compile(&loop_ir, 0x1000, GuestArch::X86, None)
+                .expect("compile loop");
+        }
+        for _ in 0..32 {
+            if state.rip == 0x1005 {
+                break;
+            }
+            assert_eq!(state.rip, 0x1000, "the only loop entry is 0x1000");
+            let ir = lower_to_ir(
+                &decode_block(&bytes[..5], 0x1000, GuestArch::X86).expect("decode loop"),
+            )
+            .expect("lower loop");
+            if use_jit {
+                engine
+                    .execute_with_jit(&mut state, &mut memory, &ir, jit.as_mut())
+                    .expect("jit exec");
+            } else {
+                execute_ir_with_hashing(&mut state, &mut memory, &ir, None, false, None)
+                    .expect("interp exec");
+            }
+        }
+        assert_eq!(state.rip, 0x1005, "the loop must fall through at ECX == 0");
+        let tail =
+            lower_to_ir(&decode_block(&bytes[5..], 0x1005, GuestArch::X86).expect("decode ret"))
+                .expect("lower ret");
+        if use_jit {
+            engine
+                .execute_with_jit(&mut state, &mut memory, &tail, jit.as_mut())
+                .expect("jit ret");
+        } else {
+            execute_ir_with_hashing(&mut state, &mut memory, &tail, None, false, None)
+                .expect("interp ret");
+        }
+        state.get(Register::Rcx)
+    };
+    assert_eq!(run(false), 0, "interpreter stops the count at zero");
+    assert_eq!(
+        run(true),
+        0,
+        "JIT must stop sub ecx,1/jne at zero (no 0xffffffff wrap)"
+    );
+}
+
+fn run_x86_once(
+    bytes: &[u8],
+    seed: &[(Register, u64)],
+    data: &[(u64, &[u8])],
+    use_jit: bool,
+) -> CpuState {
+    let config =
+        CpuEngineConfig::from_profile(GuestArch::X86, "test", "test", None).expect("cpu config");
+    let engine = CpuExecutionEngine::new(config);
+    let mut state = CpuState::new(GuestArch::X86);
+    for &(register, value) in seed {
+        state.set(register, value);
+    }
+    state.rip = 0x1000;
+    let mut memory = MemoryImage::default();
+    memory.map_bytes(0x1000, bytes);
+    memory.map_bytes(0x1000 + bytes.len() as u64, &[0xc3]);
+    memory.map_bytes(0x7000_0000, &[0; 0x1000]);
+    memory.map_bytes(0x8000, &[0; 0x1000]);
+    for &(address, contents) in data {
+        memory.map_bytes(address, contents);
+    }
+    if state.get(Register::Rsp) == 0 {
+        state.set(Register::Rsp, 0x7000_0800);
+    }
+    crate::jit::JIT_FAULT_STORM_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut jit = if use_jit {
+        Some(crate::jit::JitRuntime::new(GuestArch::X86))
+    } else {
+        None
+    };
+    let decoded = decode_block(bytes, 0x1000, GuestArch::X86).expect("decode");
+    let ir = lower_to_ir(&decoded).expect("lower");
+    if let Some(jit) = jit.as_mut() {
+        jit.get_or_compile(&ir, 0x1000, GuestArch::X86, None)
+            .expect("compile");
+    }
+    if use_jit {
+        engine
+            .execute_with_jit(&mut state, &mut memory, &ir, jit.as_mut())
+            .expect("jit exec");
+    } else {
+        execute_ir_with_hashing(&mut state, &mut memory, &ir, None, false, None)
+            .expect("interp exec");
+    }
+    state
+}
+
+#[test]
+fn x86_sub_operand_boundary_value_and_flags_jit_matches_interpreter() {
+    // 2b c3 = sub eax, ebx; c3 = ret
+    let bytes = [0x2b, 0xc3, 0xc3];
+    for (a, b) in [
+        (0x8010u64, 0x8000u64),
+        (0, 1),
+        (0x8000_0000, 1),
+        (0x7fff_ffff, 0xffff_ffff),
+        (0xffff_ffff, 0xffff_ffff),
+    ] {
+        let seed = [(Register::Rax, a), (Register::Rbx, b)];
+        let reference = run_x86_once(&bytes, &seed, &[], false);
+        let jitted = run_x86_once(&bytes, &seed, &[], true);
+        assert_eq!(
+            jitted.get(Register::Rax),
+            reference.get(Register::Rax),
+            "sub eax,ebx value {a:#x}-{b:#x}"
+        );
+        assert_flags_eq(
+            jitted.flags,
+            reference.flags,
+            &format!("sub eax,ebx {a:#x}-{b:#x}"),
+        );
+    }
+}
+
+#[test]
+fn x86_strlen_boundary_length_jit_matches_interpreter() {
+    // 8a 08       mov cl,[eax]
+    // 40          inc eax
+    // 84 c9       test cl,cl
+    // 75 f9       jne 0x1000
+    // 2b c3       sub eax,ebx
+    // c3          ret
+    let bytes = [0x8a, 0x08, 0x40, 0x84, 0xc9, 0x75, 0xf9, 0x2b, 0xc3, 0xc3];
+    for length in [0usize, 1, 2, 15, 16, 17, 31, 32, 53] {
+        let mut text = vec![b'A'; length];
+        text.push(0);
+        let seed = [(Register::Rax, 0x8000u64), (Register::Rbx, 0x8000u64)];
+        let run = |use_jit: bool| -> CpuState {
+            let config = CpuEngineConfig::from_profile(GuestArch::X86, "test", "test", None)
+                .expect("cpu config");
+            let engine = CpuExecutionEngine::new(config);
+            let mut state = CpuState::new(GuestArch::X86);
+            for &(register, value) in &seed {
+                state.set(register, value);
+            }
+            state.rip = 0x1000;
+            state.set(Register::Rsp, 0x7000_0800);
+            let mut memory = MemoryImage::default();
+            memory.map_bytes(0x1000, &bytes);
+            memory.map_bytes(0x7000_0000, &[0; 0x1000]);
+            memory.map_bytes(0x8000, &text);
+            memory.map_bytes(0x7000_0800, &0xDEAD_u32.to_le_bytes());
+            crate::jit::JIT_FAULT_STORM_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+            let mut jit = if use_jit {
+                Some(crate::jit::JitRuntime::new(GuestArch::X86))
+            } else {
+                None
+            };
+            let loop_ir = lower_to_ir(
+                &decode_block(&bytes[..7], 0x1000, GuestArch::X86).expect("decode loop"),
+            )
+            .expect("lower loop");
+            if let Some(jit) = jit.as_mut() {
+                jit.get_or_compile(&loop_ir, 0x1000, GuestArch::X86, None)
+                    .expect("compile loop");
+            }
+            for _ in 0..256 {
+                if state.rip == 0x1007 {
+                    break;
+                }
+                let ir = lower_to_ir(
+                    &decode_block(&bytes[..7], 0x1000, GuestArch::X86).expect("decode loop"),
+                )
+                .expect("lower loop");
+                if use_jit {
+                    engine
+                        .execute_with_jit(&mut state, &mut memory, &ir, jit.as_mut())
+                        .expect("jit loop");
+                } else {
+                    execute_ir_with_hashing(&mut state, &mut memory, &ir, None, false, None)
+                        .expect("interp loop");
+                }
+            }
+            assert_eq!(state.rip, 0x1007, "strlen loop must reach the NUL");
+            let tail = lower_to_ir(
+                &decode_block(&bytes[7..], 0x1007, GuestArch::X86).expect("decode tail"),
+            )
+            .expect("lower tail");
+            if use_jit {
+                engine
+                    .execute_with_jit(&mut state, &mut memory, &tail, jit.as_mut())
+                    .expect("jit tail");
+            } else {
+                execute_ir_with_hashing(&mut state, &mut memory, &tail, None, false, None)
+                    .expect("interp tail");
+            }
+            state
+        };
+        let reference = run(false);
+        let jitted = run(true);
+        assert_eq!(
+            reference.get(Register::Rax),
+            (length + 1) as u64,
+            "interpreter strlen length {length} (loop counts the NUL)"
+        );
+        assert_eq!(
+            jitted.get(Register::Rax),
+            reference.get(Register::Rax),
+            "JIT strlen length {length}"
+        );
+        assert_flags_eq(jitted.flags, reference.flags, &format!("strlen {length}"));
+    }
+}
+
+fn run_x86_result(
+    bytes: &[u8],
+    seed: &[(Register, u64)],
+    use_jit: bool,
+) -> Result<CpuState, String> {
+    let config =
+        CpuEngineConfig::from_profile(GuestArch::X86, "test", "test", None).expect("cpu config");
+    let engine = CpuExecutionEngine::new(config);
+    let mut state = CpuState::new(GuestArch::X86);
+    for &(register, value) in seed {
+        state.set(register, value);
+    }
+    state.rip = 0x1000;
+    state.set(Register::Rsp, 0x7000_0800);
+    let mut memory = MemoryImage::default();
+    memory.map_bytes(0x1000, bytes);
+    memory.map_bytes(0x1000 + bytes.len() as u64, &[0xc3]);
+    memory.map_bytes(0x7000_0000, &[0; 0x2000]);
+    memory.map_bytes(0x7000_0800, &0xDEAD_u32.to_le_bytes());
+    crate::jit::JIT_FAULT_STORM_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut jit = if use_jit {
+        Some(crate::jit::JitRuntime::new(GuestArch::X86))
+    } else {
+        None
+    };
+    let decoded = decode_block(bytes, 0x1000, GuestArch::X86).map_err(|e| e.to_string())?;
+    let ir = lower_to_ir(&decoded).map_err(|e| e.to_string())?;
+    if use_jit {
+        jit.as_mut()
+            .expect("jit runtime")
+            .get_or_compile(&ir, 0x1000, GuestArch::X86, None)
+            .map_err(|e| e.to_string())?;
+        engine
+            .execute_with_jit(&mut state, &mut memory, &ir, jit.as_mut())
+            .map_err(|e| e.to_string())?;
+    } else {
+        execute_ir_with_hashing(&mut state, &mut memory, &ir, None, false, None)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(state)
+}
+
+/// Systemic audit: every x86 flag-producing form is executed once in the JIT
+/// and once in the interpreter with boundary operands; CF/PF/AF/ZF/SF/OF and
+/// the result register must match exactly.  Unsupported forms are reported
+/// separately (they must not silently diverge).
+#[test]
+fn x86_flag_audit_boundary_jit_matches_interpreter() {
+    let mut divergences = Vec::new();
+    let mut unsupported = Vec::new();
+    let mut check = |label: &str, bytes: &[u8], seeds: &[(u64, u64)]| {
+        for &(a, b) in seeds {
+            let seed = [(Register::Rax, a), (Register::Rbx, b)];
+            let reference = match run_x86_result(bytes, &seed, false) {
+                Ok(state) => state,
+                Err(_error) => {
+                    // Divide-by-zero/overflow and other architecturally
+                    // exceptional operand pairs are not flag divergences.
+                    continue;
+                }
+            };
+            let jitted = match run_x86_result(bytes, &seed, true) {
+                Ok(state) => state,
+                Err(error) => {
+                    unsupported.push(format!("{label}: {error}"));
+                    continue;
+                }
+            };
+            if jitted.get(Register::Rax) != reference.get(Register::Rax) {
+                divergences.push(format!(
+                    "{label} {a:#x},{b:#x}: RAX jit={:#x} ref={:#x}",
+                    jitted.get(Register::Rax),
+                    reference.get(Register::Rax)
+                ));
+            }
+            if jitted.get(Register::Rdx) != reference.get(Register::Rdx) {
+                divergences.push(format!(
+                    "{label} {a:#x},{b:#x}: RDX jit={:#x} ref={:#x}",
+                    jitted.get(Register::Rdx),
+                    reference.get(Register::Rdx)
+                ));
+            }
+            if jitted.flags != reference.flags {
+                divergences.push(format!(
+                    "{label} {a:#x},{b:#x}: flags jit={:?} ref={:?}",
+                    jitted.flags, reference.flags
+                ));
+            }
+        }
+    };
+
+    let boundary32 = [
+        (0x1234_5678u64, 0x9abc_def0u64),
+        (0x7fff_ffff, 1),
+        (0x8000_0000, 0x8000_0000),
+        (0xffff_ffff, 0xffff_ffff),
+        (0xffff_ffff, 1),
+        (0, 1),
+        (1, 0),
+        (0x10, 0x0f),
+    ];
+    let boundary16 = [
+        (0x1234, 0x5678),
+        (0x7fff, 1),
+        (0x8000, 0x8000),
+        (0xffff, 0xffff),
+        (0xffff, 1),
+        (0, 1),
+        (1, 0),
+    ];
+    let boundary8 = [
+        (0x12, 0x34),
+        (0x7f, 1),
+        (0x80, 0x80),
+        (0xff, 0xff),
+        (0xff, 1),
+        (0, 1),
+        (1, 0),
+    ];
+    let forms32: &[(&str, &[u8])] = &[
+        ("add", &[0x01, 0xd8]),
+        ("sub", &[0x2b, 0xc3]),
+        ("and", &[0x21, 0xd8]),
+        ("or", &[0x09, 0xd8]),
+        ("xor", &[0x31, 0xd8]),
+        ("adc", &[0x11, 0xd8]),
+        ("sbb", &[0x19, 0xd8]),
+        ("cmp", &[0x39, 0xd8]),
+        ("test", &[0x85, 0xd8]),
+        ("inc", &[0x40]),
+        ("dec", &[0x48]),
+        ("neg", &[0xf7, 0xd8]),
+        ("shl0", &[0xc1, 0xe0, 0x00]),
+        ("shl1", &[0xc1, 0xe0, 0x01]),
+        ("shl31", &[0xc1, 0xe0, 0x1f]),
+        ("shl32", &[0xc1, 0xe0, 0x20]),
+        ("shr0", &[0xc1, 0xe8, 0x00]),
+        ("shr1", &[0xc1, 0xe8, 0x01]),
+        ("shr31", &[0xc1, 0xe8, 0x1f]),
+        ("shr32", &[0xc1, 0xe8, 0x20]),
+        ("sar1", &[0xc1, 0xf8, 0x01]),
+        ("sar31", &[0xc1, 0xf8, 0x1f]),
+        ("rol1", &[0xc1, 0xc0, 0x01]),
+        ("ror1", &[0xc1, 0xc8, 0x01]),
+        ("imul2", &[0x0f, 0xaf, 0xc3]),
+        ("imul3i8", &[0x6b, 0xc3, 0x05]),
+        ("imul3i32", &[0x69, 0xc3, 0x00, 0x01, 0x00, 0x00]),
+        ("mul", &[0xf7, 0xe3]),
+        ("div", &[0xf7, 0xf3]),
+        ("idiv", &[0xf7, 0xfb]),
+        ("sete", &[0x39, 0xd8, 0x0f, 0x94, 0xc0]),
+        ("setne", &[0x39, 0xd8, 0x0f, 0x95, 0xc0]),
+        ("setb", &[0x39, 0xd8, 0x0f, 0x92, 0xc0]),
+        ("setae", &[0x39, 0xd8, 0x0f, 0x93, 0xc0]),
+        ("setl", &[0x39, 0xd8, 0x0f, 0x9c, 0xc0]),
+        ("setge", &[0x39, 0xd8, 0x0f, 0x9d, 0xc0]),
+        ("cmove", &[0x39, 0xd8, 0x0f, 0x44, 0xc3]),
+        ("cmovne", &[0x39, 0xd8, 0x0f, 0x45, 0xc3]),
+        ("cmovb", &[0x39, 0xd8, 0x0f, 0x42, 0xc3]),
+        ("cmovl", &[0x39, 0xd8, 0x0f, 0x4c, 0xc3]),
+    ];
+    for (label, bytes) in forms32 {
+        check(label, bytes, &boundary32);
+    }
+    let forms16: &[(&str, &[u8])] = &[
+        ("add16", &[0x66, 0x01, 0xd8]),
+        ("sub16", &[0x66, 0x2b, 0xc3]),
+        ("and16", &[0x66, 0x21, 0xd8]),
+        ("or16", &[0x66, 0x09, 0xd8]),
+        ("xor16", &[0x66, 0x31, 0xd8]),
+        ("adc16", &[0x66, 0x11, 0xd8]),
+        ("sbb16", &[0x66, 0x19, 0xd8]),
+        ("cmp16", &[0x66, 0x39, 0xd8]),
+        ("test16", &[0x66, 0x85, 0xd8]),
+        ("inc16", &[0x66, 0x40]),
+        ("dec16", &[0x66, 0x48]),
+        ("neg16", &[0x66, 0xf7, 0xd8]),
+        ("shl16_1", &[0x66, 0xc1, 0xe0, 0x01]),
+        ("shr16_1", &[0x66, 0xc1, 0xe8, 0x01]),
+        ("sar16_1", &[0x66, 0xc1, 0xf8, 0x01]),
+    ];
+    for (label, bytes) in forms16 {
+        check(label, bytes, &boundary16);
+    }
+    let forms8: &[(&str, &[u8])] = &[
+        ("add8", &[0x00, 0xd8]),
+        ("sub8", &[0x28, 0xd8]),
+        ("and8", &[0x20, 0xd8]),
+        ("or8", &[0x08, 0xd8]),
+        ("xor8", &[0x30, 0xd8]),
+        ("adc8", &[0x10, 0xd8]),
+        ("sbb8", &[0x18, 0xd8]),
+        ("cmp8", &[0x38, 0xd8]),
+        ("test8", &[0x84, 0xd8]),
+        ("inc8", &[0xfe, 0xc0]),
+        ("dec8", &[0xfe, 0xc8]),
+        ("neg8", &[0xf6, 0xd8]),
+        ("shl8_1", &[0xd0, 0xe0]),
+        ("shr8_1", &[0xd0, 0xe8]),
+        ("sar8_1", &[0xd0, 0xf8]),
+    ];
+    for (label, bytes) in forms8 {
+        check(label, bytes, &boundary8);
+    }
+
+    if !divergences.is_empty() {
+        println!("DIVERGENCES ({}):", divergences.len());
+        for divergence in divergences.iter().take(80) {
+            println!("  {divergence}");
+        }
+    }
+    if !unsupported.is_empty() {
+        println!("UNSUPPORTED ({}):", unsupported.len());
+        for entry in unsupported.iter().take(40) {
+            println!("  {entry}");
+        }
+    }
+    assert!(
+        divergences.is_empty(),
+        "JIT/interpreter flag divergences: {divergences:#?}"
+    );
+}

@@ -121,6 +121,7 @@ pub(super) enum AotHelper {
     SetFlags,
     MaterializeFlags,
     LockXadd,
+    Shift,
 }
 
 impl AotHelper {
@@ -133,6 +134,7 @@ impl AotHelper {
             Self::SetFlags => jit_helper_set_flags as *const () as u64,
             Self::MaterializeFlags => jit_helper_materialize_flags as *const () as u64,
             Self::LockXadd => jit_helper_lock_xadd as *const () as u64,
+            Self::Shift => jit_helper_shift as *const () as u64,
         }
     }
 
@@ -145,6 +147,7 @@ impl AotHelper {
             Self::SetFlags => 5,
             Self::MaterializeFlags => 6,
             Self::LockXadd => 7,
+            Self::Shift => 8,
         }
     }
 
@@ -157,6 +160,7 @@ impl AotHelper {
             5 => Self::SetFlags,
             6 => Self::MaterializeFlags,
             7 => Self::LockXadd,
+            8 => Self::Shift,
             _ => return None,
         })
     }

@@ -1067,6 +1067,7 @@ impl PeHostRuntime {
         if stream == 0 || self.crt_iob_index(stream).is_some() {
             let text = String::from_utf8_lossy(bytes);
             if self.crt_iob_index(stream) == Some(2) {
+                crate::runtime::trace_guest_stderr(&text);
                 self.stderr.push_str(&text);
             } else {
                 self.stdout.push_str(&text);
@@ -1686,6 +1687,7 @@ impl PeHostRuntime {
         if let Some(index) = self.crt_iob_index(stream) {
             let text = String::from_utf8_lossy(&bytes);
             if index == 2 {
+                crate::runtime::trace_guest_stderr(&text);
                 self.stderr.push_str(&text);
             } else {
                 self.stdout.push_str(&text);

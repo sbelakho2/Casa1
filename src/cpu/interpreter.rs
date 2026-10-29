@@ -1015,12 +1015,7 @@ pub(crate) fn execute_cold_path(
                 let result = ((value >> rotate) | (value << (bits - rotate))) & mask;
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
                 let mut flags = state.flags;
-                flags.cf = ((result >> (bits - 1)) & 1) != 0;
-                if rotate == 1 {
-                    let msb = (result >> (bits - 1)) & 1;
-                    let next_msb = (result >> (bits - 2)) & 1;
-                    flags.of = (msb ^ next_msb) != 0;
-                }
+                set_rotate_flags(&mut flags, result, bits, rotate, 1);
                 state.flags = flags;
             }
         }
@@ -1939,11 +1934,7 @@ pub(crate) fn execute_cold_path(
                 let result = ((value << rotate) | (value >> (bits - rotate))) & mask;
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
                 let mut flags = state.flags;
-                flags.cf = (result & 1) != 0;
-                if rotate == 1 {
-                    let msb = (result >> (bits - 1)) & 1;
-                    flags.of = (msb ^ u64::from(flags.cf)) != 0;
-                }
+                set_rotate_flags(&mut flags, result, bits, rotate, 0);
                 state.flags = flags;
             }
         }
@@ -1965,11 +1956,7 @@ pub(crate) fn execute_cold_path(
                 let result = ((value << rotate) | (value >> (bits - rotate))) & mask;
                 write_memory_value(memory, target, result, *width)?;
                 let mut flags = state.flags;
-                flags.cf = (result & 1) != 0;
-                if rotate == 1 {
-                    let msb = (result >> (bits - 1)) & 1;
-                    flags.of = (msb ^ u64::from(flags.cf)) != 0;
-                }
+                set_rotate_flags(&mut flags, result, bits, rotate, 0);
                 state.flags = flags;
             }
         }
@@ -1986,12 +1973,7 @@ pub(crate) fn execute_cold_path(
                 let result = ((value >> rotate) | (value << (bits - rotate))) & mask;
                 state.set(*dst, merge_register_result(state.get(*dst), result, *width));
                 let mut flags = state.flags;
-                flags.cf = ((result >> (bits - 1)) & 1) != 0;
-                if rotate == 1 {
-                    let msb = (result >> (bits - 1)) & 1;
-                    let next_msb = (result >> (bits - 2)) & 1;
-                    flags.of = (msb ^ next_msb) != 0;
-                }
+                set_rotate_flags(&mut flags, result, bits, rotate, 1);
                 state.flags = flags;
             }
         }
@@ -2013,12 +1995,7 @@ pub(crate) fn execute_cold_path(
                 let result = ((value >> rotate) | (value << (bits - rotate))) & mask;
                 write_memory_value(memory, target, result, *width)?;
                 let mut flags = state.flags;
-                flags.cf = ((result >> (bits - 1)) & 1) != 0;
-                if rotate == 1 {
-                    let msb = (result >> (bits - 1)) & 1;
-                    let next_msb = (result >> (bits - 2)) & 1;
-                    flags.of = (msb ^ next_msb) != 0;
-                }
+                set_rotate_flags(&mut flags, result, bits, rotate, 1);
                 state.flags = flags;
             }
         }
@@ -6692,6 +6669,24 @@ pub(crate) fn execute_cold_path(
         }
     }
     Ok(())
+}
+
+/// x86 rotate flags: CF is the last bit rotated; OF is defined only for a
+/// count of 1 (ROL: MSB^CF, ROR: MSB^next-MSB); PF/ZF/SF follow the result.
+fn set_rotate_flags(flags: &mut Flags, result: u64, bits: u32, rotate: u32, kind: u8) {
+    let msb = (result >> (bits - 1)) & 1 != 0;
+    flags.pf = parity(result as u8);
+    flags.af = false;
+    flags.zf = result == 0;
+    flags.sf = msb;
+    if kind == 0 {
+        flags.cf = (result & 1) != 0;
+        flags.of = rotate == 1 && msb != flags.cf;
+    } else {
+        flags.cf = msb;
+        let next = ((result >> (bits - 2)) & 1) != 0;
+        flags.of = rotate == 1 && msb != next;
+    }
 }
 
 pub(crate) fn width_mask(width: usize) -> u64 {
