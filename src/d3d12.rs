@@ -7,7 +7,7 @@ use crate::gfx::{
 use crate::reason::ReasonCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_D3D12_METAL_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -341,6 +341,216 @@ struct QueryHeap {
     /// Final resolved values (end - begin for timestamps), written to the
     /// guest's readback buffer by ResolveQueryData.
     resolved: Vec<u64>,
+}
+
+/// Observability snapshot for the D3D12 residency sets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct D3d12ResidencyStats {
+    /// Per-frame MTLResidencySet allocation count at the last observation.
+    pub per_frame_allocations: u64,
+    /// Long-lived MTLResidencySet allocation count at the last observation.
+    pub long_lived_allocations: u64,
+    /// `MakeResident` calls driven through the sets.
+    pub make_resident_calls: u64,
+    /// `Evict` calls driven through the sets.
+    pub evict_calls: u64,
+    /// `SetResidencyPriority` calls applied.
+    pub priority_calls: u64,
+    /// `EnqueueMakeResident` calls applied.
+    pub enqueue_calls: u64,
+    /// Commit operations performed on either set.
+    pub commits: u64,
+    /// `requestResidency` calls.
+    pub requests: u64,
+    /// `endResidency` calls.
+    pub ends: u64,
+    /// Successful queue attachments.
+    pub attachments: u64,
+    /// Successful queue detachments.
+    pub detachments: u64,
+    /// Allocations added to either set.
+    pub additions: u64,
+    /// Allocations removed from either set.
+    pub removals: u64,
+    /// Budget reported by the Metal device (`recommendedMaxWorkingSetSize`).
+    pub budget_bytes: u64,
+    /// Memory footprint of both sets at their last commit.
+    pub allocated_bytes: u64,
+    /// Last priority value applied by `SetResidencyPriority`.
+    pub last_priority: u32,
+}
+
+/// Real MTLResidencySets backing D3D12 residency calls.
+///
+/// One set tracks long-lived allocations (committed resources/upload
+/// textures) and one tracks the per-present-frame set. Both are attached to a
+/// Metal 4 command queue when the runtime exposes `addResidencySet:`; the
+/// exact unsupported-platform error is kept observable when it does not.
+struct D3d12Residency {
+    device: metal::Device,
+    per_frame: crate::metal_backend::MetalResidencySet,
+    long_lived: crate::metal_backend::MetalResidencySet,
+    queue: Option<crate::metal_backend::Metal4Queue>,
+    attached: bool,
+    per_frame_requested: bool,
+    long_lived_requested: bool,
+    priorities: BTreeMap<ResourceId, u32>,
+    stats: D3d12ResidencyStats,
+    last_error: Option<AppError>,
+}
+
+impl std::fmt::Debug for D3d12Residency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("D3d12Residency")
+            .field("attached", &self.attached)
+            .field("stats", &self.stats)
+            .field("last_error", &self.last_error)
+            .finish()
+    }
+}
+
+impl Drop for D3d12Residency {
+    fn drop(&mut self) {
+        if let Some(queue) = self.queue.as_ref() {
+            if self.attached {
+                let _ = queue.remove_residency_set(&self.per_frame);
+                let _ = queue.remove_residency_set(&self.long_lived);
+            }
+        }
+        if self.per_frame_requested {
+            self.per_frame.end_residency();
+        }
+        if self.long_lived_requested {
+            self.long_lived.end_residency();
+        }
+    }
+}
+
+impl D3d12Residency {
+    fn new() -> AppResult<Self> {
+        let device = metal::Device::system_default().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcUnsupportedPlatformApi,
+                "D3D12 residency sets require a Metal device; none is available",
+            )
+        })?;
+        let per_frame =
+            crate::metal_backend::create_residency_set(&device, Some("casa1-d3d12-per-frame"), 64)?;
+        let long_lived = crate::metal_backend::create_residency_set(
+            &device,
+            Some("casa1-d3d12-long-lived"),
+            256,
+        )?;
+        let budget_bytes = device.recommended_max_working_set_size();
+        Ok(Self {
+            device,
+            per_frame,
+            long_lived,
+            queue: None,
+            attached: false,
+            per_frame_requested: false,
+            long_lived_requested: false,
+            priorities: BTreeMap::new(),
+            stats: D3d12ResidencyStats {
+                budget_bytes,
+                ..D3d12ResidencyStats::default()
+            },
+            last_error: None,
+        })
+    }
+
+    fn attach(&mut self) -> AppResult<()> {
+        if self.attached {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "D3D12 residency sets are already attached to the command queue",
+            ));
+        }
+        if self.queue.is_none() {
+            self.queue = Some(crate::metal_backend::Metal4Queue::new(&self.device)?);
+        }
+        let Some(queue) = self.queue.as_ref() else {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "Metal 4 command queue was not created for residency attachment",
+            ));
+        };
+        queue.add_residency_set(&self.per_frame)?;
+        if let Err(error) = queue.add_residency_set(&self.long_lived) {
+            let _ = queue.remove_residency_set(&self.per_frame);
+            return Err(error);
+        }
+        self.attached = true;
+        self.stats.attachments += 1;
+        Ok(())
+    }
+
+    fn detach(&mut self) -> AppResult<()> {
+        if !self.attached {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "D3D12 residency sets are not attached to the command queue",
+            ));
+        }
+        let Some(queue) = self.queue.as_ref() else {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "D3D12 residency sets have no command queue to detach from",
+            ));
+        };
+        queue.remove_residency_set(&self.per_frame)?;
+        queue.remove_residency_set(&self.long_lived)?;
+        self.attached = false;
+        self.stats.detachments += 1;
+        Ok(())
+    }
+
+    fn attach_best_effort(&mut self) {
+        if !self.attached {
+            if let Err(error) = self.attach() {
+                self.last_error = Some(error);
+            }
+        }
+    }
+
+    fn add_texture_to_long_lived(&mut self, texture: &crate::metal_backend::DirectStorageTexture) {
+        for plane in 0..2 {
+            if let Some(plane) = texture.plane_texture(plane) {
+                self.long_lived.add_allocation(plane);
+                self.stats.additions += 1;
+            }
+        }
+    }
+
+    fn remove_texture_from_sets(&mut self, texture: &crate::metal_backend::DirectStorageTexture) {
+        for plane in 0..2 {
+            if let Some(plane) = texture.plane_texture(plane) {
+                self.per_frame.remove_allocation(plane);
+                self.long_lived.remove_allocation(plane);
+                self.stats.removals += 2;
+            }
+        }
+    }
+
+    fn commit_and_request_long_lived(&mut self) {
+        self.long_lived.commit();
+        self.long_lived.request_residency();
+        self.long_lived_requested = true;
+        self.stats.commits += 1;
+        self.stats.requests += 1;
+    }
+
+    fn refresh_allocated_bytes(&mut self) {
+        self.stats.per_frame_allocations = self.per_frame.allocation_count();
+        self.stats.long_lived_allocations = self.long_lived.allocation_count();
+        self.stats.allocated_bytes =
+            self.per_frame.allocated_size() + self.long_lived.allocated_size();
+    }
+
+    fn snapshot(&mut self) -> D3d12ResidencyStats {
+        self.refresh_allocated_bytes();
+        self.stats
+    }
 }
 
 /// Cloneable slot for the DirectStorage completion callback. Clones share the
@@ -699,6 +909,15 @@ pub struct D3d12Runtime {
     native_command_states: BTreeMap<CommandListId, D3d12NativeCommandState>,
     /// Render-target dimensions keyed by resource.
     native_target_dimensions: BTreeMap<ResourceId, (u32, u32)>,
+    /// Real per-frame and long-lived MTLResidencySets, created on first use.
+    residency: Option<std::sync::Arc<std::sync::Mutex<D3d12Residency>>>,
+    /// D3D12 resources whose real Metal allocations are in the long-lived set.
+    residency_long_lived_resources: BTreeSet<ResourceId>,
+    /// D3D12 resources recorded for the current frame's residency set.
+    residency_frame_resources: BTreeSet<ResourceId>,
+    /// Test-only exact error injected into residency operations.
+    #[cfg(test)]
+    residency_fault: Option<AppError>,
     /// Metal 4 grouped executor for ExecuteCommandLists, created on first use.
     metal4_batch: Option<metal4_batch::Metal4Batch>,
     /// True when this host refused Metal 4; batches then use the CPU fallback.
@@ -938,6 +1157,11 @@ impl Default for D3d12Runtime {
             pso_native_pipelines: BTreeMap::new(),
             native_command_states: BTreeMap::new(),
             native_target_dimensions: BTreeMap::new(),
+            residency: None,
+            residency_long_lived_resources: BTreeSet::new(),
+            residency_frame_resources: BTreeSet::new(),
+            #[cfg(test)]
+            residency_fault: None,
             metal4_batch: None,
             metal4_batch_disabled: false,
             metal4_batch_fallbacks: 0,
@@ -1010,6 +1234,11 @@ impl D3d12Runtime {
             pso_native_pipelines: BTreeMap::new(),
             native_command_states: BTreeMap::new(),
             native_target_dimensions: BTreeMap::new(),
+            residency: None,
+            residency_long_lived_resources: BTreeSet::new(),
+            residency_frame_resources: BTreeSet::new(),
+            #[cfg(test)]
+            residency_fault: None,
             metal4_batch: None,
             metal4_batch_disabled: false,
             metal4_batch_fallbacks: 0,
@@ -1781,9 +2010,14 @@ impl D3d12Runtime {
             crate::metal_backend::clear_last_present_timing();
             crate::metal_backend::set_present_timing_enabled(true);
         }
+        // Drive the real per-frame MTLResidencySet around the submission. A
+        // residency failure is kept observable and never blocks the present
+        // fallback.
+        let _ = self.d3d12_residency_begin_frame();
         let result = self
             .backend
             .present(swapchain, sync_interval, allow_tearing);
+        let _ = self.d3d12_residency_end_frame();
         if timing_requested {
             if result.is_ok()
                 && let Some(probe) = crate::metal_backend::take_last_present_timing()
@@ -2179,7 +2413,9 @@ impl D3d12Runtime {
     }
 
     pub fn create_committed_resource(&mut self, desc: ResourceDesc) -> AppResult<ResourceId> {
-        self.backend.create_resource(desc)
+        let resource = self.backend.create_resource(desc)?;
+        self.residency_track_resource(resource)?;
+        Ok(resource)
     }
 
     /// D3D12 `CreateResource` with `pInitialData`: the translated resource is
@@ -2207,6 +2443,7 @@ impl D3d12Runtime {
             };
             self.staging_bytes += initial.data.len() as u64;
             self.gpu_textures.insert(resource, upload);
+            self.residency_track_resource(resource)?;
         }
         Ok(resource)
     }
@@ -2247,6 +2484,7 @@ impl D3d12Runtime {
         }
         self.guest_initial_uploads += 1;
         self.gpu_textures.insert(resource, upload);
+        self.residency_track_resource(resource)?;
         Ok(resource)
     }
 
@@ -2325,6 +2563,7 @@ impl D3d12Runtime {
             },
         })?;
         self.gpu_textures.insert(resource, upload);
+        self.residency_track_resource(resource)?;
         Ok(resource)
     }
 
@@ -2445,6 +2684,7 @@ impl D3d12Runtime {
         self.directstorage_bytes += stats.directstorage_bytes;
         self.staging_bytes += stats.staging_bytes;
         self.gpu_textures.insert(resource, upload);
+        self.residency_track_resource(resource)?;
         self.directstorage_pending_resources
             .push((resource, fence_value));
         Ok(D3D12UploadTicket {
@@ -2504,6 +2744,7 @@ impl D3d12Runtime {
         self.directstorage_bytes += stats.directstorage_bytes;
         self.staging_bytes += stats.staging_bytes;
         self.gpu_textures.insert(resource, upload);
+        self.residency_track_resource(resource)?;
         self.directstorage_pending_resources
             .push((resource, fence_value));
         Ok(D3D12UploadTicket {
@@ -2719,12 +2960,382 @@ impl D3d12Runtime {
     }
 
     pub fn destroy_resource(&mut self, resource: ResourceId) -> AppResult<()> {
+        // Purge the resource from the residency sets before dropping the real
+        // MTLTexture: sets do not retain allocations, so a dangling pointer
+        // would otherwise outlive the texture.
+        self.residency_forget_resource(resource);
         // Drop any GPU upload texture first so resource destruction releases
         // the real MTLTexture (no shadow entries left behind).
         self.gpu_textures.remove(&resource);
         self.directstorage_pending_resources
             .retain(|(pending, _)| *pending != resource);
         self.backend.destroy_resource(resource)
+    }
+
+    fn residency_fault(&self) -> Option<AppError> {
+        #[cfg(test)]
+        {
+            return self.residency_fault.clone();
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    fn residency_handle(&mut self) -> AppResult<std::sync::Arc<std::sync::Mutex<D3d12Residency>>> {
+        if self.residency.is_none() {
+            self.residency = Some(std::sync::Arc::new(std::sync::Mutex::new(
+                D3d12Residency::new()?,
+            )));
+        }
+        self.residency.as_ref().cloned().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcInvalidState,
+                "D3D12 residency state allocation failed",
+            )
+        })
+    }
+
+    fn residency_forget_resource(&mut self, resource: ResourceId) {
+        self.residency_long_lived_resources.remove(&resource);
+        self.residency_frame_resources.remove(&resource);
+        let Some(handle) = self.residency.as_ref().cloned() else {
+            return;
+        };
+        let texture = self.gpu_textures.get(&resource).cloned();
+        let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+        if let Some(texture) = texture {
+            residency.remove_texture_from_sets(&texture);
+            residency.per_frame.commit();
+            residency.long_lived.commit();
+            residency.stats.commits += 2;
+            residency.refresh_allocated_bytes();
+        }
+    }
+
+    fn residency_track_resource(&mut self, resource: ResourceId) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        let Some(handle) = self.residency.as_ref().cloned() else {
+            return Ok(());
+        };
+        if !self.residency_long_lived_resources.insert(resource) {
+            return Ok(());
+        }
+        let texture = self.gpu_textures.get(&resource).cloned();
+        let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+        if let Some(texture) = texture {
+            residency.add_texture_to_long_lived(&texture);
+            residency.commit_and_request_long_lived();
+            residency.attach_best_effort();
+            residency.refresh_allocated_bytes();
+        }
+        Ok(())
+    }
+
+    /// Create the real per-frame and long-lived MTLResidencySets and adopt
+    /// every resource that already has a Metal allocation. Idempotent
+    /// conflicts are rejected exactly.
+    pub fn enable_d3d12_residency(&mut self) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        if self.residency.is_some() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "D3D12 residency management is already enabled",
+            ));
+        }
+        self.residency = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            D3d12Residency::new()?,
+        )));
+        let resources: Vec<ResourceId> = self.gpu_textures.keys().copied().collect();
+        for resource in resources {
+            self.residency_track_resource(resource)?;
+        }
+        Ok(())
+    }
+
+    /// Attach both sets to the Metal 4 command queue.
+    pub fn d3d12_residency_attach(&mut self) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        let handle = self.residency_handle()?;
+        handle
+            .lock()
+            .expect("D3D12 residency state lock poisoned")
+            .attach()
+    }
+
+    /// Detach both sets from the Metal 4 command queue.
+    pub fn d3d12_residency_detach(&mut self) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        let Some(handle) = self.residency.as_ref().cloned() else {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "D3D12 residency management is not enabled",
+            ));
+        };
+        handle
+            .lock()
+            .expect("D3D12 residency state lock poisoned")
+            .detach()
+    }
+
+    /// Begin a present frame: replace the per-frame membership, commit, and
+    /// request residency. A missing Metal 4 queue keeps the error observable
+    /// without breaking the present fallback.
+    pub fn d3d12_residency_begin_frame(&mut self) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        let Some(handle) = self.residency.as_ref().cloned() else {
+            return Ok(());
+        };
+        let resources: Vec<ResourceId> = self.residency_frame_resources.iter().copied().collect();
+        let textures: Vec<_> = resources
+            .iter()
+            .filter_map(|resource| self.gpu_textures.get(resource).cloned())
+            .collect();
+        let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+        residency.per_frame.remove_all_allocations();
+        for texture in &textures {
+            for plane in 0..2 {
+                if let Some(plane) = texture.plane_texture(plane) {
+                    residency.per_frame.add_allocation(plane);
+                    residency.stats.additions += 1;
+                }
+            }
+        }
+        residency.per_frame.commit();
+        residency.per_frame.request_residency();
+        residency.stats.commits += 1;
+        residency.stats.requests += 1;
+        residency.per_frame_requested = true;
+        residency.attach_best_effort();
+        residency.refresh_allocated_bytes();
+        Ok(())
+    }
+
+    /// End a present frame: end per-frame residency and clear its membership.
+    pub fn d3d12_residency_end_frame(&mut self) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        let Some(handle) = self.residency.as_ref().cloned() else {
+            return Ok(());
+        };
+        let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+        if residency.per_frame_requested {
+            residency.per_frame.end_residency();
+            residency.stats.ends += 1;
+            residency.per_frame_requested = false;
+        }
+        residency.per_frame.remove_all_allocations();
+        residency.per_frame.commit();
+        residency.stats.commits += 1;
+        residency.refresh_allocated_bytes();
+        Ok(())
+    }
+
+    /// Record a resource as used by the current frame (per-frame set).
+    pub fn d3d12_residency_record_frame_resource(&mut self, resource: ResourceId) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        let Some(handle) = self.residency.as_ref().cloned() else {
+            return Ok(());
+        };
+        if !self.residency_frame_resources.insert(resource) {
+            return Ok(());
+        }
+        let texture = self.gpu_textures.get(&resource).cloned();
+        let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+        if let Some(texture) = texture {
+            for plane in 0..2 {
+                if let Some(plane) = texture.plane_texture(plane) {
+                    residency.per_frame.add_allocation(plane);
+                    residency.stats.additions += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// D3D12 `MakeResident`: commit and request the long-lived set.
+    pub fn d3d12_residency_make_resident(&mut self, resources: &[ResourceId]) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        let handle = self.residency_handle()?;
+        for resource in resources {
+            self.residency_track_resource(*resource)?;
+        }
+        let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+        residency.commit_and_request_long_lived();
+        residency.attach_best_effort();
+        residency.stats.make_resident_calls += 1;
+        residency.refresh_allocated_bytes();
+        Ok(())
+    }
+
+    /// D3D12 `Evict`: remove allocations, commit, and end residency once the
+    /// long-lived set is empty.
+    pub fn d3d12_residency_evict(&mut self, resources: &[ResourceId]) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        let handle = self.residency_handle()?;
+        let textures: Vec<_> = resources
+            .iter()
+            .filter_map(|resource| self.gpu_textures.get(resource).cloned())
+            .collect();
+        let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+        for texture in &textures {
+            residency.remove_texture_from_sets(texture);
+        }
+        for resource in resources {
+            self.residency_long_lived_resources.remove(resource);
+            self.residency_frame_resources.remove(resource);
+        }
+        residency.long_lived.commit();
+        residency.stats.commits += 1;
+        if residency.long_lived.allocation_count() == 0 && residency.long_lived_requested {
+            residency.long_lived.end_residency();
+            residency.long_lived_requested = false;
+            residency.stats.ends += 1;
+        }
+        residency.stats.evict_calls += 1;
+        residency.refresh_allocated_bytes();
+        Ok(())
+    }
+
+    /// Evict every tracked long-lived resource.
+    ///
+    /// The D3D12 Evict thunk receives an object array the dispatcher cannot
+    /// dereference (its signature has no guest memory), so the runtime evicts
+    /// the tracked set. The hardware operation is still a real remove/commit.
+    pub fn d3d12_residency_evict_all(&mut self) -> AppResult<()> {
+        let resources: Vec<ResourceId> = self
+            .residency_long_lived_resources
+            .iter()
+            .copied()
+            .collect();
+        self.d3d12_residency_evict(&resources)
+    }
+
+    /// D3D12 `SetResidencyPriority`: record the priority and make the
+    /// resources resident for NORMAL and above.
+    pub fn d3d12_residency_set_priority(
+        &mut self,
+        resources: &[ResourceId],
+        priority: u32,
+    ) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        if !matches!(priority, 0x0000 | 0x4000 | 0x8000 | 0xC000 | 0x1_0000) {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidParameter,
+                format!(
+                    "invalid D3D12 residency priority {priority:#x}: expected 0, 0x4000, \
+                     0x8000, 0xC000, or 0x10000"
+                ),
+            ));
+        }
+        let handle = self.residency_handle()?;
+        {
+            let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+            for resource in resources {
+                residency.priorities.insert(*resource, priority);
+            }
+            residency.stats.priority_calls += 1;
+            residency.stats.last_priority = priority;
+        }
+        if priority >= 0x8000 {
+            self.d3d12_residency_make_resident(resources)?;
+        }
+        Ok(())
+    }
+
+    /// D3D12 `EnqueueMakeResident`: the Metal residency API has no
+    /// fence-coupled residency operation, so the sets are made resident now
+    /// and the fence/value pair is preserved in the trace counters.
+    pub fn d3d12_residency_enqueue_make_resident(
+        &mut self,
+        _fence: FenceId,
+        _value: u64,
+        resources: &[ResourceId],
+    ) -> AppResult<()> {
+        if let Some(error) = self.residency_fault() {
+            return Err(error);
+        }
+        self.d3d12_residency_make_resident(resources)?;
+        let Some(handle) = self.residency.as_ref().cloned() else {
+            return Ok(());
+        };
+        let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+        residency.stats.enqueue_calls += 1;
+        Ok(())
+    }
+
+    /// Real device memory budget (`recommendedMaxWorkingSetSize`).
+    pub fn d3d12_residency_budget_bytes(&mut self) -> AppResult<u64> {
+        let handle = self.residency_handle()?;
+        Ok(handle
+            .lock()
+            .expect("D3D12 residency state lock poisoned")
+            .device
+            .recommended_max_working_set_size())
+    }
+
+    /// Residency-set instrumentation snapshot.
+    pub fn d3d12_residency_stats(&mut self) -> Option<D3d12ResidencyStats> {
+        let handle = self.residency.as_ref().cloned()?;
+        Some(
+            handle
+                .lock()
+                .expect("D3D12 residency state lock poisoned")
+                .snapshot(),
+        )
+    }
+
+    /// Most recent residency error kept after a present fallback.
+    pub fn d3d12_residency_last_error(&self) -> Option<AppError> {
+        self.residency.as_ref().and_then(|handle| {
+            handle
+                .lock()
+                .expect("D3D12 residency state lock poisoned")
+                .last_error
+                .clone()
+        })
+    }
+
+    /// Release the residency sets deterministically.
+    pub fn disable_d3d12_residency(&mut self) -> AppResult<()> {
+        let Some(handle) = self.residency.take() else {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "D3D12 residency management is not enabled",
+            ));
+        };
+        let mut residency = handle.lock().expect("D3D12 residency state lock poisoned");
+        if residency.attached {
+            residency.detach()?;
+        }
+        self.residency_long_lived_resources.clear();
+        self.residency_frame_resources.clear();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_residency_fault_for_test(&mut self, fault: Option<AppError>) {
+        self.residency_fault = fault;
     }
 
     pub fn resource_state(
@@ -14957,5 +15568,157 @@ entry:
         assert!(runtime.last_present_timing().is_none());
         assert_eq!(crate::metal_backend::present_timing_enabled(), false);
         assert!(runtime.take_last_present_timing().is_none());
+    }
+    #[test]
+    fn d3d12_residency_lifecycle_rejects_double_attach_and_exact_failure() {
+        if std::env::var_os("CI").is_some() {
+            return;
+        }
+        let mut runtime = D3d12Runtime::new();
+        runtime
+            .enable_d3d12_residency()
+            .expect("enable real D3D12 residency sets");
+        let error = runtime
+            .enable_d3d12_residency()
+            .expect_err("double enable must be rejected");
+        assert_eq!(error.code, ReasonCode::RcInvalidState);
+        assert_eq!(
+            error.message,
+            "D3D12 residency management is already enabled"
+        );
+
+        let desc = ResourceDesc {
+            name: "residency-texture".to_string(),
+            format: DxgiFormat::R8G8B8A8Unorm,
+            heap: HeapType::Default,
+            size: 16,
+            subresources: 1,
+            initial_state: ResourceState::CopyDest,
+            usage_hint: ResourceUsageHint::Texture {
+                sampled: true,
+                render_target: false,
+                depth_stencil: false,
+                cpu_write_frequent: false,
+            },
+        };
+        let resource = runtime
+            .create_committed_resource_with_initial_data(
+                desc,
+                Some(D3d12InitialTextureData {
+                    width: 2,
+                    height: 2,
+                    format: metal::MTLPixelFormat::RGBA8Unorm,
+                    data: vec![0x7f; 16],
+                }),
+            )
+            .expect("texture resource with a real MTLTexture");
+        let stats = runtime
+            .d3d12_residency_stats()
+            .expect("residency statistics");
+        assert_eq!(stats.long_lived_allocations, 1);
+        assert_eq!(stats.additions, 1);
+
+        runtime
+            .d3d12_residency_make_resident(&[resource])
+            .expect("MakeResident drives commit/request");
+        let stats = runtime
+            .d3d12_residency_stats()
+            .expect("residency statistics");
+        assert_eq!(stats.make_resident_calls, 1);
+        assert_eq!(stats.requests > 0, true);
+
+        let stats = runtime
+            .d3d12_residency_stats()
+            .expect("residency statistics");
+        if stats.attachments == 0 {
+            runtime
+                .d3d12_residency_attach()
+                .expect("attach residency sets to the Metal 4 queue");
+        }
+        runtime
+            .d3d12_residency_detach()
+            .expect("detach residency sets");
+        let error = runtime
+            .d3d12_residency_detach()
+            .expect_err("double detach must be rejected");
+        assert_eq!(error.code, ReasonCode::RcInvalidState);
+        assert_eq!(
+            error.message,
+            "D3D12 residency sets are not attached to the command queue"
+        );
+        runtime
+            .d3d12_residency_attach()
+            .expect("reattach residency sets");
+        let error = runtime
+            .d3d12_residency_attach()
+            .expect_err("double attach must be rejected");
+        assert_eq!(error.code, ReasonCode::RcInvalidState);
+        assert_eq!(
+            error.message,
+            "D3D12 residency sets are already attached to the command queue"
+        );
+        runtime.d3d12_residency_detach().expect("final detach");
+
+        runtime
+            .d3d12_residency_record_frame_resource(resource)
+            .expect("record per-frame resource");
+        runtime
+            .d3d12_residency_begin_frame()
+            .expect("begin frame residency");
+        let stats = runtime
+            .d3d12_residency_stats()
+            .expect("residency statistics");
+        assert_eq!(stats.per_frame_allocations, 1);
+        runtime
+            .d3d12_residency_end_frame()
+            .expect("end frame residency");
+        let stats = runtime
+            .d3d12_residency_stats()
+            .expect("residency statistics");
+        assert_eq!(stats.per_frame_allocations, 0);
+        assert_eq!(stats.ends > 0, true);
+
+        let error = runtime
+            .d3d12_residency_set_priority(&[resource], 0x1234)
+            .expect_err("invalid residency priority must be rejected");
+        assert_eq!(error.code, ReasonCode::RcInvalidParameter);
+        assert_eq!(
+            error.message,
+            "invalid D3D12 residency priority 0x1234: expected 0, 0x4000, 0x8000, 0xC000, or \
+             0x10000"
+        );
+
+        runtime
+            .d3d12_residency_evict(&[resource])
+            .expect("Evict removes and ends residency");
+        let stats = runtime
+            .d3d12_residency_stats()
+            .expect("residency statistics");
+        assert_eq!(stats.long_lived_allocations, 0);
+        assert_eq!(stats.evict_calls, 1);
+        assert_eq!(stats.budget_bytes > 0, true);
+
+        runtime.set_residency_fault_for_test(Some(AppError::new(
+            ReasonCode::RcIo,
+            "injected D3D12 residency failure",
+        )));
+        let error = runtime
+            .d3d12_residency_make_resident(&[resource])
+            .expect_err("injected residency failure must surface exactly");
+        runtime.set_residency_fault_for_test(None);
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(error.message, "injected D3D12 residency failure");
+
+        runtime
+            .destroy_resource(resource)
+            .expect("destroying the resource purges its allocation");
+        runtime
+            .disable_d3d12_residency()
+            .expect("disable residency");
+        let error = runtime
+            .disable_d3d12_residency()
+            .expect_err("double disable must be rejected");
+        assert_eq!(error.code, ReasonCode::RcInvalidState);
+        assert_eq!(error.message, "D3D12 residency management is not enabled");
     }
 }

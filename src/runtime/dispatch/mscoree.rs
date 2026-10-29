@@ -10,14 +10,15 @@
 //!   [`crate::clr_meta`]).  Version strings, runtime directories, PE CLI
 //!   metadata and exported dylib symbols are read from the filesystem; no
 //!   version is invented.
-//! * **CLR activation** — `CorBindToRuntime`/`CorBindToRuntimeEx` bind an
-//!   explicitly requested *installed* CoreCLR version (for example `8.0.31`)
-//!   to the same real `ICLRRuntimeHost` the meta host exposes, including
-//!   `ExecuteInDefaultAppDomain` and `ExecuteApplication`.  The legacy
-//!   .NET Framework CLR (`v4.0.30319`, `Microsoft.NET\Framework*`) is not
-//!   installed, so Framework-version and versionless requests keep the real
-//!   Framework-absent failure `COR_E_CLRNOTAVAILABLE` rather than silently
-//!   binding a different runtime generation.
+//! * **CLR activation** — `CorBindToRuntime`/`CorBindToRuntimeEx` split the
+//!   legacy contract by runtime generation.  A CoreCLR version request
+//!   (`v5.0`+, e.g. an installed `10.0.13`) binds the same real
+//!   `ICLRRuntimeHost` the meta host exposes, including
+//!   `ExecuteInDefaultAppDomain` and `ExecuteApplication`.  A versionless or
+//!   .NET Framework version request (`v1.0`, `v1.1`, `v2.0`, `v4.0`, ...)
+//!   consults the `IFrameworkRuntimeProvider` seam; no Framework CLR is
+//!   installed, so it answers the documented `COR_E_CLRNOTAVAILABLE` and never
+//!   silently binds CoreCLR.
 //!
 //! Layer contract: every export returns its HRESULT in EAX.
 
@@ -41,7 +42,7 @@ const E_INVALIDARG: u32 = 0x8007_0057;
 const E_NOTIMPL: u32 = 0x8000_4001;
 /// COR_E_CLRNOTAVAILABLE — "the CLR is unavailable" (the error a Windows
 /// machine without .NET Framework returns from Framework activation).
-const COR_E_CLRNOTAVAILABLE: u32 = 0x8013_1013;
+const COR_E_CLRNOTAVAILABLE: u32 = crate::clr_host::COR_E_CLRNOTAVAILABLE;
 
 // ── Interface / class IDs ─────────────────────────────────────────────────
 
@@ -68,6 +69,16 @@ const IID_ICLR_RUNTIME_HOST: [u8; 16] = [
 /// `CLSID_CLRRuntimeHost` {90F1A06E-7712-4762-86B5-7A5EBA6B65E6}.
 const CLSID_CLR_RUNTIME_HOST: [u8; 16] = [
     0x6E, 0xA0, 0xF1, 0x90, 0x12, 0x77, 0x62, 0x47, 0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B, 0x65, 0xE6,
+];
+/// `CLSID_CorRuntimeHost` {CB2F6723-AB3A-11D2-9C40-00C04FA30A3E} — the legacy
+/// Framework class that exposes `ICorRuntimeHost`.
+const CLSID_COR_RUNTIME_HOST: [u8; 16] = [
+    0x23, 0x67, 0x2F, 0xCB, 0x3A, 0xAB, 0xD2, 0x11, 0x9C, 0x40, 0x00, 0xC0, 0x4F, 0xA3, 0x0A, 0x3E,
+];
+/// `IID_ICorRuntimeHost` {CB2F6722-AB3A-11D2-9C40-00C04FA30A3E} — the legacy
+/// Framework interface; CoreCLR does not implement it.
+const IID_ICOR_RUNTIME_HOST: [u8; 16] = [
+    0x22, 0x67, 0x2F, 0xCB, 0x3A, 0xAB, 0xD2, 0x11, 0x9C, 0x40, 0x00, 0xC0, 0x4F, 0xA3, 0x0A, 0x3E,
 ];
 /// `COR_E_EXECUTIONENGINE` — a real CLR execution failure.
 const COR_E_EXECUTIONENGINE: u32 = 0x8013_1506;
@@ -131,6 +142,34 @@ fn write_optional_u32(memory: &mut MemoryImage, pointer: u64, value: u32) -> App
         0 => Ok(()),
         pointer => write_guest_u32(memory, pointer, value),
     }
+}
+
+/// Write a UTF-16 string for the `GetRequestedRuntimeInfo` shape: the
+/// caller passes the buffer capacity by value and a separate required-size
+/// out-pointer, unlike the `ICLRRuntimeInfo` in/out size contract.
+fn write_runtime_info_string(
+    memory: &mut MemoryImage,
+    buffer: u64,
+    capacity: u32,
+    length_out: u64,
+    text: &str,
+) -> AppResult<u32> {
+    let units = text.encode_utf16().count() as u32;
+    let required = units.saturating_add(1);
+    if length_out != 0 {
+        write_guest_u32(memory, length_out, required)?;
+    }
+    if buffer == 0 {
+        return Ok(S_OK);
+    }
+    if capacity < required {
+        return Ok(HRESULT_INSUFFICIENT_BUFFER);
+    }
+    for (index, unit) in text.encode_utf16().enumerate() {
+        memory.write_u16(buffer + index as u64 * 2, unit);
+    }
+    memory.write_u16(buffer + units as u64 * 2, 0);
+    Ok(S_OK)
 }
 
 impl PeHostRuntime {
@@ -240,9 +279,8 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         match thunk {
             HostThunk::ClrCreateInstance => self.dispatch_clr_create_instance(state, memory),
-            HostThunk::CorBindToRuntime | HostThunk::CorBindToRuntimeEx => {
-                self.dispatch_cor_bind_to_runtime(state, memory)
-            }
+            HostThunk::CorBindToRuntime => self.dispatch_cor_bind_to_runtime(state, memory, false),
+            HostThunk::CorBindToRuntimeEx => self.dispatch_cor_bind_to_runtime(state, memory, true),
             HostThunk::GetCorSystemDirectory => {
                 self.dispatch_get_cor_system_directory(state, memory)
             }
@@ -473,36 +511,66 @@ impl PeHostRuntime {
     // ── Framework activation (genuinely absent) ──────────────────────────
 
     /// `CorBindToRuntimeEx(pwszVersion, pwszBuildFlavor, startupFlags,
-    /// rclsid, riid, ppv)` (and the 4-argument CorBindToRuntime) — the
-    /// An explicitly requested installed CoreCLR version binds the real
-    /// runtime host.  A Framework version (or a versionless Framework
-    /// request) stays `COR_E_CLRNOTAVAILABLE`: CoreCLR is not a Framework
-    /// substitute.
+    /// rclsid, riid, ppv)` and the legacy 5-argument `CorBindToRuntime`
+    /// (which has no `startupFlags`).
+    ///
+    /// The contract is split by runtime generation:
+    ///
+    /// * a CoreCLR version request (major 5+) binds the real installed
+    ///   `ICLRRuntimeHost`;
+    /// * a versionless or major 1-4 Framework request consults
+    ///   `IFrameworkRuntimeProvider`; because no Framework CLR is installed it
+    ///   answers the documented `COR_E_CLRNOTAVAILABLE` and the out pointer
+    ///   stays null — CoreCLR is never silently substituted;
+    /// * a malformed request is likewise unavailable.
+    ///
+    /// Both `CLSID_CLRRuntimeHost`/`ICLRRuntimeHost` and the legacy
+    /// `CLSID_CorRuntimeHost`/`ICorRuntimeHost` IDs are recognized: a CoreCLR
+    /// version exposes only `ICLRRuntimeHost`, while a Framework request is
+    /// absent before interface negotiation.
     pub(crate) fn dispatch_cor_bind_to_runtime(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
+        extended: bool,
     ) -> AppResult<()> {
-        let version = guest_call_arg(state, memory, 0)?;
-        let _flavor = guest_call_arg(state, memory, 1)?;
-        let _startup_flags = guest_call_arg(state, memory, 2)?;
-        let rclsid = guest_call_arg(state, memory, 3)?;
-        let riid = guest_call_arg(state, memory, 4)?;
-        let out = guest_call_arg(state, memory, 5)?;
+        let version_pointer = guest_call_arg(state, memory, 0)?;
+        let flavor_pointer = guest_call_arg(state, memory, 1)?;
+        let (startup_flags, rclsid, riid, out) = if extended {
+            (
+                guest_call_arg(state, memory, 2)?,
+                guest_call_arg(state, memory, 3)?,
+                guest_call_arg(state, memory, 4)?,
+                guest_call_arg(state, memory, 5)?,
+            )
+        } else {
+            (
+                0,
+                guest_call_arg(state, memory, 2)?,
+                guest_call_arg(state, memory, 3)?,
+                guest_call_arg(state, memory, 4)?,
+            )
+        };
+        let _ = startup_flags;
         if out == 0 {
             state.set(Register::Rax, u64::from(E_POINTER));
             return Ok(());
         }
         write_guest_pointer(memory, out, 0, self.guest_arch).ok();
-        // No version is the legacy Framework "latest runtime" request; this
-        // host has no Framework CLR, so it stays absent rather than silently
-        // binding a different runtime generation.  An explicit CoreCLR
-        // version binds the real installed runtime of that version.
-        if version == 0 {
+        // The flavor is nullable; "wks"/"svr" are the documented values.  It
+        // never changes the installed-runtime contract, but a non-null flavor
+        // must still be readable guest memory.
+        if flavor_pointer != 0 {
+            let _ = read_utf16_string(memory, flavor_pointer)?;
+        }
+        // No version (or an empty one) is the legacy Framework "latest
+        // runtime" request.  With no Framework CLR it is absent rather than
+        // silently bound to a different runtime generation.
+        if version_pointer == 0 {
             state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
             return Ok(());
         }
-        let requested = read_utf16_string(memory, version)?;
+        let requested = read_utf16_string(memory, version_pointer)?;
         if requested.is_empty() {
             state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
             return Ok(());
@@ -519,31 +587,52 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_POINTER));
             return Ok(());
         };
-        if class_id != CLSID_CLR_RUNTIME_HOST {
+        if class_id != CLSID_CLR_RUNTIME_HOST && class_id != CLSID_COR_RUNTIME_HOST {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
             return Ok(());
         }
-        if interface_id != IID_ICLR_RUNTIME_HOST && interface_id != IID_IUNKNOWN {
-            state.set(Register::Rax, u64::from(E_NOINTERFACE));
-            return Ok(());
+        match crate::clr_host::activation_family(Some(&requested)) {
+            crate::clr_host::ActivationFamily::Framework => {
+                let provider = crate::clr_host::framework_runtime_provider();
+                if !provider.is_available() {
+                    state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+                    return Ok(());
+                }
+                // A future provider is available; this build has no
+                // ICorRuntimeHost object model to hand out, so it cannot
+                // fabricate one.
+                match provider.version() {
+                    Some(_) => state.set(Register::Rax, u64::from(E_NOTIMPL)), // coverage: unreachable — no supported host installs a Framework provider
+                    None => state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)), // coverage: unreachable — same absent-provider design
+                }
+                Ok(())
+            }
+            crate::clr_host::ActivationFamily::Unsupported => {
+                state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+                Ok(())
+            }
+            crate::clr_host::ActivationFamily::CoreClr(parsed) => {
+                if interface_id == IID_ICOR_RUNTIME_HOST
+                    || (interface_id != IID_ICLR_RUNTIME_HOST && interface_id != IID_IUNKNOWN)
+                {
+                    state.set(Register::Rax, u64::from(E_NOINTERFACE));
+                    return Ok(());
+                }
+                let installed = clr_meta::installed_runtimes();
+                let Some(runtime) = clr_meta::select_runtime(&parsed, &installed) else {
+                    state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+                    return Ok(());
+                };
+                if runtime.coreclr_library().is_none() {
+                    state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — select_runtime() only returns runtimes from installed_runtimes(), which filters out missing CLR libraries
+                    return Ok(()); // coverage: unreachable — same filtered-installation branch as the line above
+                }
+                let host = self.alloc_clr_runtime_host(memory, runtime.clone())?;
+                write_guest_pointer(memory, out, host, self.guest_arch)?;
+                state.set(Register::Rax, u64::from(S_OK));
+                Ok(())
+            }
         }
-        let Some(requested) = clr_meta::ClrVersion::parse_request(&requested) else {
-            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
-            return Ok(());
-        };
-        let installed = clr_meta::installed_runtimes();
-        let Some(runtime) = clr_meta::select_runtime(&requested, &installed) else {
-            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
-            return Ok(());
-        };
-        if runtime.coreclr_library().is_none() {
-            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — select_runtime() only returns runtimes from installed_runtimes(), which filters out missing CLR libraries
-            return Ok(()); // coverage: unreachable — same filtered-installation branch as the line above
-        }
-        let host = self.alloc_clr_runtime_host(memory, runtime.clone())?;
-        write_guest_pointer(memory, out, host, self.guest_arch)?;
-        state.set(Register::Rax, u64::from(S_OK));
-        Ok(())
     }
 
     /// `GetCORSystemDirectory(pbuffer, cchBuffer, pdwlength)` — reports the
@@ -586,23 +675,90 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `GetRequestedRuntimeInfo(...)` — asks for the .NET Framework runtime;
-    /// none is installed.
+    /// `GetRequestedRuntimeInfo(pExe, pwszVersion, pConfigurationFile,
+    /// startupFlags, runtimeInfoFlags, pDirectory, dwDirectory,
+    /// dwDirectoryLength, pVersion, cchBuffer, pdwLength)`.
+    ///
+    /// The legacy shim reports the runtime a process would get.  This host
+    /// has no Framework CLR, so a versionless or Framework version request
+    /// is exactly `COR_E_CLRNOTAVAILABLE`; an explicit installed CoreCLR
+    /// version reports that runtime's real directory (terminating separator
+    /// included) and real version string.  Both outputs follow the Windows
+    /// size contract: a null buffer is a size query, a short buffer returns
+    /// `ERROR_INSUFFICIENT_BUFFER` with the required size, and success writes
+    /// the string plus NUL.
     pub(crate) fn dispatch_get_requested_runtime_info(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
-        let _pwsz = guest_call_arg(state, memory, 0)?;
-        let _build = guest_call_arg(state, memory, 1)?;
-        let _flags = guest_call_arg_u32(state, memory, 2)?;
-        let _version = guest_call_arg_u32(state, memory, 3)?;
-        let _dir = guest_call_arg(state, memory, 4)?;
-        let _dir_size = guest_call_arg_u32(state, memory, 5)?;
-        let _version_size = guest_call_arg(state, memory, 6)?;
-        let _actual = guest_call_arg(state, memory, 7)?;
-        let _actual_dir = guest_call_arg(state, memory, 8)?;
-        state.set(Register::Rax, u64::from(E_FAIL));
+        let _exe = guest_call_arg(state, memory, 0)?;
+        let version_pointer = guest_call_arg(state, memory, 1)?;
+        let _configuration = guest_call_arg(state, memory, 2)?;
+        let _startup_flags = guest_call_arg_u32(state, memory, 3)?;
+        let _runtime_info_flags = guest_call_arg_u32(state, memory, 4)?;
+        let directory = guest_call_arg(state, memory, 5)?;
+        let directory_capacity = guest_call_arg_u32(state, memory, 6)?;
+        let directory_length = guest_call_arg(state, memory, 7)?;
+        let version_buffer = guest_call_arg(state, memory, 8)?;
+        let version_capacity = guest_call_arg_u32(state, memory, 9)?;
+        let version_length = guest_call_arg(state, memory, 10)?;
+
+        let wants_directory = directory != 0 || directory_length != 0;
+        let wants_version = version_buffer != 0 || version_length != 0;
+        if !wants_directory && !wants_version {
+            // No output was requested, so there is nothing the shim can
+            // report for this call.
+            state.set(Register::Rax, u64::from(E_FAIL));
+            return Ok(());
+        }
+        if (directory != 0 && directory_length == 0) || (version_buffer != 0 && version_length == 0)
+        {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        }
+        let requested = if version_pointer == 0 {
+            None
+        } else {
+            Some(read_utf16_string(memory, version_pointer)?)
+        };
+        let Some(version_text) = crate::clr_host::requested_runtime_version(requested.as_deref())
+        else {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+            return Ok(());
+        };
+        let mut directory_text = crate::clr_host::requested_runtime_directory(requested.as_deref())
+            .map(|directory| directory.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !directory_text.ends_with('\\') {
+            directory_text.push('\\');
+        }
+
+        let mut results = [S_OK; 2];
+        if wants_directory {
+            results[0] = write_runtime_info_string(
+                memory,
+                directory,
+                directory_capacity,
+                directory_length,
+                &directory_text,
+            )?;
+        }
+        if wants_version {
+            results[1] = write_runtime_info_string(
+                memory,
+                version_buffer,
+                version_capacity,
+                version_length,
+                &version_text,
+            )?;
+        }
+        let status = if results.contains(&HRESULT_INSUFFICIENT_BUFFER) {
+            HRESULT_INSUFFICIENT_BUFFER
+        } else {
+            S_OK
+        };
+        state.set(Register::Rax, u64::from(status));
         Ok(())
     }
 
@@ -3744,6 +3900,473 @@ mod tests {
                 .expect_err("an unrouted mscoree thunk is an implementation error");
             assert_eq!(error.code, crate::reason::ReasonCode::RcUnimplInsn);
             assert_eq!(read_u32_at(&fixture.memory, size), 0);
+        })
+    }
+
+    fn alloc_wide(fixture: &mut Fixture, text: &str) -> u64 {
+        fixture
+            .runtime
+            .alloc_utf16_string(&mut fixture.memory, text)
+            .expect("allocate wide string")
+    }
+
+    fn bind_expected_hr(request: &str) -> u64 {
+        let crate::clr_host::ActivationFamily::CoreClr(parsed) =
+            crate::clr_host::activation_family(Some(request))
+        else {
+            return u64::from(COR_E_CLRNOTAVAILABLE);
+        };
+        let installed = crate::clr_meta::installed_runtimes();
+        if crate::clr_meta::select_runtime(&parsed, &installed).is_some() {
+            u64::from(S_OK)
+        } else {
+            u64::from(COR_E_CLRNOTAVAILABLE)
+        }
+    }
+
+    fn bind_ex_args(
+        version: u64,
+        flavor: u64,
+        flags: u32,
+        clsid: u64,
+        iid: u64,
+        out: u64,
+    ) -> [u32; 6] {
+        [
+            version as u32,
+            flavor as u32,
+            flags,
+            clsid as u32,
+            iid as u32,
+            out as u32,
+        ]
+    }
+
+    fn requested_info_args(
+        version: u64,
+        directory: u64,
+        directory_capacity: u32,
+        directory_length: u64,
+        version_buffer: u64,
+        version_capacity: u32,
+        version_length: u64,
+    ) -> [u32; 11] {
+        [
+            0,
+            version as u32,
+            0,
+            0,
+            0,
+            directory as u32,
+            directory_capacity,
+            directory_length as u32,
+            version_buffer as u32,
+            version_capacity,
+            version_length as u32,
+        ]
+    }
+
+    #[test]
+    fn cor_bind_framework_versions_flavors_flags_and_riids_are_exactly_absent() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("cor-bind-framework-absent");
+            let out = words(&mut fixture.memory, 0x41_000, 1);
+            let clsid = words(&mut fixture.memory, 0x41_020, 4);
+            let iid = words(&mut fixture.memory, 0x41_040, 4);
+
+            let mut versions = Vec::new();
+            for version in [
+                "v1.0.3650",
+                "v1.1.4322",
+                "v2.0.50727",
+                "v4.0.30319",
+                "1.0",
+                "1.1",
+                "2.0",
+                "4.0",
+                "v3.5",
+            ] {
+                versions.push(alloc_wide(&mut fixture, version));
+            }
+            let mut flavors = Vec::new();
+            for flavor in ["wks", "svr", "bogus"] {
+                flavors.push(alloc_wide(&mut fixture, flavor));
+            }
+            let ids = [
+                (CLSID_CLR_RUNTIME_HOST, IID_ICLR_RUNTIME_HOST),
+                (CLSID_CLR_RUNTIME_HOST, IID_IUNKNOWN),
+                (CLSID_COR_RUNTIME_HOST, IID_ICOR_RUNTIME_HOST),
+                (CLSID_COR_RUNTIME_HOST, IID_ICLR_RUNTIME_HOST),
+                (CLSID_COR_RUNTIME_HOST, IID_IUNKNOWN),
+            ];
+
+            for version in &versions {
+                for flavor in std::iter::once(0).chain(flavors.iter().copied()) {
+                    for (class, interface) in ids {
+                        write_guid(&mut fixture.memory, clsid, class);
+                        write_guid(&mut fixture.memory, iid, interface);
+                        for flags in [0_u32, 1, 0xFFFF_FFFF] {
+                            assert_eq!(
+                                dispatch_x86(
+                                    &mut fixture,
+                                    HostThunk::CorBindToRuntimeEx,
+                                    &bind_ex_args(*version, flavor, flags, clsid, iid, out),
+                                ),
+                                u64::from(COR_E_CLRNOTAVAILABLE),
+                                "a Framework request is genuinely absent"
+                            );
+                            assert_eq!(read_ptr_at(&fixture.memory, out), 0);
+                        }
+                    }
+                }
+            }
+
+            // The legacy CorBindToRuntime has no startupFlags argument; its
+            // CLSID/RIID/out arguments are in the Ex positions minus one.
+            write_guid(&mut fixture.memory, clsid, CLSID_COR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, iid, IID_ICOR_RUNTIME_HOST);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntime,
+                    &[
+                        versions[3] as u32,
+                        flavors[0] as u32,
+                        clsid as u32,
+                        iid as u32,
+                        out as u32,
+                    ],
+                ),
+                u64::from(COR_E_CLRNOTAVAILABLE),
+                "the 5-argument export keeps the Framework-absent contract"
+            );
+            assert_eq!(read_ptr_at(&fixture.memory, out), 0);
+
+            // Versionless and empty requests are the Framework latest-runtime
+            // request, not a CoreCLR bind.
+            let empty = alloc_wide(&mut fixture, "");
+            for version in [0_u32, empty as u32] {
+                assert_eq!(
+                    dispatch_x86(
+                        &mut fixture,
+                        HostThunk::CorBindToRuntimeEx,
+                        &bind_ex_args(u64::from(version), 0, 0, clsid, iid, out),
+                    ),
+                    u64::from(COR_E_CLRNOTAVAILABLE)
+                );
+                assert_eq!(read_ptr_at(&fixture.memory, out), 0);
+            }
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &bind_ex_args(versions[3], 0, 0, clsid, iid, 0),
+                ),
+                u64::from(E_POINTER)
+            );
+        })
+    }
+
+    #[test]
+    fn cor_bind_coreclr_versions_bind_real_host_and_reject_framework_interfaces() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("cor-bind-coreclr");
+            let out = words(&mut fixture.memory, 0x41_000, 1);
+            let clsid = words(&mut fixture.memory, 0x41_020, 4);
+            let iid = words(&mut fixture.memory, 0x41_040, 4);
+            let version = alloc_wide(&mut fixture, &real_version());
+
+            write_guid(&mut fixture.memory, clsid, CLSID_CLR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, iid, IID_ICLR_RUNTIME_HOST);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &bind_ex_args(version, 0, 0xFFFF_FFFF, clsid, iid, out),
+                ),
+                0,
+                "an installed CoreCLR version binds the real host"
+            );
+            let host = read_ptr_at(&fixture.memory, out);
+            assert_ne!(host, 0);
+            assert_eq!(call_method(&mut fixture, host, 2, &[]), 0);
+
+            // Both runtime class IDs are accepted; the interface decides what
+            // the runtime can actually expose.
+            write_guid(&mut fixture.memory, clsid, CLSID_COR_RUNTIME_HOST);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntime,
+                    &[version as u32, 0, clsid as u32, iid as u32, out as u32],
+                ),
+                0,
+                "the legacy export binds the same real CoreCLR host"
+            );
+            assert_ne!(read_ptr_at(&fixture.memory, out), 0);
+
+            // CoreCLR does not implement the legacy Framework interface.
+            write_guid(&mut fixture.memory, iid, IID_ICOR_RUNTIME_HOST);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &bind_ex_args(version, 0, 0, clsid, iid, out),
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(read_ptr_at(&fixture.memory, out), 0);
+            write_guid(&mut fixture.memory, iid, IID_IENUM_UNKNOWN);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &bind_ex_args(version, 0, 0, clsid, iid, out),
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+
+            // Unknown class IDs are rejected before the runtime is touched.
+            write_guid(&mut fixture.memory, clsid, IID_ICLR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, iid, IID_ICLR_RUNTIME_HOST);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &bind_ex_args(version, 0, 0, clsid, iid, out),
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+
+            // Null out/CLSID/RIID pointers follow the COM pointer contract.
+            write_guid(&mut fixture.memory, clsid, CLSID_CLR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, iid, IID_ICLR_RUNTIME_HOST);
+            for args in [
+                bind_ex_args(version, 0, 0, clsid, iid, 0),
+                bind_ex_args(version, 0, 0, 0, iid, out),
+                bind_ex_args(version, 0, 0, clsid, 0, out),
+                bind_ex_args(version, 0, 0, 0, 0, out),
+            ] {
+                assert_eq!(
+                    dispatch_x86(&mut fixture, HostThunk::CorBindToRuntimeEx, &args),
+                    u64::from(E_POINTER)
+                );
+            }
+
+            // "8.0" resolves only when an 8.x CoreCLR is installed.
+            let eight = alloc_wide(&mut fixture, "8.0");
+            let expected = bind_expected_hr("8.0");
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &bind_ex_args(eight, 0, 0, clsid, iid, out),
+                ),
+                expected
+            );
+            assert_eq!(read_ptr_at(&fixture.memory, out) != 0, expected == 0);
+
+            for text in ["9.9.9", "v8", "not-a-version", "4.0.30319"] {
+                let request = alloc_wide(&mut fixture, text);
+                let expected = bind_expected_hr(text);
+                assert_eq!(
+                    dispatch_x86(
+                        &mut fixture,
+                        HostThunk::CorBindToRuntimeEx,
+                        &bind_ex_args(request, 0, 0, clsid, iid, out),
+                    ),
+                    expected,
+                    "{text} cannot bind a runtime"
+                );
+                assert_eq!(read_ptr_at(&fixture.memory, out), 0);
+            }
+        })
+    }
+
+    #[test]
+    fn get_requested_runtime_info_reports_real_install_buffers_and_absent_failure() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("get-requested-runtime-info");
+            let runtime = crate::clr_meta::installed_runtimes()
+                .into_iter()
+                .next()
+                .expect("a real CoreCLR runtime is installed");
+            let version_text = runtime.version_string();
+            let expected_directory = format!("{}\\", runtime.directory.to_string_lossy());
+            let directory_units = expected_directory.encode_utf16().count() as u32 + 1;
+            let version_units = version_text.encode_utf16().count() as u32 + 1;
+            let request = alloc_wide(&mut fixture, &version_text);
+
+            let directory_length = words(&mut fixture.memory, 0x41_100, 1);
+            let version_length = words(&mut fixture.memory, 0x41_120, 1);
+            let directory_buffer = words(&mut fixture.memory, 0x42_000, 128);
+            let version_buffer = words(&mut fixture.memory, 0x42_400, 64);
+
+            // Size query: null buffers report the required units including NUL.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetRequestedRuntimeInfo,
+                    &requested_info_args(request, 0, 0, directory_length, 0, 0, version_length),
+                ),
+                0
+            );
+            assert_eq!(
+                read_u32_at(&fixture.memory, directory_length),
+                directory_units
+            );
+            assert_eq!(read_u32_at(&fixture.memory, version_length), version_units);
+
+            // Short buffers report the required size and fail with the exact
+            // Windows insufficient-buffer status.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetRequestedRuntimeInfo,
+                    &requested_info_args(
+                        request,
+                        directory_buffer,
+                        directory_units - 1,
+                        directory_length,
+                        version_buffer,
+                        version_units - 1,
+                        version_length,
+                    ),
+                ),
+                u64::from(HRESULT_INSUFFICIENT_BUFFER)
+            );
+            assert_eq!(
+                read_u32_at(&fixture.memory, directory_length),
+                directory_units
+            );
+            assert_eq!(read_u32_at(&fixture.memory, version_length), version_units);
+
+            // Exact capacities succeed and write the real directory/version.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetRequestedRuntimeInfo,
+                    &requested_info_args(
+                        request,
+                        directory_buffer,
+                        directory_units,
+                        directory_length,
+                        version_buffer,
+                        version_units,
+                        version_length,
+                    ),
+                ),
+                0
+            );
+            assert_eq!(
+                read_wide(&fixture.memory, directory_buffer),
+                expected_directory
+            );
+            assert_eq!(read_wide(&fixture.memory, version_buffer), version_text);
+            assert_eq!(
+                read_u32_at(&fixture.memory, directory_length),
+                directory_units
+            );
+            assert_eq!(read_u32_at(&fixture.memory, version_length), version_units);
+
+            // A non-null buffer with no length out-pointer is E_POINTER.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetRequestedRuntimeInfo,
+                    &requested_info_args(request, directory_buffer, 128, 0, 0, 0, 0),
+                ),
+                u64::from(E_POINTER)
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetRequestedRuntimeInfo,
+                    &requested_info_args(request, 0, 0, 0, version_buffer, 64, 0),
+                ),
+                u64::from(E_POINTER)
+            );
+            // No output requested at all keeps the legacy shim E_FAIL.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetRequestedRuntimeInfo,
+                    &requested_info_args(request, 0, 0, 0, 0, 0, 0),
+                ),
+                u64::from(E_FAIL)
+            );
+
+            // Framework, garbage, absent and versionless requests are absent.
+            for text in ["v4.0.30319", "v2.0", "garbage", "999.0.0"] {
+                let request = alloc_wide(&mut fixture, text);
+                write_u32(&mut fixture.memory, directory_length, 0);
+                write_u32(&mut fixture.memory, version_length, 0);
+                assert_eq!(
+                    dispatch_x86(
+                        &mut fixture,
+                        HostThunk::GetRequestedRuntimeInfo,
+                        &requested_info_args(
+                            request,
+                            directory_buffer,
+                            directory_units,
+                            directory_length,
+                            version_buffer,
+                            version_units,
+                            version_length,
+                        ),
+                    ),
+                    u64::from(COR_E_CLRNOTAVAILABLE),
+                    "{text} is not an installed runtime"
+                );
+                assert_eq!(read_u32_at(&fixture.memory, directory_length), 0);
+                assert_eq!(read_u32_at(&fixture.memory, version_length), 0);
+            }
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetRequestedRuntimeInfo,
+                    &requested_info_args(
+                        0,
+                        directory_buffer,
+                        directory_units,
+                        directory_length,
+                        version_buffer,
+                        version_units,
+                        version_length,
+                    ),
+                ),
+                u64::from(COR_E_CLRNOTAVAILABLE),
+                "a versionless request is the absent Framework latest runtime"
+            );
+
+            // "8.0" reports the installed 8.x runtime exactly when present.
+            // Its directory can differ in length from the newest runtime, so
+            // use roomy buffers for this conditional selection.
+            let eight = alloc_wide(&mut fixture, "8.0");
+            let expected = bind_expected_hr("8.0");
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetRequestedRuntimeInfo,
+                    &requested_info_args(
+                        eight,
+                        directory_buffer,
+                        256,
+                        directory_length,
+                        version_buffer,
+                        64,
+                        version_length,
+                    ),
+                ),
+                expected
+            );
+            if expected == 0 {
+                assert_eq!(
+                    read_wide(&fixture.memory, version_buffer),
+                    crate::clr_host::requested_runtime_version(Some("8.0"))
+                        .expect("selected runtime")
+                );
+            }
         })
     }
 }

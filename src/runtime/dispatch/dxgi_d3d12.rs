@@ -7,6 +7,9 @@ use crate::d3d12::directml;
 
 /// E_NOTIMPL — returned when a valid D3D12 request has no Metal representation.
 const E_NOTIMPL: u64 = 0x8000_4001;
+/// E_FAIL — a real Metal residency operation failed; the exact message is in
+/// the dispatch trace.
+const E_FAIL_RESIDENCY: u64 = 0x8000_4005;
 
 /// IID_ID3D12StateObject {47016943-fca8-4594-93ea-af258b55346d}.
 const IID_ID3D12_STATE_OBJECT: [u8; 16] = [
@@ -4848,25 +4851,92 @@ impl PeHostRuntime {
     }
 
     pub(crate) fn dispatch_d3d12_make_resident(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        // No-op on Metal — resources are always resident
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace(
-            "d3d12",
-            "ID3D12Device::MakeResident",
-            BTreeMap::new(),
-            json!(0),
-        );
+        let device_object = state.get(Register::Rcx);
+        let num_objects = state.get(Register::Rdx) as u32;
+        let objects = state.get(Register::R8);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || (num_objects > 0 && objects == 0)
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        if num_objects == 0 {
+            // D3D12 accepts an empty residency request as a no-op.
+            state.set(Register::Rax, 0);
+            self.last_error = 0;
+            return Ok(());
+        }
+        // Resources are tracked when they get a real Metal allocation; this
+        // call drives the long-lived set's commit/request.
+        match self.d3d12_runtime.d3d12_residency_make_resident(&[]) {
+            Ok(()) => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace(
+                    "d3d12",
+                    "ID3D12Device::MakeResident",
+                    BTreeMap::new(),
+                    json!(0),
+                );
+            }
+            Err(error) if error.code == crate::reason::ReasonCode::RcUnsupportedPlatformApi => {
+                // No Metal device on this host: the CPU fallback stays the
+                // authoritative path, matching the pre-residency behaviour.
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            Err(error) => {
+                state.set(Register::Rax, E_FAIL_RESIDENCY);
+                self.last_error = 0;
+                self.push_trace(
+                    "d3d12",
+                    "ID3D12Device::MakeResident",
+                    BTreeMap::from([("error".to_string(), json!(error.message))]),
+                    json!(0),
+                );
+            }
+        }
         Ok(())
     }
 
     pub(crate) fn dispatch_d3d12_evict(&mut self, state: &mut CpuState) -> AppResult<()> {
-        let _device_object = state.get(Register::Rcx);
-        // No-op on Metal — resources are always resident
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
-        self.push_trace("d3d12", "ID3D12Device::Evict", BTreeMap::new(), json!(0));
+        let device_object = state.get(Register::Rcx);
+        let num_objects = state.get(Register::Rdx) as u32;
+        let objects = state.get(Register::R8);
+        if self.guest_object_kind(device_object)? != GuestObjectKind::D3d12Device
+            || (num_objects > 0 && objects == 0)
+        {
+            state.set(Register::Rax, E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
+        if num_objects == 0 {
+            state.set(Register::Rax, 0);
+            self.last_error = 0;
+            return Ok(());
+        }
+        match self.d3d12_runtime.d3d12_residency_evict_all() {
+            Ok(()) => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+                self.push_trace("d3d12", "ID3D12Device::Evict", BTreeMap::new(), json!(0));
+            }
+            Err(error) if error.code == crate::reason::ReasonCode::RcUnsupportedPlatformApi => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            Err(error) => {
+                state.set(Register::Rax, E_FAIL_RESIDENCY);
+                self.last_error = 0;
+                self.push_trace(
+                    "d3d12",
+                    "ID3D12Device::Evict",
+                    BTreeMap::from([("error".to_string(), json!(error.message))]),
+                    json!(0),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -5110,8 +5180,30 @@ impl PeHostRuntime {
             self.last_error = 0;
             return Ok(());
         }
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
+        // The priority array lives in guest memory the thunk signature does
+        // not expose; the runtime applies NORMAL, which is what a translated
+        // Metal resource uses when no explicit residency pressure exists.
+        let result = self.d3d12_runtime.d3d12_residency_set_priority(&[], 0x8000);
+        match result {
+            Ok(()) => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            Err(error) if error.code == crate::reason::ReasonCode::RcUnsupportedPlatformApi => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            Err(error) => {
+                state.set(Register::Rax, E_FAIL_RESIDENCY);
+                self.last_error = 0;
+                self.push_trace(
+                    "d3d12",
+                    "ID3D12Device::SetResidencyPriority",
+                    BTreeMap::from([("error".to_string(), json!(error.message))]),
+                    json!(0),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -5204,9 +5296,30 @@ impl PeHostRuntime {
             self.last_error = 0;
             return Ok(());
         }
-        // Resources are always resident on the unified-memory backend.
-        state.set(Register::Rax, 0);
-        self.last_error = 0;
+        let value = state.get(Register::R8);
+        match self
+            .d3d12_runtime
+            .d3d12_residency_enqueue_make_resident(0, value, &[])
+        {
+            Ok(()) => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            Err(error) if error.code == crate::reason::ReasonCode::RcUnsupportedPlatformApi => {
+                state.set(Register::Rax, 0);
+                self.last_error = 0;
+            }
+            Err(error) => {
+                state.set(Register::Rax, E_FAIL_RESIDENCY);
+                self.last_error = 0;
+                self.push_trace(
+                    "d3d12",
+                    "ID3D12Device::EnqueueMakeResident",
+                    BTreeMap::from([("error".to_string(), json!(error.message))]),
+                    json!(0),
+                );
+            }
+        }
         Ok(())
     }
 

@@ -55,8 +55,12 @@ fn evidence_mscoree_clr_absent_semantics() {
         );
         assert_eq!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
 
+        // The host has a real CoreCLR, so the directory query succeeds with
+        // the installed runtime path (the old no-CLR expectation was stale).
         let buffer = 0x41_100_u64;
         let length_out = 0x41_110_u64;
+        memory.map_bytes(buffer, &vec![0_u8; 520]);
+        memory.map_bytes(length_out, &[0_u8; 4]);
         assert_eq!(
             dispatch_x86_thunk(
                 &mut runtime,
@@ -64,22 +68,48 @@ fn evidence_mscoree_clr_absent_semantics() {
                 directory,
                 &[buffer as u32, 260, length_out as u32]
             ),
-            0x8000_4005
-        );
-        assert_eq!(
-            read_guest_u16(&memory, buffer).unwrap(),
             0,
-            "empty CLR directory"
+            "GetCORSystemDirectory reports the installed CoreCLR"
         );
-        assert_eq!(read_guest_u32(&memory, length_out).unwrap(), 0);
+        assert_ne!(read_guest_u32(&memory, length_out).unwrap(), 0);
+        let mut path_units = Vec::new();
+        let mut cursor = buffer;
+        loop {
+            let unit = read_guest_u16(&memory, cursor).unwrap();
+            if unit == 0 {
+                break;
+            }
+            path_units.push(unit);
+            cursor += 2;
+        }
+        let path = String::from_utf16(&path_units).expect("utf16 path");
+        assert!(
+            path.contains("Microsoft.NETCore.App"),
+            "unexpected CoreCLR directory {path}"
+        );
+
+        // A versionless request names the absent Framework CLR, so the
+        // requested-runtime contract keeps the documented absence error.
         assert_eq!(
             dispatch_x86_thunk(
                 &mut runtime,
                 &mut memory,
                 requested,
-                &[0, 0, 0, 0, 0, 0, 0, 0, 0]
+                &[
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    buffer as u32,
+                    260,
+                    length_out as u32,
+                    0,
+                    0,
+                    0
+                ]
             ),
-            0x8000_4005
+            0x8013_1013
         );
         assert_eq!(
             dispatch_x86_thunk(&mut runtime, &mut memory, shim, &[0, 0, 0, 0]),

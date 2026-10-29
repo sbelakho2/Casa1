@@ -1848,6 +1848,19 @@
   "( wic_copy_source_pixels(&objects, &scaler, 0, 0, 1, 1), Vec::<u8>::new(), \"a scaler without its wrapped source yields no pixels\" )",
   "( wic_copy_source_pixels(&objects, &rotator, 0, 0, 1, 1), Vec::<u8>::new(), \"a flip-rotator without its wrapped source yields no pixels\" )"
  ],
+ "cor_bind_coreclr_versions_bind_real_host_and_reject_framework_interfaces": [
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(version, 0, 0xFFFF_FFFF, clsid, iid, out), ), 0, \"an installed CoreCLR version binds the real host\" )",
+  "(call_method(&mut fixture, host, 2, &[]), 0)",
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntime, &[version as u32, 0, clsid as u32, iid as u32, out as u32], ), 0, \"the legacy export binds the same real CoreCLR host\" )",
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(version, 0, 0, clsid, iid, out), ), u64::from(E_NOINTERFACE) )",
+  "(read_ptr_at(&fixture.memory, out), 0)"
+ ],
+ "cor_bind_framework_versions_flavors_flags_and_riids_are_exactly_absent": [
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(*version, flavor, flags, clsid, iid, out), ), u64::from(COR_E_CLRNOTAVAILABLE), \"a Framework request is genuinely absent\" )",
+  "(read_ptr_at(&fixture.memory, out), 0)",
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntime, &[ versions[3] as u32, flavors[0] as u32, clsid as u32, iid as u32, out as u32, ], ), u64::from(COR_E_CLRNOTAVAILABLE), \"the 5-argument export keeps the Framework-absent contract\" )",
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(u64::from(version), 0, 0, clsid, iid, out), ), u64::from(COR_E_CLRNOTAVAILABLE) )"
+ ],
  "corrupt_machine_guid_is_replaced_not_reused": [
   "( store.get(MACHINE_GUID_VALUE).as_deref(), Some(identity.machine_guid.as_str()) )"
  ],
@@ -2493,6 +2506,14 @@
   "(source.contains(\"msl_closest_hit\"), true)",
   "(pso.ray_stages.contains_key(\"chs\"), true)",
   "(pso.ray_stages.contains_key(\"entry\"), true)"
+ ],
+ "d3d12_residency_lifecycle_rejects_double_attach_and_exact_failure": [
+  "(error.code, ReasonCode::RcInvalidState)",
+  "( error.message, \"D3D12 residency management is already enabled\" )",
+  "(stats.long_lived_allocations, 1)",
+  "(stats.additions, 1)",
+  "(stats.make_resident_calls, 1)",
+  "(stats.requests > 0, true)"
  ],
  "d3d12_set_pipeline_state1_rejects_collection_state_object": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
@@ -3884,7 +3905,7 @@
  ],
  "driver_service_load_unload": [
   "( crate::runtime::registered_export_implementation_level(\"ntdll.dll\", \"NtLoadDriver\"), ImplementationLevel::Implemented )",
-  "( crate::runtime::registered_export_implementation_level( \"ntdll.dll\", \"NtUnloadDriver\" ), ImplementationLevel::Implemented )",
+  "( crate::runtime::registered_export_implementation_level(\"ntdll.dll\", \"NtUnloadDriver\"), ImplementationLevel::Implemented )",
   "(load, STATUS_SUCCESS, \"NtLoadDriver loads the service\")",
   "(island.status(), STATUS_SUCCESS)",
   "(island.device_count(), 1)",
@@ -4973,6 +4994,14 @@
   "(*semaphore.slots.lock().unwrap(), 1)",
   "(*empty.slots.lock().unwrap(), 1)"
  ],
+ "framework_provider_seam_and_activation_families_are_exact": [
+  "(activation_family(None), ActivationFamily::Framework)",
+  "(activation_family(Some(\"\")), ActivationFamily::Framework)",
+  "( activation_family(Some(version)), ActivationFamily::Framework, \"{version} is a Framework version\" )",
+  "( activation_family(Some(version)), ActivationFamily::Unsupported, \"{version} is not a runtime version\" )",
+  "(provider.version(), None)",
+  "( provider.host_assembly( Path::new(\"/casa1/does/not/exist/Framework.exe\"), &[\"argument\".to_string()], ), Err(ClrHostError::FrameworkUnavailable) )"
+ ],
  "free_releases_or_decommits": [
   "(range, 0x1000)",
   "(vm.query(base).state, VmState::Committed)",
@@ -5209,6 +5238,12 @@
   "(rc(&run(&mut tpm, &too_many)), rc_parameter(TPM_RC_VALUE, 1))",
   "(rc(&response), TPM_RC_SUCCESS)",
   "(&response[10..], &[0, 0])"
+ ],
+ "get_requested_runtime_info_reports_real_install_buffers_and_absent_failure": [
+  "( dispatch_x86( &mut fixture, HostThunk::GetRequestedRuntimeInfo, &requested_info_args(request, 0, 0, directory_length, 0, 0, version_length), ), 0 )",
+  "( read_u32_at(&fixture.memory, directory_length), directory_units )",
+  "(read_u32_at(&fixture.memory, version_length), version_units)",
+  "( dispatch_x86( &mut fixture, HostThunk::GetRequestedRuntimeInfo, &requested_info_args( request, directory_buffer, directory_units - 1, directory_length, version_buffer, version_units - 1, version_length, ), ), u64::from(HRESULT_INSUFFICIENT_BUFFER) )"
  ],
  "get_version_ex_w_and_rtl_get_version_report_the_same_version": [
   "(rax, 1, \"GetVersionExW succeeds\")",
@@ -9862,6 +9897,20 @@
   "( state.validate(), Err(Corruption::InvalidNvIndex(0x0000_0001)) )",
   "( state.validate(), Err(Corruption::InvalidNvIndex(0x0150_0001)) )"
  ],
+ "persistent_pipeline_archive_rejects_gpu_family_translator_corrupt_and_orphan_metadata_exactly": [
+  "(error.code, ReasonCode::RcIo)",
+  "( error.message, format!( \"persistent pipeline archive {} targets GPU family {} but this device is apple1; \\ recompile required\", archive_path.display(), identity.gpu_family ) )",
+  "( error.message, format!( \"persistent pipeline archive {} was written by translator version {} but this \\ build is {}-stale; recompile required\", archive_path.display(), PIPELINE_ARCHIVE_TRANSLATOR_VERSION, PIPELINE_ARCHIVE_TRANSLATOR_VERSION ) )",
+  "( error.message, format!( \"persistent pipeline archive {} has no metadata sidecar; refusing to load an \\ unverified archive\", archive_path.display() ) )"
+ ],
+ "persistent_pipeline_archive_reload_rejects_key_change_and_serves_unchanged_keys": [
+  "(writer.persistent_pipeline_archive_enabled(), true)",
+  "(report.compiled, 2)",
+  "(report.serializations, 1)",
+  "(report.archive_keys, 2)",
+  "(archive_path.exists(), true)",
+  "(metadata_path.exists(), true)"
+ ],
  "physical_hotplug_and_controller_state_are_real_and_stale_safe": [
   "(user32.device_handle_count(), 2)",
   "( user32.apply_physical_hotplug(&[HotplugEvent::Arrived(controller.record())]), Ok(()) )",
@@ -11169,6 +11218,12 @@
   "( subsystem .d3dkmt_query_adapter_info(adapter) .expect(\"adapter info\") .segments[0] .used, 4096 )",
   "( subsystem .d3dkmt_make_resident(over_budget, 7) .unwrap_err() .status(), STATUS_GRAPHICS_NO_VIDEO_MEMORY )",
   "(subsystem.d3dkmt_evict(allocation, 7), Ok(1))"
+ ],
+ "residency_queue_attachment_rejects_injected_failure_and_double_release_exactly": [
+  "(error.code, ReasonCode::RcIo)",
+  "( error.message, \"Metal refused addResidencySet: MTL4CommandQueue (injected residency attachment \\ failure)\" )",
+  "(error.code, ReasonCode::RcGeNotFound)",
+  "(error.message, format!(\"residency set {set_id} not found\"))"
  ],
  "residency_set_backend_integration_and_destroy_purges": [
   "( backend .residency_set_allocation_count(set_id) .expect(\"count\"), 4 )",

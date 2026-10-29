@@ -2514,6 +2514,8 @@ mod test_faults {
         static BINARY_ARCHIVES_UNSUPPORTED: Cell<bool> = const { Cell::new(false) };
         static ARCHIVE_CREATE_FAULT: Cell<u8> = const { Cell::new(0) };
         static ARCHIVE_LOAD_FAULT: Cell<u8> = const { Cell::new(0) };
+        static ARCHIVE_IDENTITY_FAULT: Cell<u8> = const { Cell::new(0) };
+        static RESIDENCY_QUEUE_FAULT: Cell<u8> = const { Cell::new(0) };
         static RENDER_ENCODER_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
         static PARALLEL_ENCODER_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
         static PARALLEL_CHILD_ENCODER_UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
@@ -2613,6 +2615,18 @@ mod test_faults {
     pub(super) fn archive_load_fault() -> u8 {
         ARCHIVE_LOAD_FAULT.with(Cell::get)
     }
+    pub(super) fn set_archive_identity_fault(value: u8) {
+        ARCHIVE_IDENTITY_FAULT.with(|flag| flag.set(value));
+    }
+    pub(super) fn archive_identity_fault() -> u8 {
+        ARCHIVE_IDENTITY_FAULT.with(Cell::get)
+    }
+    pub(super) fn set_residency_queue_fault(value: u8) {
+        RESIDENCY_QUEUE_FAULT.with(|flag| flag.set(value));
+    }
+    pub(super) fn residency_queue_fault() -> u8 {
+        RESIDENCY_QUEUE_FAULT.with(Cell::get)
+    }
     pub(super) fn set_render_encoder_unavailable(value: bool) {
         RENDER_ENCODER_UNAVAILABLE.with(|flag| flag.set(value));
     }
@@ -2678,6 +2692,8 @@ mod test_faults {
         set_binary_archives_unsupported(false);
         set_archive_create_fault(0);
         set_archive_load_fault(0);
+        set_archive_identity_fault(0);
+        set_residency_queue_fault(0);
         set_render_encoder_unavailable(false);
         set_parallel_encoder_unavailable(false);
         set_parallel_child_encoder_unavailable(false);
@@ -7600,6 +7616,15 @@ pub struct MetalGpuBackend {
     /// descriptors so the device can reuse its compiled binaries instead of
     /// compiling from source.
     loaded_pipeline_archive: Option<MetalPipelineArchive>,
+    /// Automatic per-GPU persistent archive configured through
+    /// [`Self::enable_persistent_pipeline_archive`]. When present, every
+    /// compiled pipeline is recorded and the archive is flushed by
+    /// [`Self::flush_persistent_pipeline_archive`] or the prewarm entry point.
+    persistent_pipeline_archive: Option<PersistentPipelineArchive>,
+    /// Stable hash of the MSL source behind each registered library. The
+    /// persistent archive invalidation key mixes this with the pipeline
+    /// descriptor, the translator version, and the GPU family.
+    library_hashes: BTreeMap<u64, u64>,
     /// Number of render-pipeline creation requests satisfied from the cache.
     pub pipeline_cache_hits: u64,
     /// Number of shader-library requests satisfied from the cache.
@@ -7615,6 +7640,15 @@ pub struct MetalGpuBackend {
     pub pipeline_archive_unverified: u64,
     /// Pipelines successfully added to a registered archive.
     pub pipeline_archive_records: u64,
+    /// Automatic persistent-archive records whose Metal call failed. The
+    /// pipeline was still returned; the exact error is kept in
+    /// [`Self::pipeline_archive_last_error`].
+    pub pipeline_archive_record_failures: u64,
+    /// Whole-archive rebuilds caused by a changed shader hash for an existing
+    /// pipeline descriptor (Metal cannot hold two binaries for one function).
+    pub pipeline_archive_invalidations: u64,
+    /// Most recent non-fatal persistent-archive failure (record or flush).
+    pub pipeline_archive_last_error: Option<AppError>,
     /// Successful `serialize_archive` writes.
     pub pipeline_archive_serializations: u64,
     /// Buffers created as no-copy views of canonical guest pages. The
@@ -7742,12 +7776,17 @@ impl MetalGpuBackend {
             active_pipeline_archive: None,
             pipeline_archive_path: None,
             loaded_pipeline_archive: None,
+            persistent_pipeline_archive: None,
+            library_hashes: BTreeMap::new(),
             pipeline_cache_hits: 0,
             shader_cache_hits: 0,
             pipeline_archive_hits: 0,
             pipeline_archive_misses: 0,
             pipeline_archive_unverified: 0,
             pipeline_archive_records: 0,
+            pipeline_archive_record_failures: 0,
+            pipeline_archive_invalidations: 0,
+            pipeline_archive_last_error: None,
             pipeline_archive_serializations: 0,
             guest_backed_buffers: 0,
             staging_copies: 0,
@@ -8079,8 +8118,10 @@ impl MetalGpuBackend {
     /// re-link of the same shader costs a hash lookup, not a device
     /// compile).
     pub fn compile_shader(&mut self, source: &str) -> AppResult<u64> {
+        let source_hash = stable_hash_bytes(source.as_bytes());
         if let Some(&cached) = self.shader_library_cache.get(source) {
             self.shader_cache_hits += 1;
+            self.library_hashes.insert(cached, source_hash);
             return Ok(cached);
         }
         let library = self.device.compile_shader_library(source)?;
@@ -8089,6 +8130,7 @@ impl MetalGpuBackend {
         self.libraries.insert(id, library);
         cap_cache(&mut self.shader_library_cache);
         self.shader_library_cache.insert(source.to_string(), id);
+        self.library_hashes.insert(id, source_hash);
         Ok(id)
     }
 
@@ -8123,10 +8165,13 @@ impl MetalGpuBackend {
         }
 
         let descriptor = self.build_render_pipeline_descriptor(&key)?;
-        let pipeline = self.create_render_pipeline_state_with_optional_archive(&descriptor)?;
+        let archive_key = self.persistent_render_archive_key(&key);
+        let pipeline =
+            self.create_render_pipeline_state_with_optional_archive(&descriptor, archive_key)?;
         let id = alloc_gpu_id();
         cap_registry(&mut self.render_pipelines);
         self.render_pipelines.insert(id, pipeline);
+        self.record_persistent_render_pipeline(&key);
         cap_cache(&mut self.render_pipeline_cache);
         self.render_pipeline_cache.insert(key, id);
         Ok(id)
@@ -8169,10 +8214,13 @@ impl MetalGpuBackend {
             )
         })?;
 
-        let pipeline = self.create_compute_pipeline_state_with_optional_archive(&compute_fn)?;
+        let archive_key = self.persistent_compute_archive_key(&key);
+        let pipeline =
+            self.create_compute_pipeline_state_with_optional_archive(&compute_fn, archive_key)?;
         let id = alloc_gpu_id();
         cap_registry(&mut self.compute_pipelines);
         self.compute_pipelines.insert(id, pipeline);
+        self.record_persistent_compute_pipeline(&key);
         cap_cache(&mut self.compute_pipeline_cache);
         self.compute_pipeline_cache.insert(key, id);
         Ok(id)
@@ -8246,10 +8294,22 @@ impl MetalGpuBackend {
     fn create_render_pipeline_state_with_optional_archive(
         &mut self,
         descriptor: &metal::RenderPipelineDescriptorRef,
+        archive_key: Option<u64>,
     ) -> AppResult<metal::RenderPipelineState> {
         let Some(archive) = self.loaded_pipeline_archive.as_ref() else {
             return self.device.create_render_pipeline_state(descriptor);
         };
+        // The automatic persistent archive only serves descriptors whose exact
+        // invalidation key is recorded. A changed shader hash, descriptor,
+        // translator version, or GPU family therefore recompiles instead of
+        // accepting a stale binary.
+        if let Some(state) = self.persistent_pipeline_archive.as_ref() {
+            let known = archive_key.is_some_and(|key| state.keys.contains(&key));
+            if !known {
+                self.pipeline_archive_misses += 1;
+                return self.device.create_render_pipeline_state(descriptor);
+            }
+        }
         descriptor.set_binary_archives(&[archive.archive()]);
         match try_create_render_pipeline_using_archive(self.device.metal_device(), descriptor) {
             Ok(Some(pipeline)) => {
@@ -8272,10 +8332,18 @@ impl MetalGpuBackend {
     fn create_compute_pipeline_state_with_optional_archive(
         &mut self,
         compute_fn: &metal::FunctionRef,
+        archive_key: Option<u64>,
     ) -> AppResult<metal::ComputePipelineState> {
         let Some(archive) = self.loaded_pipeline_archive.as_ref() else {
             return self.device.create_compute_pipeline_state(compute_fn);
         };
+        if let Some(state) = self.persistent_pipeline_archive.as_ref() {
+            let known = archive_key.is_some_and(|key| state.keys.contains(&key));
+            if !known {
+                self.pipeline_archive_misses += 1;
+                return self.device.create_compute_pipeline_state(compute_fn);
+            }
+        }
         let descriptor = metal::ComputePipelineDescriptor::new();
         descriptor.set_compute_function(Some(compute_fn));
         descriptor.set_binary_archives(&[archive.archive()]);
@@ -8339,6 +8407,7 @@ impl MetalGpuBackend {
     /// Destroy a shader library.
     pub fn destroy_library(&mut self, id: u64) {
         self.libraries.remove(&id);
+        self.library_hashes.remove(&id);
         // The pipeline caches must never resurrect a pipeline whose library
         // was destroyed: drop every cached entry compiled from this library.
         self.shader_library_cache
@@ -16372,6 +16441,21 @@ impl MetalResidencySet {
         }
     }
 
+    /// Attach this set to a Metal 4 command queue.
+    ///
+    /// MTLCommandQueue (Metal 3) has no residency-set attachment; only
+    /// `MTL4CommandQueue` exposes `addResidencySet:`. A runtime without it
+    /// returns the exact [`ReasonCode::RcUnsupportedPlatformApi`] error and
+    /// callers keep their existing submission path.
+    pub fn attach_to_queue(&self, queue: &Metal4Queue) -> AppResult<()> {
+        queue.add_residency_set(self)
+    }
+
+    /// Detach this set from a Metal 4 command queue.
+    pub fn detach_from_queue(&self, queue: &Metal4Queue) -> AppResult<()> {
+        queue.remove_residency_set(self)
+    }
+
     /// Add one allocation (a buffer, texture, or heap) to the set.
     pub fn add_allocation<A: ResidencyAllocationPtr + ?Sized>(&self, allocation: &A) {
         self.add_allocation_ptr(allocation.residency_obj_ptr());
@@ -16912,6 +16996,395 @@ impl MetalPipelineArchive {
     }
 }
 
+/// Translator version mixed into every persistent-archive invalidation key.
+///
+/// Bumping the crate version invalidates persisted archives: a binary recorded
+/// by a different translator is rejected at load instead of being silently
+/// reused against a descriptor it was not compiled for.
+pub const PIPELINE_ARCHIVE_TRANSLATOR_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// On-disk metadata format for the automatic persistent archive.
+const PIPELINE_ARCHIVE_FORMAT: &str = "casa1-metal-pipeline-archive-v1";
+
+/// Identity a persistent archive is bound to (filename + metadata).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineArchiveIdentity {
+    /// Metal device name (e.g. "Apple M2 Pro").
+    pub device_name: String,
+    /// Highest supported GPU family ("apple9".."apple1", "mac2", "mac1").
+    pub gpu_family: String,
+    /// Translator version that produced the archive.
+    pub translator_version: String,
+}
+
+/// Highest Metal GPU family the device supports, as a stable archive key.
+pub fn device_gpu_family(device: &metal::DeviceRef) -> String {
+    for (family, name) in [
+        (metal::MTLGPUFamily::Apple9, "apple9"),
+        (metal::MTLGPUFamily::Apple8, "apple8"),
+        (metal::MTLGPUFamily::Apple7, "apple7"),
+        (metal::MTLGPUFamily::Apple6, "apple6"),
+        (metal::MTLGPUFamily::Apple5, "apple5"),
+        (metal::MTLGPUFamily::Apple4, "apple4"),
+        (metal::MTLGPUFamily::Apple3, "apple3"),
+        (metal::MTLGPUFamily::Mac2, "mac2"),
+        (metal::MTLGPUFamily::Mac1, "mac1"),
+    ] {
+        if device.supports_family(family) {
+            return name.to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Identity of the device a persistent archive is created for.
+pub fn pipeline_archive_identity(device: &metal::DeviceRef) -> PipelineArchiveIdentity {
+    PipelineArchiveIdentity {
+        device_name: device.name().to_string(),
+        gpu_family: device_gpu_family(device),
+        translator_version: PIPELINE_ARCHIVE_TRANSLATOR_VERSION.to_string(),
+    }
+}
+
+/// File-name component sanitizer: keep ASCII alphanumerics, map everything
+/// else to `-`, and collapse repeats so two devices never collide by
+/// accident.
+fn sanitize_archive_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// The archive file for `directory` and `identity`.
+pub fn persistent_pipeline_archive_path(
+    directory: &std::path::Path,
+    identity: &PipelineArchiveIdentity,
+) -> std::path::PathBuf {
+    directory.join(format!(
+        "{}-{}-{}.metalarchive",
+        sanitize_archive_component(&identity.device_name),
+        sanitize_archive_component(&identity.gpu_family),
+        sanitize_archive_component(&identity.translator_version),
+    ))
+}
+
+/// The metadata sidecar next to the archive.
+fn persistent_pipeline_archive_metadata_path(archive_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = archive_path.to_path_buf();
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("archive");
+    path.set_file_name(format!("{name}.json"));
+    path
+}
+
+/// Stable 64-bit hash (FNV-1a) used for shader sources and pipeline keys.
+///
+/// `std::hash::DefaultHasher` is not stable across Rust releases; FNV is, so
+/// a persisted key keeps its meaning after a toolchain update (the translator
+/// version still invalidates deliberately).
+fn stable_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn hash_u64(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+fn hash_str(hash: &mut u64, value: &str) {
+    hash_u64(hash, value.len() as u64);
+    for byte in value.as_bytes() {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+/// Exact persistent-archive invalidation key: shader hash + pipeline
+/// descriptor + translator version + GPU family.
+fn render_pipeline_archive_key(
+    shader_hash: u64,
+    key: &RenderPipelineCacheKey,
+    identity: &PipelineArchiveIdentity,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    hash_str(&mut hash, PIPELINE_ARCHIVE_FORMAT);
+    hash_u64(&mut hash, shader_hash);
+    hash_u64(&mut hash, 0);
+    hash_u64(&mut hash, key.color_format as u64);
+    hash_u64(
+        &mut hash,
+        key.depth_format
+            .map(|format| format as u64 + 1)
+            .unwrap_or(0),
+    );
+    hash_str(&mut hash, &key.vertex_fn);
+    hash_str(&mut hash, &key.fragment_fn);
+    hash_str(&mut hash, &identity.translator_version);
+    hash_str(&mut hash, &identity.gpu_family);
+    hash
+}
+
+/// Descriptor identity without the shader hash. Used to notice that a shader
+/// changed for the same PSO shape, which forces a whole-archive rebuild.
+fn render_pipeline_descriptor_identity(
+    key: &RenderPipelineCacheKey,
+    identity: &PipelineArchiveIdentity,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    hash_str(&mut hash, PIPELINE_ARCHIVE_FORMAT);
+    hash_u64(&mut hash, 0);
+    hash_u64(&mut hash, key.color_format as u64);
+    hash_u64(
+        &mut hash,
+        key.depth_format
+            .map(|format| format as u64 + 1)
+            .unwrap_or(0),
+    );
+    hash_str(&mut hash, &key.vertex_fn);
+    hash_str(&mut hash, &key.fragment_fn);
+    hash_str(&mut hash, &identity.translator_version);
+    hash_str(&mut hash, &identity.gpu_family);
+    hash
+}
+
+fn compute_pipeline_descriptor_identity(
+    key: &ComputePipelineCacheKey,
+    identity: &PipelineArchiveIdentity,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    hash_str(&mut hash, PIPELINE_ARCHIVE_FORMAT);
+    hash_u64(&mut hash, 1);
+    hash_str(&mut hash, &key.compute_fn);
+    hash_str(&mut hash, &identity.translator_version);
+    hash_str(&mut hash, &identity.gpu_family);
+    hash
+}
+
+fn compute_pipeline_archive_key(
+    shader_hash: u64,
+    key: &ComputePipelineCacheKey,
+    identity: &PipelineArchiveIdentity,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    hash_str(&mut hash, PIPELINE_ARCHIVE_FORMAT);
+    hash_u64(&mut hash, shader_hash);
+    hash_u64(&mut hash, 1);
+    hash_str(&mut hash, &key.compute_fn);
+    hash_str(&mut hash, &identity.translator_version);
+    hash_str(&mut hash, &identity.gpu_family);
+    hash
+}
+
+/// On-disk metadata sidecar for a persistent archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistentArchiveMetadata {
+    format: String,
+    identity: PipelineArchiveIdentity,
+    keys: BTreeSet<u64>,
+    descriptor_hashes: BTreeMap<u64, u64>,
+}
+
+impl PersistentArchiveMetadata {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "format": self.format,
+            "device_name": self.identity.device_name,
+            "gpu_family": self.identity.gpu_family,
+            "translator_version": self.identity.translator_version,
+            "keys": self.keys.iter().map(|key| format!("{key:016x}")).collect::<Vec<_>>(),
+            "descriptors": self
+                .descriptor_hashes
+                .iter()
+                .map(|(descriptor, shader)| {
+                    (format!("{descriptor:016x}"), format!("{shader:016x}"))
+                })
+                .collect::<BTreeMap<_, _>>(),
+        })
+    }
+
+    fn from_json(value: &serde_json::Value, path: &std::path::Path) -> AppResult<Self> {
+        let string = |field: &str| {
+            value
+                .get(field)
+                .and_then(|item| item.as_str())
+                .ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        format!(
+                            "persistent pipeline archive metadata {} is missing '{field}'",
+                            path.display()
+                        ),
+                    )
+                })
+        };
+        let format = string("format")?.to_string();
+        let identity = PipelineArchiveIdentity {
+            device_name: string("device_name")?.to_string(),
+            gpu_family: string("gpu_family")?.to_string(),
+            translator_version: string("translator_version")?.to_string(),
+        };
+        let entries = value
+            .get("keys")
+            .and_then(|item| item.as_array())
+            .ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "persistent pipeline archive metadata {} is missing 'keys'",
+                        path.display()
+                    ),
+                )
+            })?;
+        let mut keys = BTreeSet::new();
+        for entry in entries {
+            let text = entry.as_str().ok_or_else(|| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "persistent pipeline archive metadata {} has a non-string key",
+                        path.display()
+                    ),
+                )
+            })?;
+            let key = u64::from_str_radix(text, 16).map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "persistent pipeline archive metadata {} has an invalid key '{text}': {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            keys.insert(key);
+        }
+        let mut descriptor_hashes = BTreeMap::new();
+        if let Some(object) = value.get("descriptors").and_then(|item| item.as_object()) {
+            for (descriptor, shader) in object {
+                let descriptor = u64::from_str_radix(descriptor, 16).map_err(|error| {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        format!(
+                            "persistent pipeline archive metadata {} has an invalid descriptor \
+                             key '{descriptor}': {error}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                let shader = shader.as_str().ok_or_else(|| {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        format!(
+                            "persistent pipeline archive metadata {} has a non-string shader \
+                             hash for descriptor {descriptor:016x}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                let shader = u64::from_str_radix(shader, 16).map_err(|error| {
+                    AppError::new(
+                        ReasonCode::RcIo,
+                        format!(
+                            "persistent pipeline archive metadata {} has an invalid shader \
+                             hash '{shader}': {error}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                descriptor_hashes.insert(descriptor, shader);
+            }
+        }
+        Ok(Self {
+            format,
+            identity,
+            keys,
+            descriptor_hashes,
+        })
+    }
+}
+
+/// Apply a test-only identity perturbation to the *expected* identity, so a
+/// mismatch is rejected even though the file-name lookup used the real one.
+#[allow(unused_mut)]
+fn persistent_validation_identity(identity: &PipelineArchiveIdentity) -> PipelineArchiveIdentity {
+    let mut expected = identity.clone();
+    #[cfg(test)]
+    match faults::archive_identity_fault() {
+        1 => expected.translator_version.push_str("-stale"),
+        2 => expected.gpu_family = "apple1".to_string(),
+        _ => {}
+    }
+    expected
+}
+
+/// One pipeline to compile during [`MetalGpuBackend::prewarm_pipelines`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelinePrewarmRequest {
+    /// A render pipeline compiled from MSL source.
+    Render {
+        library_source: String,
+        vertex_fn: String,
+        fragment_fn: String,
+        color_format: metal::MTLPixelFormat,
+        depth_format: Option<metal::MTLPixelFormat>,
+    },
+    /// A compute pipeline compiled from MSL source.
+    Compute {
+        library_source: String,
+        compute_fn: String,
+    },
+}
+
+/// Outcome of a prewarm batch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PipelinePrewarmReport {
+    /// Pipelines compiled (cache hits count here too).
+    pub compiled: u64,
+    /// Total pipelines recorded in the persistent archive (cumulative).
+    pub archive_records: u64,
+    /// Keys present in the archive metadata after the flush.
+    pub archive_keys: u64,
+    /// Successful archive serializations (cumulative).
+    pub serializations: u64,
+}
+
+/// Automatic per-GPU archive state attached to a backend.
+#[derive(Debug, Clone)]
+struct PersistentPipelineArchive {
+    directory: std::path::PathBuf,
+    archive_path: std::path::PathBuf,
+    metadata_path: std::path::PathBuf,
+    identity: PipelineArchiveIdentity,
+    keys: BTreeSet<u64>,
+    /// Descriptor identity (without the shader hash) -> shader hash that was
+    /// recorded. A changed hash for the same descriptor invalidates the whole
+    /// archive because Metal cannot hold two binaries for one function name.
+    descriptor_hashes: BTreeMap<u64, u64>,
+    pending_records: u64,
+}
+
 /// Create a new empty MTLBinaryArchive for recording pipelines.
 ///
 /// `write_url` is only recorded as the default serialization destination
@@ -17157,6 +17630,15 @@ pub struct PipelineArchiveStats {
     pub unverified: u64,
     /// Pipelines successfully added to a registered archive.
     pub records: u64,
+    /// Automatic persistent-archive records that failed (the pipeline was
+    /// still returned; the error stays observable).
+    pub record_failures: u64,
+    /// Whether an automatic per-GPU persistent archive is enabled.
+    pub persistent_archive: bool,
+    /// Pipeline keys recorded in the persistent archive metadata.
+    pub persistent_keys: u64,
+    /// Whole-archive rebuilds caused by a changed shader hash.
+    pub invalidations: u64,
     /// Successful `serialize_archive` writes.
     pub serializations: u64,
 }
@@ -17352,9 +17834,509 @@ impl MetalGpuBackend {
 
     /// Detach any loaded archive; pipeline creation returns to source
     /// compilation (and the in-memory caches).
+    ///
+    /// An automatic persistent archive stays enabled; it keeps recording
+    /// future compiles (and flushes them with
+    /// [`Self::flush_persistent_pipeline_archive`]).
     pub fn clear_pipeline_archive_path(&mut self) {
         self.loaded_pipeline_archive = None;
         self.pipeline_archive_path = None;
+    }
+
+    /// Enable the automatic per-GPU persistent archive rooted at `directory`.
+    ///
+    /// The archive file name and metadata are derived from the device name,
+    /// the highest GPU family, and [`PIPELINE_ARCHIVE_TRANSLATOR_VERSION`].
+    /// When a matching archive exists it is loaded and attached to every
+    /// pipeline descriptor; otherwise a fresh archive is created. This is the
+    /// startup/install entry point: call it before creating pipelines and
+    /// `flush_persistent_pipeline_archive` (or
+    /// [`Self::prewarm_pipelines`]) after the batch.
+    ///
+    /// Stale or corrupt state is rejected with an exact error rather than
+    /// loaded: wrong translator version, wrong GPU family, a metadata sidecar
+    /// without its archive, an archive without metadata, and unreadable
+    /// metadata each keep their own message.
+    pub fn enable_persistent_pipeline_archive(
+        &mut self,
+        directory: &std::path::Path,
+    ) -> AppResult<()> {
+        std::fs::create_dir_all(directory).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "could not create persistent pipeline archive directory {}: {error}",
+                    directory.display()
+                ),
+            )
+        })?;
+        let identity = pipeline_archive_identity(self.device.metal_device());
+        let archive_path = persistent_pipeline_archive_path(directory, &identity);
+        let metadata_path = persistent_pipeline_archive_metadata_path(&archive_path);
+        let archive_exists = archive_path.exists();
+        let metadata_exists = metadata_path.exists();
+        let mut keys = BTreeSet::new();
+        let mut descriptor_hashes = BTreeMap::new();
+        if metadata_exists {
+            let text = std::fs::read_to_string(&metadata_path).map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "could not read persistent pipeline archive metadata {}: {error}",
+                        metadata_path.display()
+                    ),
+                )
+            })?;
+            let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+                AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "persistent pipeline archive metadata {} is not valid JSON: {error}",
+                        metadata_path.display()
+                    ),
+                )
+            })?;
+            let metadata = PersistentArchiveMetadata::from_json(&value, &metadata_path)?;
+            if metadata.format != PIPELINE_ARCHIVE_FORMAT {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "persistent pipeline archive metadata {} has format '{}' but this build \
+                         expects '{}'; recompile required",
+                        metadata_path.display(),
+                        metadata.format,
+                        PIPELINE_ARCHIVE_FORMAT
+                    ),
+                ));
+            }
+            let expected = persistent_validation_identity(&identity);
+            if metadata.identity.translator_version != expected.translator_version {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "persistent pipeline archive {} was written by translator version {} but \
+                         this build is {}; recompile required",
+                        archive_path.display(),
+                        metadata.identity.translator_version,
+                        expected.translator_version
+                    ),
+                ));
+            }
+            if metadata.identity.gpu_family != expected.gpu_family {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "persistent pipeline archive {} targets GPU family {} but this device is \
+                         {}; recompile required",
+                        archive_path.display(),
+                        metadata.identity.gpu_family,
+                        expected.gpu_family
+                    ),
+                ));
+            }
+            if !archive_exists {
+                return Err(AppError::new(
+                    ReasonCode::RcIo,
+                    format!(
+                        "persistent pipeline archive metadata {} has no archive at {}",
+                        metadata_path.display(),
+                        archive_path.display()
+                    ),
+                ));
+            }
+            keys = metadata.keys;
+            descriptor_hashes = metadata.descriptor_hashes;
+        } else if archive_exists {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "persistent pipeline archive {} has no metadata sidecar; refusing to load an \
+                     unverified archive",
+                    archive_path.display()
+                ),
+            ));
+        }
+
+        let archive = if archive_exists {
+            load_pipeline_archive(self.device.metal_device(), &archive_path)?
+        } else {
+            create_pipeline_archive(
+                self.device.metal_device(),
+                Some("casa1-persistent"),
+                &archive_path,
+            )?
+        };
+        self.loaded_pipeline_archive = Some(archive);
+        self.pipeline_archive_path = Some(archive_path.clone());
+        self.persistent_pipeline_archive = Some(PersistentPipelineArchive {
+            directory: directory.to_path_buf(),
+            archive_path,
+            metadata_path,
+            identity,
+            keys,
+            descriptor_hashes,
+            pending_records: 0,
+        });
+        Ok(())
+    }
+
+    /// Whether the automatic persistent archive is enabled.
+    pub fn persistent_pipeline_archive_enabled(&self) -> bool {
+        self.persistent_pipeline_archive.is_some()
+    }
+
+    /// Directory and file the persistent archive uses, when enabled.
+    pub fn persistent_pipeline_archive_location(
+        &self,
+    ) -> Option<(&std::path::Path, &std::path::Path)> {
+        self.persistent_pipeline_archive
+            .as_ref()
+            .map(|state| (state.directory.as_path(), state.archive_path.as_path()))
+    }
+
+    /// Number of pipeline keys recorded in the persistent archive metadata.
+    pub fn persistent_pipeline_archive_key_count(&self) -> u64 {
+        self.persistent_pipeline_archive
+            .as_ref()
+            .map(|state| state.keys.len() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Serialize the persistent archive and its metadata after a compile batch.
+    ///
+    /// No-op (and no serialization counter) when no pipeline was recorded
+    /// since the last flush. A Metal or filesystem failure is returned exactly
+    /// and leaves the previous on-disk archive untouched.
+    pub fn flush_persistent_pipeline_archive(&mut self) -> AppResult<()> {
+        let Some(state) = self.persistent_pipeline_archive.as_ref() else {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "persistent pipeline archive is not enabled; call enable_persistent_pipeline_archive first",
+            ));
+        };
+        if state.pending_records == 0 {
+            return Ok(());
+        }
+        let (archive_path, metadata_path) =
+            (state.archive_path.clone(), state.metadata_path.clone());
+        let metadata = PersistentArchiveMetadata {
+            format: PIPELINE_ARCHIVE_FORMAT.to_string(),
+            identity: state.identity.clone(),
+            keys: state.keys.clone(),
+            descriptor_hashes: state.descriptor_hashes.clone(),
+        };
+        let archive = self.loaded_pipeline_archive.as_ref().ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcInvalidState,
+                "persistent pipeline archive has no loaded MTLBinaryArchive to serialize",
+            )
+        })?;
+        archive.serialize_to_path(&archive_path)?;
+        let encoded = serde_json::to_vec_pretty(&metadata.to_json()).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "could not encode persistent pipeline archive metadata {}: {error}",
+                    metadata_path.display()
+                ),
+            )
+        })?;
+        let temporary = metadata_path.with_extension("json.tmp");
+        std::fs::write(&temporary, encoded).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "could not write persistent pipeline archive metadata {}: {error}",
+                    temporary.display()
+                ),
+            )
+        })?;
+        std::fs::rename(&temporary, &metadata_path).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcIo,
+                format!(
+                    "could not install persistent pipeline archive metadata {}: {error}",
+                    metadata_path.display()
+                ),
+            )
+        })?;
+        if let Some(state) = self.persistent_pipeline_archive.as_mut() {
+            state.pending_records = 0;
+        }
+        self.pipeline_archive_serializations += 1;
+        Ok(())
+    }
+
+    /// Disable the persistent archive after flushing any pending records.
+    pub fn disable_persistent_pipeline_archive(&mut self) -> AppResult<()> {
+        if self.persistent_pipeline_archive.is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "persistent pipeline archive is not enabled",
+            ));
+        }
+        self.flush_persistent_pipeline_archive()?;
+        self.persistent_pipeline_archive = None;
+        self.loaded_pipeline_archive = None;
+        self.pipeline_archive_path = None;
+        Ok(())
+    }
+
+    fn persistent_render_archive_key(&self, key: &RenderPipelineCacheKey) -> Option<u64> {
+        let state = self.persistent_pipeline_archive.as_ref()?;
+        let shader_hash = self.library_hashes.get(&key.library_id)?;
+        Some(render_pipeline_archive_key(
+            *shader_hash,
+            key,
+            &state.identity,
+        ))
+    }
+
+    fn persistent_compute_archive_key(&self, key: &ComputePipelineCacheKey) -> Option<u64> {
+        let state = self.persistent_pipeline_archive.as_ref()?;
+        let shader_hash = self.library_hashes.get(&key.library_id)?;
+        Some(compute_pipeline_archive_key(
+            *shader_hash,
+            key,
+            &state.identity,
+        ))
+    }
+
+    fn reset_persistent_pipeline_archive_for_invalidation(&mut self) -> AppResult<()> {
+        let Some(path) = self
+            .persistent_pipeline_archive
+            .as_ref()
+            .map(|state| state.archive_path.clone())
+        else {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "persistent pipeline archive is not enabled",
+            ));
+        };
+        let archive =
+            create_pipeline_archive(self.device.metal_device(), Some("casa1-persistent"), &path)?;
+        self.loaded_pipeline_archive = Some(archive);
+        if let Some(state) = self.persistent_pipeline_archive.as_mut() {
+            state.keys.clear();
+            state.descriptor_hashes.clear();
+            state.pending_records = 0;
+        }
+        self.pipeline_archive_invalidations += 1;
+        Ok(())
+    }
+
+    fn record_persistent_render_pipeline(&mut self, key: &RenderPipelineCacheKey) {
+        let Some(identity) = self
+            .persistent_pipeline_archive
+            .as_ref()
+            .map(|state| state.identity.clone())
+        else {
+            return;
+        };
+        let shader_hash = match self.library_hashes.get(&key.library_id) {
+            Some(hash) => *hash,
+            None => {
+                self.pipeline_archive_record_failures += 1;
+                self.pipeline_archive_last_error = Some(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!(
+                        "shader library {} has no recorded source hash; persistent archive key is \
+                         unavailable",
+                        key.library_id
+                    ),
+                ));
+                return;
+            }
+        };
+        let archive_key = render_pipeline_archive_key(shader_hash, key, &identity);
+        let descriptor_identity = render_pipeline_descriptor_identity(key, &identity);
+        let previous_hash = self
+            .persistent_pipeline_archive
+            .as_ref()
+            .and_then(|state| state.descriptor_hashes.get(&descriptor_identity).copied());
+        if previous_hash.is_some_and(|previous| previous != shader_hash) {
+            if let Err(error) = self.reset_persistent_pipeline_archive_for_invalidation() {
+                self.pipeline_archive_record_failures += 1;
+                self.pipeline_archive_last_error = Some(error);
+                return;
+            }
+        }
+        let descriptor = match self.build_render_pipeline_descriptor(key) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                self.pipeline_archive_record_failures += 1;
+                self.pipeline_archive_last_error = Some(error);
+                return;
+            }
+        };
+        let result = match self.loaded_pipeline_archive.as_ref() {
+            Some(archive) => archive.add_render_pipeline(&descriptor),
+            None => Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "persistent pipeline archive has no loaded MTLBinaryArchive to record into",
+            )),
+        };
+        match result {
+            Ok(()) => {
+                self.pipeline_archive_records += 1;
+                if let Some(state) = self.persistent_pipeline_archive.as_mut() {
+                    state.keys.insert(archive_key);
+                    state
+                        .descriptor_hashes
+                        .insert(descriptor_identity, shader_hash);
+                    state.pending_records += 1;
+                }
+            }
+            Err(error) => {
+                self.pipeline_archive_record_failures += 1;
+                self.pipeline_archive_last_error = Some(error);
+            }
+        }
+    }
+
+    fn record_persistent_compute_pipeline(&mut self, key: &ComputePipelineCacheKey) {
+        let Some(identity) = self
+            .persistent_pipeline_archive
+            .as_ref()
+            .map(|state| state.identity.clone())
+        else {
+            return;
+        };
+        let shader_hash = match self.library_hashes.get(&key.library_id) {
+            Some(hash) => *hash,
+            None => {
+                self.pipeline_archive_record_failures += 1;
+                self.pipeline_archive_last_error = Some(AppError::new(
+                    ReasonCode::RcInvalidState,
+                    format!(
+                        "shader library {} has no recorded source hash; persistent archive key is \
+                         unavailable",
+                        key.library_id
+                    ),
+                ));
+                return;
+            }
+        };
+        let archive_key = compute_pipeline_archive_key(shader_hash, key, &identity);
+        let descriptor_identity = compute_pipeline_descriptor_identity(key, &identity);
+        let previous_hash = self
+            .persistent_pipeline_archive
+            .as_ref()
+            .and_then(|state| state.descriptor_hashes.get(&descriptor_identity).copied());
+        if previous_hash.is_some_and(|previous| previous != shader_hash) {
+            if let Err(error) = self.reset_persistent_pipeline_archive_for_invalidation() {
+                self.pipeline_archive_record_failures += 1;
+                self.pipeline_archive_last_error = Some(error);
+                return;
+            }
+        }
+        let descriptor = match self.libraries.get(&key.library_id) {
+            Some(library) => match library.get_function(&key.compute_fn, None) {
+                Ok(function) => {
+                    let descriptor = metal::ComputePipelineDescriptor::new();
+                    descriptor.set_compute_function(Some(&function));
+                    descriptor
+                }
+                Err(error) => {
+                    self.pipeline_archive_record_failures += 1;
+                    self.pipeline_archive_last_error = Some(AppError::new(
+                        ReasonCode::RcCliInvalid,
+                        format!("compute function '{}' not found: {error}", key.compute_fn),
+                    ));
+                    return;
+                }
+            },
+            None => {
+                self.pipeline_archive_record_failures += 1;
+                self.pipeline_archive_last_error = Some(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    format!("library {} not found", key.library_id),
+                ));
+                return;
+            }
+        };
+        let result = match self.loaded_pipeline_archive.as_ref() {
+            Some(archive) => archive.add_compute_pipeline(&descriptor),
+            None => Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "persistent pipeline archive has no loaded MTLBinaryArchive to record into",
+            )),
+        };
+        match result {
+            Ok(()) => {
+                self.pipeline_archive_records += 1;
+                if let Some(state) = self.persistent_pipeline_archive.as_mut() {
+                    state.keys.insert(archive_key);
+                    state
+                        .descriptor_hashes
+                        .insert(descriptor_identity, shader_hash);
+                    state.pending_records += 1;
+                }
+            }
+            Err(error) => {
+                self.pipeline_archive_record_failures += 1;
+                self.pipeline_archive_last_error = Some(error);
+            }
+        }
+    }
+
+    /// The most recent non-fatal persistent-archive failure, if any.
+    pub fn pipeline_archive_last_error(&self) -> Option<&AppError> {
+        self.pipeline_archive_last_error.as_ref()
+    }
+
+    /// Prewarm entry point for install/loading: compile a batch of pipelines
+    /// from MSL sources, record every compiled PSO in the persistent archive,
+    /// and flush the archive to disk once at the end.
+    ///
+    /// Exact compile/creation errors are returned (the batch stops there);
+    /// archive recording failures are recorded in
+    /// [`Self::pipeline_archive_last_error`] and do not fail the prewarm, so a
+    /// device that refuses archiving still yields usable pipelines.
+    pub fn prewarm_pipelines(
+        &mut self,
+        requests: &[PipelinePrewarmRequest],
+    ) -> AppResult<PipelinePrewarmReport> {
+        if self.persistent_pipeline_archive.is_none() {
+            return Err(AppError::new(
+                ReasonCode::RcInvalidState,
+                "persistent pipeline archive is not enabled; call enable_persistent_pipeline_archive first",
+            ));
+        }
+        let mut report = PipelinePrewarmReport::default();
+        for request in requests {
+            match request {
+                PipelinePrewarmRequest::Render {
+                    library_source,
+                    vertex_fn,
+                    fragment_fn,
+                    color_format,
+                    depth_format,
+                } => {
+                    let library = self.compile_shader(library_source)?;
+                    self.create_render_pipeline(
+                        vertex_fn,
+                        fragment_fn,
+                        library,
+                        *color_format,
+                        *depth_format,
+                    )?;
+                }
+                PipelinePrewarmRequest::Compute {
+                    library_source,
+                    compute_fn,
+                } => {
+                    let library = self.compile_shader(library_source)?;
+                    self.create_compute_pipeline(compute_fn, library)?;
+                }
+            }
+            report.compiled += 1;
+        }
+        self.flush_persistent_pipeline_archive()?;
+        report.archive_records = self.pipeline_archive_records;
+        report.archive_keys = self.persistent_pipeline_archive_key_count();
+        report.serializations = self.pipeline_archive_serializations;
+        Ok(report)
     }
 
     /// Pipeline-archive instrumentation snapshot.
@@ -17371,6 +18353,10 @@ impl MetalGpuBackend {
             misses: self.pipeline_archive_misses,
             unverified: self.pipeline_archive_unverified,
             records: self.pipeline_archive_records,
+            record_failures: self.pipeline_archive_record_failures,
+            persistent_archive: self.persistent_pipeline_archive.is_some(),
+            persistent_keys: self.persistent_pipeline_archive_key_count(),
+            invalidations: self.pipeline_archive_invalidations,
             serializations: self.pipeline_archive_serializations,
         }
     }
@@ -18934,6 +19920,65 @@ impl Metal4Queue {
             let _: () = msg_send![self.object, signalEvent: event_obj value: value];
         }
     }
+
+    /// Attach a residency set to this Metal 4 queue.
+    ///
+    /// The selector is probed before messaging, so a runtime that does not
+    /// expose `addResidencySet:` fails with an exact error instead of an
+    /// unrecognized-selector exception.
+    pub fn add_residency_set(&self, set: &MetalResidencySet) -> AppResult<()> {
+        #[cfg(test)]
+        if faults::residency_queue_fault() == 1 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "Metal refused addResidencySet: MTL4CommandQueue (injected residency attachment \
+                 failure)",
+            ));
+        }
+        let accepts: bool =
+            unsafe { msg_send![self.object, respondsToSelector: sel!(addResidencySet:)] };
+        if !accepts {
+            return Err(residency_attachment_unsupported_error());
+        }
+        let set_obj = set.object as *mut objc::runtime::Object;
+        // SAFETY: the queue and set are live; the selector was probed above.
+        unsafe {
+            let _: () = msg_send![self.object, addResidencySet: set_obj];
+        }
+        Ok(())
+    }
+
+    /// Detach a residency set from this Metal 4 queue.
+    pub fn remove_residency_set(&self, set: &MetalResidencySet) -> AppResult<()> {
+        #[cfg(test)]
+        if faults::residency_queue_fault() == 2 {
+            return Err(AppError::new(
+                ReasonCode::RcIo,
+                "Metal refused removeResidencySet: MTL4CommandQueue (injected residency detach \
+                 failure)",
+            ));
+        }
+        let accepts: bool =
+            unsafe { msg_send![self.object, respondsToSelector: sel!(removeResidencySet:)] };
+        if !accepts {
+            return Err(residency_attachment_unsupported_error());
+        }
+        let set_obj = set.object as *mut objc::runtime::Object;
+        // SAFETY: the queue and set are live; the selector was probed above.
+        unsafe {
+            let _: () = msg_send![self.object, removeResidencySet: set_obj];
+        }
+        Ok(())
+    }
+}
+
+/// Exact error when the runtime cannot attach residency sets to its queue.
+fn residency_attachment_unsupported_error() -> AppError {
+    AppError::new(
+        ReasonCode::RcUnsupportedPlatformApi,
+        "MTL4CommandQueue does not expose addResidencySet: (MTLResidencySet); residency sets \
+         cannot be attached",
+    )
 }
 
 /// An owned `MTL4CommandBuffer` (allocator-backed, Metal 4 encoding).
@@ -31084,5 +32129,263 @@ declare void @ray.storePayloadField(i32, ...)
             Err(error) => panic!("unexpected CAMetalLayer present error: {error:?}"),
         }
         set_present_timing_enabled(false);
+    }
+    // -----------------------------------------------------------------------
+    // Automatic per-GPU persistent archive + queue residency attachment
+    // -----------------------------------------------------------------------
+
+    fn persistent_requests() -> Vec<PipelinePrewarmRequest> {
+        vec![
+            PipelinePrewarmRequest::Render {
+                library_source: TEST_MULTI_ENTRY_SRC.to_string(),
+                vertex_fn: "vertex_main".to_string(),
+                fragment_fn: "fragment_main".to_string(),
+                color_format: metal::MTLPixelFormat::BGRA8Unorm,
+                depth_format: None,
+            },
+            PipelinePrewarmRequest::Compute {
+                library_source: TEST_COMPUTE_SRC.to_string(),
+                compute_fn: "compute_main".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn persistent_pipeline_archive_reload_rejects_key_change_and_serves_unchanged_keys() {
+        if std::env::var_os("CI").is_some() || !binary_archives_available() {
+            return;
+        }
+        let dir = archive_temp_dir("persistent-reload");
+
+        let mut writer = create_backend();
+        writer
+            .enable_persistent_pipeline_archive(&dir)
+            .expect("enable persistent archive");
+        assert_eq!(writer.persistent_pipeline_archive_enabled(), true);
+        let report = writer
+            .prewarm_pipelines(&persistent_requests())
+            .expect("prewarm batch");
+        assert_eq!(report.compiled, 2);
+        assert_eq!(report.serializations, 1);
+        assert_eq!(report.archive_keys, 2);
+        let (_, archive_path) = writer
+            .persistent_pipeline_archive_location()
+            .expect("persistent location");
+        let archive_path = archive_path.to_path_buf();
+        assert_eq!(archive_path.exists(), true);
+        let metadata_path = archive_path.with_extension("metalarchive.json");
+        assert_eq!(metadata_path.exists(), true);
+        writer
+            .disable_persistent_pipeline_archive()
+            .expect("disable after flush");
+        assert_eq!(writer.persistent_pipeline_archive_enabled(), false);
+
+        // A fresh process/device loads the persisted archive and every key is
+        // served from it.
+        let mut reader = create_backend();
+        reader
+            .enable_persistent_pipeline_archive(&dir)
+            .expect("reload persistent archive on a fresh device");
+        assert_eq!(reader.persistent_pipeline_archive_key_count(), 2);
+        let report = reader
+            .prewarm_pipelines(&persistent_requests())
+            .expect("replay prewarm");
+        assert_eq!(report.archive_keys, 2);
+        let stats = reader.pipeline_archive_stats();
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 0);
+
+        // A changed shader source changes the shader hash, so the invalidation
+        // key is absent and the render pipeline recompiles; the unchanged
+        // compute key still hits.
+        let changed = TEST_MULTI_ENTRY_SRC.replace(
+            "return float4(1.0, 0.0, 0.0, 1.0);",
+            "return float4(0.0, 1.0, 0.0, 1.0);",
+        );
+        let mut invalidated = create_backend();
+        invalidated
+            .enable_persistent_pipeline_archive(&dir)
+            .expect("reload before key change");
+        let report = invalidated
+            .prewarm_pipelines(&[
+                PipelinePrewarmRequest::Render {
+                    library_source: changed,
+                    vertex_fn: "vertex_main".to_string(),
+                    fragment_fn: "fragment_main".to_string(),
+                    color_format: metal::MTLPixelFormat::BGRA8Unorm,
+                    depth_format: None,
+                },
+                PipelinePrewarmRequest::Compute {
+                    library_source: TEST_COMPUTE_SRC.to_string(),
+                    compute_fn: "compute_main".to_string(),
+                },
+            ])
+            .expect("prewarm invalidation batch");
+        assert_eq!(
+            report.archive_keys, 2,
+            "the changed shader rebuilds the whole archive (Metal cannot hold two binaries for \
+             one function name)"
+        );
+        let stats = invalidated.pipeline_archive_stats();
+        assert_eq!(
+            stats.misses, 2,
+            "the changed shader invalidates the archive and both keys recompile"
+        );
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.invalidations, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persistent_pipeline_archive_rejects_gpu_family_translator_corrupt_and_orphan_metadata_exactly()
+     {
+        if std::env::var_os("CI").is_some() || !binary_archives_available() {
+            return;
+        }
+        let dir = archive_temp_dir("persistent-reject");
+        let mut writer = create_backend();
+        writer
+            .enable_persistent_pipeline_archive(&dir)
+            .expect("enable persistent archive");
+        writer
+            .prewarm_pipelines(&persistent_requests())
+            .expect("prewarm batch");
+        let device = metal::Device::system_default().expect("Metal device");
+        let identity = pipeline_archive_identity(&device);
+        let archive_path = persistent_pipeline_archive_path(&dir, &identity);
+        let metadata_path = archive_path.with_extension("metalarchive.json");
+
+        test_faults::set_archive_identity_fault(2);
+        let mut mismatch = create_backend();
+        let error = mismatch
+            .enable_persistent_pipeline_archive(&dir)
+            .expect_err("GPU-family mismatch must be rejected");
+        test_faults::set_archive_identity_fault(0);
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            format!(
+                "persistent pipeline archive {} targets GPU family {} but this device is apple1; \
+                 recompile required",
+                archive_path.display(),
+                identity.gpu_family
+            )
+        );
+
+        test_faults::set_archive_identity_fault(1);
+        let mut stale = create_backend();
+        let error = stale
+            .enable_persistent_pipeline_archive(&dir)
+            .expect_err("translator mismatch must be rejected");
+        test_faults::set_archive_identity_fault(0);
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            format!(
+                "persistent pipeline archive {} was written by translator version {} but this \
+                 build is {}-stale; recompile required",
+                archive_path.display(),
+                PIPELINE_ARCHIVE_TRANSLATOR_VERSION,
+                PIPELINE_ARCHIVE_TRANSLATOR_VERSION
+            )
+        );
+
+        // An archive without its metadata sidecar is never loaded unverified.
+        let metadata_bytes = std::fs::read(&metadata_path).expect("metadata bytes");
+        std::fs::remove_file(&metadata_path).expect("remove metadata");
+        let mut orphan = create_backend();
+        let error = orphan
+            .enable_persistent_pipeline_archive(&dir)
+            .expect_err("archive without metadata must be rejected");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            format!(
+                "persistent pipeline archive {} has no metadata sidecar; refusing to load an \
+                 unverified archive",
+                archive_path.display()
+            )
+        );
+        std::fs::write(&metadata_path, &metadata_bytes).expect("restore metadata");
+
+        // Metadata without its archive is also rejected, not recreated.
+        let archive_bytes = std::fs::read(&archive_path).expect("archive bytes");
+        std::fs::remove_file(&archive_path).expect("remove archive");
+        let mut orphan = create_backend();
+        let error = orphan
+            .enable_persistent_pipeline_archive(&dir)
+            .expect_err("metadata without archive must be rejected");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            format!(
+                "persistent pipeline archive metadata {} has no archive at {}",
+                metadata_path.display(),
+                archive_path.display()
+            )
+        );
+        std::fs::write(&archive_path, &archive_bytes).expect("restore archive");
+
+        // A corrupt archive is rejected by the real Metal loader.
+        std::fs::write(&archive_path, b"not an MTLBinaryArchive").expect("corrupt archive");
+        let mut corrupt = create_backend();
+        let error = corrupt
+            .enable_persistent_pipeline_archive(&dir)
+            .expect_err("corrupt archive must be rejected");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message.starts_with(&format!(
+                "failed to load MTLBinaryArchive from {}",
+                archive_path.display()
+            )),
+            true
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn residency_queue_attachment_rejects_injected_failure_and_double_release_exactly() {
+        if std::env::var_os("CI").is_some() {
+            return;
+        }
+        let device = MetalDevice::system_default().expect("Metal device");
+        if !Metal4Queue::is_supported(device.metal_device()) {
+            return;
+        }
+        let set = create_residency_set(device.metal_device(), Some("queue-set"), 4)
+            .expect("residency set");
+        let buffer = device.create_buffer(64, metal::MTLResourceOptions::StorageModeShared);
+        set.add_allocation(&buffer);
+        set.commit();
+        let queue = Metal4Queue::new(device.metal_device()).expect("Metal 4 queue");
+
+        test_faults::set_residency_queue_fault(1);
+        let error = set
+            .attach_to_queue(&queue)
+            .expect_err("injected attachment failure");
+        test_faults::set_residency_queue_fault(0);
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            "Metal refused addResidencySet: MTL4CommandQueue (injected residency attachment \
+             failure)"
+        );
+
+        set.attach_to_queue(&queue).expect("attach after fault");
+        set.detach_from_queue(&queue).expect("detach");
+        let mut backend = create_backend();
+        let set_id = backend
+            .create_residency_set(Some("double-release"), 1)
+            .expect("backend residency set");
+        backend
+            .destroy_residency_set(set_id)
+            .expect("first release");
+        let error = backend
+            .destroy_residency_set(set_id)
+            .expect_err("second release must be rejected");
+        assert_eq!(error.code, ReasonCode::RcGeNotFound);
+        assert_eq!(error.message, format!("residency set {set_id} not found"));
     }
 }

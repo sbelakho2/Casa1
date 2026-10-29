@@ -2059,27 +2059,31 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
          ICLRRuntimeInfo and a real ICLRRuntimeHost whose \
          ExecuteInDefaultAppDomain runs managed static methods natively on ARM64 \
          CoreCLR.  Managed (.NET Core) images also execute through the managed \
-         image path.  The legacy .NET Framework activation contract \
-         (CorBindToRuntime*) remains absent, so .NET Framework-only images do not \
-         run; the capability is partial, never synthetic.",
+         image path.  The legacy .NET Framework CLR is genuinely absent, so \
+         Framework-version activation answers COR_E_CLRNOTAVAILABLE and is \
+         never satisfied by CoreCLR; the capability is partial, never synthetic.",
     ),
     semantic_override(
         "mscoree.dll",
         "CorBindToRuntime",
         None,
-        SemanticFidelity::SyntheticEnvironment,
+        SemanticFidelity::Exact,
         SubsystemCapability::Partial,
-        "Models a Windows machine with no .NET CLR installed: activation answers \
-         COR_E_CLRNOTAVAILABLE.",
+        "Binds an explicitly requested installed CoreCLR version (major 5+) to \
+         the real ICLRRuntimeHost; versionless and .NET Framework requests \
+         (v1.0/v1.1/v2.0/v4.0) answer the documented COR_E_CLRNOTAVAILABLE via \
+         the absent IFrameworkRuntimeProvider and never bind CoreCLR.",
     ),
     semantic_override(
         "mscoree.dll",
         "CorBindToRuntimeEx",
         None,
-        SemanticFidelity::SyntheticEnvironment,
+        SemanticFidelity::Exact,
         SubsystemCapability::Partial,
-        "Models a Windows machine with no .NET CLR installed: activation answers \
-         COR_E_CLRNOTAVAILABLE.",
+        "Binds an explicitly requested installed CoreCLR version (major 5+) to \
+         the real ICLRRuntimeHost, accepting the legacy flavor and startup \
+         flags; versionless and .NET Framework requests answer \
+         COR_E_CLRNOTAVAILABLE and never bind CoreCLR.",
     ),
     semantic_override(
         "mscoree.dll",
@@ -2091,6 +2095,18 @@ static SEMANTIC_OVERRIDES: &[SemanticOverrideSeed] = &[
          host, including the terminating separator and the required-character \
          count.  A host with no runtime still returns E_FAIL; the legacy \
          .NET Framework directory (Microsoft.NET\\Framework*) is absent.",
+    ),
+    semantic_override(
+        "mscoree.dll",
+        "GetRequestedRuntimeInfo",
+        None,
+        SemanticFidelity::Exact,
+        SubsystemCapability::Partial,
+        "Reports the real directory (terminating separator included) and version \
+         of the installed CoreCLR selected by an explicit CoreCLR version \
+         request, following the Windows buffer/required-size contract.  \
+         Versionless and .NET Framework requests answer \
+         COR_E_CLRNOTAVAILABLE because the Framework CLR is genuinely absent.",
     ),
     semantic_override(
         "mscorwks.dll",

@@ -21,11 +21,135 @@ use std::sync::{Arc, OnceLock};
 
 use crate::clr_meta;
 
+/// `COR_E_CLRNOTAVAILABLE` — the documented activation failure when the
+/// requested legacy .NET Framework CLR is not installed.
+pub(crate) const COR_E_CLRNOTAVAILABLE: u32 = 0x8013_1013;
+
+/// The runtime generation a `CorBindToRuntime*` version string names.
+///
+/// The split is deliberately conservative: the legacy Framework version
+/// scheme owns majors 1-4 (`v1.0`, `v1.1`, `v2.0`, `v4.0`, ...), and a
+/// versionless request is the Framework "latest runtime" request.  CoreCLR
+/// versions are majors 5 and later (`5.0` ... `10.0`), so a Framework version
+/// can never be rounded to an installed CoreCLR runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActivationFamily {
+    /// A .NET Framework request (versionless or major 1-4).
+    Framework,
+    /// A CoreCLR version request with the parsed version.
+    CoreClr(clr_meta::ClrVersion),
+    /// A malformed/unsupported version string.
+    Unsupported,
+}
+
+/// Classify a guest `CorBindToRuntime*` version request.
+pub(crate) fn activation_family(version: Option<&str>) -> ActivationFamily {
+    let version = match version {
+        // No version is the legacy Framework "latest runtime" request.
+        None => return ActivationFamily::Framework,
+        Some(version) if version.is_empty() => return ActivationFamily::Framework,
+        Some(version) => version,
+    };
+    let Some(parsed) = clr_meta::ClrVersion::parse_request(version) else {
+        return ActivationFamily::Unsupported;
+    };
+    let major = parsed
+        .as_string()
+        .split('.')
+        .next()
+        .and_then(|part| part.parse::<u16>().ok())
+        .unwrap_or(0);
+    if major <= 4 {
+        ActivationFamily::Framework
+    } else {
+        ActivationFamily::CoreClr(parsed)
+    }
+}
+
+/// The seam a platform with a real legacy .NET Framework CLR implements.
+///
+/// There is no fake provider: the only provider in this host is the honest
+/// absence implementation, which reports no version and fails hosting with
+/// [`ClrHostError::FrameworkUnavailable`].  A future platform provider plugs
+/// in by returning its implementation from [`framework_runtime_provider`];
+/// the activation dispatch already consumes the trait.
+pub(crate) trait IFrameworkRuntimeProvider: Send + Sync {
+    /// Whether a legacy Framework CLR is installed and usable.
+    fn is_available(&self) -> bool;
+    /// The installed Framework version string, when available.
+    fn version(&self) -> Option<String>;
+    /// Host a managed assembly on the Framework CLR, returning its exit code.
+    ///
+    /// No caller in this build can reach a provider (there is none), so this
+    /// contract is exercised directly by the tests that pin provider absence;
+    /// a future provider uses it from the Framework execution path.
+    #[allow(dead_code)]
+    fn host_assembly(
+        &self,
+        assembly_path: &Path,
+        arguments: &[String],
+    ) -> Result<i32, ClrHostError>;
+}
+
+/// The honest absence implementation: this host has no .NET Framework CLR.
+struct AbsentFrameworkRuntimeProvider;
+
+impl IFrameworkRuntimeProvider for AbsentFrameworkRuntimeProvider {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> Option<String> {
+        None
+    }
+
+    fn host_assembly(
+        &self,
+        _assembly_path: &Path,
+        _arguments: &[String],
+    ) -> Result<i32, ClrHostError> {
+        Err(ClrHostError::FrameworkUnavailable)
+    }
+}
+
+static ABSENT_FRAMEWORK_RUNTIME: AbsentFrameworkRuntimeProvider = AbsentFrameworkRuntimeProvider;
+
+/// The provider the activation dispatch consults for Framework requests.
+pub(crate) fn framework_runtime_provider() -> &'static dyn IFrameworkRuntimeProvider {
+    &ABSENT_FRAMEWORK_RUNTIME
+}
+
+/// Select the real installed CoreCLR runtime named by a guest request.
+///
+/// Framework, versionless and malformed requests never select CoreCLR.
+fn select_requested_runtime(requested: Option<&str>) -> Option<clr_meta::ClrRuntime> {
+    let ActivationFamily::CoreClr(parsed) = activation_family(requested) else {
+        return None;
+    };
+    let installed = clr_meta::installed_runtimes();
+    clr_meta::select_runtime(&parsed, &installed).cloned()
+}
+
+/// The `GetRequestedRuntimeVersion` contract: the real installed CoreCLR
+/// version string for a CoreCLR request, or `None` when the request names the
+/// absent Framework CLR, is malformed, or matches no installed runtime.
+pub(crate) fn requested_runtime_version(requested: Option<&str>) -> Option<String> {
+    select_requested_runtime(requested).map(|runtime| runtime.version_string())
+}
+
+/// The directory half of `GetRequestedRuntimeInfo` for the same selection.
+pub(crate) fn requested_runtime_directory(requested: Option<&str>) -> Option<PathBuf> {
+    select_requested_runtime(requested).map(|runtime| runtime.directory)
+}
+
 /// A failed managed execution, with the real cause preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClrHostError {
     /// No CoreCLR installation was found on the host.
     NoRuntime,
+    /// No legacy .NET Framework CLR is installed on the host.
+    #[allow(dead_code)] // constructed by the provider contract, which no caller can reach here
+    FrameworkUnavailable,
     /// The requested managed assembly does not exist or is not a file.
     AssemblyNotFound(PathBuf),
     /// A guest-supplied identifier is empty or contains an interior NUL.
@@ -50,6 +174,7 @@ impl std::fmt::Display for ClrHostError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoRuntime => write!(f, "no CoreCLR runtime is installed"),
+            Self::FrameworkUnavailable => write!(f, "the .NET Framework CLR is not available"),
             Self::AssemblyNotFound(path) => {
                 write!(f, "managed assembly not found: {}", path.display())
             }
@@ -458,6 +583,10 @@ mod tests {
         let cases = [
             (ClrHostError::NoRuntime, "no CoreCLR runtime is installed"),
             (
+                ClrHostError::FrameworkUnavailable,
+                "the .NET Framework CLR is not available",
+            ),
+            (
                 ClrHostError::AssemblyNotFound(PathBuf::from("/x.dll")),
                 "managed assembly not found: /x.dll",
             ),
@@ -610,5 +739,87 @@ mod tests {
         )
         .expect("System.Environment::get_ProcessorCount is a static int method");
         assert_ne!(processors, 0, "the host always has at least one CPU");
+    }
+
+    #[test]
+    fn framework_provider_seam_and_activation_families_are_exact() {
+        // Versionless is the Framework "latest" request, never CoreCLR.
+        assert_eq!(activation_family(None), ActivationFamily::Framework);
+        assert_eq!(activation_family(Some("")), ActivationFamily::Framework);
+        for version in [
+            "v1.0.3650",
+            "1.0",
+            "v1.1.4322",
+            "1.1",
+            "v2.0.50727",
+            "2.0",
+            "v3.5",
+            "4.0.30319",
+            "v4.0",
+        ] {
+            assert_eq!(
+                activation_family(Some(version)),
+                ActivationFamily::Framework,
+                "{version} is a Framework version"
+            );
+        }
+        for version in ["5.0", "8.0", "v10.0.13"] {
+            assert!(
+                matches!(
+                    activation_family(Some(version)),
+                    ActivationFamily::CoreClr(_)
+                ),
+                "{version} is a CoreCLR version"
+            );
+        }
+        for version in ["garbage", "v8", "1", "1.2.3.4.5", "v08.0", " 8.0", "4.0.x"] {
+            assert_eq!(
+                activation_family(Some(version)),
+                ActivationFamily::Unsupported,
+                "{version} is not a runtime version"
+            );
+        }
+
+        // The provider seam has no fake implementation: absence is reported
+        // exactly and hosting fails with the documented Framework error.
+        let provider = framework_runtime_provider();
+        assert!(!provider.is_available());
+        assert_eq!(provider.version(), None);
+        assert_eq!(
+            provider.host_assembly(
+                Path::new("/casa1/does/not/exist/Framework.exe"),
+                &["argument".to_string()],
+            ),
+            Err(ClrHostError::FrameworkUnavailable)
+        );
+
+        // Framework and malformed requests never select an installed CoreCLR.
+        assert_eq!(requested_runtime_version(None), None);
+        assert_eq!(requested_runtime_directory(Some("v4.0.30319")), None);
+        assert_eq!(requested_runtime_version(Some("garbage")), None);
+
+        let installed = clr_meta::installed_runtimes();
+        let runtime = installed
+            .first()
+            .expect("a real CoreCLR runtime is installed");
+        let version = runtime.version_string();
+        assert_eq!(
+            activation_family(Some(&version)),
+            ActivationFamily::CoreClr(runtime.version.clone())
+        );
+        assert_eq!(
+            requested_runtime_version(Some(&version)),
+            Some(version.clone())
+        );
+        assert_eq!(
+            requested_runtime_directory(Some(&version)),
+            Some(runtime.directory.clone())
+        );
+
+        // An 8.0 request resolves only when an 8.0.x runtime is installed.
+        let eight = clr_meta::ClrVersion::parse_request("8.0").expect("valid version");
+        let expected =
+            clr_meta::select_runtime(&eight, &installed).map(|runtime| runtime.version_string());
+        assert_eq!(requested_runtime_version(Some("8.0")), expected);
     }
 }
