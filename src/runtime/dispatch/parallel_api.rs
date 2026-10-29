@@ -24,23 +24,27 @@
 //! barrier verdict rather than guessing.
 
 use super::super::{
-    ABBR_MONTHS, ABBR_WEEKDAYS, CP_ACP, ERROR_ENVVAR_NOT_FOUND, ERROR_FILE_NOT_FOUND,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
+    ABBR_MONTHS, ABBR_WEEKDAYS, C1_ALPHA, C1_DIGIT, C1_LOWER, C1_SPACE, C1_UPPER, CP_ACP,
+    CT_CTYPE1, ERROR_ENVVAR_NOT_FOUND, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS,
     ERROR_PATH_NOT_FOUND, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
-    FULL_MONTHS, FULL_WEEKDAYS, GuestThreadContext, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG,
-    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS, HostThunk, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
-    PROCESS_HEAP_HANDLE, ProcessShared, WINDOWS_EPOCH_OFFSET_100NS, WorkerLocale, WorkerVersion,
-    civil_day_of_week, current_guest_utc_components, current_host_ticks_100ns,
+    FILE_TYPE_CHAR, FILE_TYPE_UNKNOWN, FULL_MONTHS, FULL_WEEKDAYS, GuestThreadContext,
+    HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS,
+    HostThunk, KEY_WOW64_32KEY, KEY_WOW64_64KEY, PROCESS_HEAP_HANDLE, ProcessShared,
+    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WINDOWS_EPOCH_OFFSET_100NS,
+    WorkerLocale, WorkerRegistry, WorkerRegistryKey, WorkerVersion, civil_day_of_week,
+    classify_wide_char_type, current_guest_utc_components, current_host_ticks_100ns,
     current_host_time_zone_information, encode_registry_value_data,
-    encode_registry_value_data_ansi, guest_code_page_max_char_size, is_processor_feature_present,
-    locale_name_to_lcid, normalize_registry_runtime_key, registry_value_type_to_win32,
-    shlwapi_format_time_interval,
+    encode_registry_value_data_ansi, filetime_ticks_to_systemtime, guest_code_page_max_char_size,
+    is_processor_feature_present, local_timezone_bias_minutes, locale_name_to_lcid,
+    normalize_registry_runtime_key, registry_value_type_to_win32, resolve_full_guest_path,
+    shlwapi_format_time_interval, systemtime_to_filetime_ticks, windows_file_part_offset,
 };
 use super::{BarrierReason, WorkerCategory};
 use crate::cpu::{GuestArch, Register};
 use crate::host_thunks::ThunkConcurrency;
 use crate::jit::GuestSliceMemory;
-use crate::win32::{CP_THREAD_ACP, CP_UTF8};
+use crate::win32::{CP_THREAD_ACP, CP_UTF8, cp1252_uppercase};
 use std::cell::Cell;
 
 /// The concurrency-safe worker implementation of one host thunk.
@@ -105,6 +109,26 @@ pub(crate) enum WorkerApi {
     GetExitCodeThread,
     GetExitCodeProcess,
     GetThreadPriority,
+    RegEnumKeyExW,
+    RegEnumValueW,
+    RegQueryInfoKeyW,
+    ShRegGetValueW,
+    LcMapStringW,
+    LcMapStringEx,
+    CharUpperW,
+    IsCharAlphaW,
+    IsCharAlphaNumericW,
+    IsCharLowerW,
+    IsCharUpperW,
+    IsCharSpaceW,
+    TlsSetValue,
+    FlsSetValue,
+    SystemTimeToTzSpecificLocalTime,
+    GetSystemMetrics,
+    GetFullPathNameW,
+    GetLongPathNameW,
+    GetShortPathNameW,
+    GetFileType,
 }
 
 impl WorkerApi {
@@ -132,7 +156,16 @@ impl WorkerApi {
             | Self::GetFileSizeEx
             | Self::GetExitCodeThread
             | Self::GetExitCodeProcess
-            | Self::GetThreadPriority => ThunkConcurrency::ReadMostly,
+            | Self::GetThreadPriority
+            | Self::RegEnumKeyExW
+            | Self::RegEnumValueW
+            | Self::RegQueryInfoKeyW
+            | Self::ShRegGetValueW
+            | Self::GetSystemMetrics
+            | Self::GetFullPathNameW
+            | Self::GetLongPathNameW
+            | Self::GetShortPathNameW
+            | Self::GetFileType => ThunkConcurrency::ReadMostly,
             _ => ThunkConcurrency::Stateless,
         }
     }
@@ -151,13 +184,15 @@ impl WorkerApi {
             | Self::GetSystemTimeAsFileTime
             | Self::GetSystemTimePreciseAsFileTime
             | Self::GetTimeZoneInformation
-            | Self::GetSystemTime => WorkerCategory::Clock,
+            | Self::GetSystemTime
+            | Self::SystemTimeToTzSpecificLocalTime => WorkerCategory::Clock,
             Self::GetVersion | Self::GetVersionExW | Self::GetVersionExA => WorkerCategory::Version,
             Self::IsWow64Process
             | Self::GetSystemInfo
             | Self::GetNativeSystemInfo
             | Self::IsProcessorFeaturePresent
-            | Self::GetComputerNameW => WorkerCategory::SystemInfo,
+            | Self::GetComputerNameW
+            | Self::GetSystemMetrics => WorkerCategory::SystemInfo,
             Self::GlobalMemoryStatusEx => WorkerCategory::MemoryStatus,
             Self::CharNextW
             | Self::CharPrevW
@@ -175,22 +210,41 @@ impl WorkerApi {
             | Self::IsValidCodePage
             | Self::LocaleNameToLCID
             | Self::GetDateFormatW
-            | Self::GetTimeFormatW => WorkerCategory::Nls,
+            | Self::GetTimeFormatW
+            | Self::LcMapStringW
+            | Self::LcMapStringEx
+            | Self::CharUpperW
+            | Self::IsCharAlphaW
+            | Self::IsCharAlphaNumericW
+            | Self::IsCharLowerW
+            | Self::IsCharUpperW
+            | Self::IsCharSpaceW => WorkerCategory::Nls,
             Self::GetProcessHeap | Self::GetProcessHeaps | Self::HeapSize => WorkerCategory::Heap,
             Self::GetEnvironmentVariableW => WorkerCategory::Environment,
-            Self::RegQueryValueExA | Self::RegQueryValueExW => WorkerCategory::Registry,
+            Self::RegQueryValueExA
+            | Self::RegQueryValueExW
+            | Self::RegEnumKeyExW
+            | Self::RegEnumValueW
+            | Self::RegQueryInfoKeyW
+            | Self::ShRegGetValueW => WorkerCategory::Registry,
             Self::GetFileAttributesW
             | Self::GetFileAttributesA
             | Self::GetFileAttributesExW
             | Self::GetFileSize
             | Self::GetFileSizeEx => WorkerCategory::FileSystem,
-            Self::TlsGetValue | Self::FlsGetValue => WorkerCategory::Tls,
+            Self::GetFullPathNameW | Self::GetLongPathNameW | Self::GetShortPathNameW => {
+                WorkerCategory::Path
+            }
+            Self::TlsGetValue | Self::FlsGetValue | Self::TlsSetValue | Self::FlsSetValue => {
+                WorkerCategory::Tls
+            }
             Self::InterlockedIncrement
             | Self::InterlockedDecrement
             | Self::InterlockedExchangeAdd => WorkerCategory::Interlocked,
-            Self::GetExitCodeThread | Self::GetExitCodeProcess | Self::GetThreadPriority => {
-                WorkerCategory::ObjectStatus
-            }
+            Self::GetExitCodeThread
+            | Self::GetExitCodeProcess
+            | Self::GetThreadPriority
+            | Self::GetFileType => WorkerCategory::ObjectStatus,
         }
     }
 }
@@ -298,6 +352,26 @@ pub(crate) fn worker_api(thunk: &HostThunk) -> Option<WorkerApi> {
         HostThunk::GetExitCodeThread => WorkerApi::GetExitCodeThread,
         HostThunk::GetExitCodeProcess => WorkerApi::GetExitCodeProcess,
         HostThunk::GetThreadPriority => WorkerApi::GetThreadPriority,
+        HostThunk::RegEnumKeyExW => WorkerApi::RegEnumKeyExW,
+        HostThunk::RegEnumValueW => WorkerApi::RegEnumValueW,
+        HostThunk::RegQueryInfoKeyW => WorkerApi::RegQueryInfoKeyW,
+        HostThunk::SHRegGetValueW => WorkerApi::ShRegGetValueW,
+        HostThunk::LCMapStringW => WorkerApi::LcMapStringW,
+        HostThunk::LCMapStringEx => WorkerApi::LcMapStringEx,
+        HostThunk::CharUpperW => WorkerApi::CharUpperW,
+        HostThunk::IsCharAlphaW => WorkerApi::IsCharAlphaW,
+        HostThunk::IsCharAlphaNumericW => WorkerApi::IsCharAlphaNumericW,
+        HostThunk::IsCharLowerW => WorkerApi::IsCharLowerW,
+        HostThunk::IsCharUpperW => WorkerApi::IsCharUpperW,
+        HostThunk::IsCharSpaceW => WorkerApi::IsCharSpaceW,
+        HostThunk::TlsSetValue => WorkerApi::TlsSetValue,
+        HostThunk::FlsSetValue => WorkerApi::FlsSetValue,
+        HostThunk::SystemTimeToTzSpecificLocalTime => WorkerApi::SystemTimeToTzSpecificLocalTime,
+        HostThunk::GetSystemMetrics => WorkerApi::GetSystemMetrics,
+        HostThunk::GetFullPathNameW => WorkerApi::GetFullPathNameW,
+        HostThunk::GetLongPathNameW => WorkerApi::GetLongPathNameW,
+        HostThunk::GetShortPathNameW => WorkerApi::GetShortPathNameW,
+        HostThunk::GetFileType => WorkerApi::GetFileType,
         _ => return None,
     })
 }
@@ -1618,6 +1692,710 @@ fn execute(
             context.last_error = 0;
             true
         }
+        WorkerApi::RegEnumKeyExW => {
+            let Some([hkey, index, name_ptr, name_size_ptr, _reserved, _last_write]) =
+                read_args::<6>(context, memory)
+            else {
+                return false;
+            };
+            if name_size_ptr == 0 {
+                context
+                    .state
+                    .set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            let Some(registry) = shared.worker_registry_snapshot() else {
+                return false;
+            };
+            let Some(key) = worker_registry_key_entry(&registry, hkey as u32, context.state.arch)
+            else {
+                mark_fallback(WorkerFallback::UnsupportedInput);
+                return false;
+            };
+            let Some(name_size) = read_u32(memory, name_size_ptr) else {
+                return false;
+            };
+            if index as usize >= key.subkeys.len() {
+                if !write_u32(memory, name_size_ptr, 0) {
+                    return false;
+                }
+                if name_ptr != 0 && name_size > 0 && !write_u16(memory, name_ptr, 0) {
+                    return false;
+                }
+                context
+                    .state
+                    .set(Register::Rax, u64::from(ERROR_NO_MORE_ITEMS));
+                context.last_error = ERROR_NO_MORE_ITEMS;
+                return true;
+            }
+            let Some(char_count) = write_utf16_api_string_worker(
+                memory,
+                name_ptr,
+                name_size,
+                &key.subkeys[index as usize],
+            ) else {
+                return false;
+            };
+            if !write_u32(memory, name_size_ptr, char_count) {
+                return false;
+            }
+            context.state.set(Register::Rax, 0);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::RegEnumValueW => {
+            let Some(
+                [
+                    hkey,
+                    index,
+                    name_ptr,
+                    name_size_ptr,
+                    _reserved,
+                    type_ptr,
+                    data_ptr,
+                    data_size_ptr,
+                ],
+            ) = read_args::<8>(context, memory)
+            else {
+                return false;
+            };
+            if name_size_ptr == 0 {
+                context
+                    .state
+                    .set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            let Some(registry) = shared.worker_registry_snapshot() else {
+                return false;
+            };
+            let Some(key) = worker_registry_key_entry(&registry, hkey as u32, context.state.arch)
+            else {
+                mark_fallback(WorkerFallback::UnsupportedInput);
+                return false;
+            };
+            let Some(name_size) = read_u32(memory, name_size_ptr) else {
+                return false;
+            };
+            let Some((value_name, stored)) = key.values.iter().nth(index as usize) else {
+                if !write_u32(memory, name_size_ptr, 0) {
+                    return false;
+                }
+                if name_ptr != 0 && !write_u16(memory, name_ptr, 0) {
+                    return false;
+                }
+                context
+                    .state
+                    .set(Register::Rax, u64::from(ERROR_NO_MORE_ITEMS));
+                context.last_error = ERROR_NO_MORE_ITEMS;
+                return true;
+            };
+            let type_code = registry_value_type_to_win32(&stored.value_type).unwrap_or(1);
+            let data_bytes = encode_registry_value_data(stored).unwrap_or_default();
+            let Some(char_count) =
+                write_utf16_api_string_worker(memory, name_ptr, name_size, value_name)
+            else {
+                return false;
+            };
+            if !write_u32(memory, name_size_ptr, char_count) {
+                return false;
+            }
+            if type_ptr != 0 && !write_u32(memory, type_ptr, type_code) {
+                return false;
+            }
+            if data_size_ptr != 0 {
+                let Some(data_capacity) = read_u32(memory, data_size_ptr) else {
+                    return false;
+                };
+                let written = data_bytes.len().min(data_capacity as usize);
+                if data_ptr != 0
+                    && written > 0
+                    && !write_bytes(memory, data_ptr, &data_bytes[..written])
+                {
+                    return false;
+                }
+                if !write_u32(memory, data_size_ptr, data_bytes.len() as u32) {
+                    return false;
+                }
+            }
+            context.state.set(Register::Rax, 0);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::RegQueryInfoKeyW => {
+            let Some(
+                [
+                    hkey,
+                    class_ptr,
+                    class_size_ptr,
+                    _reserved,
+                    subkeys_ptr,
+                    max_subkey_ptr,
+                    max_class_ptr,
+                    values_ptr,
+                    max_value_name_ptr,
+                    max_value_data_ptr,
+                    _security_descriptor_ptr,
+                    last_write_ptr,
+                ],
+            ) = read_args::<12>(context, memory)
+            else {
+                return false;
+            };
+            let Some(registry) = shared.worker_registry_snapshot() else {
+                return false;
+            };
+            let Some(key) = worker_registry_key_entry(&registry, hkey as u32, context.state.arch)
+            else {
+                mark_fallback(WorkerFallback::UnsupportedInput);
+                return false;
+            };
+            let max_subkey = key
+                .subkeys
+                .iter()
+                .map(|name| name.encode_utf16().count() as u32 + 1)
+                .max()
+                .unwrap_or(0);
+            let max_value = key
+                .values
+                .keys()
+                .map(|name| name.encode_utf16().count() as u32 + 1)
+                .max()
+                .unwrap_or(0);
+            let mut written = true;
+            if subkeys_ptr != 0 {
+                written &= write_u32(memory, subkeys_ptr, key.subkeys.len() as u32);
+            }
+            if max_subkey_ptr != 0 {
+                written &= write_u32(memory, max_subkey_ptr, max_subkey);
+            }
+            if values_ptr != 0 {
+                written &= write_u32(memory, values_ptr, key.values.len() as u32);
+            }
+            if max_value_name_ptr != 0 {
+                written &= write_u32(memory, max_value_name_ptr, max_value);
+            }
+            if max_value_data_ptr != 0 {
+                written &= write_u32(memory, max_value_data_ptr, 0);
+            }
+            if class_ptr != 0 && class_size_ptr != 0 {
+                written &= write_u16(memory, class_ptr, 0);
+            }
+            if class_size_ptr != 0 {
+                written &= write_u32(memory, class_size_ptr, 0);
+            }
+            if max_class_ptr != 0 {
+                written &= write_u32(memory, max_class_ptr, 0);
+            }
+            if last_write_ptr != 0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let filetime = now.saturating_add(11_644_473_600) * 10_000_000;
+                written &= write_u32(memory, last_write_ptr, filetime as u32);
+                written &= write_u32(memory, last_write_ptr + 4, (filetime >> 32) as u32);
+            }
+            if !written {
+                return false;
+            }
+            context.state.set(Register::Rax, 0);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::ShRegGetValueW => {
+            const SRRF_RT_ANY: u32 = 0xFFFF;
+            let Some(
+                [
+                    hkey,
+                    sub_key_ptr,
+                    value_ptr,
+                    srrf_flags,
+                    type_ptr,
+                    data_ptr,
+                    data_size_ptr,
+                ],
+            ) = read_args::<7>(context, memory)
+            else {
+                return false;
+            };
+            let sub_key = if sub_key_ptr != 0 {
+                let Some(sub_key) = read_utf16_lossy(memory, sub_key_ptr) else {
+                    return false;
+                };
+                sub_key
+            } else {
+                String::new()
+            };
+            if !sub_key.is_empty() {
+                // The snapshot indexes roots and open key handles; an
+                // arbitrary subkey path is resolved by the owner from the
+                // live registry database.
+                mark_fallback(WorkerFallback::UnsupportedInput);
+                return false;
+            }
+            let value_name = if value_ptr != 0 {
+                let Some(value_name) = read_utf16_lossy(memory, value_ptr) else {
+                    return false;
+                };
+                value_name
+            } else {
+                String::new()
+            };
+            let Some(registry) = shared.worker_registry_snapshot() else {
+                return false;
+            };
+            let Some(key) = worker_registry_key_entry(&registry, hkey as u32, context.state.arch)
+            else {
+                mark_fallback(WorkerFallback::UnsupportedInput);
+                return false;
+            };
+            let Some(stored) = key.values.get(&value_name) else {
+                context
+                    .state
+                    .set(Register::Rax, u64::from(ERROR_FILE_NOT_FOUND));
+                context.last_error = 0;
+                return true;
+            };
+            let Some(type_code) = registry_value_type_to_win32(&stored.value_type).ok() else {
+                mark_fallback(WorkerFallback::UnsupportedInput);
+                return false;
+            };
+            let Ok(encoded) = encode_registry_value_data(stored) else {
+                mark_fallback(WorkerFallback::UnsupportedInput);
+                return false;
+            };
+            let srrf_flags = srrf_flags as u32;
+            if srrf_flags & SRRF_RT_ANY != 0 {
+                let mask = match type_code {
+                    1 => 0x0002,
+                    2 => 0x0004,
+                    7 => 0x0008,
+                    3 => 0x0010,
+                    4 => 0x0020,
+                    11 => 0x0040,
+                    _ => 0,
+                };
+                if srrf_flags & mask == 0 {
+                    context
+                        .state
+                        .set(Register::Rax, u64::from(ERROR_INVALID_PARAMETER));
+                    context.last_error = 0;
+                    return true;
+                }
+            }
+            if type_ptr != 0 && !write_u32(memory, type_ptr, type_code) {
+                return false;
+            }
+            let available = encoded.len() as u32;
+            if data_size_ptr != 0 {
+                let Some(capacity) = read_u32(memory, data_size_ptr) else {
+                    return false;
+                };
+                if data_ptr != 0 && capacity < available {
+                    if !write_u32(memory, data_size_ptr, available) {
+                        return false;
+                    }
+                    context.state.set(Register::Rax, u64::from(ERROR_MORE_DATA));
+                    context.last_error = 0;
+                    return true;
+                }
+                if data_ptr != 0 && !encoded.is_empty() && !write_bytes(memory, data_ptr, &encoded)
+                {
+                    return false;
+                }
+                if !write_u32(memory, data_size_ptr, available) {
+                    return false;
+                }
+            }
+            context.state.set(Register::Rax, 0);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::LcMapStringW | WorkerApi::LcMapStringEx => {
+            let args = if api == WorkerApi::LcMapStringW {
+                read_args::<6>(context, memory).map(
+                    |[_, flags, source, source_len, destination, destination_len]| {
+                        (flags, source, source_len, destination, destination_len)
+                    },
+                )
+            } else {
+                let Some(
+                    [
+                        locale_name_ptr,
+                        flags,
+                        source,
+                        source_len,
+                        destination,
+                        destination_len,
+                    ],
+                ) = read_args::<6>(context, memory)
+                else {
+                    return false;
+                };
+                if locale_name_ptr != 0 {
+                    let Some(locale_name) = read_utf16_lossy(memory, locale_name_ptr) else {
+                        return false;
+                    };
+                    if locale_name_to_lcid(&locale_name).is_none() {
+                        context.state.set(Register::Rax, 0);
+                        context.last_error = ERROR_INVALID_PARAMETER;
+                        return true;
+                    }
+                }
+                Some((flags, source, source_len, destination, destination_len))
+            };
+            let Some((flags, source, source_len, destination, destination_len)) = args else {
+                return false;
+            };
+            lcmap_string_worker(
+                context,
+                memory,
+                flags as u32,
+                source,
+                source_len as i32,
+                destination,
+                destination_len as i32,
+            )
+        }
+        WorkerApi::CharUpperW => {
+            let Some(value) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            if value <= u16::MAX as u64 {
+                context
+                    .state
+                    .set(Register::Rax, u64::from(cp1252_uppercase(value as u32)));
+            } else {
+                let Some(text) = read_utf16_lossy(memory, value) else {
+                    return false;
+                };
+                let mut bytes = Vec::new();
+                for unit in text.encode_utf16() {
+                    let upper = cp1252_uppercase(u32::from(unit));
+                    let unit = if upper <= u16::MAX as u32 {
+                        upper as u16
+                    } else {
+                        unit
+                    };
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+                bytes.extend_from_slice(&0_u16.to_le_bytes());
+                if !write_bytes(memory, value, &bytes) {
+                    return false;
+                }
+                context.state.set(Register::Rax, value);
+            }
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::IsCharAlphaW
+        | WorkerApi::IsCharAlphaNumericW
+        | WorkerApi::IsCharLowerW
+        | WorkerApi::IsCharUpperW
+        | WorkerApi::IsCharSpaceW => {
+            let Some(character) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            let mask = classify_wide_char_type(CT_CTYPE1, character as u16);
+            let result = match api {
+                WorkerApi::IsCharAlphaW => mask & C1_ALPHA != 0,
+                WorkerApi::IsCharAlphaNumericW => mask & (C1_ALPHA | C1_DIGIT) != 0,
+                WorkerApi::IsCharLowerW => mask & C1_LOWER != 0,
+                WorkerApi::IsCharUpperW => mask & C1_UPPER != 0,
+                WorkerApi::IsCharSpaceW => mask & C1_SPACE != 0,
+                _ => unreachable!(),
+            };
+            context.state.set(Register::Rax, u64::from(result));
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::TlsSetValue => {
+            let Some([slot, value]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            let slot = slot as u32;
+            if slot >= 4096 {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            if context.tls_vector_ptr != 0 {
+                let pointer_bytes = context.state.arch.pointer_bytes() as u64;
+                let address = context
+                    .tls_vector_ptr
+                    .wrapping_add(u64::from(slot) * pointer_bytes);
+                if !write_pointer(memory, address, value, context.state.arch) {
+                    return false;
+                }
+                if let Some(entry) = context.tls_slots.get_mut(&slot) {
+                    *entry = value;
+                }
+            } else {
+                context.tls_slots.insert(slot, value);
+            }
+            context.state.set(Register::Rax, 1);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::FlsSetValue => {
+            let Some([slot, value]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            let stored = if let Some(entry) = context.fls_slots.get_mut(&(slot as u32)) {
+                *entry = value;
+                true
+            } else {
+                false
+            };
+            context.state.set(Register::Rax, u64::from(stored));
+            context.last_error = if stored { 0 } else { ERROR_INVALID_PARAMETER };
+            true
+        }
+        WorkerApi::SystemTimeToTzSpecificLocalTime => {
+            let Some([_timezone_ptr, system_time_ptr, local_time_ptr]) =
+                read_args::<3>(context, memory)
+            else {
+                return false;
+            };
+            if system_time_ptr == 0 || local_time_ptr == 0 {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            let Some(year) = read_u16(memory, system_time_ptr) else {
+                return false;
+            };
+            let Some(month) = read_u16(memory, system_time_ptr + 2) else {
+                return false;
+            };
+            let Some(day) = read_u16(memory, system_time_ptr + 6) else {
+                return false;
+            };
+            let Some(hour) = read_u16(memory, system_time_ptr + 8) else {
+                return false;
+            };
+            let Some(minute) = read_u16(memory, system_time_ptr + 10) else {
+                return false;
+            };
+            let Some(second) = read_u16(memory, system_time_ptr + 12) else {
+                return false;
+            };
+            let Some(milliseconds) = read_u16(memory, system_time_ptr + 14) else {
+                return false;
+            };
+            let filetime = systemtime_to_filetime_ticks(
+                i32::from(year),
+                i32::from(month),
+                i32::from(day),
+                i32::from(hour),
+                i32::from(minute),
+                i32::from(second),
+                i32::from(milliseconds),
+            );
+            let bias = i128::from(local_timezone_bias_minutes()) * 600_000_000_i128;
+            let biased = (i128::from(filetime) - bias).max(0) as u64;
+            let (year, month, day_of_week, day, hour, minute, second, milliseconds) =
+                filetime_ticks_to_systemtime(biased);
+            let mut written = write_u16(memory, local_time_ptr, year);
+            written &= write_u16(memory, local_time_ptr + 2, month);
+            written &= write_u16(memory, local_time_ptr + 4, day_of_week);
+            written &= write_u16(memory, local_time_ptr + 6, day);
+            written &= write_u16(memory, local_time_ptr + 8, hour);
+            written &= write_u16(memory, local_time_ptr + 10, minute);
+            written &= write_u16(memory, local_time_ptr + 12, second);
+            written &= write_u16(memory, local_time_ptr + 14, milliseconds);
+            if !written {
+                return false;
+            }
+            // The owner preserves last-error on this success path.
+            context.state.set(Register::Rax, 1);
+            true
+        }
+        WorkerApi::GetSystemMetrics => {
+            let Some(index) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            let Some(display) = shared.worker_display_snapshot() else {
+                return false;
+            };
+            let index = index as i32;
+            let (screen_w, screen_h) = (display.screen_width, display.screen_height);
+            let value = match index {
+                0 => screen_w,
+                1 => screen_h,
+                2 | 3 => 17,
+                4 => 23,
+                5 | 6 => 1,
+                7 | 8 => 4,
+                9 => 17,
+                10 => 17,
+                11 | 12 => 32,
+                13 | 14 => 32,
+                15 => 19,
+                16 => screen_w,
+                17 => screen_h,
+                18 => 0,
+                19 => 1,
+                20 => 17,
+                21 => 17,
+                22 => 0,
+                23 => 0,
+                24 | 25 => 0,
+                26 | 27 => 0,
+                28 => 80,
+                29 => 80,
+                30 | 31 => 16,
+                32 | 33 => 4,
+                34 => 80,
+                35 => 80,
+                36 | 37 => 4,
+                38 | 39 => 75,
+                40 => 0,
+                41 => 0,
+                42 => 0,
+                43 => 5,
+                44 => 0,
+                45 | 46 => 2,
+                47 | 48 => 28,
+                49 | 50 => 16,
+                51 => 18,
+                52 | 53 => 12,
+                54 | 55 => 16,
+                56 => 0,
+                57 => 160,
+                58 => 28,
+                59 => 2560,
+                60 => 1600,
+                61 => 2560,
+                62 => 1600,
+                63 => 0,
+                67 => 0,
+                68 | 69 => 4,
+                70 => 0,
+                71 | 72 => 13,
+                73 => 0,
+                74 => 0,
+                75 => 1,
+                76 => 0,
+                77 => 0,
+                78 => screen_w,
+                79 => screen_h,
+                80 => display.monitor_count,
+                81 => 1,
+                82 => 1,
+                83 | 84 => 1,
+                86 => 0,
+                87 => 0,
+                88 => 0,
+                89 => 0,
+                90 => display.screen_dpi,
+                91 => 1,
+                92 => 4,
+                94 => 0,
+                95 => 0,
+                0x1000 => 0,
+                0x2000 => 0,
+                0x2001 => 0,
+                0x2002 => 1,
+                0x2003 => 0,
+                0x2004 => 0,
+                _ => 0,
+            };
+            context.state.set(Register::Rax, u64::from(value));
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetFullPathNameW => {
+            let Some([path_ptr, size, buffer, file_part_ptr]) = read_args::<4>(context, memory)
+            else {
+                return false;
+            };
+            let size = size as u32;
+            let Some(raw_path) = read_utf16_lossy(memory, path_ptr) else {
+                return false;
+            };
+            if raw_path.is_empty() {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_PATH_NOT_FOUND;
+                return true;
+            }
+            let Some(current_directory) = shared.worker_current_directory_snapshot() else {
+                return false;
+            };
+            let path = resolve_full_guest_path(&current_directory, &raw_path);
+            let path_length = path.encode_utf16().count() as u32;
+            let Some(result) = write_utf16_api_string_worker(memory, buffer, size, &path) else {
+                return false;
+            };
+            let file_part = if buffer != 0 && size >= path_length.saturating_add(1) {
+                windows_file_part_offset(&path)
+                    .map(|offset| buffer + offset)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if file_part_ptr != 0
+                && !write_pointer(memory, file_part_ptr, file_part, context.state.arch)
+            {
+                return false;
+            }
+            context.state.set(Register::Rax, u64::from(result));
+            context.last_error = if buffer != 0 && size != 0 && size <= path_length {
+                ERROR_INSUFFICIENT_BUFFER
+            } else {
+                0
+            };
+            true
+        }
+        WorkerApi::GetLongPathNameW | WorkerApi::GetShortPathNameW => {
+            let Some([path_ptr, buffer, buffer_size]) = read_args::<3>(context, memory) else {
+                return false;
+            };
+            let Some(raw_path) = read_utf16_lossy(memory, path_ptr) else {
+                return false;
+            };
+            let Some(current_directory) = shared.worker_current_directory_snapshot() else {
+                return false;
+            };
+            let path = resolve_full_guest_path(&current_directory, &raw_path);
+            let Some(result) =
+                write_utf16_api_string_worker(memory, buffer, buffer_size as u32, &path)
+            else {
+                return false;
+            };
+            context.state.set(Register::Rax, u64::from(result));
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetFileType => {
+            let Some(handle) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            let handle = handle as u32;
+            let file_type = match handle {
+                STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE => FILE_TYPE_CHAR,
+                0 | u32::MAX => FILE_TYPE_UNKNOWN,
+                _ => {
+                    let Some(objects) = shared.worker_object_status_snapshot() else {
+                        return false;
+                    };
+                    objects
+                        .file_types
+                        .get(&handle)
+                        .copied()
+                        .unwrap_or(FILE_TYPE_UNKNOWN)
+                }
+            };
+            context.state.set(Register::Rax, u64::from(file_type));
+            context.last_error = if file_type == FILE_TYPE_UNKNOWN {
+                ERROR_INVALID_HANDLE
+            } else {
+                0
+            };
+            true
+        }
     }
 }
 
@@ -2287,6 +3065,107 @@ fn root_registry_key(hkey: u32) -> Option<(&'static str, &'static str)> {
     }
 }
 
+fn worker_registry_key_entry<'a>(
+    registry: &'a WorkerRegistry,
+    hkey: u32,
+    arch: GuestArch,
+) -> Option<&'a WorkerRegistryKey> {
+    if let Some((hive, base_key)) = root_registry_key(hkey) {
+        let view = worker_registry_view(0, arch);
+        let normalized = normalize_registry_runtime_key(hive, base_key);
+        registry
+            .roots
+            .get(&(hkey, view))
+            .filter(|entry| entry.hive == hive && entry.key == normalized)
+    } else {
+        registry.keys.get(&hkey)
+    }
+}
+
+fn lcmap_string_worker(
+    context: &mut GuestThreadContext,
+    memory: &dyn WorkerMemoryView,
+    flags: u32,
+    source_ptr: u64,
+    source_len: i32,
+    destination_ptr: u64,
+    destination_len: i32,
+) -> bool {
+    const LCMAP_LOWERCASE: u32 = 0x0000_0100;
+    const LCMAP_UPPERCASE: u32 = 0x0000_0200;
+    if source_ptr == 0
+        || source_len == 0
+        || (flags & (LCMAP_LOWERCASE | LCMAP_UPPERCASE)) == (LCMAP_LOWERCASE | LCMAP_UPPERCASE)
+    {
+        context.state.set(Register::Rax, 0);
+        context.last_error = ERROR_INVALID_PARAMETER;
+        return true;
+    }
+    let source_units = if source_len < 0 {
+        let Some(text) = read_utf16_lossy(memory, source_ptr) else {
+            return false;
+        };
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    } else {
+        let Some(units) = read_utf16_units(memory, source_ptr, source_len as usize) else {
+            return false;
+        };
+        units
+    };
+    let mapped_units = if flags & (LCMAP_LOWERCASE | LCMAP_UPPERCASE) != 0 {
+        source_units
+            .into_iter()
+            .map(|unit| {
+                let Some(original) = char::from_u32(u32::from(unit)) else {
+                    return unit;
+                };
+                let mapped = if flags & LCMAP_UPPERCASE != 0 {
+                    original.to_uppercase().collect::<Vec<_>>()
+                } else {
+                    original.to_lowercase().collect::<Vec<_>>()
+                };
+                let Some(&candidate) = mapped.first() else {
+                    return unit;
+                };
+                if mapped.len() != 1 {
+                    return unit;
+                }
+                let mut encoded = [0_u16; 2];
+                if candidate.encode_utf16(&mut encoded).len() != 1 {
+                    return unit;
+                }
+                if encode_cp1252(candidate).is_none() {
+                    return unit;
+                }
+                encoded[0]
+            })
+            .collect::<Vec<_>>()
+    } else {
+        source_units
+    };
+    let required = mapped_units.len() as u32;
+    if destination_ptr == 0 || destination_len == 0 {
+        context.state.set(Register::Rax, u64::from(required));
+        context.last_error = 0;
+        return true;
+    }
+    if destination_len < required as i32 {
+        context.state.set(Register::Rax, 0);
+        context.last_error = ERROR_INSUFFICIENT_BUFFER;
+        return true;
+    }
+    let encoded = mapped_units
+        .iter()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect::<Vec<_>>();
+    if !encoded.is_empty() && !write_bytes(memory, destination_ptr, &encoded) {
+        return false;
+    }
+    context.state.set(Register::Rax, u64::from(required));
+    context.last_error = 0;
+    true
+}
+
 fn query_registry_value(
     api: WorkerApi,
     shared: &ProcessShared,
@@ -2586,9 +3465,9 @@ mod tests {
     use crate::ge::StoredRegistryValue;
     use crate::runtime::{
         BarrierReason, GuestThreadContext, ParallelThunk, ProcessShared, WorkerCategory,
-        WorkerClock, WorkerEnvironment, WorkerFileMetadata, WorkerFileSystem, WorkerIdentity,
-        WorkerLocale, WorkerMemoryStatus, WorkerObjectStatus, WorkerRegistry, WorkerRegistryKey,
-        WorkerVersion,
+        WorkerClock, WorkerDisplayMetrics, WorkerEnvironment, WorkerFileMetadata, WorkerFileSystem,
+        WorkerIdentity, WorkerLocale, WorkerMemoryStatus, WorkerObjectStatus, WorkerRegistry,
+        WorkerRegistryKey, WorkerVersion,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -2692,6 +3571,7 @@ mod tests {
                     WorkerRegistryKey {
                         hive: hive.to_string(),
                         key: base.to_string(),
+                        subkeys: vec!["Child".to_string(), "DemoSub".to_string()],
                         values: values.clone(),
                     },
                 );
@@ -2702,6 +3582,7 @@ mod tests {
             WorkerRegistryKey {
                 hive: "HKCU".to_string(),
                 key: "Software\\Casa".to_string(),
+                subkeys: vec!["Child".to_string()],
                 values,
             },
         );
@@ -2741,6 +3622,7 @@ mod tests {
         objects.thread_exit_codes.insert(0x20, 0x1234);
         objects.process_exit_codes.insert(0x21, 0x5678);
         objects.thread_priorities.insert(0x22, -2);
+        objects.file_types.insert(0x10, 1);
         objects
     }
 
@@ -2783,6 +3665,13 @@ mod tests {
             registry: registry_with_value("hello"),
             files: filesystem_snapshot(),
             objects: object_status_snapshot(),
+            current_directory: "C:\\game".to_string(),
+            display: WorkerDisplayMetrics {
+                screen_width: 2560,
+                screen_height: 1600,
+                screen_dpi: 96,
+                monitor_count: 1,
+            },
         }
     }
 
@@ -5315,8 +6204,23 @@ mod tests {
     const W_EXIT_PROCESS: usize = 13;
     const W_THREAD_PRIORITY: usize = 14;
     const W_INTERLOCKED: usize = 15;
-    const W_OWNER_ONLY: usize = 16;
-    const W_COUNT: usize = 17;
+    const W_REG_ENUM_KEY: usize = 16;
+    const W_REG_ENUM_VALUE: usize = 17;
+    const W_REG_INFO: usize = 18;
+    const W_SHREG: usize = 19;
+    const W_LCMAP: usize = 20;
+    const W_CHAR_UPPER: usize = 21;
+    const W_IS_CHAR: usize = 22;
+    const W_TLS_SET: usize = 23;
+    const W_FLS_SET: usize = 24;
+    const W_TZ: usize = 25;
+    const W_METRICS: usize = 26;
+    const W_FULL_PATH: usize = 27;
+    const W_LONG_PATH: usize = 28;
+    const W_SHORT_PATH: usize = 29;
+    const W_FILE_TYPE: usize = 30;
+    const W_OWNER_ONLY: usize = 31;
+    const W_COUNT: usize = 32;
 
     const W_FILE_PATH: u64 = 0x1F00;
     const W_DIR_PATH: u64 = 0x1F40;
@@ -5329,6 +6233,24 @@ mod tests {
     const W_EXIT_THREAD_OUT: u64 = 0x1EC4;
     const W_EXIT_PROCESS_OUT: u64 = 0x1EC8;
     const W_INTERLOCKED_CELL: u64 = 0x1ED0;
+    const W_REG_NAME_OUT: u64 = 0x1800;
+    const W_REG_DATA_OUT: u64 = 0x1840;
+    const W_REG_NAME_SIZE: u64 = 0x1880;
+    const W_REG_DATA_SIZE: u64 = 0x1884;
+    const W_REG_TYPE_OUT: u64 = 0x1888;
+    const W_REG_SUBKEY_OUT: u64 = 0x1890;
+    const W_LCMAP_SRC: u64 = 0x18A0;
+    const W_LCMAP_DST: u64 = 0x18C0;
+    const W_CHAR_BUF: u64 = 0x18E0;
+    const W_TZ_IN: u64 = 0x1900;
+    const W_TZ_OUT: u64 = 0x1910;
+    const W_PATH_OUT: u64 = 0x1940;
+    const W_PATH_PART: u64 = 0x1A40;
+    const W_INFO_SUBKEYS: u64 = 0x1A60;
+    const W_INFO_MAX_SUBKEY: u64 = 0x1A64;
+    const W_INFO_VALUES: u64 = 0x1A68;
+    const W_INFO_MAX_VALUE: u64 = 0x1A6C;
+    const W_INFO_MAX_DATA: u64 = 0x1A70;
 
     fn workload_thunk(index: usize) -> HostThunk {
         match index {
@@ -5348,6 +6270,21 @@ mod tests {
             W_EXIT_PROCESS => HostThunk::GetExitCodeProcess,
             W_THREAD_PRIORITY => HostThunk::GetThreadPriority,
             W_INTERLOCKED => HostThunk::InterlockedIncrement,
+            W_REG_ENUM_KEY => HostThunk::RegEnumKeyExW,
+            W_REG_ENUM_VALUE => HostThunk::RegEnumValueW,
+            W_REG_INFO => HostThunk::RegQueryInfoKeyW,
+            W_SHREG => HostThunk::SHRegGetValueW,
+            W_LCMAP => HostThunk::LCMapStringW,
+            W_CHAR_UPPER => HostThunk::CharUpperW,
+            W_IS_CHAR => HostThunk::IsCharAlphaW,
+            W_TLS_SET => HostThunk::TlsSetValue,
+            W_FLS_SET => HostThunk::FlsSetValue,
+            W_TZ => HostThunk::SystemTimeToTzSpecificLocalTime,
+            W_METRICS => HostThunk::GetSystemMetrics,
+            W_FULL_PATH => HostThunk::GetFullPathNameW,
+            W_LONG_PATH => HostThunk::GetLongPathNameW,
+            W_SHORT_PATH => HostThunk::GetShortPathNameW,
+            W_FILE_TYPE => HostThunk::GetFileType,
             W_OWNER_ONLY => HostThunk::CreateFileW,
             _ => HostThunk::GetLastError,
         }
@@ -5363,6 +6300,14 @@ mod tests {
         }
     }
 
+    fn store_u16_values(memory: &TestMemory, address: u64, values: &[u16]) {
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(memory.store(address, &bytes), true);
+    }
+
     fn prepare_workload_memory(memory: &TestMemory) {
         prepare_hammer_memory(memory);
         store_utf16(memory, W_FILE_PATH, "C:\\game\\data.bin");
@@ -5370,6 +6315,16 @@ mod tests {
         store_ascii(memory, W_ANSI_FILE_PATH, "C:\\game\\data.bin");
         assert_eq!(memory.store(W_INTERLOCKED_CELL, &5_u32.to_le_bytes()), true);
         assert_eq!(memory.store(W_COMPUTER_LEN, &16_u32.to_le_bytes()), true);
+        assert_eq!(memory.store(W_REG_NAME_SIZE, &64_u32.to_le_bytes()), true);
+        assert_eq!(memory.store(W_REG_DATA_SIZE, &64_u32.to_le_bytes()), true);
+        store_utf16(memory, W_LCMAP_SRC, "hello");
+        store_utf16(memory, W_CHAR_BUF, "Abc");
+        store_u16_values(memory, W_TZ_IN, &[2024, 1, 2, 3, 4, 5, 6, 7, 8]);
+        store_utf16(memory, W_PATH_OUT, "");
+        assert_eq!(
+            memory.store(W_PATH_PART, &0xFFFF_FFFF_u64.to_le_bytes()),
+            true
+        );
     }
 
     /// Call a pre-published thunk without touching the dispatch table, so the
@@ -5453,6 +6408,88 @@ mod tests {
         record!(W_THREAD_PRIORITY, &[0x22]);
         record!(W_INTERLOCKED, &[W_INTERLOCKED_CELL]);
         results.push((memory.load(W_INTERLOCKED_CELL, 4).unwrap_or(0), 0));
+        record!(
+            W_REG_ENUM_KEY,
+            &[
+                u64::from(HKEY_CURRENT_USER),
+                0,
+                W_REG_NAME_OUT,
+                W_REG_NAME_SIZE,
+                0,
+                0
+            ]
+        );
+        results.push((memory.load(W_REG_NAME_SIZE, 4).unwrap_or(0), 0));
+        results.push((memory.load(W_REG_NAME_OUT, 2).unwrap_or(0), 0));
+        record!(
+            W_REG_ENUM_VALUE,
+            &[
+                u64::from(HKEY_CURRENT_USER),
+                0,
+                W_REG_NAME_OUT,
+                W_REG_NAME_SIZE,
+                0,
+                W_REG_TYPE_OUT,
+                W_REG_DATA_OUT,
+                W_REG_DATA_SIZE
+            ]
+        );
+        results.push((memory.load(W_REG_NAME_SIZE, 4).unwrap_or(0), 0));
+        results.push((memory.load(W_REG_TYPE_OUT, 4).unwrap_or(0), 0));
+        results.push((memory.load(W_REG_DATA_SIZE, 4).unwrap_or(0), 0));
+        results.push((memory.load(W_REG_DATA_OUT, 2).unwrap_or(0), 0));
+        record!(
+            W_REG_INFO,
+            &[
+                u64::from(HKEY_CURRENT_USER),
+                0,
+                0,
+                0,
+                W_INFO_SUBKEYS,
+                W_INFO_MAX_SUBKEY,
+                0,
+                W_INFO_VALUES,
+                W_INFO_MAX_VALUE,
+                W_INFO_MAX_DATA,
+                0,
+                0
+            ]
+        );
+        results.push((memory.load(W_INFO_SUBKEYS, 4).unwrap_or(0), 0));
+        results.push((memory.load(W_INFO_VALUES, 4).unwrap_or(0), 0));
+        record!(
+            W_SHREG,
+            &[
+                u64::from(HKEY_CURRENT_USER),
+                0,
+                REG_NAME,
+                0,
+                W_REG_TYPE_OUT,
+                W_REG_DATA_OUT,
+                W_REG_DATA_SIZE
+            ]
+        );
+        results.push((memory.load(W_REG_DATA_SIZE, 4).unwrap_or(0), 0));
+        results.push((memory.load(W_REG_DATA_OUT, 2).unwrap_or(0), 0));
+        record!(W_LCMAP, &[0x0409, 0x0200, W_LCMAP_SRC, 5, W_LCMAP_DST, 8]);
+        results.push((memory.load(W_LCMAP_DST, 2).unwrap_or(0), 0));
+        record!(W_CHAR_UPPER, &[W_CHAR_BUF]);
+        results.push((memory.load(W_CHAR_BUF, 2).unwrap_or(0), 0));
+        record!(W_IS_CHAR, &[u64::from(b'A' as u32)]);
+        record!(W_TLS_SET, &[3, 0x1234]);
+        record!(W_FLS_SET, &[2, 0x88]);
+        record!(W_TZ, &[0, W_TZ_IN, W_TZ_OUT]);
+        results.push((memory.load(W_TZ_OUT, 2).unwrap_or(0), 0));
+        record!(W_METRICS, &[0]);
+        record!(W_FULL_PATH, &[W_LCMAP_SRC, 128, W_PATH_OUT, W_PATH_PART]);
+        results.push((memory.load(W_PATH_PART, 4).unwrap_or(0), 0));
+        results.push((memory.load(W_PATH_OUT, 2).unwrap_or(0), 0));
+        store_utf16(memory, W_LCMAP_SRC, "data.bin");
+        record!(W_LONG_PATH, &[W_LCMAP_SRC, W_PATH_OUT, 128]);
+        results.push((memory.load(W_PATH_OUT, 2).unwrap_or(0), 0));
+        record!(W_SHORT_PATH, &[W_LCMAP_SRC, W_PATH_OUT, 128]);
+        results.push((memory.load(W_PATH_OUT, 2).unwrap_or(0), 0));
+        record!(W_FILE_TYPE, &[0x10]);
         record!(W_OWNER_ONLY, &[]);
         results
     }
@@ -5461,7 +6498,7 @@ mod tests {
     fn parallel_api_mixed_workload_ratio_and_serial_reference_match() {
         let shared = Arc::new(ProcessShared::new());
         shared.publish_environment(environment(0x1234));
-        const THREADS: u32 = 8;
+        const THREADS: u32 = 16;
         const ITERATIONS: u32 = 40;
         for thread in 0..THREADS {
             publish_workload(&shared, thread);
@@ -5512,9 +6549,14 @@ mod tests {
         }
 
         let snapshot = shared.api_dispatch_snapshot();
+        println!(
+            "parallel ratio={}% {}",
+            snapshot.parallel_percent(),
+            shared.api_dispatch_log_line()
+        );
         assert!(
-            snapshot.parallel_percent() >= 90,
-            "parallel dispatch ratio must exceed the pinned 90% threshold: {}",
+            snapshot.parallel_percent() >= 96,
+            "parallel dispatch ratio must exceed the pinned 96% threshold: {}",
             shared.api_dispatch_log_line()
         );
         assert_eq!(
@@ -5534,16 +6576,43 @@ mod tests {
             Some(u64::from(THREADS * ITERATIONS))
         );
         assert_eq!(snapshot.totals.fallback_barriers, 0);
-        assert_eq!(
-            snapshot
-                .categories
-                .iter()
-                .find(|(category, _, _)| *category == WorkerCategory::FileSystem)
-                .map(|(_, dispatched, _)| *dispatched),
-            Some(u64::from(THREADS * ITERATIONS * 5))
-        );
+        let expected_categories = [
+            (WorkerCategory::ThreadState, 1_u32),
+            (WorkerCategory::Version, 1),
+            (WorkerCategory::Environment, 1),
+            (WorkerCategory::Registry, 5),
+            (WorkerCategory::FileSystem, 5),
+            (WorkerCategory::SystemInfo, 2),
+            (WorkerCategory::Tls, 4),
+            (WorkerCategory::ObjectStatus, 4),
+            (WorkerCategory::Interlocked, 1),
+            (WorkerCategory::Path, 3),
+            (WorkerCategory::Nls, 3),
+            (WorkerCategory::Clock, 1),
+        ];
+        for (category, per_iteration) in expected_categories {
+            assert_eq!(
+                snapshot
+                    .categories
+                    .iter()
+                    .find(|(entry, _, _)| *entry == category)
+                    .map(|(_, dispatched, _)| *dispatched),
+                Some(u64::from(THREADS * ITERATIONS * per_iteration)),
+                "category {category:?} dispatch count"
+            );
+        }
+        for (reason, count) in snapshot.fallbacks {
+            let expected = if reason == BarrierReason::OwnerOnly {
+                u64::from(THREADS * ITERATIONS)
+            } else {
+                0
+            };
+            assert_eq!(count, expected, "fallback reason {reason:?}");
+        }
         let line = shared.api_dispatch_log_line();
         assert_eq!(line.contains("filesystem:"), true);
+        assert_eq!(line.contains("path:"), true);
+        assert_eq!(line.contains("registry:"), true);
         assert_eq!(line.contains("owner-only:"), true);
     }
 
@@ -6269,5 +7338,917 @@ mod tests {
         );
         assert_eq!(snapshot.totals.barrier_calls, u64::from(THREADS * ROUNDS));
         assert_eq!(shared.process_operations(), u64::from(THREADS * ROUNDS));
+    }
+
+    #[test]
+    fn parallel_api_new_wave_cache_invalidation_and_error_paths_are_exact() {
+        let shared = ProcessShared::new();
+        shared.publish_environment(environment(0x6000));
+        let memory = TestMemory::new();
+        prepare_workload_memory(&memory);
+        let mut context = x86_context(0x1600);
+
+        // Registry key-existence/value reads.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegEnumKeyExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    0,
+                    W_REG_NAME_OUT,
+                    W_REG_NAME_SIZE,
+                    0,
+                    0
+                ]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(memory.load(W_REG_NAME_SIZE, 4), Some(5));
+        assert_eq!(load_utf16(&memory, W_REG_NAME_OUT, 16), "Child");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegEnumKeyExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    9,
+                    W_REG_NAME_OUT,
+                    W_REG_NAME_SIZE,
+                    0,
+                    0
+                ]
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            u64::from(ERROR_NO_MORE_ITEMS)
+        );
+        assert_eq!(context.last_error, ERROR_NO_MORE_ITEMS);
+        assert_eq!(memory.load(W_REG_NAME_SIZE, 4), Some(0));
+        assert_eq!(memory.store(W_REG_NAME_SIZE, &64_u32.to_le_bytes()), true);
+
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegEnumValueW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    0,
+                    W_REG_NAME_OUT,
+                    W_REG_NAME_SIZE,
+                    0,
+                    W_REG_TYPE_OUT,
+                    W_REG_DATA_OUT,
+                    W_REG_DATA_SIZE
+                ]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(load_utf16(&memory, W_REG_NAME_OUT, 16), "Ansi");
+        assert_eq!(memory.load(W_REG_TYPE_OUT, 4), Some(1));
+        assert_eq!(memory.load(W_REG_DATA_SIZE, 4), Some(6));
+        assert_eq!(memory.load(W_REG_DATA_OUT, 2), Some(0x68));
+        assert_eq!(memory.store(W_REG_NAME_SIZE, &64_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegEnumValueW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    99,
+                    W_REG_NAME_OUT,
+                    W_REG_NAME_SIZE,
+                    0,
+                    W_REG_TYPE_OUT,
+                    W_REG_DATA_OUT,
+                    W_REG_DATA_SIZE
+                ]
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            u64::from(ERROR_NO_MORE_ITEMS)
+        );
+        assert_eq!(context.last_error, ERROR_NO_MORE_ITEMS);
+
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryInfoKeyW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    0,
+                    0,
+                    0,
+                    W_INFO_SUBKEYS,
+                    W_INFO_MAX_SUBKEY,
+                    0,
+                    W_INFO_VALUES,
+                    W_INFO_MAX_VALUE,
+                    W_INFO_MAX_DATA,
+                    0,
+                    0
+                ]
+            ),
+            true
+        );
+        assert_eq!(memory.load(W_INFO_SUBKEYS, 4), Some(2));
+        assert_eq!(memory.load(W_INFO_VALUES, 4), Some(3));
+        assert_eq!(memory.load(W_INFO_MAX_SUBKEY, 4), Some(8));
+        assert_eq!(memory.store(W_REG_DATA_SIZE, &64_u32.to_le_bytes()), true);
+
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::SHRegGetValueW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    0,
+                    REG_NAME,
+                    0,
+                    W_REG_TYPE_OUT,
+                    W_REG_DATA_OUT,
+                    W_REG_DATA_SIZE
+                ]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(memory.load(W_REG_DATA_SIZE, 4), Some(12));
+        assert_eq!(memory.load(W_REG_DATA_OUT, 2), Some(0x68));
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::SHRegGetValueW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    0,
+                    REG_NAME,
+                    0x20,
+                    W_REG_TYPE_OUT,
+                    W_REG_DATA_OUT,
+                    W_REG_DATA_SIZE
+                ]
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            u64::from(ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(context.last_error, 0);
+        assert_eq!(memory.store(W_REG_DATA_SIZE, &1_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::SHRegGetValueW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    0,
+                    REG_NAME,
+                    0,
+                    W_REG_TYPE_OUT,
+                    W_REG_DATA_OUT,
+                    W_REG_DATA_SIZE
+                ]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), u64::from(ERROR_MORE_DATA));
+        assert_eq!(context.last_error, 0);
+        assert_eq!(memory.load(W_REG_DATA_SIZE, 4), Some(12));
+        store_utf16(&memory, W_CHAR_BUF, "Nope");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::SHRegGetValueW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    0,
+                    W_CHAR_BUF,
+                    0,
+                    W_REG_TYPE_OUT,
+                    W_REG_DATA_OUT,
+                    W_REG_DATA_SIZE
+                ]
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            u64::from(ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(context.last_error, 0);
+
+        // NLS mapping and classification.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::LCMapStringW,
+                &[0x0409, 0x0200, W_LCMAP_SRC, 5, W_LCMAP_DST, 8]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 5);
+        assert_eq!(memory.load(W_LCMAP_DST, 2), Some(0x48));
+        store_utf16(&memory, W_CHAR_BUF, "Abc");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::CharUpperW,
+                &[W_CHAR_BUF]
+            ),
+            true
+        );
+        assert_eq!(memory.load(W_CHAR_BUF, 2), Some(0x41));
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::IsCharAlphaW,
+                &[u64::from(b'A' as u32)]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::IsCharAlphaW,
+                &[u64::from(b'1' as u32)]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::LCMapStringW,
+                &[0x0409, 0x0200, 0, 5, W_LCMAP_DST, 8]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::LCMapStringW,
+                &[0x0409, 0x0200, W_LCMAP_SRC, 5, W_LCMAP_DST, 2]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INSUFFICIENT_BUFFER);
+        store_utf16(&memory, W_CHAR_BUF, "not-a-locale");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::LCMapStringEx,
+                &[W_CHAR_BUF, 0x0200, W_LCMAP_SRC, 5, W_LCMAP_DST, 8]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::CharUpperW,
+                &[u64::from(b'a' as u32)]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), u64::from(b'A' as u32));
+        for (thunk, character) in [
+            (HostThunk::IsCharAlphaNumericW, b'7'),
+            (HostThunk::IsCharLowerW, b'a'),
+            (HostThunk::IsCharUpperW, b'A'),
+            (HostThunk::IsCharSpaceW, b' '),
+        ] {
+            assert_eq!(
+                invoke_x86(
+                    &shared,
+                    &mut context,
+                    &memory,
+                    thunk,
+                    &[u64::from(character as u32)]
+                ),
+                true
+            );
+            assert_eq!(context.state.get(Register::Rax), 1);
+        }
+
+        // TLS/FLS setters are thread-local.
+        assert_eq!(memory.store(W_TZ_IN, &TZ_SYSTEMTIME), true);
+        context.tls_slots.insert(3, 1);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::TlsSetValue,
+                &[3, 0xDEAD]
+            ),
+            true
+        );
+        assert_eq!(context.tls_slots.get(&3), Some(&0xDEAD));
+        context.tls_vector_ptr = W_TZ_OUT;
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::TlsSetValue,
+                &[5, 0xBEEF]
+            ),
+            true
+        );
+        assert_eq!(memory.load(W_TZ_OUT + 5 * 4, 4), Some(0xBEEF));
+        context.tls_vector_ptr = 0;
+        context.fls_slots.insert(2, 1);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::FlsSetValue,
+                &[2, 0x55]
+            ),
+            true
+        );
+        assert_eq!(context.fls_slots.get(&2), Some(&0x55));
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::FlsSetValue,
+                &[9, 0x55]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        // Time-zone conversion equals the documented host bias exactly.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::SystemTimeToTzSpecificLocalTime,
+                &[0, W_TZ_IN, W_TZ_OUT]
+            ),
+            true
+        );
+        let filetime = systemtime_to_filetime_ticks(2024, 1, 2, 3, 4, 5, 7);
+        let biased = (i128::from(filetime)
+            - i128::from(local_timezone_bias_minutes()) * 600_000_000)
+            .max(0) as u64;
+        let (year, month, day_of_week, day, hour, minute, second, milliseconds) =
+            filetime_ticks_to_systemtime(biased);
+        let expected = [
+            year,
+            month,
+            day_of_week,
+            day,
+            hour,
+            minute,
+            second,
+            milliseconds,
+        ];
+        for (index, value) in expected.into_iter().enumerate() {
+            assert_eq!(
+                memory.load(W_TZ_OUT + index as u64 * 2, 2),
+                Some(u64::from(value))
+            );
+        }
+
+        // Display metrics.
+        for (index, expected) in [(0_u64, 2560_u64), (1, 1600), (28, 80), (80, 1), (90, 96)] {
+            assert_eq!(
+                invoke_x86(
+                    &shared,
+                    &mut context,
+                    &memory,
+                    HostThunk::GetSystemMetrics,
+                    &[index]
+                ),
+                true
+            );
+            assert_eq!(context.state.get(Register::Rax), expected);
+            assert_eq!(context.last_error, 0);
+        }
+
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::SystemTimeToTzSpecificLocalTime,
+                &[0, 0, W_TZ_OUT]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        // Path canonicalization and the required-size/truncation contract.
+        store_utf16(&memory, W_LCMAP_SRC, "");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetFullPathNameW,
+                &[W_LCMAP_SRC, 128, W_PATH_OUT, 0]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_PATH_NOT_FOUND);
+        store_utf16(&memory, W_LCMAP_SRC, "data.bin");
+        let expected_path = resolve_full_guest_path("C:\\game", "data.bin");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetFullPathNameW,
+                &[W_LCMAP_SRC, 128, W_PATH_OUT, W_PATH_PART]
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            expected_path.encode_utf16().count() as u64
+        );
+        assert_eq!(load_utf16(&memory, W_PATH_OUT, 128), expected_path);
+        assert_eq!(
+            memory.load(W_PATH_PART, 4),
+            Some(W_PATH_OUT + windows_file_part_offset(&expected_path).unwrap_or(0) as u32 as u64)
+        );
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetFullPathNameW,
+                &[W_LCMAP_SRC, 4, W_PATH_OUT, 0]
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            expected_path.encode_utf16().count() as u64 + 1
+        );
+        assert_eq!(context.last_error, ERROR_INSUFFICIENT_BUFFER);
+        for thunk in [HostThunk::GetLongPathNameW, HostThunk::GetShortPathNameW] {
+            assert_eq!(
+                invoke_x86(
+                    &shared,
+                    &mut context,
+                    &memory,
+                    thunk,
+                    &[W_LCMAP_SRC, W_PATH_OUT, 128]
+                ),
+                true
+            );
+            assert_eq!(context.last_error, 0);
+            assert_eq!(load_utf16(&memory, W_PATH_OUT, 128), expected_path);
+        }
+
+        // Simple handle queries.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetFileType,
+                &[0x10]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(context.last_error, 0);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetFileType,
+                &[u64::from(STD_OUTPUT_HANDLE)]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), u64::from(FILE_TYPE_CHAR));
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetFileType,
+                &[0x99]
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            u64::from(FILE_TYPE_UNKNOWN)
+        );
+        assert_eq!(context.last_error, ERROR_INVALID_HANDLE);
+
+        // Cache invalidation: a republished registry/file snapshot wins.
+        assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ]
+            ),
+            true
+        );
+        assert_eq!(memory.load(REG_BUF, 2), Some(0x68));
+        let mut changed = environment(0x6000);
+        changed.registry = registry_with_value("zulu");
+        shared.publish_environment(changed);
+        assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegQueryValueExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    REG_NAME,
+                    0,
+                    REG_TYPE,
+                    REG_BUF,
+                    REG_LEN
+                ]
+            ),
+            true
+        );
+        assert_eq!(memory.load(REG_BUF, 2), Some(0x7a));
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetFileSizeEx,
+                &[0x10, W_SIZE_OUT]
+            ),
+            true
+        );
+        assert_eq!(memory.load(W_SIZE_OUT, 8), Some(12_345));
+        let mut changed = environment(0x6000);
+        changed.files.sizes.insert(0x10, 999);
+        shared.publish_environment(changed);
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetFileSizeEx,
+                &[0x10, W_SIZE_OUT]
+            ),
+            true
+        );
+        assert_eq!(memory.load(W_SIZE_OUT, 8), Some(999));
+    }
+
+    const TZ_SYSTEMTIME: [u8; 16] = [
+        0xe8, 0x07, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x07,
+        0x00,
+    ];
+
+    #[test]
+    fn parallel_api_new_wave_unreadable_pointers_and_unknown_handles_fall_back() {
+        let shared = ProcessShared::new();
+        shared.publish_environment(environment(0x6100));
+        let memory = TestMemory::new();
+        prepare_workload_memory(&memory);
+        let mut context = x86_context(0x1700);
+
+        // Unreadable name-size pointer on an otherwise valid registry key.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegEnumKeyExW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    0,
+                    W_REG_NAME_OUT,
+                    0x9000,
+                    0,
+                    0
+                ]
+            ),
+            false
+        );
+        // Unknown registry handle.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::RegEnumKeyExW,
+                &[0xDEAD, 0, W_REG_NAME_OUT, W_REG_NAME_SIZE, 0, 0]
+            ),
+            false
+        );
+        // SHRegGetValueW subkey paths are owner-resolved from the live DB.
+        store_utf16(&memory, W_LCMAP_SRC, "Sub");
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::SHRegGetValueW,
+                &[
+                    u64::from(HKEY_CURRENT_USER),
+                    W_LCMAP_SRC,
+                    REG_NAME,
+                    0,
+                    W_REG_TYPE_OUT,
+                    W_REG_DATA_OUT,
+                    W_REG_DATA_SIZE
+                ]
+            ),
+            false
+        );
+        // A TLS vector that the worker view cannot write is a guest-write
+        // fallback, never a silent update of the thread map.
+        context.tls_vector_ptr = 0x9000;
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::TlsSetValue,
+                &[0, 1]
+            ),
+            false
+        );
+        assert_eq!(context.tls_slots.get(&0), None);
+        context.tls_vector_ptr = 0;
+        // Unreadable SYSTEMTIME input.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::SystemTimeToTzSpecificLocalTime,
+                &[0, 0x9000, W_TZ_OUT]
+            ),
+            false
+        );
+        // Unreadable path input.
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetFullPathNameW,
+                &[0x9000, 128, W_PATH_OUT, 0]
+            ),
+            false
+        );
+
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(snapshot.totals.fallback_barriers, 6);
+        assert_eq!(
+            snapshot
+                .fallbacks
+                .iter()
+                .find(|(reason, _)| *reason == BarrierReason::UnsupportedInput)
+                .map(|(_, count)| *count),
+            Some(5)
+        );
+        assert_eq!(
+            snapshot
+                .fallbacks
+                .iter()
+                .find(|(reason, _)| *reason == BarrierReason::GuestMemoryWrite)
+                .map(|(_, count)| *count),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .find(|(category, _, _)| *category == WorkerCategory::Registry)
+                .map(|(_, _, fallbacks)| *fallbacks),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn parallel_api_new_wave_mixed_parallel_barrier_no_deadlock() {
+        let shared = Arc::new(ProcessShared::new());
+        shared.publish_environment(environment(0x6200));
+        const THREADS: u32 = 8;
+        const ROUNDS: u32 = 100;
+        for thread in 0..THREADS {
+            publish_workload(&shared, thread);
+        }
+        let started = std::time::Instant::now();
+        let mut workers = Vec::new();
+        for thread in 0..THREADS {
+            let shared = Arc::clone(&shared);
+            workers.push(std::thread::spawn(move || {
+                let mut context = x86_context(0x1800 + thread);
+                context.fls_slots.insert(2, 0);
+                let memory = TestMemory::new();
+                prepare_workload_memory(&memory);
+                for _ in 0..ROUNDS {
+                    assert_eq!(
+                        call_published(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            thread,
+                            W_REG_ENUM_KEY,
+                            &[
+                                u64::from(HKEY_CURRENT_USER),
+                                0,
+                                W_REG_NAME_OUT,
+                                W_REG_NAME_SIZE,
+                                0,
+                                0
+                            ]
+                        ),
+                        true
+                    );
+                    assert_eq!(
+                        call_published(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            thread,
+                            W_FULL_PATH,
+                            &[W_LCMAP_SRC, 128, W_PATH_OUT, W_PATH_PART]
+                        ),
+                        true
+                    );
+                    shared.with_process(|| std::thread::yield_now());
+                    assert_eq!(
+                        call_published(&shared, &mut context, &memory, thread, W_OWNER_ONLY, &[]),
+                        false
+                    );
+                    assert_eq!(
+                        call_published(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            thread,
+                            W_FLS_SET,
+                            &[2, 0x88]
+                        ),
+                        true
+                    );
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("new-wave mixed worker");
+        }
+        assert_eq!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            true,
+            "new-wave parallel/barrier mix must not deadlock"
+        );
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(
+            snapshot.totals.parallel_dispatched,
+            u64::from(THREADS * ROUNDS * 3)
+        );
+        assert_eq!(snapshot.totals.barrier_calls, u64::from(THREADS * ROUNDS));
+        assert_eq!(shared.process_operations(), u64::from(THREADS * ROUNDS));
+    }
+
+    #[test]
+    fn parallel_api_new_wave_last_error_isolation_under_parallel_calls() {
+        let shared = Arc::new(ProcessShared::new());
+        shared.publish_environment(environment(0x6300));
+        const THREADS: u32 = 16;
+        const ROUNDS: u32 = 50;
+        let mut workers = Vec::new();
+        for thread in 0..THREADS {
+            let shared = Arc::clone(&shared);
+            workers.push(std::thread::spawn(move || {
+                let mut context = x86_context(0x1A00 + thread);
+                let memory = TestMemory::new();
+                prepare_workload_memory(&memory);
+                let expected = 0x5000 + thread;
+                for _ in 0..ROUNDS {
+                    assert_eq!(
+                        invoke_x86(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            HostThunk::SetLastError,
+                            &[u64::from(expected)]
+                        ),
+                        true
+                    );
+                    assert_eq!(
+                        invoke_x86(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            HostThunk::SystemTimeToTzSpecificLocalTime,
+                            &[0, W_TZ_IN, W_TZ_OUT]
+                        ),
+                        true
+                    );
+                    assert_eq!(context.last_error, expected);
+                    assert_eq!(
+                        invoke_x86(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            HostThunk::GetSystemMetrics,
+                            &[0]
+                        ),
+                        true
+                    );
+                    assert_eq!(context.last_error, 0);
+                    assert_eq!(
+                        invoke_x86(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            HostThunk::SetLastError,
+                            &[u64::from(expected)]
+                        ),
+                        true
+                    );
+                    assert_eq!(
+                        invoke_x86(&shared, &mut context, &memory, HostThunk::GetLastError, &[]),
+                        true
+                    );
+                    assert_eq!(context.state.get(Register::Rax), u64::from(expected));
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("last-error isolation worker");
+        }
+        let metrics = shared.api_dispatch_metrics();
+        assert_eq!(metrics.parallel_dispatched, u64::from(THREADS * ROUNDS * 5));
+        assert_eq!(metrics.barrier_calls, 0);
+        assert_eq!(metrics.fallback_barriers, 0);
     }
 }

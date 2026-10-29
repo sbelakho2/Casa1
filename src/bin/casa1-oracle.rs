@@ -21,6 +21,8 @@
 //!     the generated corpus and compare its output.
 
 use casa1::api_database::ApiDatabase;
+use casa1::corpus::{self, CorpusConfig};
+use casa1::pe_inventory;
 use casa1::windows_oracle::{
     self, ComparisonReport, ReferenceResultsFile, VectorFile, WINDOWS_ORACLE_SCHEMA_VERSION,
 };
@@ -106,6 +108,43 @@ enum OracleCommand {
         #[arg(long)]
         categories: Option<String>,
     },
+    /// Inventory the exports/imports of a real-application PE corpus and
+    /// diff them against Casa1's API registry.  Emits deterministic JSON
+    /// plus a human summary on stderr.
+    Inventory {
+        /// Directory tree containing real Windows PE32/PE32+ files.
+        #[arg(long)]
+        pe_dir: PathBuf,
+        /// Destination path for the deterministic inventory JSON.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Run a real-application corpus through the Casa1 runner sequentially,
+    /// with a per-title timeout and sandboxed working directory.
+    #[command(name = "corpus")]
+    Corpus {
+        /// Directory tree containing .exe/.dll titles.
+        #[arg(long)]
+        corpus: PathBuf,
+        /// Destination path for the deterministic corpus JSON.
+        #[arg(long)]
+        out: PathBuf,
+        /// Per-title wall-clock timeout in milliseconds (authoritative).
+        #[arg(long, default_value_t = corpus::DEFAULT_TIMEOUT_MS)]
+        timeout_ms: u64,
+        /// Root directory for per-title sandboxes.
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+        /// Re-run titles even when the content hash is unchanged.
+        #[arg(long)]
+        force: bool,
+        /// Explicit casa1-runner binary (default: sibling binary).
+        #[arg(long)]
+        runner: Option<PathBuf>,
+        /// Print a per-title human summary to stderr.
+        #[arg(long)]
+        human: bool,
+    },
     /// Compare the Casa1 runtime's behavior per vector against the captured
     /// Windows reference results. Exits 1 on any diff unless --report-only,
     /// and on any required-category coverage gap (always).
@@ -140,6 +179,63 @@ fn main() {
         write_api_report(out, *gate);
         return;
     }
+    if let OracleCommand::Inventory { pe_dir, out } = &cli.command {
+        let database = ApiDatabase::from_thunk_metadata();
+        match pe_inventory::build_report(pe_dir, &database).and_then(|report| {
+            pe_inventory::write_report(&report, out)?;
+            Ok(report)
+        }) {
+            Ok(report) => {
+                eprintln!("{}", report.human_summary);
+                eprintln!("wrote {}", out.display());
+            }
+            Err(error) => {
+                eprintln!("inventory failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if let OracleCommand::Corpus {
+        corpus,
+        out,
+        timeout_ms,
+        work_dir,
+        force,
+        runner,
+        human,
+    } = &cli.command
+    {
+        let config = CorpusConfig {
+            corpus_dir: corpus.clone(),
+            out: out.clone(),
+            timeout_ms: *timeout_ms,
+            work_dir: work_dir.clone(),
+            force: *force,
+            runner: runner.clone(),
+            runtime_deadline_secs: None,
+        };
+        match corpus::run_corpus(&config) {
+            Ok(report) => {
+                if *human {
+                    eprintln!("{}", corpus::human_summary(&report));
+                }
+                eprintln!(
+                    "corpus: {} title(s), {} executed, {} skipped unchanged, fingerprint {}",
+                    report.discovered_title_count,
+                    report.summary.executed,
+                    report.summary.skipped_unchanged,
+                    report.corpus_fingerprint
+                );
+                eprintln!("wrote {}", out.display());
+            }
+            Err(error) => {
+                eprintln!("corpus failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if let OracleCommand::ApiLimitations { out } = &cli.command {
         let database = ApiDatabase::from_thunk_metadata();
         if let Err(error) = std::fs::write(out, database.compatibility_limitations_markdown()) {
@@ -160,6 +256,14 @@ fn main() {
         OracleCommand::ApiLimitations { .. } => {
             // Handled by the pre-match special case above.
             unreachable!("ApiLimitations is handled before the match")
+        }
+        OracleCommand::Inventory { .. } => {
+            // Handled by the pre-match special case above.
+            unreachable!("Inventory is handled before the match")
+        }
+        OracleCommand::Corpus { .. } => {
+            // Handled by the pre-match special case above.
+            unreachable!("Corpus is handled before the match")
         }
         OracleCommand::Vectors {
             out,

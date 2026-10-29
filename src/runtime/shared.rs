@@ -116,6 +116,8 @@ pub(crate) struct WorkerObjectStatus {
     pub(crate) thread_exit_codes: BTreeMap<u32, u32>,
     pub(crate) process_exit_codes: BTreeMap<u32, u32>,
     pub(crate) thread_priorities: BTreeMap<u32, i32>,
+    /// Open handle -> `GetFileType` result for the read-only handle query.
+    pub(crate) file_types: BTreeMap<u32, u32>,
 }
 
 /// One registry key's read-only snapshot: its normalized runtime key and the
@@ -124,6 +126,7 @@ pub(crate) struct WorkerObjectStatus {
 pub(crate) struct WorkerRegistryKey {
     pub(crate) hive: String,
     pub(crate) key: String,
+    pub(crate) subkeys: Vec<String>,
     pub(crate) values: BTreeMap<String, crate::ge::StoredRegistryValue>,
 }
 
@@ -136,6 +139,15 @@ pub(crate) struct WorkerRegistryKey {
 pub(crate) struct WorkerRegistry {
     pub(crate) roots: BTreeMap<(u32, u8), WorkerRegistryKey>,
     pub(crate) keys: BTreeMap<u32, WorkerRegistryKey>,
+}
+
+/// Owner-published primary-display metrics for `GetSystemMetrics`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorkerDisplayMetrics {
+    pub(crate) screen_width: u32,
+    pub(crate) screen_height: u32,
+    pub(crate) screen_dpi: u32,
+    pub(crate) monitor_count: u32,
 }
 
 /// Read-mostly process state published for worker API execution.
@@ -151,6 +163,10 @@ pub(crate) struct WorkerEnvironment {
     pub(crate) registry: WorkerRegistry,
     pub(crate) files: WorkerFileSystem,
     pub(crate) objects: WorkerObjectStatus,
+    /// Current guest working directory for path canonicalization.
+    pub(crate) current_directory: String,
+    /// Primary virtual display metrics for `GetSystemMetrics`.
+    pub(crate) display: WorkerDisplayMetrics,
 }
 
 /// One registered thunk's worker-execution classification.
@@ -176,13 +192,14 @@ pub(crate) enum WorkerCategory {
     Environment,
     Registry,
     FileSystem,
+    Path,
     Tls,
     Interlocked,
     ObjectStatus,
 }
 
 impl WorkerCategory {
-    pub(crate) const COUNT: usize = 15;
+    pub(crate) const COUNT: usize = 16;
 
     pub(crate) const ALL: [Self; Self::COUNT] = [
         Self::ThreadState,
@@ -197,6 +214,7 @@ impl WorkerCategory {
         Self::Environment,
         Self::Registry,
         Self::FileSystem,
+        Self::Path,
         Self::Tls,
         Self::Interlocked,
         Self::ObjectStatus,
@@ -220,6 +238,7 @@ impl WorkerCategory {
             Self::Environment => "env",
             Self::Registry => "registry",
             Self::FileSystem => "filesystem",
+            Self::Path => "path",
             Self::Tls => "tls",
             Self::Interlocked => "interlocked",
             Self::ObjectStatus => "objects",
@@ -370,6 +389,10 @@ pub(crate) struct ProcessShared {
     files: RwLock<WorkerFileSystem>,
     /// Read-only object-status snapshot for the synchronization queries.
     objects: RwLock<WorkerObjectStatus>,
+    /// Current guest working directory for read-only path canonicalization.
+    current_directory: RwLock<String>,
+    /// Primary display metrics for `GetSystemMetrics`.
+    display: RwLock<WorkerDisplayMetrics>,
     /// Worker-execution classification for every registered host thunk, keyed
     /// by guest thunk address for the current dispatch round.
     thunks: RwLock<BTreeMap<u64, ParallelThunk>>,
@@ -437,6 +460,8 @@ impl ProcessShared {
             registry: RwLock::new(WorkerRegistry::default()),
             files: RwLock::new(WorkerFileSystem::default()),
             objects: RwLock::new(WorkerObjectStatus::default()),
+            current_directory: RwLock::new(String::new()),
+            display: RwLock::new(WorkerDisplayMetrics::default()),
             thunks: RwLock::new(BTreeMap::new()),
             parallel_api_calls: AtomicU64::new(0),
             barrier_api_calls: AtomicU64::new(0),
@@ -496,6 +521,14 @@ impl ProcessShared {
             .objects
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.objects;
+        *self
+            .current_directory
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.current_directory;
+        *self
+            .display
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.display;
     }
 
     /// Replace only the guest process identity (read-mostly writer path).
@@ -609,6 +642,20 @@ impl ProcessShared {
             .clone()
     }
 
+    pub(crate) fn current_directory_snapshot(&self) -> String {
+        self.current_directory
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn display_snapshot(&self) -> WorkerDisplayMetrics {
+        *self
+            .display
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Non-blocking snapshot for a worker: a writer holding the lock is
     /// recorded as `LockContention` and the call falls back to the owner
     /// barrier instead of stalling the worker.
@@ -661,6 +708,14 @@ impl ProcessShared {
 
     pub(crate) fn worker_object_status_snapshot(&self) -> Option<WorkerObjectStatus> {
         Self::worker_snapshot(&self.objects)
+    }
+
+    pub(crate) fn worker_current_directory_snapshot(&self) -> Option<String> {
+        Self::worker_snapshot(&self.current_directory)
+    }
+
+    pub(crate) fn worker_display_snapshot(&self) -> Option<WorkerDisplayMetrics> {
+        Self::worker_snapshot(&self.display)
     }
 
     /// Parallel-versus-barrier API dispatch split.

@@ -83,7 +83,11 @@ def llvm_tool(name: str) -> str | None:
     return None
 
 
-def build_target(args: list[str], env: dict[str, str] | None = None) -> pathlib.Path | None:
+def build_target(
+    args: list[str],
+    env: dict[str, str] | None = None,
+    label: str | None = None,
+) -> pathlib.Path | None:
     command = ["cargo", "test", *args, "--no-run", "--message-format=json"]
     print(f":: building: {' '.join(command)}")
     result = subprocess.run(
@@ -93,14 +97,33 @@ def build_target(args: list[str], env: dict[str, str] | None = None) -> pathlib.
         sys.stderr.write(result.stderr)
         return None
     executable: pathlib.Path | None = None
+    fallback: pathlib.Path | None = None
     for line in result.stdout.splitlines():
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if record.get("reason") == "compiler-artifact" and record.get("executable"):
-            executable = pathlib.Path(record["executable"])
-    return executable
+        if record.get("reason") != "compiler-artifact" or not record.get("executable"):
+            continue
+        artifact = pathlib.Path(record["executable"])
+        fallback = artifact
+        if label is None:
+            executable = artifact
+            continue
+        target = record.get("target") or {}
+        kinds = target.get("kind") or []
+        name = target.get("name")
+        # `cargo test` also emits bin test-harnesses; select the artifact that
+        # belongs to the requested target instead of whichever came last.
+        if label == "lib":
+            if "lib" in kinds:
+                executable = artifact
+        elif label == "bins":
+            if "bin" in kinds:
+                executable = artifact
+        elif name == label:
+            executable = artifact
+    return executable or fallback
 
 
 def list_tests(binary: pathlib.Path, env: dict[str, str] | None = None) -> list[str]:
@@ -202,7 +225,7 @@ def main() -> int:
 
     for target_args, label in targets:
         env = coverage_env
-        binary = build_target(target_args, env=env)
+        binary = build_target(target_args, env=env, label=label)
         if binary is None:
             return 1
         compiled = list_tests(binary, env=env)

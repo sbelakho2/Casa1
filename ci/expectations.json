@@ -1870,6 +1870,28 @@
   "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntime, &[ versions[3] as u32, flavors[0] as u32, clsid as u32, iid as u32, out as u32, ], ), u64::from(COR_E_CLRNOTAVAILABLE), \"the 5-argument export keeps the Framework-absent contract\" )",
   "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(u64::from(version), 0, 0, clsid, iid, out), ), u64::from(COR_E_CLRNOTAVAILABLE) )"
  ],
+ "corpus_classifies_missing_import_crash_timeout_library_and_invalid_title_exactly": [
+  "(report.discovered_title_count, 7)",
+  "(report.summary.executed, 7)",
+  "(trivial.classification, OutcomeClass::CleanExit)",
+  "(trivial.guest_exit_code, Some(0))",
+  "(trivial.reason_name, None)",
+  "(trivial.cancel, None)"
+ ],
+ "corpus_resume_keeps_stale_unchanged_titles_out_of_the_runner": [
+  "(first.summary.executed, 1)",
+  "(first.summary.skipped_unchanged, 0)",
+  "(first.titles[0].execution, ExecutionState::Executed)",
+  "(second.summary.executed, 0)",
+  "(second.summary.skipped_unchanged, 1)",
+  "(second.titles[0].execution, ExecutionState::SkippedUnchanged)"
+ ],
+ "corpus_timeout_cancels_the_runner_process_group_at_the_hard_deadline": [
+  "(hang.classification, OutcomeClass::Timeout)",
+  "(hang.reason_code, Some(RC_CORPUS_TIMEOUT.0))",
+  "(cancel.mechanism, \"wrapper_sigkill_process_group\")",
+  "(hang.status, \"timeout\")"
+ ],
  "corrupt_machine_guid_is_replaced_not_reused": [
   "( store.get(MACHINE_GUID_VALUE).as_deref(), Some(identity.machine_guid.as_str()) )"
  ],
@@ -6181,6 +6203,64 @@
  "invalidate_window_queues_paint_once": [
   "( kinds .iter() .filter(|kind| **kind == MessageKind::Paint) .count(), 1 )"
  ],
+ "inventory_diff_reports_missing_and_extra_symbols_exactly": [
+  "(diff.summary.imported_symbol_count, 2)",
+  "(diff.summary.modeled_import_count, 1)",
+  "(diff.summary.unmodeled_import_count, 1)",
+  "(diff.unmodeled_imports.len(), 1)",
+  "(unmodeled.dll, \"notreal.dll\")",
+  "(unmodeled.canonical_dll, \"notreal\")"
+ ],
+ "inventory_diff_resolves_api_set_alias_without_false_unmodeled_error": [
+  "(diff.summary.unmodeled_import_count, 0)",
+  "(diff.summary.modeled_import_count, 1)",
+  "(diff.summary.alias_count, 1)",
+  "(diff.aliases[0].observed, \"api-ms-win-core-file-l1-1-0.dll\")",
+  "(diff.aliases[0].resolved, \"kernel32.dll\")",
+  "(diff.aliases[0].kind, \"api_set\")"
+ ],
+ "inventory_directory_records_malformed_pe_instead_of_aborting": [
+  "(inventory.pe_file_count, 2)",
+  "(inventory.modules.len(), 1)",
+  "(inventory.modules[0].path, \"good.exe\")",
+  "(inventory.errors.len(), 1)",
+  "(inventory.errors[0].path, \"malformed.exe\")",
+  "(inventory.errors[0].reason_code, 2000)"
+ ],
+ "inventory_distinguishes_delay_load_from_eager_imports_without_mismatch": [
+  "(module.imports.len(), 2)"
+ ],
+ "inventory_empty_directory_rejects_phantom_coverage": [
+  "(inventory.pe_file_count, 0)",
+  "(inventory.modules.len(), 0)",
+  "(inventory.errors.len(), 0)",
+  "(inventory.corpus_fingerprint, util::sha256_bytes(b\"\"))"
+ ],
+ "inventory_rejects_malformed_pe_while_accepting_pe32_and_pe32plus": [
+  "(module32.format, \"PE32\")",
+  "(module32.machine, 0x014c)",
+  "(module64.format, \"PE32+\")",
+  "(module64.machine, 0x8664)",
+  "(error.code, ReasonCode::RcPeParseInvalid)",
+  "(error.message, \"invalid DOS signature\")"
+ ],
+ "inventory_rejects_name_assumption_for_ordinal_only_and_forwarded_exports": [
+  "(module.exports.len(), 3)",
+  "(ordinal_only.name, None)",
+  "(ordinal_only.rva, Some(0x1500))",
+  "(ordinal_only.forwarder, None)",
+  "(forwarded.name.as_deref(), Some(\"Forwarded\"))",
+  "(forwarded.forwarder.as_deref(), Some(\"KERNELBASE.Sleep\"))"
+ ],
+ "inventory_report_never_mismatches_across_repeated_walks": [
+  "( serde_json::to_string(&first).expect(\"json\"), serde_json::to_string(&second).expect(\"json\") )",
+  "(first.inventory.modules.len(), 2)",
+  "(first.diff.summary.parse_error_count, 0)"
+ ],
+ "inventory_reports_truncated_pe_with_exact_parser_error": [
+  "(error.code, ReasonCode::RcPeParseInvalid)",
+  "(error.message, \"NT headers exceeds file size\")"
+ ],
  "io_connect_interrupt_ex_versions_and_malformed_blocks_are_exact": [
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::IoConnectInterruptEx, &[0], ), STATUS_INVALID_PARAMETER )",
   "(memory.read_u32(params).unwrap(), 1)",
@@ -9679,7 +9759,7 @@
   "( snapshot.totals.barrier_calls, u64::from(THREADS * ITERATIONS) )",
   "( snapshot .fallbacks .iter() .find(|(reason, _)| *reason == BarrierReason::OwnerOnly) .map(|(_, count)| *count), Some(u64::from(THREADS * ITERATIONS)) )",
   "(snapshot.totals.fallback_barriers, 0)",
-  "( snapshot .categories .iter() .find(|(category, _, _)| *category == WorkerCategory::FileSystem) .map(|(_, dispatched, _)| *dispatched), Some(u64::from(THREADS * ITERATIONS * 5)) )"
+  "( snapshot .categories .iter() .find(|(entry, _, _)| *entry == category) .map(|(_, dispatched, _)| *dispatched), Some(u64::from(THREADS * ITERATIONS * per_iteration)), \"category {category:?} dispatch count\" )"
  ],
  "parallel_api_new_categories_match_owner_error_codes": [
   "( call_published( &shared, &mut context, &memory, 0x1200, W_FILE_EX, &[0, 0, W_ATTR_OUT] ), true )",
@@ -9687,6 +9767,37 @@
   "(context.last_error, ERROR_PATH_NOT_FOUND)",
   "( call_published( &shared, &mut context, &memory, 0x1200, W_FILE_EX, &[W_FILE_PATH, 1, W_ATTR_OUT] ), true )",
   "(context.last_error, ERROR_INVALID_PARAMETER)"
+ ],
+ "parallel_api_new_wave_cache_invalidation_and_error_paths_are_exact": [
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::RegEnumKeyExW, &[ u64::from(HKEY_CURRENT_USER), 0, W_REG_NAME_OUT, W_REG_NAME_SIZE, 0, 0 ] ), true )",
+  "(context.state.get(Register::Rax), 0)",
+  "(memory.load(W_REG_NAME_SIZE, 4), Some(5))",
+  "(load_utf16(&memory, W_REG_NAME_OUT, 16), \"Child\")",
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::RegEnumKeyExW, &[ u64::from(HKEY_CURRENT_USER), 9, W_REG_NAME_OUT, W_REG_NAME_SIZE, 0, 0 ] ), true )",
+  "( context.state.get(Register::Rax), u64::from(ERROR_NO_MORE_ITEMS) )"
+ ],
+ "parallel_api_new_wave_last_error_isolation_under_parallel_calls": [
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::SetLastError, &[u64::from(expected)] ), true )",
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::SystemTimeToTzSpecificLocalTime, &[0, W_TZ_IN, W_TZ_OUT] ), true )",
+  "(context.last_error, expected)",
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::GetSystemMetrics, &[0] ), true )",
+  "(context.last_error, 0)"
+ ],
+ "parallel_api_new_wave_mixed_parallel_barrier_no_deadlock": [
+  "( call_published( &shared, &mut context, &memory, thread, W_REG_ENUM_KEY, &[ u64::from(HKEY_CURRENT_USER), 0, W_REG_NAME_OUT, W_REG_NAME_SIZE, 0, 0 ] ), true )",
+  "( call_published( &shared, &mut context, &memory, thread, W_FULL_PATH, &[W_LCMAP_SRC, 128, W_PATH_OUT, W_PATH_PART] ), true )",
+  "( call_published(&shared, &mut context, &memory, thread, W_OWNER_ONLY, &[]), false )",
+  "( call_published( &shared, &mut context, &memory, thread, W_FLS_SET, &[2, 0x88] ), true )",
+  "( started.elapsed() < std::time::Duration::from_secs(5), true, \"new-wave parallel/barrier mix must not deadlock\" )",
+  "( snapshot.totals.parallel_dispatched, u64::from(THREADS * ROUNDS * 3) )"
+ ],
+ "parallel_api_new_wave_unreadable_pointers_and_unknown_handles_fall_back": [
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::RegEnumKeyExW, &[ u64::from(HKEY_CURRENT_USER), 0, W_REG_NAME_OUT, 0x9000, 0, 0 ] ), false )",
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::RegEnumKeyExW, &[0xDEAD, 0, W_REG_NAME_OUT, W_REG_NAME_SIZE, 0, 0] ), false )",
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::SHRegGetValueW, &[ u64::from(HKEY_CURRENT_USER), W_LCMAP_SRC, REG_NAME, 0, W_REG_TYPE_OUT, W_REG_DATA_OUT, W_REG_DATA_SIZE ] ), false )",
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::TlsSetValue, &[0, 1] ), false )",
+  "(context.tls_slots.get(&0), None)",
+  "( invoke_x86( &shared, &mut context, &memory, HostThunk::SystemTimeToTzSpecificLocalTime, &[0, 0x9000, W_TZ_OUT] ), false )"
  ],
  "parallel_api_out_of_bounds_reads_and_writes_fail_closed": [
   "(format!(\"{:?}\", ProcessShared::new()).is_empty(), false)",

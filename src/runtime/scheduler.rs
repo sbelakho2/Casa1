@@ -3204,7 +3204,12 @@ impl PeHostRuntime {
         let registry = if self.host_thunks.values().any(|thunk| {
             matches!(
                 thunk,
-                HostThunk::RegQueryValueExA | HostThunk::RegQueryValueExW
+                HostThunk::RegQueryValueExA
+                    | HostThunk::RegQueryValueExW
+                    | HostThunk::RegEnumKeyExW
+                    | HostThunk::RegEnumValueW
+                    | HostThunk::RegQueryInfoKeyW
+                    | HostThunk::SHRegGetValueW
             )
         }) {
             self.build_worker_registry()
@@ -3231,11 +3236,31 @@ impl PeHostRuntime {
                 HostThunk::GetExitCodeThread
                     | HostThunk::GetExitCodeProcess
                     | HostThunk::GetThreadPriority
+                    | HostThunk::GetFileType
             )
         }) {
             self.build_worker_object_status()
         } else {
             WorkerObjectStatus::default()
+        };
+        let display = {
+            let primary = self.user32.primary_monitor_id();
+            let monitor = self.user32.monitor_info(primary);
+            let (screen_width, screen_height) = monitor
+                .as_ref()
+                .map(|monitor| {
+                    (
+                        (monitor.bounds.right - monitor.bounds.left).max(0) as u32,
+                        (monitor.bounds.bottom - monitor.bounds.top).max(0) as u32,
+                    )
+                })
+                .unwrap_or((2560, 1600));
+            WorkerDisplayMetrics {
+                screen_width,
+                screen_height,
+                screen_dpi: monitor.as_ref().map(|monitor| monitor.dpi_x).unwrap_or(96),
+                monitor_count: self.user32.monitor_count(),
+            }
         };
         self.process_shared.publish_environment(WorkerEnvironment {
             identity: WorkerIdentity {
@@ -3263,6 +3288,8 @@ impl PeHostRuntime {
             registry,
             files,
             objects,
+            current_directory: self.current_directory.clone(),
+            display,
         });
         self.process_shared.publish_parallel_thunks(
             self.host_thunks
@@ -3336,6 +3363,11 @@ impl PeHostRuntime {
         WorkerRegistryKey {
             hive: hive.to_string(),
             key: key.to_string(),
+            subkeys: self
+                .win32
+                .ge()
+                .registry_enum_keys(hive, key, view)
+                .unwrap_or_default(),
             values,
         }
     }
@@ -3392,6 +3424,9 @@ impl PeHostRuntime {
             }
             if let Ok(Some(exit_code)) = self.win32.get_exit_code_process(handle) {
                 objects.process_exit_codes.insert(handle, exit_code);
+            }
+            if let Ok(file_type) = self.win32.file_type(handle) {
+                objects.file_types.insert(handle, file_type);
             }
         }
         objects
