@@ -2,9 +2,15 @@ name: CI
 
 on:
   push:
-    branches: ["*"]
+    branches: ["main"]
   pull_request:
     branches: ["*"]
+
+# Cancel superseded runs for the same ref. Without this, every push leaves a
+# multi-hour full-suite run queued behind the next one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
