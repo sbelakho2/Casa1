@@ -1444,9 +1444,26 @@ fn exec_synchronization(input: &Value) -> Value {
             unsafe {
                 ReleaseMutex(mutex);
             }
+            // Deterministically let the worker win the mutex before the main
+            // thread asks for it again. Without this handshake the main thread
+            // can re-acquire, then block forever joining a worker that is
+            // itself blocked on the mutex (the oracle hung for 45 minutes).
+            let mut acquired = false;
+            for _ in 0..5_000 {
+                if unsafe { (*context).acquired.load(Ordering::SeqCst) } {
+                    acquired = true;
+                    break;
+                }
+                unsafe {
+                    Sleep(1);
+                }
+            }
             // The worker acquires the mutex and terminates without releasing
             // it; the main thread's wait therefore returns WAIT_ABANDONED.
-            let wait2 = unsafe { WaitForSingleObject(mutex, INFINITE) };
+            // If the handshake ever fails, wait with a deadline instead of
+            // deadlocking the whole capture.
+            let wait2 =
+                unsafe { WaitForSingleObject(mutex, if acquired { INFINITE } else { 5_000 }) };
             unsafe {
                 WaitForSingleObject(thread, INFINITE);
                 CloseHandle(thread);

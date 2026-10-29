@@ -14,6 +14,10 @@
 mod exec;
 mod schema;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use schema::{CaptureHeader, CaptureProvenance, Result, ResultsFile, SCHEMA_VERSION, VectorFile};
 
 fn main() {
@@ -42,15 +46,61 @@ fn main() {
         );
         std::process::exit(2);
     }
-    let results: Vec<Result> = vector_file
-        .vectors
-        .iter()
-        .map(|vector| Result {
+    let total = vector_file.vectors.len();
+    let started = Instant::now();
+    let current_index = Arc::new(AtomicU64::new(0));
+    let last_activity_ms = Arc::new(AtomicU64::new(0));
+    // A vector that blocks forever must fail the capture with its identity
+    // instead of hanging the Windows runner (the previous 45-minute timeout
+    // produced no diagnostic). The watchdog only sleeps and exits; it never
+    // touches vector state, so the crt_printf ordering guarantee is intact.
+    {
+        let index = Arc::clone(&current_index);
+        let activity = Arc::clone(&last_activity_ms);
+        let identities: Vec<(String, String)> = vector_file
+            .vectors
+            .iter()
+            .map(|vector| (vector.id.clone(), vector.category.clone()))
+            .collect();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                let now_ms = started.elapsed().as_millis() as u64;
+                let last = activity.load(Ordering::Relaxed);
+                if last != 0 && now_ms.saturating_sub(last) > 120_000 {
+                    let position = index.load(Ordering::Relaxed) as usize;
+                    match identities.get(position) {
+                        Some((id, category)) => eprintln!(
+                            "vector stalled for >120s: [{}/{}] {} ({})",
+                            position + 1,
+                            identities.len(),
+                            id,
+                            category
+                        ),
+                        None => eprintln!("vector stalled for >120s at index {position}"),
+                    }
+                    std::process::exit(3);
+                }
+            }
+        });
+    }
+    let mut results: Vec<Result> = Vec::with_capacity(total);
+    for (index, vector) in vector_file.vectors.iter().enumerate() {
+        current_index.store(index as u64, Ordering::Relaxed);
+        last_activity_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        eprintln!(
+            "[{}/{}] {} ({})",
+            index + 1,
+            total,
+            vector.id,
+            vector.category
+        );
+        results.push(Result {
             id: vector.id.clone(),
             category: vector.category.clone(),
             output: exec::execute(&vector.category, &vector.input),
-        })
-        .collect();
+        });
+    }
     let out = ResultsFile {
         schema_version: SCHEMA_VERSION,
         capture: CaptureHeader::windows_capture(capture_provenance(&vectors_bytes)),
