@@ -1755,6 +1755,13 @@ pub(crate) struct PeHostRuntime {
     pub(crate) steam_owner_allocator_probe_count: usize,
     /// Counter of API calls dispatched since execution started (for Steam tracing).
     pub(crate) steam_api_call_count: u64,
+    /// Bounded ring of the most recent host API calls (name, args, return,
+    /// last-error).  Used by the huge-copy-count diagnostic to attribute a
+    /// negative length to the API whose return preceded it.  Capped at
+    /// `API_HISTORY_CAPACITY`; never grows with runtime lifetime.
+    pub(crate) api_history: VecDeque<String>,
+    /// Whether the API history ring is enabled (`CASA1_API_HISTORY=1`).
+    pub(crate) api_history_enabled: bool,
     /// Max API calls to trace under `steam_api_trace` before throttling.
     pub(crate) steam_api_trace_max: u64,
     /// Whether we've already reported the first exit from the mapped image.
@@ -2723,6 +2730,8 @@ impl PeHostRuntime {
             steam_4ae970_probe_count: 0,
             steam_owner_allocator_probe_count: 0,
             steam_api_call_count: 0,
+            api_history: VecDeque::new(),
+            api_history_enabled: std::env::var_os("CASA1_API_HISTORY").is_some(),
             steam_api_trace_max: 10000,
             steam_reported_image_exit: false,
             next_frame_index: 0,

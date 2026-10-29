@@ -2018,6 +2018,22 @@ impl JitCompiler {
             | IrInstruction::StoreMemory { address, .. }
             | IrInstruction::StoreMemory8 { address, .. }
             | IrInstruction::StoreImmediate { address, .. } => !address.rip_relative,
+            // Native Compare/Test only resolves registers, byte-register
+            // views and immediates.  A memory operand must NOT be compiled:
+            // the emitter's fallback would compare 0 and silently change the
+            // flags, so keep the whole block in the interpreter.
+            IrInstruction::Compare { lhs, rhs, .. } | IrInstruction::Test { lhs, rhs, .. } => {
+                use crate::cpu::CompareOperand;
+                let supported = |operand: &CompareOperand| {
+                    matches!(
+                        operand,
+                        CompareOperand::Register(_)
+                            | CompareOperand::Register8(_)
+                            | CompareOperand::ImmediateU64(_)
+                    )
+                };
+                supported(lhs) && supported(rhs)
+            }
             _ => true,
         }
     }
@@ -2653,10 +2669,13 @@ impl JitCompiler {
     /// block exits with `EXIT_CALL_PUSHED`: the return address is already on
     /// the guest stack, so the worker must not push it again.
     pub(super) fn emit_worker_call(&mut self, target: u64, return_address: u64, arch: GuestArch) {
+        // The guest return address occupies `pointer_bytes` on the guest
+        // stack (4 on x86-32, 8 on x64).
+        let return_width = arch.pointer_bytes() as u64;
         let arm_sp = regmap::guest_to_arm(4);
-        self.emitter.sub_imm(arm_sp, arm_sp, 8);
+        self.emitter.sub_imm(arm_sp, arm_sp, return_width as u32);
         self.emitter.mov_imm64(regmap::X25, return_address);
-        self.emit_helper_store(arm_sp, regmap::X25, 8, arch);
+        self.emit_helper_store(arm_sp, regmap::X25, return_width, arch);
 
         // Push (return_address, compiled return entry) onto the chain stack.
         // x9 is a scratch here (guest RBP was already spilled by the store
@@ -2712,8 +2731,12 @@ impl JitCompiler {
     /// statically pushed prediction.  A miss returns `EXIT_RET_RESOLVED` so
     /// the worker can resolve the dynamic target and continue.
     pub(super) fn emit_worker_return(&mut self, stack_adjust: u64, arch: GuestArch) {
+        // The return address on the guest stack is `pointer_bytes` wide
+        // (4 on x86-32); loading 8 bytes would fold in the next stack slot
+        // and make the predicted-return comparison see a garbage address.
+        let return_width = arch.pointer_bytes() as u64;
         let arm_sp = regmap::guest_to_arm(4);
-        self.emit_helper_load(regmap::X9, arm_sp, 8, arch);
+        self.emit_helper_load(regmap::X9, arm_sp, return_width, arch);
         let slot = match arch {
             GuestArch::X86 => 4,
             GuestArch::X64 => 8,
@@ -3003,6 +3026,15 @@ impl JitCompiler {
         _rip: u64,
         arch: GuestArch,
     ) {
+        // Accumulate into a scratch register, never directly into `dst_reg`:
+        // `lea edi, [edi+0x38]` (destination == base) otherwise overwrites
+        // the base with the displacement before adding it, yielding
+        // 0x38+0x38 instead of edi+0x38.  Steam's CRT calls
+        // `lea edi,[edi+0x38]` in its critical-section array initializer.
+        // X26/X27 are not guest registers (guest GPRs live in x4..x20).
+        let accum = regmap::X27;
+        let scaled = regmap::X26;
+
         // Handle segment prefix: if the operand has a segment, call
         // jit_helper_segment_base to get the segment base (FS=TEB address)
         // and start the effective address from there.
@@ -3015,48 +3047,55 @@ impl JitCompiler {
             // Absolute address (MOFFS): may still need segment base added.
             if let Some(sc) = seg_code {
                 // segment_base + absolute_address
-                self.emit_segment_base(dst_reg, sc, arch);
-                self.emitter.mov_imm64(27, abs);
-                self.emitter.add_reg(dst_reg, dst_reg, 27);
+                self.emit_segment_base(accum, sc, arch);
+                self.emitter.mov_imm64(scaled, abs);
+                self.emitter.add_reg(accum, accum, scaled);
             } else {
-                self.emitter.mov_imm64(dst_reg, abs);
+                self.emitter.mov_imm64(accum, abs);
+            }
+            self.emitter.mov_reg(dst_reg, accum);
+            if arch == GuestArch::X86 {
+                // x86-32 effective addresses are 32-bit; a guest register may
+                // hold a sign-extended value (e.g. a negative memcpy offset),
+                // so truncate instead of propagating the high 32 bits.
+                self.emitter.uxtw_reg(dst_reg, dst_reg);
             }
             return;
         }
         // If segmented, start from the segment base.
         if let Some(sc) = seg_code {
-            self.emit_segment_base(dst_reg, sc, arch);
+            self.emit_segment_base(accum, sc, arch);
         } else {
             // Start with displacement.
             let disp = operand.displacement as i64;
-            self.emitter.mov_imm64(dst_reg, disp as u64);
+            self.emitter.mov_imm64(accum, disp as u64);
         }
         if let Some(base) = operand.base {
             let arm_base = regmap::guest_to_arm(base.index());
-            self.emitter.add_reg(dst_reg, dst_reg, arm_base);
+            self.emitter.add_reg(accum, accum, arm_base);
         }
         if let Some(index) = operand.index {
             let arm_index = regmap::guest_to_arm(index.index());
             match operand.scale {
                 0 | 1 => {
-                    self.emitter.add_reg(dst_reg, dst_reg, arm_index);
+                    self.emitter.add_reg(accum, accum, arm_index);
                 }
                 2 => {
-                    self.emitter.lsl_imm(27, arm_index, 1);
-                    self.emitter.add_reg(dst_reg, dst_reg, 27);
+                    self.emitter.lsl_imm(scaled, arm_index, 1);
+                    self.emitter.add_reg(accum, accum, scaled);
                 }
                 4 => {
-                    self.emitter.lsl_imm(27, arm_index, 2);
-                    self.emitter.add_reg(dst_reg, dst_reg, 27);
+                    self.emitter.lsl_imm(scaled, arm_index, 2);
+                    self.emitter.add_reg(accum, accum, scaled);
                 }
                 8 => {
-                    self.emitter.lsl_imm(27, arm_index, 3);
-                    self.emitter.add_reg(dst_reg, dst_reg, 27);
+                    self.emitter.lsl_imm(scaled, arm_index, 3);
+                    self.emitter.add_reg(accum, accum, scaled);
                 }
                 _ => {
-                    self.emitter.mov_imm64(27, operand.scale as u64);
-                    self.emitter.mul_reg(27, arm_index, 27);
-                    self.emitter.add_reg(dst_reg, dst_reg, 27);
+                    self.emitter.mov_imm64(scaled, operand.scale as u64);
+                    self.emitter.mul_reg(scaled, arm_index, scaled);
+                    self.emitter.add_reg(accum, accum, scaled);
                 }
             }
         }
@@ -3064,6 +3103,14 @@ impl JitCompiler {
             // Can't compute rip-relative at IR level; emit a placeholder.
             // (Blocks with rip_relative memory should have been rejected by
             // can_compile_instruction if they also have other issues.)
+        }
+        self.emitter.mov_reg(dst_reg, accum);
+        if arch == GuestArch::X86 {
+            // x86-32 base+index+disp wraps modulo 2^32.  Steam's CRT copies
+            // an environment string with `mov al,[esi+edi]` where ESI is a
+            // negative offset (0xfffffd24); without truncation the address
+            // becomes 0x1_73001e7c instead of 0x73001e7c.
+            self.emitter.uxtw_reg(dst_reg, dst_reg);
         }
     }
 
@@ -3204,6 +3251,23 @@ impl JitCompiler {
             crate::cpu::CompareOperand::Register(r) => {
                 self.emitter.mov_reg(25, regmap::guest_to_arm(r.index()));
             }
+            crate::cpu::CompareOperand::Register8(r) => {
+                // Byte registers are views of the containing GPR.  AL/CL/...
+                // live in bits 0..7; AH/CH/DH/BH live in bits 8..15.  The
+                // width mask in jit_helper_set_flags then selects the low 8
+                // bits, so high-byte views must be shifted down first.
+                self.emitter
+                    .mov_reg(25, regmap::guest_to_arm(r.full_register().index()));
+                if matches!(
+                    r,
+                    crate::cpu::ByteRegister::Ah
+                        | crate::cpu::ByteRegister::Ch
+                        | crate::cpu::ByteRegister::Dh
+                        | crate::cpu::ByteRegister::Bh
+                ) {
+                    self.emitter.lsr_imm(25, 25, 8);
+                }
+            }
             crate::cpu::CompareOperand::ImmediateU64(v) => {
                 self.emitter.mov_imm64(25, *v);
             }
@@ -3214,6 +3278,19 @@ impl JitCompiler {
         match rhs {
             crate::cpu::CompareOperand::Register(r) => {
                 self.emitter.mov_reg(26, regmap::guest_to_arm(r.index()));
+            }
+            crate::cpu::CompareOperand::Register8(r) => {
+                self.emitter
+                    .mov_reg(26, regmap::guest_to_arm(r.full_register().index()));
+                if matches!(
+                    r,
+                    crate::cpu::ByteRegister::Ah
+                        | crate::cpu::ByteRegister::Ch
+                        | crate::cpu::ByteRegister::Dh
+                        | crate::cpu::ByteRegister::Bh
+                ) {
+                    self.emitter.lsr_imm(26, 26, 8);
+                }
             }
             crate::cpu::CompareOperand::ImmediateU64(v) => {
                 self.emitter.mov_imm64(26, *v);
@@ -3418,23 +3495,31 @@ impl JitCompiler {
             }
 
             IrInstruction::PushReg { src } => {
-                // Push via helper (safe MemoryImage access): store [rsp-8] = src, rsp -= 8.
+                // Push via helper (safe MemoryImage access): store
+                // [rsp - pointer_bytes] = src, rsp -= pointer_bytes.  The
+                // width MUST follow the guest architecture: x86-32 pushes
+                // are 4 bytes.  Hardcoding 8 shifts every subsequent
+                // [ebp+N] slot by four bytes, which corrupts x86 frames
+                // (Steam's bootstrapper delay-load resolver read its
+                // argument as a code pointer and faulted).
+                let width = arch.pointer_bytes() as u64;
                 let arm_src = regmap::guest_to_arm(src.index());
                 let arm_sp = regmap::guest_to_arm(4); // RSP is at index 4
-                // Compute addr = rsp - 8 into X21, then rsp -= 8.
-                self.emitter.sub_imm(regmap::X21, arm_sp, 8);
-                self.emitter.sub_imm(arm_sp, arm_sp, 8);
+                // Compute addr = rsp - width into X21, then rsp -= width.
+                self.emitter.sub_imm(regmap::X21, arm_sp, width as u32);
+                self.emitter.sub_imm(arm_sp, arm_sp, width as u32);
                 // jit_helper_store(state=x0, memory=x2, addr=X21, val=arm_src,
-                // width=8); a fault exits the block via EXIT_GUEST_FAULT.
-                self.emit_helper_store(regmap::X21, arm_src, 8, arch);
+                // width=width); a fault exits the block via EXIT_GUEST_FAULT.
+                self.emit_helper_store(regmap::X21, arm_src, width, arch);
             }
 
             IrInstruction::PopReg { dst } => {
-                // Pop via helper: dst = load(rsp), rsp += 8.
+                // Pop via helper: dst = load(rsp), rsp += pointer_bytes.
+                let width = arch.pointer_bytes() as u64;
                 let arm_dst = regmap::guest_to_arm(dst.index());
                 let arm_sp = regmap::guest_to_arm(4);
-                self.emit_helper_load(arm_dst, arm_sp, 8, arch);
-                self.emitter.add_imm(arm_sp, arm_sp, 8);
+                self.emit_helper_load(arm_dst, arm_sp, width, arch);
+                self.emitter.add_imm(arm_sp, arm_sp, width as u32);
             }
 
             IrInstruction::PushImm { value, width } => {
@@ -3510,12 +3595,14 @@ impl JitCompiler {
             }
 
             IrInstruction::Leave => {
-                // leave = mov rsp, rbp; pop rbp
+                // leave = mov rsp, rbp; pop rbp.  The saved RBP slot is
+                // pointer-sized (4 on x86-32).
+                let width = arch.pointer_bytes() as u64;
                 let arm_sp = regmap::guest_to_arm(4);
                 let arm_bp = regmap::guest_to_arm(5);
                 self.emitter.mov_reg(arm_sp, arm_bp);
-                self.emit_helper_load(arm_bp, arm_sp, 8, arch);
-                self.emitter.add_imm(arm_sp, arm_sp, 8);
+                self.emit_helper_load(arm_bp, arm_sp, width, arch);
+                self.emitter.add_imm(arm_sp, arm_sp, width as u32);
             }
 
             IrInstruction::Return { stack_adjust } => {
@@ -3616,10 +3703,16 @@ impl JitCompiler {
                         // returns EXIT_THUNK to the dispatcher.
                         JIT_THUNK_DIRECT_CALLS.fetch_add(1, Ordering::Relaxed);
                         // ── Push return_address onto guest stack ──
+                        // x86-32 return addresses occupy 4 bytes, not 8.
+                        let return_width = arch.pointer_bytes() as u64;
                         let arm_sp = regmap::guest_to_arm(4);
-                        self.emitter.sub_imm(arm_sp, arm_sp, 8);
+                        self.emitter.sub_imm(arm_sp, arm_sp, return_width as u32);
                         self.emitter.mov_imm64(regmap::X21, *return_address);
-                        self.emitter.str64_reg(regmap::X21, 1, arm_sp);
+                        if return_width == 4 {
+                            self.emitter.str32_reg(regmap::X21, 1, arm_sp);
+                        } else {
+                            self.emitter.str64_reg(regmap::X21, 1, arm_sp);
+                        }
 
                         // ── Save JIT entry context in callee-saved regs ──
                         // x0 = CpuState ptr, x1 = mem_base, x2 = MemoryImage

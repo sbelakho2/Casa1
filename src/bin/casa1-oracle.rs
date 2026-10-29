@@ -26,6 +26,7 @@ use casa1::pe_inventory;
 use casa1::windows_oracle::{
     self, ComparisonReport, ReferenceResultsFile, VectorFile, WINDOWS_ORACLE_SCHEMA_VERSION,
 };
+use casa1::winmd_inventory;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -108,13 +109,19 @@ enum OracleCommand {
         #[arg(long)]
         categories: Option<String>,
     },
-    /// Inventory the exports/imports of a real-application PE corpus and
-    /// diff them against Casa1's API registry.  Emits deterministic JSON
-    /// plus a human summary on stderr.
+    /// Inventory a real-application PE corpus or a real WinMD metadata
+    /// directory/file and diff it against Casa1's API registry.  Emits
+    /// deterministic JSON plus a human summary on stderr.
     Inventory {
-        /// Directory tree containing real Windows PE32/PE32+ files.
+        /// Directory tree containing real Windows PE32/PE32+ files.  Mutually
+        /// exclusive with `--winmd`.
         #[arg(long)]
-        pe_dir: PathBuf,
+        pe_dir: Option<PathBuf>,
+        /// WinMD file or directory tree containing `.winmd` metadata.  The
+        /// metadata universe (functions, interfaces, methods) is diffed
+        /// against the registry.  Mutually exclusive with `--pe-dir`.
+        #[arg(long)]
+        winmd: Option<PathBuf>,
         /// Destination path for the deterministic inventory JSON.
         #[arg(long)]
         out: PathBuf,
@@ -179,19 +186,47 @@ fn main() {
         write_api_report(out, *gate);
         return;
     }
-    if let OracleCommand::Inventory { pe_dir, out } = &cli.command {
-        let database = ApiDatabase::from_thunk_metadata();
-        match pe_inventory::build_report(pe_dir, &database).and_then(|report| {
-            pe_inventory::write_report(&report, out)?;
-            Ok(report)
-        }) {
-            Ok(report) => {
-                eprintln!("{}", report.human_summary);
-                eprintln!("wrote {}", out.display());
+    if let OracleCommand::Inventory { pe_dir, winmd, out } = &cli.command {
+        match (pe_dir, winmd) {
+            (Some(pe_dir), None) => {
+                let database = ApiDatabase::from_thunk_metadata();
+                match pe_inventory::build_report(pe_dir, &database).and_then(|report| {
+                    pe_inventory::write_report(&report, out)?;
+                    Ok(report)
+                }) {
+                    Ok(report) => {
+                        eprintln!("{}", report.human_summary);
+                        eprintln!("wrote {}", out.display());
+                    }
+                    Err(error) => {
+                        eprintln!("inventory failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
             }
-            Err(error) => {
-                eprintln!("inventory failed: {error}");
-                std::process::exit(1);
+            (None, Some(winmd)) => {
+                let database = ApiDatabase::from_thunk_metadata();
+                match winmd_inventory::build_report(winmd, &database).and_then(|report| {
+                    winmd_inventory::write_report(&report, out)?;
+                    Ok(report)
+                }) {
+                    Ok(report) => {
+                        eprintln!("{}", report.human_summary);
+                        eprintln!("wrote {}", out.display());
+                    }
+                    Err(error) => {
+                        eprintln!("inventory failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            (Some(_), Some(_)) => {
+                eprintln!("inventory: --pe-dir and --winmd are mutually exclusive");
+                std::process::exit(2);
+            }
+            (None, None) => {
+                eprintln!("inventory: one of --pe-dir or --winmd is required");
+                std::process::exit(2);
             }
         }
         return;

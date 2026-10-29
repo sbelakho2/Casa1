@@ -3229,3 +3229,115 @@ fn hot_path_loads_persisted_aot_record_without_recompiling() {
     assert_eq!(reader.blocks_compiled, 0, "an AOT hit does not recompile");
     assert_eq!(reader.tier0_compiles, 0);
 }
+
+// ── x86-32 pointer-width stack operations and LEA aliasing ──────────────
+
+#[test]
+fn x86_push_pop_width_mismatch_never_consumes_eight_bytes() {
+    assert!(
+        jit_execution_available(),
+        "this test requires a working executable-memory mechanism"
+    );
+    let mut runtime = JitRuntime::new(GuestArch::X86);
+    let mut memory = MemoryImage::default();
+    let stack = 0x7010_0000u64;
+    memory.map_bytes(stack & !0xfff, &vec![0u8; 0x2000]);
+    runtime.attach_guest_memory(&mut memory);
+
+    runtime
+        .get_or_compile(
+            &[IrInstruction::PushReg { src: Register::Rbx }],
+            0xB100,
+            GuestArch::X86,
+            None,
+        )
+        .expect("compile x86 push");
+    let mut state = CpuState::new(GuestArch::X86);
+    state.set(Register::Rsp, stack + 0x100);
+    state.set(Register::Rbx, 0xDEAD_BEEF);
+    let reason = execute_cached(&mut runtime, 0xB100, &mut state, &mut memory);
+    assert_eq!(
+        reason,
+        JitExitReason::Normal { new_rip: state.rip },
+        "push block must end normally"
+    );
+    assert_eq!(
+        state.get(Register::Rsp),
+        stack + 0x100 - 4,
+        "an x86-32 push must consume exactly 4 bytes, never 8"
+    );
+    assert_eq!(
+        memory.read_u32(stack + 0x100 - 4).expect("pushed slot"),
+        0xDEAD_BEEF
+    );
+
+    runtime
+        .get_or_compile(
+            &[IrInstruction::PopReg { dst: Register::Rcx }],
+            0xB200,
+            GuestArch::X86,
+            None,
+        )
+        .expect("compile x86 pop");
+    let reason = execute_cached(&mut runtime, 0xB200, &mut state, &mut memory);
+    assert_eq!(
+        reason,
+        JitExitReason::Normal { new_rip: state.rip },
+        "pop block must end normally"
+    );
+    assert_eq!(
+        state.get(Register::Rsp),
+        stack + 0x100,
+        "an x86-32 pop must restore exactly 4 bytes"
+    );
+    assert_eq!(state.get(Register::Rcx), 0xDEAD_BEEF);
+}
+
+#[test]
+fn x86_lea_destination_base_overlap_keeps_base() {
+    assert!(
+        jit_execution_available(),
+        "this test requires a working executable-memory mechanism"
+    );
+    let mut runtime = JitRuntime::new(GuestArch::X86);
+    let mut memory = MemoryImage::default();
+    let page = 0x7020_0000u64;
+    memory.map_bytes(page, &vec![0u8; 0x1000]);
+    runtime.attach_guest_memory(&mut memory);
+    let address = crate::cpu::MemoryOperand {
+        base: Some(Register::Rdi),
+        index: None,
+        scale: 1,
+        displacement: 0x38,
+        rip_relative: false,
+        rip_base: 0,
+        segment: None,
+        address_size_32: true,
+        absolute_address: None,
+    };
+    runtime
+        .get_or_compile(
+            &[IrInstruction::LoadEffectiveAddress {
+                dst: Register::Rdi,
+                address,
+                width: 4,
+            }],
+            0xB300,
+            GuestArch::X86,
+            None,
+        )
+        .expect("compile x86 lea");
+    let mut state = CpuState::new(GuestArch::X86);
+    state.set(Register::Rdi, 0x7020_0100);
+    let reason = execute_cached(&mut runtime, 0xB300, &mut state, &mut memory);
+    assert_eq!(
+        reason,
+        JitExitReason::Normal { new_rip: state.rip },
+        "lea block must end normally"
+    );
+    assert_eq!(
+        state.get(Register::Rdi),
+        0x7020_0138,
+        "lea edi,[edi+0x38] must add the original base, not 0x38+0x38"
+    );
+}

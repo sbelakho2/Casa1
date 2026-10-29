@@ -3730,7 +3730,7 @@ impl JitRuntime {
         // SAFETY: the write-protect toggle only affects this thread's view of
         // MAP_JIT pages; enabling execute state is required before jumping
         // into a block compiled on possibly another thread.
-        let reason = unsafe {
+        let (reason, final_address) = unsafe {
             self.compiler.memory_manager.prepare_execution();
             let entry_fn: unsafe extern "C" fn(
                 *mut CpuState,
@@ -3760,8 +3760,23 @@ impl JitRuntime {
             // x0 carries the exit code for every native exit arm; the optional
             // dynamic payload (indirect target / target pointer) is written by
             // the compiled block into exec_slot[2].
-            map_exit_reason(result, state, result, exit_info, (*exit_ptr).payload)
+            (
+                map_exit_reason(result, state, result, exit_info, (*exit_ptr).payload),
+                final_address,
+            )
         };
+        // Conditional exits do not carry their successor addresses in the
+        // exit reason.  Publish the block that actually exited so the
+        // dispatcher can recover its `JumpIf` metadata (a chained execution
+        // may have entered a different block than the dispatched one).
+        if matches!(
+            reason,
+            JitExitReason::ConditionalBranch { .. }
+                | JitExitReason::ConditionalTaken { .. }
+                | JitExitReason::ConditionalNotTaken { .. }
+        ) {
+            state.rip = final_address;
+        }
         // A budget/epoch guard stops BEFORE the block body runs.  Re-dispatch
         // exactly that block; never re-run the chain's already-executed
         // prefix.

@@ -305,7 +305,17 @@ impl VirtualMemory {
     /// first).
     pub fn commit(&mut self, base: u64, size: u64, protection: VmProtection, guard: bool) {
         let start = base & VM_PAGE_MASK;
-        let end = start.saturating_add(align_up(size.max(1), VM_PAGE_SIZE));
+        // Cover the half-open byte range [base, base + size), NOT
+        // [page_floor(base), page_floor(base) + page_ceil(size)): a range
+        // that starts mid-page and crosses into the next page must commit
+        // that next page too.  Steam's CRT calls calloc(0x40, 0x38), whose
+        // 0xE10-byte block starts at 0x73000840 and spills into page
+        // 0x73001000; under the old arithmetic that page was left
+        // uncommitted and the guest's first write faulted.
+        let end = base
+            .saturating_add(size.max(1))
+            .saturating_add(VM_PAGE_SIZE - 1)
+            & VM_PAGE_MASK;
         let mut page = start;
         while page < end {
             if let Some(region) = self.region_containing_mut(page) {
@@ -326,7 +336,13 @@ impl VirtualMemory {
     /// (absent from their region) while the reservation itself is kept.
     pub fn decommit(&mut self, base: u64, size: u64) {
         let start = base & VM_PAGE_MASK;
-        let end = start.saturating_add(align_up(size.max(1), VM_PAGE_SIZE));
+        // Symmetric with `commit`: decommit the half-open range
+        // [base, base + size), including the page a mid-page range spills
+        // into.
+        let end = base
+            .saturating_add(size.max(1))
+            .saturating_add(VM_PAGE_SIZE - 1)
+            & VM_PAGE_MASK;
         let mut page = start;
         while page < end {
             if let Some(region) = self.region_containing_mut(page) {
@@ -622,6 +638,45 @@ mod tests {
         assert_eq!(tail.state, VmState::Reserved);
         assert_eq!(tail.region_size, 0x1000);
         assert_eq!(tail.protection, VmProtection::NONE);
+    }
+
+    #[test]
+    fn commit_boundary_mid_page_range_covers_spill_page() {
+        // Regression: a byte range that starts mid-page and crosses into the
+        // next page must cover BOTH pages.  Steam's CRT calloc(0x40, 0x38)
+        // returns a 0xE10-byte block that can start at 0x...840; the old
+        // arithmetic committed only the first page, so the guest's first
+        // write past the page boundary faulted as "unmapped guest memory".
+        let mut vm = VirtualMemory::new(0x7400_0000);
+        let base = vm.reserve(Some(0x7400_0000), 0x3000);
+        assert_eq!(base, 0x7400_0000);
+
+        let block = base + 0x840;
+        let size = 0xE10;
+        vm.commit(block, size, VmProtection::READ_WRITE, false);
+        assert_eq!(vm.query(base).state, VmState::Committed);
+        assert_eq!(
+            vm.query(base + 0x1000).state,
+            VmState::Committed,
+            "the page the mid-page range spills into must be committed"
+        );
+        assert!(
+            vm.check_access(base + 0x164f, true, false).is_ok(),
+            "a write at the last byte of the spill page must be allowed"
+        );
+        assert_eq!(vm.query(base + 0x2000).state, VmState::Reserved);
+
+        vm.decommit(block, size);
+        assert_eq!(
+            vm.query(base).state,
+            VmState::Reserved,
+            "the first page must be decommitted"
+        );
+        assert_eq!(
+            vm.query(base + 0x1000).state,
+            VmState::Reserved,
+            "the spill page must be decommitted too"
+        );
     }
 
     #[test]

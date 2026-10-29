@@ -290,34 +290,67 @@ impl CpuExecutionEngine {
                     crate::jit::JitExitReason::Jump { target } => {
                         state.rip = target;
                     }
-                    crate::jit::JitExitReason::ConditionalBranch { taken, .. } => match ir.last() {
-                        Some(IrInstruction::JumpIf {
-                            target,
-                            fallthrough,
-                            ..
-                        }) => {
-                            state.rip = if taken { *target } else { *fallthrough };
-                        }
-                        _ => {
-                            return Err(AppError::new(
-                                ReasonCode::RcUnimplInsn,
-                                "JIT conditional exit without a JumpIf terminator",
-                            ));
-                        }
-                    },
-                    crate::jit::JitExitReason::ConditionalTaken { .. }
-                    | crate::jit::JitExitReason::ConditionalNotTaken { .. } => {
-                        let taken =
-                            matches!(&reason, crate::jit::JitExitReason::ConditionalTaken { .. });
-                        match ir.last() {
+                    crate::jit::JitExitReason::ConditionalBranch { taken, .. } => {
+                        let branch = match ir.last() {
                             Some(IrInstruction::JumpIf {
                                 target,
                                 fallthrough,
                                 ..
-                            }) => {
-                                state.rip = if taken { *target } else { *fallthrough };
+                            }) => Some((*target, *fallthrough)),
+                            // The exit may come from a block reached through JIT
+                            // chaining, in which case `ir` is the *entry* block's IR
+                            // and its last instruction is an unconditional jump.  The
+                            // chained executor sets `state.rip` to the block that
+                            // actually exited, so recover that block's Jcc metadata.
+                            _ => jit.block_cache.get(&state.rip).and_then(|block| {
+                                match block.last_exit_info {
+                                    Some(crate::jit::BlockExitInfo::JumpIf {
+                                        target,
+                                        fallthrough,
+                                        ..
+                                    }) => Some((target, fallthrough)),
+                                    _ => None,
+                                }
+                            }),
+                        };
+                        match branch {
+                            Some((target, fallthrough)) => {
+                                state.rip = if taken { target } else { fallthrough };
                             }
-                            _ => {
+                            None => {
+                                return Err(AppError::new(
+                                    ReasonCode::RcUnimplInsn,
+                                    "JIT conditional exit without a JumpIf terminator",
+                                ));
+                            }
+                        }
+                    }
+                    crate::jit::JitExitReason::ConditionalTaken { .. }
+                    | crate::jit::JitExitReason::ConditionalNotTaken { .. } => {
+                        let taken =
+                            matches!(&reason, crate::jit::JitExitReason::ConditionalTaken { .. });
+                        let branch = match ir.last() {
+                            Some(IrInstruction::JumpIf {
+                                target,
+                                fallthrough,
+                                ..
+                            }) => Some((*target, *fallthrough)),
+                            _ => jit.block_cache.get(&state.rip).and_then(|block| {
+                                match block.last_exit_info {
+                                    Some(crate::jit::BlockExitInfo::JumpIf {
+                                        target,
+                                        fallthrough,
+                                        ..
+                                    }) => Some((target, fallthrough)),
+                                    _ => None,
+                                }
+                            }),
+                        };
+                        match branch {
+                            Some((target, fallthrough)) => {
+                                state.rip = if taken { target } else { fallthrough };
+                            }
+                            None => {
                                 return Err(AppError::new(
                                     ReasonCode::RcUnimplInsn,
                                     "JIT conditional exit without a JumpIf terminator",

@@ -1014,6 +1014,12 @@
  "builtin_chrome_never_publishes_until_a_real_guest_blit_lands": [
   "(runtime.real_guest_frames, 0)"
  ],
+ "c7_slash0_is_mov_imm32_and_f8_is_xbegin_exactly": [
+  "(decoded.len(), 1)",
+  "(decoded[0].opcode, DecodedOpcode::MovImm)",
+  "( decoded[0].operands, vec![ Operand::Register(Register::Rbx), Operand::ImmediateU64(0x1234_5678) ] )",
+  "(decoded[0].opcode, DecodedOpcode::Xbegin)"
+ ],
  "cache_eviction_boundary_rejects_stale_entries_at_capacity": [
   "(cache.len(), MAX_CACHE_ENTRIES - 1)",
   "( cache.len(), MAX_CACHE_ENTRIES - 1, \"a cache below capacity must not be evicted\" )",
@@ -1649,6 +1655,14 @@
   "( manager.commit(base, 4 * PAGE_SIZE, Protection::READWRITE), Err(STATUS_INVALID_ADDRESS) )",
   "( manager.commit(base, PAGE_SIZE, Protection::READWRITE), Ok(()) )",
   "( manager.commit(base, PAGE_SIZE, Protection::READWRITE), Err(STATUS_ALREADY_COMMITTED) )"
+ ],
+ "commit_boundary_mid_page_range_covers_spill_page": [
+  "(base, 0x7400_0000)",
+  "(vm.query(base).state, VmState::Committed)",
+  "( vm.query(base + 0x1000).state, VmState::Committed, \"the page the mid-page range spills into must be committed\" )",
+  "(vm.query(base + 0x2000).state, VmState::Reserved)",
+  "( vm.query(base).state, VmState::Reserved, \"the first page must be decommitted\" )",
+  "( vm.query(base + 0x1000).state, VmState::Reserved, \"the spill page must be decommitted too\" )"
  ],
  "commit_limit_exhaustion_is_atomic": [
   "( manager.commit(base, 2 * PAGE_SIZE, Protection::READWRITE), Err(STATUS_COMMITMENT_LIMIT) )",
@@ -15796,10 +15810,47 @@
  "win_verify_trust_rejects_non_file_union_choice": [
   "(result, 0x800B_0003)"
  ],
+ "windowed_present_double_stop_and_close_are_idempotent": [
+  "(control.request_stop(), true)",
+  "(control.request_stop(), false)",
+  "(control.request_window_close(), true)",
+  "(control.request_window_close(), false)"
+ ],
+ "windowed_present_handler_missing_times_out_with_exact_reason": [
+  "(control.submitted, 2)",
+  "(control.settled, WINDOWED_SETTLE_TICKS)",
+  "(control.decide(), WindowTickDecision::Stop)",
+  "( TimingUnavailable::PresentHandlerNeverFired.reason(), \"CAMetalLayer drawable presented handler never fired before the NSApplication \\ run loop stopped; no display presentation was observed\" )",
+  "( summary.present_unavailable, Some(TimingUnavailable::PresentHandlerNeverFired) )",
+  "(summary.present_sample_count, 0)"
+ ],
+ "windowed_present_missing_display_fallback_never_fabricates_present": [
+  "(summary.present_sample_count, 0)",
+  "(summary.input_to_present, None)",
+  "( summary.present_unavailable, Some(TimingUnavailable::NoDisplaySession) )",
+  "( summary.input_to_present_unavailable, Some(TimingUnavailable::NoDisplaySession) )"
+ ],
  "windowed_present_missing_display_session_reports_exact_reason": [
   "( summary.present_unavailable, Some(TimingUnavailable::NoDisplaySession) )",
   "( summary.to_json_metrics()[\"input_to_present_p50_us\"][\"reason\"], serde_json::Value::String(TimingUnavailable::NoDisplaySession.reason().to_string()) )",
   "( TimingUnavailable::NoDisplaySession.reason(), \"no macOS window-server display session is available; a windowed CAMetalLayer cannot present and presentedTime is unavailable\" )"
+ ],
+ "windowed_present_no_run_loop_unavailable_reason_is_exact": [
+  "( TimingUnavailable::NoAppRunLoop.reason(), \"the macOS NSApplication run loop could not be started; windowed presentation \\ timestamps cannot be observed\" )"
+ ],
+ "windowed_present_stop_before_first_frame_aborts_without_submit": [
+  "(control.decide(), WindowTickDecision::Submit)",
+  "(control.decide(), WindowTickDecision::Stop)",
+  "(control.submitted, 0)"
+ ],
+ "windowed_present_timer_invalidated_once_on_error": [
+  "(control.request_timer_invalidation(), true)",
+  "(control.request_timer_invalidation(), false)",
+  "(control.request_stop(), true)",
+  "(control.request_stop(), false)"
+ ],
+ "windowed_present_zero_frames_rejects_with_exact_error": [
+  "( measure_gpu_present_windowed(0).expect_err(\"zero frames must be rejected\"), \"GPU present measurement needs at least one frame\" )"
  ],
  "windows_kernel_shim_irp_queue": [
   "(shim.irp_queue.len(), 2)",
@@ -15837,6 +15888,71 @@
   "( runtime.last_error, 12003, \"ERROR_INTERNET_OPERATION_CANCELLED\" )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, put_file, &[0x1234, 0, file as u32, 0] ), 0, \"FtpPutFileW fails without a control connection\" )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, find_first, &[0x1234, file as u32, 0, 0] ), 0, \"FtpFindFirstFileW fails without a control connection\" )"
+ ],
+ "winmd_cli_rejects_missing_and_conflicting_inventory_inputs": [
+  "(missing.status.code(), Some(1))",
+  "( String::from_utf8_lossy(&missing.stderr).contains(\"RC_FS_NOT_FOUND\"), true )",
+  "(out.exists(), false)",
+  "(conflict.status.code(), Some(2))",
+  "( String::from_utf8_lossy(&conflict.stderr).trim(), \"inventory: --pe-dir and --winmd are mutually exclusive\" )",
+  "(neither.status.code(), Some(2))"
+ ],
+ "winmd_diff_reports_missing_modules_interfaces_and_extra_registry_rows": [
+  "(diff.summary.metadata_function_count, 2)",
+  "(diff.summary.modeled_function_count, 1)",
+  "(diff.summary.missing_function_count, 1)",
+  "(diff.missing_exports.len(), 1)",
+  "(diff.missing_exports[0].export, \"Nope\")",
+  "(diff.missing_exports[0].module, \"notreal.dll\")"
+ ],
+ "winmd_directory_records_malformed_file_without_aborting": [
+  "(universe.winmd_file_count, 2)",
+  "(universe.files.len(), 1)",
+  "(universe.errors.len(), 1)",
+  "(universe.errors[0].path, \"bad.winmd\")",
+  "(universe.errors[0].reason_code, 2000)",
+  "(universe.errors[0].reason_name, \"RC_PE_PARSE_INVALID\")"
+ ],
+ "winmd_duplicate_types_and_functions_collapse_deterministically": [
+  "(universe.winmd_file_count, 2)",
+  "(universe.type_count, 1)",
+  "(universe.duplicate_type_count, 1)",
+  "(universe.function_count, 1)",
+  "(universe.functions[0].export, \"CreateFileW\")",
+  "(universe.modules.len(), 1)"
+ ],
+ "winmd_empty_directory_rejects_phantom_coverage": [
+  "(universe.winmd_file_count, 0)",
+  "(universe.type_count, 0)",
+  "(universe.function_count, 0)",
+  "(universe.interface_count, 0)",
+  "(universe.errors.len(), 0)",
+  "(universe.metadata_fingerprint, util::sha256_bytes(b\"\"))"
+ ],
+ "winmd_inventory_rejects_malformed_and_truncated_metadata_exactly": [
+  "( winmd_bytes(&[0u8]) .expect_err(\"one byte is not a PE\") .message, \"invalid DOS signature\" )"
+ ],
+ "winmd_missing_type_tables_yield_empty_universe_without_phantom_coverage": [
+  "(parsed.assembly.as_deref(), Some(\"Fixture.Winmd\"))",
+  "(parsed.types.len(), 0)",
+  "(parsed.functions.len(), 0)",
+  "(universe.type_count, 0)",
+  "(universe.function_count, 0)",
+  "(universe.interface_count, 0)"
+ ],
+ "winmd_report_has_no_mismatch_across_two_runs": [
+  "( serde_json::to_string(&first).expect(\"encode first\"), serde_json::to_string(&second).expect(\"encode second\") )",
+  "( first.universe.metadata_fingerprint, second.universe.metadata_fingerprint )",
+  "(first.universe.winmd_file_count, 1)",
+  "( first.universe.files[0].sha256, util::sha256_bytes(&built.bytes) )",
+  "( first.diff.summary.metadata_function_count, second.diff.summary.metadata_function_count )"
+ ],
+ "winmd_unknown_signature_blobs_do_not_corrupt_method_names": [
+  "(parsed.types.len(), 1)",
+  "(parsed.types[0].methods, vec![\"WeirdSignature\".to_string()])",
+  "(parsed.functions.len(), 1)",
+  "(parsed.functions[0].export, \"WeirdExport\")",
+  "(parsed.functions[0].method, \"WeirdSignature\")"
  ],
  "winspool_open_close_and_enum_dispatch": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, open, &[0, handle_out as u32, 0]), 1, \"OpenPrinterW(NULL name) opens the default printer\" )",
@@ -16071,6 +16187,10 @@
   "(decoded.tymed, TYMED_HGLOBAL)",
   "(fixture.runtime.com_format_etc_bytes(&format).len(), 32)"
  ],
+ "x86_effective_address_boundary_truncates_to_32_bits": [
+  "( interpreted, 0x5a, \"interpreter reads the wrapped 32-bit address\" )",
+  "( jitted, 0x5a, \"JIT must wrap [esi+edi] modulo 2^32, not fault at 0x1_73001e7c\" )"
+ ],
  "x86_extended_process_information_uses_the_real_32_bit_layout_and_rejects_invalid_unbacked_fields": [
   "(SYSTEM_PROCESS_INFORMATION_FIXED_SIZE_X86, 0xB8)",
   "(SYSTEM_THREAD_INFORMATION_SIZE_X86, 0x40)",
@@ -16086,6 +16206,26 @@
   "(parsed.evt_cleanup, 0)",
   "(parsed.evt_destroy, 0)",
   "(parsed.parent, Some(driver))"
+ ],
+ "x86_lea_destination_base_overlap_keeps_base": [
+  "( reason, JitExitReason::Normal { new_rip: state.rip }, \"lea block must end normally\" )",
+  "( state.get(Register::Rdi), 0x7020_0138, \"lea edi,[edi+0x38] must add the original base, not 0x38+0x38\" )"
+ ],
+ "x86_push_pop_width_mismatch_never_consumes_eight_bytes": [
+  "( reason, JitExitReason::Normal { new_rip: state.rip }, \"push block must end normally\" )",
+  "( state.get(Register::Rsp), stack + 0x100 - 4, \"an x86-32 push must consume exactly 4 bytes, never 8\" )",
+  "( memory.read_u32(stack + 0x100 - 4).expect(\"pushed slot\"), 0xDEAD_BEEF )",
+  "( reason, JitExitReason::Normal { new_rip: state.rip }, \"pop block must end normally\" )",
+  "( state.get(Register::Rsp), stack + 0x100, \"an x86-32 pop must restore exactly 4 bytes\" )",
+  "(state.get(Register::Rcx), 0xDEAD_BEEF)"
+ ],
+ "x86_scan_loop_boundary_length_jit_matches_interpreter": [
+  "(state.rip, 0x1000, \"the only loop entry is 0x1000\")",
+  "( state.rip, 0x1007, \"the loop must fall through after the NUL\" )",
+  "( interpreted.get(Register::Rax), 54, \"interpreter must compute len+1 = 54 for the 53-byte entry\" )",
+  "( jitted.get(Register::Rax), 54, \"JIT must compute len+1 = 54, not 34 (the Steam _setenvp truncation)\" )",
+  "(jitted.get(Register::Rcx), interpreted.get(Register::Rcx))",
+  "(jitted.get(Register::Rsi), interpreted.get(Register::Rsi))"
  ],
  "xact_bad_indices_and_engine_errors_are_genuine": [
   "(eax, u64::from(crate::xact::XACTENGINE_E_NOTINITIALIZED))",

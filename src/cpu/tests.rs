@@ -3940,3 +3940,157 @@ fn c7_slash0_is_mov_imm32_and_f8_is_xbegin_exactly() {
     assert_eq!(decoded.len(), 1);
     assert_eq!(decoded[0].opcode, DecodedOpcode::Xbegin);
 }
+
+/// Regression for the Steam CRT `_setenvp` environment scan.  The guest loop
+/// is exactly `mov al,[ecx]; inc ecx; test al,al; jne` followed by
+/// `sub ecx,esi; lea eax,[ecx+1]`.  With a 53-byte entry it must produce 54;
+/// the x86 JIT once stopped after 33 bytes because the loop's back-edge was
+/// lost when the block was compiled as a multi-block slice, so `_setenvp`
+/// allocated a 34-byte buffer and `strcpy_s` raised
+/// STATUS_INVALID_CRUNTIME_PARAMETER.
+#[test]
+fn x86_scan_loop_boundary_length_jit_matches_interpreter() {
+    let bytes = [
+        0x8a, 0x01, // mov al, byte ptr [ecx]
+        0x41, // inc ecx
+        0x84, 0xc0, // test al, al
+        0x75, 0xf9, // jne 0x1000
+        0x2b, 0xce, // sub ecx, esi
+        0x8d, 0x41, 0x01, // lea eax, [ecx + 1]
+        0xc3, // ret
+    ];
+    let run = |use_jit: bool| -> CpuState {
+        let config = CpuEngineConfig::from_profile(GuestArch::X86, "test", "test", None)
+            .expect("cpu config");
+        let engine = CpuExecutionEngine::new(config);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = 0x1000;
+        state.set(Register::Rcx, 0x8000);
+        state.set(Register::Rsi, 0x8001);
+        state.set(Register::Rsp, 0x7000_0ff0);
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &bytes);
+        memory.map_bytes(0x7000_0000, &[0; 0x1000]);
+        let mut string = vec![b'A'; 53];
+        string.push(0);
+        memory.map_bytes(0x8000, &string);
+        memory.map_bytes(0x7000_0ff0, &0xDEAD_u32.to_le_bytes());
+        crate::jit::JIT_FAULT_STORM_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut jit = if use_jit {
+            Some(crate::jit::JitRuntime::new(GuestArch::X86))
+        } else {
+            None
+        };
+        let loop_ir =
+            lower_to_ir(&decode_block(&bytes[..7], 0x1000, GuestArch::X86).expect("decode loop"))
+                .expect("lower loop");
+        if let Some(jit) = jit.as_mut() {
+            jit.get_or_compile(&loop_ir, 0x1000, GuestArch::X86, None)
+                .expect("compile loop");
+        }
+        for _ in 0..256 {
+            if state.rip == 0x1007 {
+                break;
+            }
+            assert_eq!(state.rip, 0x1000, "the only loop entry is 0x1000");
+            let decoded = decode_block(&bytes[..7], 0x1000, GuestArch::X86).expect("decode loop");
+            let ir = lower_to_ir(&decoded).expect("lower loop");
+            if use_jit {
+                engine
+                    .execute_with_jit(&mut state, &mut memory, &ir, jit.as_mut())
+                    .expect("jit exec");
+            } else {
+                execute_ir_with_hashing(&mut state, &mut memory, &ir, None, false, None)
+                    .expect("interp exec");
+            }
+        }
+        assert_eq!(
+            state.rip, 0x1007,
+            "the loop must fall through after the NUL"
+        );
+        let decoded = decode_block(&bytes[7..], 0x1007, GuestArch::X86).expect("decode tail");
+        let ir = lower_to_ir(&decoded).expect("lower tail");
+        if use_jit {
+            engine
+                .execute_with_jit(&mut state, &mut memory, &ir, jit.as_mut())
+                .expect("jit tail");
+        } else {
+            execute_ir_with_hashing(&mut state, &mut memory, &ir, None, false, None)
+                .expect("interp tail");
+        }
+        state
+    };
+
+    let interpreted = run(false);
+    let jitted = run(true);
+    assert_eq!(
+        interpreted.get(Register::Rax),
+        54,
+        "interpreter must compute len+1 = 54 for the 53-byte entry"
+    );
+    assert_eq!(
+        jitted.get(Register::Rax),
+        54,
+        "JIT must compute len+1 = 54, not 34 (the Steam _setenvp truncation)"
+    );
+    assert_eq!(jitted.get(Register::Rcx), interpreted.get(Register::Rcx));
+    assert_eq!(jitted.get(Register::Rsi), interpreted.get(Register::Rsi));
+}
+
+/// Regression for the Steam CRT environment copy.  The guest computes
+/// `mov al,[esi+edi]` with ESI holding a sign-extended negative offset
+/// (0xfffffd24) and EDI the destination pointer (0x73002158).  x86-32
+/// effective addresses wrap modulo 2^32, so the source is 0x73001e7c; the JIT
+/// once added the full 64-bit ESI and faulted at 0x1_73001e7c.
+#[test]
+fn x86_effective_address_boundary_truncates_to_32_bits() {
+    let bytes = [0x8a, 0x04, 0x3e, 0xc3]; // mov al,[esi+edi]; ret
+    let run = |use_jit: bool| -> u64 {
+        let config = CpuEngineConfig::from_profile(GuestArch::X86, "test", "test", None)
+            .expect("cpu config");
+        let engine = CpuExecutionEngine::new(config);
+        let mut state = CpuState::new(GuestArch::X86);
+        state.rip = 0x1000;
+        state.set(Register::Rsi, 0xffff_ffff_ffff_fd24);
+        state.set(Register::Rdi, 0x7300_2158);
+        state.set(Register::Rax, 0);
+        state.set(Register::Rsp, 0x7000_0ff0);
+        let mut memory = MemoryImage::default();
+        memory.map_bytes(0x1000, &bytes);
+        memory.map_bytes(0x7000_0000, &[0; 0x1000]);
+        memory.map_bytes(0x7300_0000, &[0; 0x2000]);
+        memory.map_bytes(0x7300_1e7c, &[0x5a]);
+        memory.map_bytes(0x7000_0ff0, &0xDEAD_u32.to_le_bytes());
+        crate::jit::JIT_FAULT_STORM_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut jit = if use_jit {
+            Some(crate::jit::JitRuntime::new(GuestArch::X86))
+        } else {
+            None
+        };
+        let ir = lower_to_ir(&decode_block(&bytes, 0x1000, GuestArch::X86).expect("decode"))
+            .expect("lower");
+        if let Some(jit) = jit.as_mut() {
+            jit.get_or_compile(&ir, 0x1000, GuestArch::X86, None)
+                .expect("compile");
+        }
+        if use_jit {
+            engine
+                .execute_with_jit(&mut state, &mut memory, &ir, jit.as_mut())
+                .expect("jit exec");
+        } else {
+            execute_ir_with_hashing(&mut state, &mut memory, &ir, None, false, None)
+                .expect("interp exec");
+        }
+        state.get(Register::Rax) & 0xff
+    };
+    let interpreted = run(false);
+    let jitted = run(true);
+    assert_eq!(
+        interpreted, 0x5a,
+        "interpreter reads the wrapped 32-bit address"
+    );
+    assert_eq!(
+        jitted, 0x5a,
+        "JIT must wrap [esi+edi] modulo 2^32, not fault at 0x1_73001e7c"
+    );
+}

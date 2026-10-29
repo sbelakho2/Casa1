@@ -61,6 +61,16 @@ impl PeHostRuntime {
             popped_return_address = true;
         }
         let caller_rva = return_address.saturating_sub(self.mapped_image_base);
+        // Bounded argument capture for the API history ring (the huge-copy
+        // diagnostic uses it to attribute a negative length to the API call
+        // whose return preceded it).
+        let api_args: Vec<u64> = if self.api_history_enabled && self.guest_arch == GuestArch::X86 {
+            (0..4)
+                .map(|index| guest_call_arg(state, memory, index).unwrap_or(0))
+                .collect()
+        } else {
+            Vec::new()
+        };
         if self.guest_arch == GuestArch::X86
             && matches!(caller_rva, 0x0013_d197 | 0x0013_f650 | 0x0013_f78d)
         {
@@ -29859,6 +29869,12 @@ impl PeHostRuntime {
             }
             HostThunk::UnhandledExceptionFilter => {
                 let exception_info = guest_call_arg(state, memory, 0)?;
+                // Record the guest EXCEPTION_POINTERS/stack context before the
+                // filter runs: a statically linked UCRT reports invalid
+                // parameters through its own `_invalid_parameter` and then
+                // terminates, so this is the only point where the expression/
+                // function/file/line arguments are still on the stack.
+                self.capture_unhandled_exception_context(state, memory, exception_info);
                 let installed_filter = self.unhandled_exception_filter;
                 let result = if installed_filter != 0 {
                     self.execute_guest_callback(
@@ -51352,6 +51368,25 @@ impl PeHostRuntime {
         // can clone it into the wait queue.
         if let Some(wait) = self.parked_wait.take() {
             self.park_for_wait(state, wait);
+        }
+        // Bounded API history ring (64 entries): name, caller, first four
+        // arguments, return value and GetLastError.  This is the only
+        // persistent record of the call that produced a bad length.
+        if self.api_history_enabled {
+            const API_HISTORY_CAPACITY: usize = 64;
+            if self.api_history.len() >= API_HISTORY_CAPACITY {
+                self.api_history.pop_front();
+            }
+            self.api_history.push_back(
+                json!({
+                    "name": thunk_name,
+                    "caller_rva": format!("{caller_rva:#x}"),
+                    "args": api_args.iter().map(|arg| format!("{arg:#x}")).collect::<Vec<_>>(),
+                    "ret": format!("{:#x}", state.get(Register::Rax)),
+                    "last_error": self.last_error,
+                })
+                .to_string(),
+            );
         }
         Ok(None)
     }

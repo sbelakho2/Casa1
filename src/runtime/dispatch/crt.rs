@@ -167,8 +167,29 @@ impl PeHostRuntime {
         file: u64,
         line: u32,
     ) -> AppResult<bool> {
-        if self.invalid_parameter_handler != 0 {
-            let handler = self.invalid_parameter_handler;
+        let handler = self.invalid_parameter_handler;
+        // Persist the complete invalid-parameter context BEFORE invoking the
+        // guest handler: the handler may terminate the process, and the
+        // expression/function/file/line arguments are otherwise lost.
+        let mut record = BTreeMap::new();
+        record.insert(
+            "expression_pointer".to_string(),
+            json!(format!("{expression:#x}")),
+        );
+        record.insert(
+            "expression".to_string(),
+            json!(describe_guest_string(memory, expression).unwrap_or_default()),
+        );
+        record.insert("file_pointer".to_string(), json!(format!("{file:#x}")));
+        record.insert(
+            "file".to_string(),
+            json!(describe_guest_string(memory, file).unwrap_or_default()),
+        );
+        record.insert("line".to_string(), json!(line));
+        record.insert("handler".to_string(), json!(format!("{handler:#x}")));
+        record.insert("caller_rip".to_string(), json!(format!("{:#x}", state.rip)));
+        self.push_trace("process", "InvalidParameter", record, json!(null));
+        if handler != 0 {
             let _ = self.execute_guest_callback(
                 state,
                 memory,
@@ -178,6 +199,194 @@ impl PeHostRuntime {
             )?;
         }
         Ok(true)
+    }
+
+    /// Capture the guest `EXCEPTION_POINTERS` at an unhandled exception so a
+    /// guest-side UCRT `_invalid_parameter` report is diagnosable.
+    ///
+    /// A statically linked CRT does not import `_invalid_parameter`; it calls
+    /// its own copy, then `_invoke_watson` → `UnhandledExceptionFilter` →
+    /// `TerminateProcess(STATUS_INVALID_CRUNTIME_PARAMETER)`.  At that point
+    /// the expression/function/file/line arguments are still in the caller
+    /// frames on the guest stack, so record the exception record, the x86
+    /// CONTEXT, and an EBP-chain dump with printable pointer arguments
+    /// decoded.  This is observational only: the guest still terminates.
+    pub(crate) fn capture_unhandled_exception_context(
+        &mut self,
+        state: &CpuState,
+        memory: &MemoryImage,
+        exception_info: u64,
+    ) {
+        use crate::runtime::guest_memory::read_u32;
+        if self.guest_arch != GuestArch::X86 || exception_info == 0 {
+            return;
+        }
+        let mut context = BTreeMap::new();
+        context.insert(
+            "exception_info".to_string(),
+            json!(format!("{exception_info:#x}")),
+        );
+        let record_ptr = u64::from(read_u32(memory, exception_info).unwrap_or(0));
+        if record_ptr != 0 {
+            let code = read_u32(memory, record_ptr).unwrap_or(0);
+            let flags = read_u32(memory, record_ptr + 4).unwrap_or(0);
+            let address = u64::from(read_u32(memory, record_ptr + 12).unwrap_or(0));
+            let nparams = read_u32(memory, record_ptr + 16).unwrap_or(0).min(15);
+            let mut params = Vec::new();
+            for i in 0..nparams {
+                params.push(format!(
+                    "{:#x}",
+                    read_u32(memory, record_ptr + 20 + u64::from(i) * 4).unwrap_or(0)
+                ));
+            }
+            context.insert("code".to_string(), json!(format!("{code:#x}")));
+            context.insert(
+                "code_name".to_string(),
+                json!(match code {
+                    0xC000_0417 => "STATUS_INVALID_CRUNTIME_PARAMETER",
+                    0xC000_0005 => "STATUS_ACCESS_VIOLATION",
+                    0x8000_0003 => "STATUS_BREAKPOINT",
+                    _ => "other",
+                }),
+            );
+            context.insert("flags".to_string(), json!(format!("{flags:#x}")));
+            context.insert("address".to_string(), json!(format!("{address:#x}")));
+            context.insert(
+                "address_rva".to_string(),
+                json!(format!(
+                    "{:#x}",
+                    address.saturating_sub(self.mapped_image_base)
+                )),
+            );
+            context.insert("parameters".to_string(), json!(params));
+            let mut raw = Vec::new();
+            for index in 0..16_u64 {
+                raw.push(format!(
+                    "{:#x}",
+                    read_u32(memory, record_ptr + index * 4).unwrap_or(0)
+                ));
+            }
+            context.insert("record_dwords".to_string(), json!(raw));
+        }
+        let ctx_ptr = u64::from(read_u32(memory, exception_info + 4).unwrap_or(0));
+        let mut ebp_from_context = 0_u64;
+        let mut esp_from_context = 0_u64;
+        if ctx_ptr != 0 {
+            let regs = [
+                ("edi", 0x9C_u64),
+                ("esi", 0xA0),
+                ("ebx", 0xA4),
+                ("edx", 0xA8),
+                ("ecx", 0xAC),
+                ("eax", 0xB0),
+                ("ebp", 0xB4),
+                ("eip", 0xB8),
+                ("esp", 0xC4),
+            ];
+            let mut recorded = BTreeMap::new();
+            for (name, offset) in regs {
+                let value = u64::from(read_u32(memory, ctx_ptr + offset).unwrap_or(0));
+                let rendered = if matches!(name, "ebp" | "eip" | "esp") {
+                    format!(
+                        "{value:#x} (rva {:#x})",
+                        value.saturating_sub(self.mapped_image_base)
+                    )
+                } else {
+                    format!("{value:#x}")
+                };
+                recorded.insert(name.to_string(), json!(rendered));
+                if name == "ebp" {
+                    ebp_from_context = value;
+                }
+                if name == "esp" {
+                    esp_from_context = value;
+                }
+            }
+            context.insert("context".to_string(), json!(recorded));
+        }
+        if esp_from_context != 0 {
+            let mut stack = Vec::new();
+            for index in 0..24_u64 {
+                let Ok(raw) = read_u32(memory, esp_from_context + index * 4) else {
+                    break;
+                };
+                let mut slot = BTreeMap::new();
+                slot.insert("value".to_string(), json!(format!("{raw:#x}")));
+                if let Some(text) = describe_guest_string(memory, u64::from(raw)) {
+                    slot.insert("text".to_string(), json!(text));
+                }
+                stack.push(json!(slot));
+            }
+            context.insert("stack_esp".to_string(), json!(stack));
+        }
+        for (label, mut frame) in [
+            ("context", ebp_from_context),
+            ("live", state.get(Register::Rbp)),
+        ] {
+            if frame == 0 {
+                continue;
+            }
+            let mut frames = Vec::new();
+            for _ in 0..8 {
+                if frame < 0x1_0000 {
+                    break;
+                }
+                let ret = read_u32(memory, frame + 4).ok().map(u64::from);
+                let mut args = Vec::new();
+                let mut raws = Vec::new();
+                for slot in 0..4_u64 {
+                    let Ok(raw) = read_u32(memory, frame + 8 + slot * 4) else {
+                        break;
+                    };
+                    raws.push(raw);
+                    let mut arg = BTreeMap::new();
+                    arg.insert("value".to_string(), json!(format!("{raw:#x}")));
+                    if let Some(text) = describe_guest_string(memory, u64::from(raw)) {
+                        arg.insert("text".to_string(), json!(text));
+                    }
+                    args.push(json!(arg));
+                }
+                let mut probe = BTreeMap::new();
+                if raws.len() >= 3 && raws[1] != 0 && raws[1] < 0x1_0000 {
+                    if let Ok(bytes) = memory.read_bytes(u64::from(raws[2]), 128) {
+                        let first_nul = bytes.iter().position(|&byte| byte == 0);
+                        probe.insert("src".to_string(), json!(format!("{:#x}", raws[2])));
+                        probe.insert("declared_size".to_string(), json!(raws[1]));
+                        probe.insert("first_nul".to_string(), json!(first_nul));
+                        probe.insert(
+                            "raw_hex".to_string(),
+                            json!(
+                                bytes
+                                    .iter()
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            ),
+                        );
+                    }
+                }
+                frames.push(json!({
+                    "ebp": format!("{frame:#x}"),
+                    "ret": ret.map(|value| format!("{value:#x}")),
+                    "ret_rva": ret.map(|value| {
+                        format!("{:#x}", value.saturating_sub(self.mapped_image_base))
+                    }),
+                    "args": args,
+                    "copy_probe": probe,
+                }));
+                let next = u64::from(read_u32(memory, frame).unwrap_or(0));
+                if next <= frame {
+                    break;
+                }
+                frame = next;
+            }
+            context.insert(format!("frames_{label}"), json!(frames));
+        }
+        crate::runtime::emit_live_ui_debug(format!(
+            "[crt] unhandled exception context: {}",
+            serde_json::to_string(&context).unwrap_or_default()
+        ));
+        self.push_trace("process", "UnhandledExceptionContext", context, json!(null));
     }
 
     /// Convenience: raise the invalid-parameter handler and set errno; used by
@@ -1665,4 +1874,39 @@ impl PeHostRuntime {
         self.last_error = 0;
         Ok(required as u64)
     }
+}
+
+/// Decode a guest pointer as a printable ASCII or UTF-16LE string, bounded to
+/// 96 bytes so an arbitrary stack dword cannot turn diagnostics into an
+/// unbounded read.  Used only for invalid-parameter/exception reporting.
+fn describe_guest_string(memory: &MemoryImage, pointer: u64) -> Option<String> {
+    if pointer < 0x1_0000 {
+        return None;
+    }
+    let bytes = memory.read_bytes(pointer, 96).ok()?;
+    if let Some(end) = bytes.iter().position(|&byte| byte == 0)
+        && end >= 3
+    {
+        let text = String::from_utf8_lossy(&bytes[..end]).to_string();
+        if text.is_ascii() && text.chars().all(|character| !character.is_control()) {
+            return Some(format!("ascii:{text}"));
+        }
+    }
+    let mut units = Vec::new();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        let unit = u16::from_le_bytes([bytes[index], bytes[index + 1]]);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+        index += 2;
+    }
+    if units.len() >= 3 {
+        let text = String::from_utf16_lossy(&units);
+        if text.chars().all(|character| !character.is_control()) {
+            return Some(format!("wide:{text}"));
+        }
+    }
+    None
 }

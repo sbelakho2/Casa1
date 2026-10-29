@@ -2378,6 +2378,12 @@ pub enum TimingUnavailable {
     NoDisplaySession,
     /// The drawable reported `presentedTime == 0` (not displayed).
     MissingPresentTimestamp,
+    /// The drawable's presented handler never fired before the run loop
+    /// stopped, so no presentation timestamp could be observed.
+    PresentHandlerNeverFired,
+    /// `NSApplication` or its run loop could not be started, so windowed
+    /// presentation cannot be observed.
+    NoAppRunLoop,
     /// No input-event timestamp was correlated with the measured frame.
     MissingInputTimestamp,
     /// Fewer than two real present/GPU-completion timestamps were recorded.
@@ -2412,6 +2418,14 @@ impl TimingUnavailable {
             }
             TimingUnavailable::MissingPresentTimestamp => {
                 "CAMetalLayer drawable reported presentedTime=0; no display presentation occurred"
+            }
+            TimingUnavailable::PresentHandlerNeverFired => {
+                "CAMetalLayer drawable presented handler never fired before the NSApplication \
+                 run loop stopped; no display presentation was observed"
+            }
+            TimingUnavailable::NoAppRunLoop => {
+                "the macOS NSApplication run loop could not be started; windowed presentation \
+                 timestamps cannot be observed"
             }
             TimingUnavailable::MissingInputTimestamp => {
                 "no input-event timestamp was correlated with the measured frames"
@@ -3173,10 +3187,12 @@ pub fn measure_gpu_present_into(
 }
 
 /// Windowed present mode: create a real `NSWindow`, attach a real
-/// `CAMetalLayer` to its content view, and correlate the drawable's
-/// `presentedTime` with the input/CPU-submit timestamps.  When the host has no
-/// window-server display session the recorder carries the exact
-/// [`TimingUnavailable::NoDisplaySession`] reason; no timestamp is synthesized.
+/// `CAMetalLayer` to its content view, then run `[NSApp run]` and submit one
+/// frame per `NSTimer` tick so CoreAnimation actually composites the layer and
+/// its drawables report a real `presentedTime`.  When the host has no
+/// window-server display session or no run loop can be started, the recorder
+/// carries the exact [`TimingUnavailable::NoDisplaySession`] /
+/// [`TimingUnavailable::NoAppRunLoop`] reason; no timestamp is synthesized.
 #[cfg(target_os = "macos")]
 pub fn measure_gpu_present_windowed_into(
     recorder: &mut GpuPresentRecorder,
@@ -3221,6 +3237,462 @@ unsafe fn pump_app_events_for(milliseconds: u64) {
             let _: () = msg_send![app, sendEvent: event];
         }
     }
+}
+
+/// Ticks spent after the last submitted frame so CoreAnimation can commit the
+/// outstanding transactions and deliver the drawables' presented handlers.
+#[cfg(target_os = "macos")]
+const WINDOWED_SETTLE_TICKS: usize = 30;
+
+/// One frame per timer tick, then a fixed settle window: never more than
+/// `frames + settle_ticks` ticks, even when no presented handler ever fires.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowTickDecision {
+    Submit,
+    Settle,
+    Stop,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowRunControl {
+    frames: usize,
+    settle_ticks: usize,
+    submitted: usize,
+    settled: usize,
+    stopped: bool,
+    timer_invalidated: bool,
+    window_closed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl WindowRunControl {
+    fn new(frames: usize, settle_ticks: usize) -> Self {
+        Self {
+            frames,
+            settle_ticks,
+            submitted: 0,
+            settled: 0,
+            stopped: false,
+            timer_invalidated: false,
+            window_closed: false,
+        }
+    }
+
+    fn decide(&self) -> WindowTickDecision {
+        if self.stopped {
+            WindowTickDecision::Stop
+        } else if self.submitted < self.frames {
+            WindowTickDecision::Submit
+        } else if self.settled < self.settle_ticks {
+            WindowTickDecision::Settle
+        } else {
+            WindowTickDecision::Stop
+        }
+    }
+
+    fn note_submitted(&mut self) {
+        self.submitted += 1;
+    }
+
+    fn note_settled(&mut self) {
+        self.settled += 1;
+    }
+
+    /// Idempotent: a second stop request (double `[NSApp stop:]` or an error
+    /// path racing the normal stop) reports `false` and performs no work.
+    fn request_stop(&mut self) -> bool {
+        if self.stopped {
+            return false;
+        }
+        self.stopped = true;
+        true
+    }
+
+    /// Idempotent timer invalidation.
+    fn request_timer_invalidation(&mut self) -> bool {
+        if self.timer_invalidated {
+            return false;
+        }
+        self.timer_invalidated = true;
+        true
+    }
+
+    /// Idempotent window close.
+    fn request_window_close(&mut self) -> bool {
+        if self.window_closed {
+            return false;
+        }
+        self.window_closed = true;
+        true
+    }
+}
+
+/// A submitted frame whose presented handler has not been observed yet. The
+/// drawable is retained so its presented handler and timestamp stay valid.
+#[cfg(target_os = "macos")]
+struct PendingWindowFrame {
+    sample: FrameSample,
+    probe: crate::metal_backend::DrawableTimingProbe,
+    // The layer vends autoreleased drawables. Retain it until its presented
+    // handler fires so the handler registration and timestamp stay valid
+    // across run-loop autorelease pool drains.
+    _drawable: RetainedDrawable,
+}
+
+/// A retained `CAMetalDrawable` that is released exactly once when the frame
+/// is finalized.
+#[cfg(target_os = "macos")]
+struct RetainedDrawable(*mut objc::runtime::Object);
+
+#[cfg(target_os = "macos")]
+impl RetainedDrawable {
+    fn retain(drawable: &metal::MetalDrawableRef) -> Self {
+        use metal::foreign_types::ForeignTypeRef;
+        let object = drawable.as_ptr() as *mut objc::runtime::Object;
+        // SAFETY: `object` is a live MTLDrawable; retain balances the release
+        // in `Drop` and keeps it alive until presentation is observed.
+        let _: () = unsafe {
+            use objc::{msg_send, sel, sel_impl};
+            msg_send![object, retain]
+        };
+        Self(object)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RetainedDrawable {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        // SAFETY: `self.0` was retained in `retain` and is released once here.
+        let _: () = unsafe {
+            use objc::{msg_send, sel, sel_impl};
+            msg_send![self.0, release]
+        };
+    }
+}
+
+/// Drives the windowed measurement from the `NSApplication` run loop. Every
+/// field is touched only on the main thread, inside the timer block.
+#[cfg(target_os = "macos")]
+struct WindowFrameDriver {
+    recorder: *mut GpuPresentRecorder,
+    layer: metal::MetalLayer,
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    output: metal::Buffer,
+    clock: MediaClock,
+    app: *mut objc::runtime::Object,
+    window: *mut std::ffi::c_void,
+    control: WindowRunControl,
+    pending: Vec<PendingWindowFrame>,
+    sequence: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl WindowFrameDriver {
+    fn tick(&mut self, timer: *mut objc::runtime::Object) {
+        let tick_start = std::time::Instant::now();
+        // Harvest completed presentations before deciding what this tick
+        // submits, so a drawable presented between ticks is never missed.
+        self.harvest(false);
+        match self.control.decide() {
+            WindowTickDecision::Submit => {
+                self.control.note_submitted();
+                if let Err(reason) = self.submit_frame() {
+                    self.recorder().mark_present_unavailable(reason);
+                    self.control.request_stop();
+                }
+            }
+            WindowTickDecision::Settle => {
+                self.control.note_settled();
+                // Every submitted frame has delivered (or failed to deliver)
+                // its presented handler; no need to burn the remaining settle
+                // window before stopping.
+                if self.pending.is_empty() {
+                    self.control.request_stop();
+                }
+            }
+            WindowTickDecision::Stop => {
+                self.control.request_stop();
+            }
+        }
+        if std::env::var_os("CASA1_PERF_DEBUG_WINDOW").is_some() {
+            eprintln!(
+                "[perf-window] tick submitted={} settled={} pending={} stopped={} elapsed_ms={:.1}",
+                self.control.submitted,
+                self.control.settled,
+                self.pending.len(),
+                self.control.stopped,
+                tick_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        if matches!(self.control.decide(), WindowTickDecision::Stop) {
+            self.control.request_stop();
+            // Drain the frames submitted before the stop tick; anything still
+            // unobserved gets the exact never-fired reason in `harvest`.
+            self.harvest(true);
+            self.stop_timer_and_app(timer);
+        }
+    }
+
+    fn recorder(&mut self) -> &mut GpuPresentRecorder {
+        // SAFETY: `recorder` points at the caller's recorder, which outlives
+        // this driver (the driver is stack-allocated inside the measurement
+        // call and never escapes the main thread).
+        unsafe { &mut *self.recorder }
+    }
+
+    fn submit_frame(&mut self) -> Result<(), TimingUnavailable> {
+        use crate::metal_backend::{DrawableTimingProbe, GpuTimestampReading, GpuTimingProbe};
+
+        let host_cpu_start = process_cpu_time_ns();
+        let input_ns = self.clock.now_ns();
+        let submit_start_ns = self.clock.now_ns();
+        let command_buffer = self.queue.new_command_buffer();
+        let gpu_probe = GpuTimingProbe::attach(command_buffer);
+        {
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline);
+            encoder.set_buffer(0, Some(&self.output), 0);
+            encoder.dispatch_threads(
+                metal::MTLSize::new(4096, 1, 1),
+                metal::MTLSize::new(64, 1, 1),
+            );
+            encoder.end_encoding();
+        }
+        // A windowed layer must vend a drawable; no drawable means the window
+        // server never made this layer presentable.
+        let drawable = self
+            .layer
+            .next_drawable()
+            .ok_or(TimingUnavailable::NoDrawable)?;
+        let retained_drawable = RetainedDrawable::retain(drawable);
+        let drawable_probe = DrawableTimingProbe::attach(drawable);
+        {
+            let pass = metal::RenderPassDescriptor::new().to_owned();
+            if let Some(attachment) = pass.color_attachments().object_at(0) {
+                attachment.set_texture(Some(drawable.texture()));
+                attachment.set_load_action(metal::MTLLoadAction::Clear);
+                attachment.set_store_action(metal::MTLStoreAction::Store);
+                attachment.set_clear_color(metal::MTLClearColor::new(0.05, 0.05, 0.08, 1.0));
+            }
+            let encoder = command_buffer.new_render_command_encoder(&pass);
+            encoder.end_encoding();
+            command_buffer.present_drawable(drawable);
+        }
+        command_buffer.commit();
+        let submit_end_ns = self.clock.now_ns();
+        command_buffer.wait_until_completed();
+        let host_cpu_ns = process_cpu_time_ns().saturating_sub(host_cpu_start);
+        let mut sample = FrameSample::new(
+            self.sequence,
+            Some(input_ns),
+            submit_start_ns,
+            submit_end_ns,
+        )
+        .with_host_cpu_ns(host_cpu_ns);
+        self.sequence += 1;
+
+        match gpu_probe.snapshot() {
+            Some(GpuTimestampReading::Measured {
+                start_seconds,
+                end_seconds,
+            }) => match (
+                self.clock.seconds_to_ns(start_seconds),
+                self.clock.seconds_to_ns(end_seconds),
+            ) {
+                (Some(start_ns), Some(end_ns)) if end_ns >= start_ns => {
+                    sample = sample.with_gpu_timestamps(start_ns, end_ns);
+                }
+                _ => self
+                    .recorder()
+                    .mark_gpu_unavailable(TimingUnavailable::MissingGpuTimestamp),
+            },
+            Some(GpuTimestampReading::UnsupportedDevice) => self
+                .recorder()
+                .mark_gpu_unavailable(TimingUnavailable::UnsupportedGpuTimestamp),
+            Some(GpuTimestampReading::MissingTimestamp { .. }) | None => self
+                .recorder()
+                .mark_gpu_unavailable(TimingUnavailable::MissingGpuTimestamp),
+        }
+
+        // CoreAnimation commits the layer in the current run-loop iteration;
+        // flushing here makes the presented handler observable on this tick.
+        unsafe {
+            use objc::{class, msg_send, sel, sel_impl};
+            let _: () = msg_send![class!(CATransaction), flush];
+        }
+        self.pending.push(PendingWindowFrame {
+            sample,
+            probe: drawable_probe,
+            _drawable: retained_drawable,
+        });
+        Ok(())
+    }
+
+    fn harvest(&mut self, final_pass: bool) {
+        use crate::metal_backend::PresentTimestampReading;
+
+        let mut index = 0;
+        while index < self.pending.len() {
+            match self.pending[index].probe.snapshot() {
+                Some(reading) => {
+                    let pending = self.pending.remove(index);
+                    let mut sample = pending.sample;
+                    match reading {
+                        PresentTimestampReading::Measured { presented_seconds } => {
+                            match self.clock.seconds_to_ns(presented_seconds) {
+                                Some(present_ns) => {
+                                    sample = sample.with_present_timestamp(present_ns)
+                                }
+                                None => self.recorder().mark_present_unavailable(
+                                    TimingUnavailable::MissingPresentTimestamp,
+                                ),
+                            }
+                        }
+                        PresentTimestampReading::UnsupportedDevice => self
+                            .recorder()
+                            .mark_present_unavailable(TimingUnavailable::UnsupportedGpuTimestamp),
+                        PresentTimestampReading::MissingTimestamp => self
+                            .recorder()
+                            .mark_present_unavailable(TimingUnavailable::MissingPresentTimestamp),
+                    }
+                    self.recorder().record(sample);
+                }
+                None if final_pass => {
+                    let pending = self.pending.remove(index);
+                    self.recorder()
+                        .mark_present_unavailable(TimingUnavailable::PresentHandlerNeverFired);
+                    self.recorder().record(pending.sample);
+                }
+                None => index += 1,
+            }
+        }
+    }
+
+    fn stop_timer_and_app(&mut self, timer: *mut objc::runtime::Object) {
+        use objc::{class, msg_send, sel, sel_impl};
+        if self.control.request_timer_invalidation() && !timer.is_null() {
+            // SAFETY: `timer` is the live NSTimer that invoked this tick.
+            let _: () = unsafe { msg_send![timer, invalidate] };
+        }
+        if self.app.is_null() {
+            return;
+        }
+        // SAFETY: `app` is the shared NSApplication singleton, and this runs on
+        // the main thread that called `[NSApp run]`.
+        unsafe {
+            let _: () = msg_send![self.app, stop: std::ptr::null_mut::<objc::runtime::Object>()];
+            // `stop:` only takes effect after the run loop wakes; post an
+            // application-defined event so `[NSApp run]` returns immediately
+            // instead of waiting for another timer/display event.
+            let event: *mut objc::runtime::Object = msg_send![
+                class!(NSEvent),
+                otherEventWithType: 15i64
+                location: crate::mac_window::NSPoint::new(0.0, 0.0)
+                modifierFlags: 0u64
+                timestamp: 0.0f64
+                windowNumber: 0i64
+                context: std::ptr::null_mut::<objc::runtime::Object>()
+                subtype: 0i16
+                data1: 0i64
+                data2: 0i64
+            ];
+            if !event.is_null() {
+                let _: () = msg_send![self.app, postEvent: event atStart: true];
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for WindowFrameDriver {
+    fn drop(&mut self) {
+        if self.control.request_window_close() && !self.window.is_null() {
+            crate::mac_window::close_nswindow(self.window);
+        }
+    }
+}
+
+/// Run the windowed capture under a real `NSApplication` run loop. One frame is
+/// submitted per `NSTimer` tick; the loop then settles for
+/// [`WINDOWED_SETTLE_TICKS`] so CoreAnimation can deliver the presented
+/// handlers, and stops with `[NSApp stop:]` plus a wake event.
+#[cfg(target_os = "macos")]
+fn run_windowed_capture(
+    recorder: &mut GpuPresentRecorder,
+    frames: usize,
+    layer: metal::MetalLayer,
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    output: metal::Buffer,
+    clock: MediaClock,
+    window: *mut std::ffi::c_void,
+) -> Result<(), String> {
+    use objc::{class, msg_send, sel, sel_impl};
+
+    let app: *mut objc::runtime::Object =
+        unsafe { msg_send![class!(NSApplication), sharedApplication] };
+    if app.is_null() {
+        recorder.mark_present_unavailable(TimingUnavailable::NoAppRunLoop);
+        return Ok(());
+    }
+
+    let mut driver = WindowFrameDriver {
+        recorder: recorder as *mut GpuPresentRecorder,
+        layer,
+        queue,
+        pipeline,
+        output,
+        clock,
+        app,
+        window,
+        control: WindowRunControl::new(frames, WINDOWED_SETTLE_TICKS),
+        pending: Vec::with_capacity(frames),
+        sequence: 0,
+    };
+    let driver_ptr: *mut WindowFrameDriver = &mut driver;
+    let tick_block = block::ConcreteBlock::new(move |timer: *mut objc::runtime::Object| {
+        // SAFETY: the block runs only on the main thread inside `[NSApp run]`;
+        // `driver` lives on this stack frame until the run loop returns.
+        let driver = unsafe { &mut *driver_ptr };
+        driver.tick(timer);
+    });
+    let tick_block = tick_block.copy();
+    let timer: *mut objc::runtime::Object = unsafe {
+        msg_send![
+            class!(NSTimer),
+            scheduledTimerWithTimeInterval: 1.0f64 / 120.0f64
+            repeats: true
+            block: &*tick_block
+        ]
+    };
+    if timer.is_null() {
+        recorder.mark_present_unavailable(TimingUnavailable::NoAppRunLoop);
+        return Ok(());
+    }
+
+    // Blocks here until the timer's final tick invalidates itself and stops
+    // the application (or the run loop exits on its own).
+    unsafe {
+        let _: () = msg_send![app, run];
+    }
+    // SAFETY: the run loop has returned, so no tick can race this cleanup.
+    unsafe {
+        let _: () = msg_send![timer, invalidate];
+    }
+    if !driver.control.stopped {
+        // The run loop returned without the measurement asking it to stop.
+        // Record the exact reason instead of leaving a default fallback.
+        recorder.mark_present_unavailable(TimingUnavailable::NoAppRunLoop);
+    }
+    driver.harvest(true);
+    drop(tick_block);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -3379,6 +3851,16 @@ fn measure_gpu_present_with_mode(
             .reason()
             .to_string()
     })?;
+    if window_presenting {
+        // Windowed presentation only produces a real `presentedTime` when the
+        // process actually runs an `NSApplication` run loop: CoreAnimation
+        // commits the layer there. Drive one frame per timer tick, settle for
+        // a few ticks, then stop the application from inside the run loop.
+        run_windowed_capture(
+            recorder, frames, layer, queue, pipeline, output, clock, window,
+        )?;
+        return Ok(());
+    }
     // A headless CAMetalLayer can still vend a drawable whose presentedTime
     // stays zero, and acquiring drawables every frame then throttles the
     // submission to the compositor. Present only while a real presentation
@@ -4295,6 +4777,109 @@ mod tests {
             TimingUnavailable::NoDisplaySession.reason(),
             "no macOS window-server display session is available; a windowed CAMetalLayer cannot present and presentedTime is unavailable"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn windowed_present_zero_frames_rejects_with_exact_error() {
+        assert_eq!(
+            measure_gpu_present_windowed(0).expect_err("zero frames must be rejected"),
+            "GPU present measurement needs at least one frame"
+        );
+    }
+
+    #[test]
+    fn windowed_present_missing_display_fallback_never_fabricates_present() {
+        let mut recorder = GpuPresentRecorder::new();
+        recorder.mark_present_unavailable(TimingUnavailable::NoDisplaySession);
+        recorder.record(FrameSample::new(0, Some(10), 20, 30));
+        let summary = recorder.summary();
+        assert_eq!(summary.present_sample_count, 0);
+        assert_eq!(summary.input_to_present, None);
+        assert_eq!(
+            summary.present_unavailable,
+            Some(TimingUnavailable::NoDisplaySession)
+        );
+        assert_eq!(
+            summary.input_to_present_unavailable,
+            Some(TimingUnavailable::NoDisplaySession)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn windowed_present_stop_before_first_frame_aborts_without_submit() {
+        let mut control = WindowRunControl::new(5, WINDOWED_SETTLE_TICKS);
+        assert_eq!(control.decide(), WindowTickDecision::Submit);
+        assert!(control.request_stop());
+        assert_eq!(control.decide(), WindowTickDecision::Stop);
+        assert_eq!(control.submitted, 0);
+        assert!(!control.request_stop());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn windowed_present_timer_invalidated_once_on_error() {
+        let mut control = WindowRunControl::new(3, WINDOWED_SETTLE_TICKS);
+        assert_eq!(control.request_timer_invalidation(), true);
+        assert_eq!(control.request_timer_invalidation(), false);
+        assert_eq!(control.request_stop(), true);
+        assert_eq!(control.request_stop(), false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn windowed_present_handler_missing_times_out_with_exact_reason() {
+        let mut control = WindowRunControl::new(2, WINDOWED_SETTLE_TICKS);
+        let mut ticks = 0usize;
+        loop {
+            match control.decide() {
+                WindowTickDecision::Submit => control.note_submitted(),
+                WindowTickDecision::Settle => control.note_settled(),
+                WindowTickDecision::Stop => break,
+            }
+            ticks += 1;
+            assert!(
+                ticks <= 2 + WINDOWED_SETTLE_TICKS,
+                "presented handler timeout must be bounded"
+            );
+        }
+        assert_eq!(control.submitted, 2);
+        assert_eq!(control.settled, WINDOWED_SETTLE_TICKS);
+        assert_eq!(control.decide(), WindowTickDecision::Stop);
+        assert_eq!(
+            TimingUnavailable::PresentHandlerNeverFired.reason(),
+            "CAMetalLayer drawable presented handler never fired before the NSApplication \
+             run loop stopped; no display presentation was observed"
+        );
+        let mut recorder = GpuPresentRecorder::new();
+        recorder.mark_present_unavailable(TimingUnavailable::PresentHandlerNeverFired);
+        recorder.record(FrameSample::new(0, Some(10), 20, 30));
+        let summary = recorder.summary();
+        assert_eq!(
+            summary.present_unavailable,
+            Some(TimingUnavailable::PresentHandlerNeverFired)
+        );
+        assert_eq!(summary.present_sample_count, 0);
+    }
+
+    #[test]
+    fn windowed_present_no_run_loop_unavailable_reason_is_exact() {
+        assert_eq!(
+            TimingUnavailable::NoAppRunLoop.reason(),
+            "the macOS NSApplication run loop could not be started; windowed presentation \
+             timestamps cannot be observed"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn windowed_present_double_stop_and_close_are_idempotent() {
+        let mut control = WindowRunControl::new(1, 1);
+        assert_eq!(control.request_stop(), true);
+        assert_eq!(control.request_stop(), false);
+        assert_eq!(control.request_window_close(), true);
+        assert_eq!(control.request_window_close(), false);
     }
 
     #[test]

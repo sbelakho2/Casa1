@@ -81,6 +81,7 @@ fn e2e_ge_root() -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires the live Steam E2E environment (CASA1_STEAM_E2E=1)"]
 fn t41_steam_e2e_acceptance() {
     if !steam_e2e_gate() {
         return;
@@ -216,8 +217,10 @@ fn t41_steam_e2e_acceptance() {
         });
     // The outcome's guest-exit semantics must be honest: the runner's own
     // exit 0 only means an outcome was produced.  guest_exit_code is Some
-    // exactly when the run ended in a real GuestExit.
-    let outcome_termination_is_guest_exit = outcome.termination == "GuestExit";
+    // exactly when the run ended in a real GuestExit.  The runner reports
+    // the termination as the enum's Debug form ("GuestExit { code: N }"),
+    // so match the variant prefix rather than the bare variant name.
+    let outcome_termination_is_guest_exit = outcome.termination.starts_with("GuestExit");
     assert_eq!(
         outcome.guest_exit_code.is_some(),
         outcome_termination_is_guest_exit,

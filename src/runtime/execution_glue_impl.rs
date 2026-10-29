@@ -366,6 +366,126 @@ impl PeHostRuntime {
         Ok(posted)
     }
 
+    /// Diagnose a decrementing copy loop entered with a huge/negative count.
+    ///
+    /// Steam's CRT `memcpy` (`mov edx,[esi]; mov [edi],edx; ...; sub ecx,1`)
+    /// reached with ECX >= 0x8000_0000 writes past the heap block.  Record the
+    /// block, count, source/dest, the bounded API history ring and the guest
+    /// EBP chain — diagnostic only; the fault is still delivered.
+    fn maybe_report_huge_copy(&mut self, state: &CpuState, memory: &MemoryImage) {
+        use std::sync::atomic::Ordering;
+        static HUGE_COPY_REPORTS: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        const HUGE_COPY_REPORT_LIMIT: u32 = 8;
+        if self.guest_arch != GuestArch::X86 || state.get(Register::Rcx) < 0x8000_0000 {
+            return;
+        }
+        let Ok(bytes) = memory.read_bytes(state.rip, 16) else {
+            return;
+        };
+        let is_copy_loop = bytes
+            .windows(4)
+            .any(|window| window == [0x83, 0xe9, 0x01, 0x75])
+            || bytes.windows(2).any(|window| {
+                matches!(
+                    window,
+                    [0xf3, 0xa4] | [0xf3, 0xa5] | [0xf2, 0xa4] | [0xf2, 0xa5]
+                )
+            });
+        if !is_copy_loop {
+            return;
+        }
+        if HUGE_COPY_REPORTS.fetch_add(1, Ordering::Relaxed) >= HUGE_COPY_REPORT_LIMIT {
+            return;
+        }
+        let mut frames = Vec::new();
+        let mut frame = state.get(Register::Rbp);
+        for _ in 0..8 {
+            if frame < 0x1_0000 {
+                break;
+            }
+            let ret = crate::runtime::guest_memory::read_u32(memory, frame + 4)
+                .ok()
+                .map(u64::from);
+            let mut args = Vec::new();
+            for slot in 0..4_u64 {
+                if let Ok(raw) =
+                    crate::runtime::guest_memory::read_u32(memory, frame + 8 + slot * 4)
+                {
+                    args.push(format!("{raw:#x}"));
+                }
+            }
+            frames.push(json!({
+                "ebp": format!("{frame:#x}"),
+                "ret": ret.map(|value| format!("{value:#x}")),
+                "ret_rva": ret.map(|value| {
+                    format!("{:#x}", value.saturating_sub(self.mapped_image_base))
+                }),
+                "args": args,
+            }));
+            let next =
+                u64::from(crate::runtime::guest_memory::read_u32(memory, frame).unwrap_or(0));
+            if next <= frame {
+                break;
+            }
+            frame = next;
+        }
+        let history: Vec<serde_json::Value> = self
+            .api_history
+            .iter()
+            .map(|entry| serde_json::from_str(entry).unwrap_or(serde_json::Value::Null))
+            .collect();
+        let mut record = BTreeMap::new();
+        record.insert(
+            "block_rva".to_string(),
+            json!(format!(
+                "{:#x}",
+                state.rip.saturating_sub(self.mapped_image_base)
+            )),
+        );
+        record.insert("block".to_string(), json!(format!("{:#x}", state.rip)));
+        record.insert(
+            "count".to_string(),
+            json!(format!("{:#x}", state.get(Register::Rcx))),
+        );
+        record.insert(
+            "source".to_string(),
+            json!(format!("{:#x}", state.get(Register::Rsi))),
+        );
+        record.insert(
+            "destination".to_string(),
+            json!(format!("{:#x}", state.get(Register::Rdi))),
+        );
+        record.insert(
+            "first_bytes".to_string(),
+            json!(
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join("")
+            ),
+        );
+        record.insert("api_history".to_string(), json!(history));
+        record.insert("frames".to_string(), json!(frames));
+        record.insert(
+            "last_thunk".to_string(),
+            json!(crate::steam_milestones::snapshot_last_thunk()),
+        );
+        eprintln!(
+            "[huge-copy] block_rva={:#x} count={:#x} src={:#x} dst={:#x} last_api={}",
+            state.rip.saturating_sub(self.mapped_image_base),
+            state.get(Register::Rcx),
+            state.get(Register::Rsi),
+            state.get(Register::Rdi),
+            self.api_history
+                .back()
+                .cloned()
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
+        self.push_trace("process", "HugeCopyCount", record, json!(null));
+    }
+
     pub(crate) fn execute_ir_with_guest_exception_delivery(
         &mut self,
         engine: &CpuExecutionEngine,
@@ -374,6 +494,7 @@ impl PeHostRuntime {
         ir: &[crate::cpu::IrInstruction],
         label: &str,
     ) -> AppResult<bool> {
+        self.maybe_report_huge_copy(state, memory);
         crate::jit::set_pe_runtime_pointer(self as *mut PeHostRuntime as *mut libc::c_void);
         let result = engine.execute_with_jit(state, memory, ir, self.jit_runtime.as_mut());
         crate::jit::set_pe_runtime_pointer(std::ptr::null_mut());
@@ -651,6 +772,78 @@ impl PeHostRuntime {
                 json!(false),
             );
             return Ok(false);
+        }
+        // The Steam bootstrapper's 32-bit `memcpy` loop
+        // (`mov edx,[esi]; mov [edi],edx; add edi,4; add esi,4; sub ecx,1`)
+        // faulting means a negative byte count was passed.  Record the EBP
+        // chain so the guest caller that supplied the length is identifiable.
+        if let Ok(bytes) = memory.read_bytes(state.rip, 6)
+            && bytes == [0x8b, 0x16, 0x89, 0x17, 0x83, 0xc7]
+        {
+            let mut frames = Vec::new();
+            let mut frame = state.get(Register::Rbp);
+            for _ in 0..8 {
+                if frame < 0x1_0000 {
+                    break;
+                }
+                let ret = crate::runtime::guest_memory::read_u32(memory, frame + 4)
+                    .ok()
+                    .map(u64::from);
+                let mut args = Vec::new();
+                for slot in 0..4_u64 {
+                    if let Ok(raw) =
+                        crate::runtime::guest_memory::read_u32(memory, frame + 8 + slot * 4)
+                    {
+                        args.push(format!("{raw:#x}"));
+                    }
+                }
+                frames.push(json!({
+                    "ebp": format!("{frame:#x}"),
+                    "ret": ret.map(|value| format!("{value:#x}")),
+                    "ret_rva": ret.map(|value| {
+                        format!("{:#x}", value.saturating_sub(self.mapped_image_base))
+                    }),
+                    "args": args,
+                }));
+                let next =
+                    u64::from(crate::runtime::guest_memory::read_u32(memory, frame).unwrap_or(0));
+                if next <= frame {
+                    break;
+                }
+                frame = next;
+            }
+            self.push_trace(
+                "process",
+                "X86AccessViolationFrames",
+                BTreeMap::from([
+                    (
+                        "fault_address".to_string(),
+                        json!(format!("{fault_address:#x}")),
+                    ),
+                    ("fault_rip".to_string(), json!(format!("{:#x}", state.rip))),
+                    (
+                        "fault_rip_rva".to_string(),
+                        json!(format!(
+                            "{:#x}",
+                            state.rip.saturating_sub(self.mapped_image_base)
+                        )),
+                    ),
+                    (
+                        "ecx".to_string(),
+                        json!(format!("{:#x}", state.get(Register::Rcx))),
+                    ),
+                    (
+                        "esi".to_string(),
+                        json!(format!("{:#x}", state.get(Register::Rsi))),
+                    ),
+                    (
+                        "edi".to_string(),
+                        json!(format!("{:#x}", state.get(Register::Rdi))),
+                    ),
+                    ("frames".to_string(), json!(frames)),
+                ]),
+                json!(null),
+            );
         }
         self.dispatch_x86_exception(
             state,

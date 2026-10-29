@@ -257,6 +257,7 @@ pub mod win32;
 pub mod windows_oracle;
 pub mod winhttp;
 pub mod wininet;
+pub mod winmd_inventory;
 pub mod winmm;
 pub mod wmi;
 pub mod workloads {
