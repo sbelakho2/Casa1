@@ -3666,7 +3666,9 @@
  ],
  "documented_restriction_table_rejects_exact_claims_for_each_arm": [
   "( row.semantic_fidelity, SemanticFidelity::Restricted, \"{interface}::{method} must not claim exact fidelity\" )",
-  "( row.subsystem_capability, SubsystemCapability::Partial, \"{interface}::{method} must not claim full capability\" )"
+  "( row.subsystem_capability, SubsystemCapability::Partial, \"{interface}::{method} must not claim full capability\" )",
+  "( row.semantic_fidelity, SemanticFidelity::Exact, \"{interface}::{method} must claim exact fidelity\" )",
+  "( row.subsystem_capability, SubsystemCapability::Full, \"{interface}::{method} must claim full capability\" )"
  ],
  "domain_name_splits_suffix_and_rejects_bare_host": [
   "(domain_name(\"host.example.com\"), \"example.com\")",
@@ -8335,6 +8337,14 @@
   "( pull_source_event_type(&mut runtime, &mut memory, graph.source), 202 )",
   "( dispatch_x86_thunk(&mut runtime, &mut memory, pause, &[graph.source as u32]), 0 )"
  ],
+ "mf_media_type_representation_builds_real_am_types_and_rejects_unrepresentable": [
+  "( call_get_representation( &mut runtime, &mut memory, video, &REP_AM_MEDIA_TYPE, am_out ), 0 )",
+  "( memory.read_bytes(am, 16).unwrap(), crate::media::MFMediaType_Video.to_bytes_le().to_vec(), \"majortype is MEDIATYPE_Video\" )",
+  "( memory.read_bytes(am + 16, 16).unwrap(), crate::media::MFVideoFormat_H264.to_bytes_le().to_vec(), \"the H264 subtype carries the DirectShow FourCC GUID\" )",
+  "( read_guest_u32(&memory, am + 32).unwrap(), 0, \"bFixedSizeSamples: MF_MT_FIXED_SIZE_SAMPLES is absent\" )",
+  "( read_guest_u32(&memory, am + 36).unwrap(), 1, \"bTemporalCompression: MF_MT_ALL_SAMPLES_INDEPENDENT is absent\" )",
+  "( read_guest_u32(&memory, am + 40).unwrap(), 0, \"lSampleSize: MF_MT_SAMPLE_SIZE is absent\" )"
+ ],
  "mf_metadata_provider_on_untagged_source_is_empty_not_unsupported": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create_reader, &[url as u32, 0, reader_out as u32] ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, get_service, &[source as u32, guid as u32, iid as u32, out as u32] ), 0, \"a real media source always provides IMFMetadata\" )",
@@ -8373,6 +8383,22 @@
   "( read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0, \"a rejected QI clears the output\" )",
   "( call_mf_slot(&mut runtime, &mut memory, object, 0, &[iid as u32, 0]), u64::from(E_POINTER), \"QI {kind:?} requires the output pointer\" )"
  ],
+ "mf_representation_reference_lifecycle_double_free_and_foreign_pointer_are_exact": [
+  "( call_get_representation( &mut runtime, &mut memory, video, &REP_AM_MEDIA_TYPE, out_one ), 0 )",
+  "( call_get_representation( &mut runtime, &mut memory, video, &REP_FORMAT_VIDEO_INFO, out_two ), 0 )",
+  "( call_free_representation( &mut runtime, &mut memory, video, &REP_AM_MEDIA_TYPE, first ), 0 )",
+  "( memory.read_bytes(first - 40, 40).unwrap(), vec![0_u8; 40], \"the release poisoned the reference header\" )",
+  "( call_free_representation( &mut runtime, &mut memory, video, &REP_AM_MEDIA_TYPE, first ), u64::from(E_INVALIDARG), \"double free is refused\" )",
+  "( call_free_representation( &mut runtime, &mut memory, video, &REP_FORMAT_VIDEO_INFO2, second ), u64::from(E_INVALIDARG), \"a mismatched GUID is not the allocating reference\" )"
+ ],
+ "mf_sink_writer_services_resolve_real_duration_and_bytestream_or_exact_unsupported": [
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, create_url, &[url_ptr as u32, 0, 0, writer_out as u32] ), 0 )",
+  "( call_mf_slot( &mut runtime, &mut memory, writer, 11, &[ all_streams, null_guid as u32, iid_writer as u32, service_out as u32 ] ), 0 )",
+  "( read_guest_pointer(&memory, service_out, GuestArch::X86).unwrap(), writer, \"GUID_NULL + IMFSinkWriter hands back the writer itself\" )",
+  "( call_mf_slot( &mut runtime, &mut memory, writer, 11, &[ all_streams, null_guid as u32, iid_attributes as u32, service_out as u32 ] ), u64::from(E_NOINTERFACE), \"the writer does not implement IMFAttributes\" )",
+  "( call_mf_slot( &mut runtime, &mut memory, writer, 11, &[ all_streams, duration_guid as u32, iid_byte_stream as u32, service_out as u32 ] ), u64::from(MF_E_UNSUPPORTED_SERVICE) )",
+  "( call_mf_slot( &mut runtime, &mut memory, writer, 11, &[ MF_SINK_WRITER_MEDIASINK, duration_guid as u32, iid_attributes as u32, service_out as u32 ] ), 0, \"MF_SINK_WRITER_MEDIASINK is a valid stream selector\" )"
+ ],
  "mf_sink_writer_streams_samples_and_invalid_state_are_exact": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create, &[0, 0, 0, sink_out as u32] ), u64::from(E_INVALIDARG), \"MFCreateSinkWriterFromURL requires a URL\" )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create, &[empty_url as u32, 0, 0, sink_out as u32] ), u64::from(E_INVALIDARG) )",
@@ -8404,12 +8430,28 @@
   "( read_guest_u32(&memory, type_out).unwrap(), MF_OBJECT_MEDIASOURCE )",
   "( call_mf_slot( &mut runtime, &mut memory, resolver, 5, &[first as u32, type_out as u32, object_out as u32] ), u64::from(E_INVALIDARG), \"a result is handed out exactly once\" )"
  ],
+ "mf_source_resolver_async_http_failures_surface_through_end_and_cancel_exactly_once": [
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, create, &[resolver_out as u32]), 0 )",
+  "( call_mf_slot( &mut runtime, &mut memory, resolver, 3, &[ url_ptr as u32, MF_RESOLUTION_MEDIASOURCE, 0, cookie as u32, MF_CB_OBJECT as u32, 0 ] ), u64::from(E_PENDING) )",
+  "( mf_callback_count(&memory), 0, \"nothing fires before a servicing point\" )",
+  "( mf_callback_count(&memory), 1, \"the failure completion fires the callback once\" )",
+  "( call_mf_slot(&mut runtime, &mut memory, failed, 4, &[status_out as u32]), 0, \"IMFAsyncResult::GetStatus\" )",
+  "( read_guest_u32(&memory, status_out).unwrap(), INET_E_CANNOT_CONNECT, \"the callback observes the exact failure status\" )"
+ ],
  "mf_source_resolver_creates_real_objects_and_rejects_invalid_forms": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, create, &[resolver_out as u32]), 0 )",
   "( call_mf_slot( &mut runtime, &mut memory, resolver, 8, &[ url as u32, MF_RESOLUTION_MEDIASOURCE, 0, type_out as u32, object_out as u32 ] ), 0 )",
   "( read_guest_u32(&memory, type_out).unwrap(), MF_OBJECT_MEDIASOURCE )",
   "( runtime.guest_object_kind(source).unwrap(), GuestObjectKind::ImfMediaSource )",
   "( call_mf_slot( &mut runtime, &mut memory, resolver, 8, &[ url as u32, MF_RESOLUTION_BYTESTREAM, 0, type_out as u32, object_out as u32 ] ), 0 )",
+  "( read_guest_u32(&memory, type_out).unwrap(), MF_OBJECT_BYTESTREAM )"
+ ],
+ "mf_source_resolver_http_urls_bind_over_winhttp_and_pin_transport_errors": [
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, create, &[resolver_out as u32]), 0 )",
+  "(create_url(&mut runtime, &mut memory, &url), 0)",
+  "( read_guest_u32(&memory, type_out).unwrap(), MF_OBJECT_MEDIASOURCE )",
+  "( runtime.guest_object_kind(source).unwrap(), GuestObjectKind::ImfMediaSource )",
+  "( call_mf_slot( &mut runtime, &mut memory, resolver, 8, &[ url_ptr as u32, MF_RESOLUTION_BYTESTREAM, 0, type_out as u32, object_out as u32 ] ), 0 )",
   "( read_guest_u32(&memory, type_out).unwrap(), MF_OBJECT_BYTESTREAM )"
  ],
  "mf_topology_source_graph_resolves_descriptor_and_drives_the_source": [
@@ -8425,7 +8467,8 @@
   "( call_mf_slot( &mut runtime, &mut memory, transform, 0, &[iid as u32, out as u32] ), 0 )",
   "( read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), transform )",
   "( call_mf_slot( &mut runtime, &mut memory, transform, 0, &[iid as u32, out as u32] ), u64::from(E_NOINTERFACE) )",
-  "( call_mf_slot(&mut runtime, &mut memory, transform, 19, &[0, 0]), 0xC00D_36C4, \"slot 19 is the model's unsupported transform method\" )"
+  "( call_mf_slot(&mut runtime, &mut memory, transform, 19, &[0, 0]), 0xC00D_36C4, \"slot 19 is the model's unsupported transform method\" )",
+  "( dispatch_x86_thunk(runtime, memory, create, &[out as u32]), 0 )"
  ],
  "mf_vtable_preamble_and_registry_slot_counts_reject_wrong_layout": [
   "(attributes.len(), 33, \"IMFAttributes registry slots\")",
@@ -14921,6 +14964,14 @@
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoTargetCreate, &[0xDEAD, 0, target_out], ) .expect(\"target for missing device\"), STATUS_INVALID_PARAMETER )",
   "( call_island_shim( &island, &mut runtime, &mut memory, DriverShim::WdfIoTargetCreate, &[device_a, attrs, target_out], ) .expect(\"target with stale parent\"), STATUS_SUCCESS )"
  ],
+ "web_browser_client_to_window_uses_window_geometry_and_rejects_missing_window": [
+  "( call( &mut fixture, WebBrowserMethod::ClientToWindow, &[object as u32, OUT as u32, (OUT + 4) as u32] ), HR_E_FAIL )",
+  "(fixture.memory.read_u32(OUT).unwrap(), 10)",
+  "(fixture.memory.read_u32(OUT + 4).unwrap(), 10)",
+  "( call( &mut fixture, WebBrowserMethod::ClientToWindow, &[object as u32, 0, (OUT + 4) as u32] ), HR_E_INVALIDARG )",
+  "( fixture.runtime.user32.dpi_for_window(hwnd).expect(\"dpi\"), 96 )",
+  "( call( &mut fixture, WebBrowserMethod::ClientToWindow, &[object as u32, OUT as u32, (OUT + 4) as u32] ), HR_S_OK )"
+ ],
  "web_browser_co_create_instance_and_query_interface_pin_supported_iids_and_e_nointerface": [
   "(result, HR_S_OK)",
   "( dispatch_x86( &mut fixture, HostThunk::CoGetClassObject, &[(IID + 0x100) as u32, 0, 1, IID as u32, OUT as u32], ), HR_S_OK )",
@@ -14937,8 +14988,38 @@
   "(fixture.memory.read_u32(IDS).unwrap(), DISPID_UNKNOWN as u32)",
   "( call( &mut fixture, WebBrowserMethod::GetIDsOfNames, &[object as u32, 0, 0, 1, 0, IDS as u32] ), HR_E_INVALIDARG )"
  ],
+ "web_browser_document_navigation_races_and_lifetime_freeze_exact": [
+  "( call( &mut fixture, WebBrowserMethod::Navigate, &[object as u32, first as u32, 0, 0, 0, 0] ), HR_S_OK )",
+  "( call( &mut fixture, WebBrowserMethod::GetDocument, &[object as u32, OUT as u32] ), HR_S_OK )",
+  "(fixture.runtime.guest_objects[&doc_one].refcount, 2)",
+  "( call( &mut fixture, WebBrowserMethod::GetDocument, &[object as u32, OUT as u32] ), HR_S_FALSE )",
+  "(read_out_pointer(&fixture, OUT), 0)",
+  "( call( &mut fixture, WebBrowserMethod::DocumentGetReadyState, &[doc_one as u32, OUT as u32] ), HR_S_OK, \"ready state {value}\" )"
+ ],
  "web_browser_every_vtable_slot_rejects_a_null_this_with_e_invalidarg": [
   "( result, HR_E_INVALIDARG, \"{} must reject a null this with E_INVALIDARG\", method.dispatch_name() )"
+ ],
+ "web_browser_exec_wb_dispatches_modeled_ole_commands_and_rejects_unsupported": [
+  "( call( &mut fixture, WebBrowserMethod::ExecWB, &[object as u32, OLECMDID_REFRESH, 0, 0, 0] ), HR_S_OK )",
+  "( fixture.runtime.web_browsers[&object].ready_state, READYSTATE_COMPLETE )",
+  "(fixture.runtime.web_browsers[&object].status_text, \"Done\")",
+  "( call( &mut fixture, WebBrowserMethod::ExecWB, &[object as u32, OLECMDID_STOP, 0, 0, 0] ), HR_S_OK )",
+  "( call( &mut fixture, WebBrowserMethod::PutStatusText, &[object as u32, status as u32] ), HR_S_OK )"
+ ],
+ "web_browser_get_document_returns_html_document_and_rejects_wrong_iids": [
+  "( call( &mut fixture, WebBrowserMethod::GetDocument, &[object as u32, OUT as u32] ), HR_S_FALSE )",
+  "(read_out_pointer(&fixture, OUT), 0)",
+  "( call( &mut fixture, WebBrowserMethod::GetDocument, &[object as u32, 0] ), HR_E_INVALIDARG )",
+  "( call( &mut fixture, WebBrowserMethod::Invoke, &[ object as u32, WebBrowserMethod::GetDocument.dispid() as u32, 0, 0, u32::from(DISPATCH_PROPERTYGET), 0, VAR as u32, 0, 0 ] ), HR_S_FALSE )",
+  "(fixture.memory.read_u16(VAR).unwrap(), 0)",
+  "( call( &mut fixture, WebBrowserMethod::DocumentGetUrl, &[object as u32, OUT as u32] ), HR_E_INVALIDARG )"
+ ],
+ "web_browser_get_type_info_loads_real_typelib_and_rejects_bad_indexes": [
+  "( call( &mut fixture, WebBrowserMethod::GetTypeInfo, &[object as u32, 0, 0, 0] ), HR_E_INVALIDARG )",
+  "( call( &mut fixture, WebBrowserMethod::GetTypeInfo, &[object as u32, 7, 0, OUT as u32] ), HR_TYPE_E_ELEMENTNOTFOUND )",
+  "(read_out_pointer(&fixture, OUT), 0)",
+  "( call( &mut fixture, WebBrowserMethod::GetTypeInfo, &[object as u32, 0, 0, OUT as u32] ), HR_S_OK )",
+  "(fixture.runtime.guest_objects[&type_info].refcount, 3)"
  ],
  "web_browser_kind_table_variant_edges_and_x64_layout_are_exact": [
   "(location(&fixture, empty), \"about:blank\")",
@@ -14972,6 +15053,12 @@
   "( call( &mut fixture, WebBrowserMethod::QueryStatusWB, &[object as u32, 0x16, 0] ), HR_E_INVALIDARG )",
   "( call( &mut fixture, WebBrowserMethod::ExecWB, &[object as u32, 0x16, 0, 0, 0] ), HR_S_OK )"
  ],
+ "web_browser_type_info_cache_path_failure_is_cantloadlibrary": [
+  "( call( &mut fixture, WebBrowserMethod::GetTypeInfo, &[object as u32, 0, 0, OUT as u32] ), HR_TYPE_E_CANTLOADLIBRARY )",
+  "(read_out_pointer(&fixture, OUT), 0)",
+  "( call( &mut fixture, WebBrowserMethod::Invoke, &[ object as u32, WebBrowserMethod::GetTypeInfo.dispid() as u32, 0, 0, u32::from(DISPATCH_METHOD), PARAMS as u32, VAR2 as u32, 0, 0 ] ), HR_TYPE_E_CANTLOADLIBRARY )",
+  "( call( &mut fixture, WebBrowserMethod::GetTypeInfo, &[object as u32, 0, 0, OUT as u32] ), HR_S_OK )"
+ ],
  "web_browser_uri_variant_and_dispatch_edge_cases_pin_exact_results": [
   "(hr, expected)",
   "(hr, HR_DISP_E_TYPEMISMATCH)",
@@ -14979,6 +15066,14 @@
   "( call( &mut fixture, WebBrowserMethod::Navigate2, &[object as u32, 0, 0, 0, 0, 0] ), HR_DISP_E_TYPEMISMATCH )",
   "( call( &mut fixture, WebBrowserMethod::Navigate, &[object as u32, ptr as u32, 0, 0, 0, 0] ), HR_S_OK, \"{url} must navigate\" )",
   "( call( &mut fixture, WebBrowserMethod::Navigate, &[object as u32, no_path as u32, 0, 0, 0, 0] ), HR_INET_E_INVALID_URL )"
+ ],
+ "web_browser_x64_typeinfo_and_document_dispatch_edges_are_exact": [
+  "(type_info_call.get(Register::Rax), HR_S_OK)",
+  "(null_out.get(Register::Rax), HR_E_INVALIDARG)",
+  "(navigate.get(Register::Rax), HR_S_OK)",
+  "(get_document.get(Register::Rax), HR_S_OK)",
+  "(document_url.get(Register::Rax), HR_S_OK)",
+  "( read_utf16_string( &fixture.memory, read_guest_pointer(&fixture.memory, OUT, GuestArch::X64).expect(\"bstr\") ) .expect(\"bstr\"), \"http://example.com/x64\" )"
  ],
  "webhelper_detection_from_command_lines": [
   "(milestones.steam.webhelper_spawn_requests, 1)",

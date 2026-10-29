@@ -6,7 +6,7 @@
 
 Every tracked export whose dispatch is not exact or whose backing subsystem is not fully available, per the semantic axes of the API database (level = dispatch quality; fidelity = how close the guest-visible behavior is to the documented operation; capability = whether the Windows subsystem the operation belongs to exists in the modeled environment).
 
-**Counts**: 85 entries deviate from exact/full — fidelity Exact 9, Restricted 64, SyntheticEnvironment 12, capability Full 1, Partial 76, Absent 8.  Method-level accounting: 810 method rows, 810 deviate from exact/full — fidelity Restricted 810, capability Partial 810.
+**Counts**: 37 entries deviate from exact/full — fidelity Exact 9, Restricted 16, SyntheticEnvironment 12, capability Full 1, Partial 28, Absent 8.  Method-level accounting: 889 method rows, 8 deviate from exact/full — fidelity Exact 881, Restricted 8, capability Full 881, Partial 8.
 
 
 ### actxprxy.dll
@@ -36,31 +36,6 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 - `CertSelectCertificate` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Selects a real certificate from the runtime certificate stores (requested store membership + parsed X.509 validity) with a deterministic best-match order (signature-strength then latest NotAfter then store order), writes a real CERT_CONTEXT and owning store handle, and answers FALSE only when no certificate is eligible (no dialog is shown); real ERROR_INVALID_PARAMETER/ERROR_INVALID_HANDLE paths.  The picker callback cannot be invoked from this surface.
 
-### d3d11.dll
-
-- `ID3D11Buffer` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Buffer resources created and managed through the D3D11 device thunks.
-- `ID3D11ComputeShader` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Compute shaders created and bound through the D3D11 device/context thunks.
-- `ID3D11DepthStencilView` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Depth-stencil views created and bound through the D3D11 device/context thunks.
-- `ID3D11Device` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Implemented subset of ID3D11Device methods as HostThunk vtable dispatch (CreateBuffer/CreateTexture2D/views/shaders/query...); remaining methods surface as unsupported_method telemetry.
-- `ID3D11DeviceContext` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Implemented subset of ID3D11DeviceContext methods as HostThunk vtable dispatch (draw, IA/VS/PS/CS binding, OMSetRenderTargets...); remaining methods surface as unsupported_method telemetry.
-- `ID3D11GeometryShader` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Geometry shaders created through the D3D11 device thunks.
-- `ID3D11InputLayout` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Input layouts created and bound through the D3D11 device/context thunks.
-- `ID3D11PixelShader` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Pixel shaders created and bound through the D3D11 device/context thunks.
-- `ID3D11Query` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Queries/predicates created and queried through the D3D11 device thunks (CreateQuery, GetDesc).
-- `ID3D11RenderTargetView` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Render-target views created and bound through the D3D11 device/context thunks.
-- `ID3D11ShaderResourceView` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Shader-resource views created and bound through the D3D11 device/context thunks.
-- `ID3D11Texture2D` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Texture2D resources created and managed through the D3D11 device thunks.
-- `ID3D11VertexShader` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Vertex shaders created and bound through the D3D11 device/context thunks.
-
-### d3d12.dll
-
-- `ID3D12CommandQueue` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Command-queue thunks (ExecuteCommandLists, Signal).
-- `ID3D12DescriptorHeap` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Descriptor-heap thunks (CreateDescriptorHeap, GetCpuHandleForHeapStart).
-- `ID3D12Device` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Implemented subset of ID3D12Device methods (CreateCommandQueue/Allocator/List, CreateDescriptorHeap, CreateFence, CreateGraphicsPipelineState, CreateRootSignature...).
-- `ID3D12Fence` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Fence thunks (CreateFence, Signal).
-- `ID3D12GraphicsCommandList` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Graphics command-list thunks (ResourceBarrier, ClearRenderTargetView, DrawInstanced, SetPipelineState, SetGraphicsRootSignature, descriptor-heap binding...).
-- `ID3D12Resource` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Committed resources created and managed through the D3D12 runtime (create_committed_resource, upload_write...).
-
 ### dpaddr.dll
 
 - `DP8SPCreate` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — No DirectPlay8 service provider: class creation answers REGDB_E_CLASSNOTREG.
@@ -74,11 +49,6 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 - `DP8SPCreate` — level `Implemented`, fidelity `SyntheticEnvironment`, capability `Absent` — DirectPlay8 peers run directly on the UDP transport, so separate service-provider objects are not created: the call answers CLASS_E_CLASSNOTAVAILABLE.
 
-### dxgi.dll
-
-- `IDXGIFactory` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Guest IDXGIFactory object (GuestDxgiFactory) with CreateSwapChain, MakeWindowAssociation, SetPrivateData; remaining methods not covered.
-- `IDXGISwapChain` — level `Implemented`, fidelity `Restricted`, capability `Partial` — SwapChain creation (ForHwnd/ForCoreWindow/ForComposition) and present lifecycle routed to the D3D12 runtime.
-
 ### gdiplus.dll
 
 - `GdipMeasureCharacterRanges` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Builds real GpRegion objects per CharacterRange (per-line runs for ranges spanning newlines) from the same lattice metrics DrawString rasterizes with; the regions are queryable through the region surface and are honored as clips.  Lattice advances are not hinted font metrics and the layout rect does not clip the range regions.
@@ -90,23 +60,11 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 
 ### mf.dll
 
-- `IMFMediaSession` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Media session state machine (Start/Pause/Stop/Shutdown/SetTopology) implemented in media.rs.
 - `MFGetService` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real service-provider table on the runtime object graph: MFGetService resolves the owner (session, topology object/node, real media source, real byte stream) and returns real service objects — the session itself, genuine IMFRateControl/IMFRateSupport backed by real session rate state, MF_MEDIASOURCE_SERVICE on real sources, a real IMFMetadata provider over parsed MP4 ilst tags, and byte-stream attribute services; genuinely unowned GUIDs answer MF_E_UNSUPPORTED_SERVICE.
 
 ### mfplat.dll
 
-- `IMFAttributes` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Full attribute-store surface on ImfMediaType (the ABI-order vtable: GetItem/SetItem/typed accessors/CopyAllItems).
-- `IMFMediaBuffer` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Lock/Unlock/GetCurrentLength/SetCurrentLength/GetMaxLength on ImfMediaBuffer.
-- `IMFMediaSource` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Media sources created through SourceResolver (MP4 container).
-- `IMFMediaType` — level `Implemented`, fidelity `Restricted`, capability `Partial` — IMFAttributes + GetMajorType/IsCompressedFormat/IsEqual on the ABI-order vtable.
-- `IMFSample` — level `Implemented`, fidelity `Restricted`, capability `Partial` — The full IMFSample surface (flags/timestamps/buffers/GetTotalLength/CopyToBuffer/ConvertToContiguousBuffer).
-- `IMFSourceResolver` — level `Implemented`, fidelity `Restricted`, capability `Partial` — SourceResolver in media.rs detects container format and creates media sources.
-- `IMFTransform` — level `Implemented`, fidelity `Restricted`, capability `Partial` — ImfTransform trait with audio/video transform implementations in media.rs.
 - `MFGetService` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real service-provider table on the runtime object graph: MFGetService resolves the owner (session, topology object/node, real media source, real byte stream) and returns real service objects — the session itself, genuine IMFRateControl/IMFRateSupport, MF_MEDIASOURCE_SERVICE on real sources, real byte-stream attribute services and a real IMFMetadata provider over the parsed MP4 ilst tag map; genuinely unowned GUIDs answer MF_E_UNSUPPORTED_SERVICE.
-
-### mfreadwrite.dll
-
-- `IMFSinkWriter` — level `Implemented`, fidelity `Restricted`, capability `Partial` — SinkWriter in media.rs (AddStream/Initialize/WriteSample...).
 
 ### mmdevapi.dll
 
@@ -138,41 +96,14 @@ Every tracked export whose dispatch is not exact or whose backing subsystem is n
 - `NtCreateProcess` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Creates a real child guest process through the same machinery CreateProcessW uses (real pid, image, environment/cwd, kernel handle, exit sync) with real NTSTATUS failure paths; image-backed SEC_IMAGE sections are resolved through the real section registry, the first NtCreateThreadEx launches the real casa1-runner host execution with the caller's start routine actually injected (verified end to end), CREATE_SUSPENDED defers the host launch until NtResumeThread and a suspended child terminated before resume never runs, NtTerminateProcess kills the tracked host child and records the exit code, and NtQueryInformationThread reports the child's real process id, TEB and start address.
 - `NtCreateThreadEx` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Real native thread creation on a process object: real handle/client id, suspend count and full NtSuspend/NtResume/NtTerminate semantics; real guest thread records (TEB, stack from StackReserve, CPU state, start routine and parameter) scheduled through the guest thread scheduler for bare entries and the first thread on an image-backed native child launches the real host child execution.  Start routines are not injected into a running host child and host-launched child threads report parent-process query fields.
 
-### ole32.dll
-
-- `IClassFactory` — level `Implemented`, fidelity `Restricted`, capability `Partial` — CoCreateInstance instantiates the supported CLSID subset; the class-factory protocol is dispatched.
-- `IDataObject` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IDropTarget` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IMalloc` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IMoniker` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IObjectWithSite` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IOleInPlaceObject` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IOleObject` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IPersist` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IServiceProvider` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IStorage` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IStream` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IUnknown` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Runtime manages guest COM object lifetimes (QueryInterface/AddRef/Release) for every COM object.
-
-### oleaut32.dll
-
-- `IConnectionPoint` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-- `IDispatch` — level `Implemented`, fidelity `Restricted`, capability `Partial` — IDispatch::GetIDsOfNames and IDispatch::Invoke vtable thunks are dispatched in pe_runtime.rs.
-- `IEnumVARIANT` — level `Implemented`, fidelity `Restricted`, capability `Partial`
-
 ### riched32.dll
 
 - `RichEditANSIWndClass` — level `Implemented`, fidelity `Exact`, capability `Partial` — Registers the real RICHEDIT class through the user32 class registry and returns its real atom; window creation routes through the built-in rich-edit control path.
 
 ### shdocvw.dll
 
-- `IWebBrowser2` — level `Implemented`, fidelity `Restricted`, capability `Partial` — No IWebBrowser2 dispatch in the runtime.
 - `SHCreateLinks` — level `Implemented`, fidelity `Restricted`, capability `Full` — Writes a real persistent Windows .lnk (header + LinkInfo + flag-gated StringData) through the single src/lnk.rs writer shared with the COM IShellLink/IPersistFile save path, parse-back verified; the export's argument layout is a modeled contract and 'ANSI' path bytes are the UTF-8 guest path (no ANSI codepage).
 - `SHNavigateToFavorite` — level `Implemented`, fidelity `Restricted`, capability `Partial` — Adds/updates/removes real per-user favorites (in-runtime store plus persistent [InternetShortcut] .url files under the guest user's Favorites); no URL-navigation engine exists, so navigation itself is the stored record with S_FALSE on missing removes.
-
-### shell32.dll
-
-- `IShellLink` — level `Implemented`, fidelity `Restricted`, capability `Partial` — ShellLink vtable (GetPathW/SetPathW/Resolve/...) is dispatched as host thunks.
 
 ### srvsvc.dll
 

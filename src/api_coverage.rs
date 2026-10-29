@@ -12344,7 +12344,7 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "shdocvw.dll",
         "IWebBrowser2",
         "get_Document",
-        "casa1-conformance:web_browser_property_surface_round_trips_and_rejects_invalid_inputs",
+        "casa1-conformance:web_browser_get_document_returns_html_document_and_rejects_wrong_iids",
     ),
     method_evidence(
         "shdocvw.dll",
@@ -12518,7 +12518,7 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "shdocvw.dll",
         "IWebBrowser2",
         "GetTypeInfo",
-        "casa1-conformance:web_browser_query_status_and_put_get_property_pin_exact_values",
+        "casa1-conformance:web_browser_get_type_info_loads_real_typelib_and_rejects_bad_indexes",
     ),
     method_evidence(
         "shdocvw.dll",
@@ -12530,7 +12530,7 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "shdocvw.dll",
         "IWebBrowser2",
         "ExecWB",
-        "casa1-conformance:web_browser_query_status_and_put_get_property_pin_exact_values",
+        "casa1-conformance:web_browser_exec_wb_dispatches_modeled_ole_commands_and_rejects_unsupported",
     ),
     method_evidence(
         "shdocvw.dll",
@@ -12548,13 +12548,13 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "shdocvw.dll",
         "IWebBrowser2",
         "ShowBrowserBar",
-        "casa1-conformance:web_browser_every_vtable_slot_rejects_a_null_this_with_e_invalidarg",
+        "casa1-conformance:web_browser_exec_wb_dispatches_modeled_ole_commands_and_rejects_unsupported",
     ),
     method_evidence(
         "shdocvw.dll",
         "IWebBrowser2",
         "ClientToWindow",
-        "casa1-conformance:web_browser_every_vtable_slot_rejects_a_null_this_with_e_invalidarg",
+        "casa1-conformance:web_browser_client_to_window_uses_window_geometry_and_rejects_missing_window",
     ),
     method_evidence(
         "oleaut32.dll",
@@ -13288,13 +13288,13 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "mfplat.dll",
         "IMFMediaType",
         "GetRepresentation",
-        "casa1-conformance:mf_method_evidence_attributes_media_type_buffer_sample_reject_invalid_inputs",
+        "casa1-conformance:mf_media_type_representation_builds_real_am_types_and_rejects_unrepresentable",
     ),
     method_evidence(
         "mfplat.dll",
         "IMFMediaType",
         "FreeRepresentation",
-        "casa1-conformance:mf_method_evidence_attributes_media_type_buffer_sample_reject_invalid_inputs",
+        "casa1-conformance:mf_representation_reference_lifecycle_double_free_and_foreign_pointer_are_exact",
     ),
     method_evidence(
         "mfplat.dll",
@@ -17433,7 +17433,7 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "mfplat.dll",
         "IMFSourceResolver",
         "BeginCreateObjectFromURL",
-        "casa1-conformance:mf_source_resolver_async_begin_end_cancel_state_is_exact",
+        "casa1-conformance:mf_source_resolver_async_http_failures_surface_through_end_and_cancel_exactly_once",
     ),
     method_evidence(
         "mfplat.dll",
@@ -17463,7 +17463,7 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "mfplat.dll",
         "IMFSourceResolver",
         "CreateObjectFromURL",
-        "casa1-conformance:mf_source_resolver_creates_real_objects_and_rejects_invalid_forms",
+        "casa1-conformance:mf_source_resolver_http_urls_bind_over_winhttp_and_pin_transport_errors",
     ),
     method_evidence(
         "mfplat.dll",
@@ -17523,7 +17523,7 @@ pub static METHOD_COVERAGE_EVIDENCE: &[MethodCoverageEvidence] = &[
         "mfreadwrite.dll",
         "IMFSinkWriter",
         "GetServiceForStream",
-        "casa1-conformance:mf_sink_writer_streams_samples_and_invalid_state_are_exact",
+        "casa1-conformance:mf_sink_writer_services_resolve_real_duration_and_bytestream_or_exact_unsupported",
     ),
     method_evidence(
         "mfreadwrite.dll",

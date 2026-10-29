@@ -36,6 +36,15 @@ jobs:
           # One assignment only: a later PKG_CONFIG_PATH write would drop the
           # ffmpeg@7 path that ffmpeg-sys-next 7.1.x must see first.
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "FFMPEG_DIR=$(brew --prefix ffmpeg@7)" >> "$GITHUB_ENV"
+          # ffmpeg-sys-next's probe TU includes <libavcodec/avcodec.h> but then
+          # references LIBAVCODEC_VERSION_* macros, which live behind a version
+          # include guard; force-include them for the probe compile.
+          echo "CFLAGS=-I$(brew --prefix ffmpeg@7)/include -include libavcodec/version_major.h -include libavcodec/version.h" >> "$GITHUB_ENV"
+          # rust-cache does not key on FFMPEG_DIR, so drop stale build-script
+          # output that may point at a different FFmpeg install.
+          rm -rf target/debug/build/ffmpeg-sys-next-* target/debug/build/ffmpeg-next-*
+          cargo clean -p ffmpeg-sys-next -p ffmpeg-next || true
           # ffmpeg-next discovers the system libraries through pkg-config.
           # Homebrew does not put its lib/pkgconfig on the default search path
           # for every runner image, so make it explicit for this step and for

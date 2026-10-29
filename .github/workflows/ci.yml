@@ -66,6 +66,12 @@ jobs:
           # assignment exists (a later assignment would drop the 7.x path).
           echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "FFMPEG_DIR=$(brew --prefix ffmpeg@7)" >> "$GITHUB_ENV"
+          # ffmpeg-sys-next's probe TU includes <libavcodec/avcodec.h> but then
+          # references LIBAVCODEC_VERSION_* macros. FFmpeg >= 6 keeps those in
+          # version_major.h/version.h, which avcodec.h only pulls in under a
+          # guard, so force-include them for the probe compile. The explicit -I
+          # keeps the forced includes resolvable for any other cc crate.
+          echo "CFLAGS=-I$(brew --prefix ffmpeg@7)/include -include libavcodec/version_major.h -include libavcodec/version.h" >> "$GITHUB_ENV"
           # Drop cached build-script output from an older FFmpeg (rust-cache
           # does not key on FFMPEG_DIR, so it can keep pointing at FFmpeg 8).
           rm -rf target/debug/build/ffmpeg-sys-next-* target/debug/build/ffmpeg-next-*

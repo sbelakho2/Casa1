@@ -11,6 +11,8 @@
 use super::super::*;
 use crate::media::{Guid, ImfMediaBuffer, ImfMediaType, ImfSample, MfEventQueue};
 use crate::runtime::state::{ComStreamState, ImfByteStreamState, ImfMetadataState};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 /// MFT_CATEGORY_VIDEO_DECODER {d6c02d4b-6833-45b4-971a-05a4b04bab91}
 /// (the guest little-endian byte form).
@@ -263,6 +265,146 @@ const MF_E_UNSUPPORTED_RATE: u32 = 0xC00D_36D0;
 /// slowest forward rate: no pipeline component in the runtime graph can
 /// run slower than real time.
 const MF_SESSION_SLOWEST_FORWARD_RATE: f32 = 1.0;
+
+// ── IMFSinkWriter::GetServiceForStream service identifiers (mfidl.h /
+// mfreadwrite.h) ──────────────────────────────────────────────────────────
+
+/// MF_SINK_WRITER_MEDIASINK (mfreadwrite.h): query the media sink itself
+/// instead of one of the writer's encoders.
+const MF_SINK_WRITER_MEDIASINK: u32 = 0xFFFF_FFFF;
+/// MF_BYTESTREAM_SERVICE {ab025e2b-16d9-4180-a127-ba6c70156161} (mfidl.h).
+/// The sink writer answers it with the real byte stream over its output
+/// target (the documented service the media sink hands out for its
+/// backing stream).
+const SERVICE_MF_BYTESTREAM: [u8; 16] = [
+    0x2b, 0x5e, 0x02, 0xab, 0xd9, 0x16, 0x80, 0x41, 0xa1, 0x27, 0xba, 0x6c, 0x70, 0x15, 0x61, 0x61,
+];
+
+// ── URLMON transport HRESULTs (urlmon.h): the errors the WinHTTP URL
+// moniker transport answers, surfaced through the source resolver's
+// http/https binding ─────────────────────────────────────────────────────
+
+/// INET_E_INVALID_URL — the URL cannot be parsed.
+const INET_E_INVALID_URL: u32 = 0x800C_0002;
+/// INET_E_CANNOT_CONNECT — the transport could not reach the server.
+const INET_E_CANNOT_CONNECT: u32 = 0x800C_0004;
+/// INET_E_OBJECT_NOT_FOUND — the server answered 404.
+const INET_E_OBJECT_NOT_FOUND: u32 = 0x800C_0006;
+/// INET_E_DOWNLOAD_FAILURE — the response could not be read or the server
+/// answered a non-404 error status.
+const INET_E_DOWNLOAD_FAILURE: u32 = 0x800C_0008;
+/// INET_E_UNKNOWN_PROTOCOL — the URL's scheme has no registered handler.
+const INET_E_UNKNOWN_PROTOCOL: u32 = 0x800C_000D;
+
+// ── IMFMediaType::GetRepresentation surface (mfapi.h / DirectShow
+// uuids.h): the documented representation GUIDs and the DirectShow structs
+// the conversion produces ────────────────────────────────────────────────
+
+/// AM_MEDIA_TYPE_REPRESENTATION {e2e42ad2-132c-491e-a268-3c7c2dca181f} —
+/// the method selects the most appropriate format structure itself.
+const REP_AM_MEDIA_TYPE: [u8; 16] = [
+    0xd2, 0x2a, 0xe4, 0xe2, 0x2c, 0x13, 0x1e, 0x49, 0xa2, 0x68, 0x3c, 0x7c, 0x2d, 0xca, 0x18, 0x1f,
+];
+/// FORMAT_MFVideoFormat {aed4ab2d-7326-43cb-9464-c879cab9c43d}.
+const REP_FORMAT_MF_VIDEO_FORMAT: [u8; 16] = [
+    0x2d, 0xab, 0xd4, 0xae, 0x26, 0x73, 0xcb, 0x43, 0x94, 0x64, 0xc8, 0x79, 0xca, 0xb9, 0xc4, 0x3d,
+];
+/// FORMAT_VideoInfo {05589f80-c356-11ce-bf01-00aa0055595a}.
+const REP_FORMAT_VIDEO_INFO: [u8; 16] = [
+    0x80, 0x9f, 0x58, 0x05, 0x56, 0xc3, 0xce, 0x11, 0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a,
+];
+/// FORMAT_VideoInfo2 {f72a76a0-eb0a-11d0-ace4-0000c0cc16ba}.
+const REP_FORMAT_VIDEO_INFO2: [u8; 16] = [
+    0xa0, 0x76, 0x2a, 0xf7, 0x0a, 0xeb, 0xd0, 0x11, 0xac, 0xe4, 0x00, 0x00, 0xc0, 0xcc, 0x16, 0xba,
+];
+/// FORMAT_WaveFormatEx {05589f81-c356-11ce-bf01-00aa0055595a}.
+const REP_FORMAT_WAVE_FORMAT_EX: [u8; 16] = [
+    0x81, 0x9f, 0x58, 0x05, 0x56, 0xc3, 0xce, 0x11, 0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a,
+];
+/// MEDIASUBTYPE_RGB32 {e436eb7e-524f-11ce-9f53-0020af0ba770} — the
+/// DirectShow subtype the AM_MEDIA_TYPE conversion maps
+/// MFVideoFormat_RGB32 onto.
+const DSHOW_SUBTYPE_RGB32: [u8; 16] = [
+    0x7e, 0xeb, 0x36, 0xe4, 0x4f, 0x52, 0xce, 0x11, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70,
+];
+/// The standard `{0000-0010-8000-00aa00389b71}` GUID suffix shared by the
+/// MF/DirectShow WAVE-formatted subtype GUIDs (a subtype in that shape
+/// converts to a plain WAVEFORMATEX tag instead of a WAVEFORMATEXTENSIBLE).
+const MF_GUID_WAVE_SUFFIX: [u8; 8] = [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71];
+
+/// Which DirectShow format structure a `GetRepresentation` call asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MfRepresentationFormat {
+    /// `AM_MEDIA_TYPE_REPRESENTATION`: the method picks the format block.
+    Auto,
+    /// FORMAT_VideoInfo — VIDEOINFOHEADER.
+    VideoInfo,
+    /// FORMAT_VideoInfo2 — VIDEOINFOHEADER2.
+    VideoInfo2,
+    /// FORMAT_WaveFormatEx — WAVEFORMATEX.
+    WaveFormatEx,
+    /// FORMAT_MFVideoFormat — MFVIDEOFORMAT.
+    MfVideoFormat,
+}
+
+/// The allocation header the runtime prefixes to every `GetRepresentation`
+/// result: `FreeRepresentation` validates magic + representation GUID +
+/// size before releasing, which makes a double free, a foreign pointer and
+/// a use of the freed region impossible (the release poisons the whole
+/// allocation, header included).
+///
+/// Layout (little-endian): magic (u32, `'MFRP'`), reserved (u32),
+/// representation GUID (16 bytes), total allocation size (u64), pad (u64).
+const MF_REPRESENTATION_MAGIC: u32 = 0x4D46_5250;
+const MF_REPRESENTATION_HEADER: u64 = 40;
+/// The largest representation allocation `FreeRepresentation` will poison:
+/// a crafted header claiming more is rejected instead of driving a huge
+/// host allocation.
+const MF_REPRESENTATION_MAX_ALLOC: u64 = 16 * 1024 * 1024;
+
+/// The sink-writer service-table projection the dispatch layer records:
+/// the output target of URL writers (the byte-stream service's backing
+/// file) and the end timestamp of the written presentation
+/// (`MF_PD_DURATION`).  `media::SinkWriter`'s fields are private to their
+/// module, so the service-visible state lives here, keyed by guest process
+/// and writer object like the other process-keyed MF registries.
+#[derive(Debug, Default)]
+struct MfSinkWriterServiceState {
+    /// The output target of `MFCreateSinkWriterFromURL` (None for writers
+    /// created directly over a media sink, which have no file target).
+    output_path: Option<String>,
+    /// The end timestamp of the last timed sample written, in 100-ns units.
+    written_end_hns: i64,
+}
+
+static MF_SINK_WRITER_SERVICES: LazyLock<Mutex<HashMap<(u32, u64), MfSinkWriterServiceState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn mf_sink_writer_services()
+-> std::sync::MutexGuard<'static, HashMap<(u32, u64), MfSinkWriterServiceState>> {
+    MF_SINK_WRITER_SERVICES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record the service-table state of a freshly created sink writer.
+fn record_mf_sink_writer(pid: u32, writer: u64, output_path: Option<String>) {
+    mf_sink_writer_services().insert(
+        (pid, writer),
+        MfSinkWriterServiceState {
+            output_path,
+            written_end_hns: 0,
+        },
+    );
+}
+
+/// Advance the writer's written-presentation end timestamp after a real
+/// sample write (samples carry their own 100-ns time and duration).
+fn track_mf_sink_writer_write(pid: u32, writer: u64, sample_end_hns: i64) {
+    if let Some(state) = mf_sink_writer_services().get_mut(&(pid, writer)) {
+        state.written_end_hns = state.written_end_hns.max(sample_end_hns.max(0));
+    }
+}
 
 /// The standard MF interface vtable preamble: IUnknown + the first
 /// interface method slots that the runtime dispatches.  The remaining slots
@@ -1600,9 +1742,26 @@ impl PeHostRuntime {
             return Ok(Err(MF_E_UNSUPPORTED_BYTESTREAM_TYPE));
         };
         let path = url.strip_prefix("file://").unwrap_or(url);
-        if path.starts_with("http://") || path.starts_with("https://") {
-            // No network byte-stream handler is registered.
-            return Ok(Err(MF_E_UNSUPPORTED_BYTESTREAM_TYPE));
+        // Scheme dispatch: http/https bind through the WinHTTP URL-moniker
+        // transport, "file" keeps the local open below, and any other
+        // scheme has no registered handler (the exact URLMON answer).
+        let scheme = path.find("://").map(|end| path[..end].to_ascii_lowercase());
+        let is_http = scheme
+            .as_deref()
+            .is_some_and(|scheme| scheme == "http" || scheme == "https");
+        let is_file = scheme.as_deref().is_some_and(|scheme| scheme == "file");
+        if scheme.is_some() && !(is_http || is_file) {
+            return Ok(Err(INET_E_UNKNOWN_PROTOCOL));
+        }
+        if is_http {
+            // The URL moniker transport: the same WinHTTP stack the
+            // moniker binding uses fetches the payload, and its exact
+            // URLMON errors (plus the container error for payloads the
+            // parser does not model) flow back to the caller.
+            return match self.mf_url_fetch(path) {
+                Ok(bytes) => self.mf_open_fetched_source_graph(memory, path, bytes),
+                Err(hr) => Ok(Err(hr)),
+            };
         }
         let handle = match self.win32.create_file_w(
             path,
@@ -1667,6 +1826,121 @@ impl PeHostRuntime {
         Ok(Ok((byte_stream, source, reader_object)))
     }
 
+    /// Fetch one http(s) URL through the runtime's WinHTTP stack (the URL
+    /// moniker transport), returning the response bytes or the URLMON
+    /// HRESULT for an invalid URL, connect failure or HTTP error status.
+    fn mf_url_fetch(&mut self, text: &str) -> std::result::Result<Vec<u8>, u32> {
+        let parsed = match url::Url::parse(text) {
+            Ok(parsed) => parsed,
+            Err(_) => return Err(INET_E_INVALID_URL),
+        };
+        let secure = parsed.scheme() == "https";
+        let host = parsed.host_str().unwrap_or_default().to_string();
+        let port = parsed
+            .port_or_known_default()
+            .unwrap_or(if secure { 443 } else { 80 });
+        let mut target = parsed.path().to_string();
+        if let Some(query) = parsed.query() {
+            target.push('?');
+            target.push_str(query);
+        }
+        let session = self
+            .winhttp
+            .win_http_open(Some("Casa1-URLMoniker"), 0, None, None);
+        // A freshly created session always connects; an invalid handle
+        // surfaces as a send failure below (the honest INET_E_CANNOT_CONNECT).
+        let connection = self
+            .winhttp
+            .win_http_connect(session, &host, port, secure)
+            .unwrap_or_default();
+        let request = self
+            .winhttp
+            .win_http_open_request(connection, "GET", &target, None)
+            .unwrap_or_default();
+        let result = self.mf_url_fetch_request(request);
+        let _ = self.winhttp.win_http_close_handle(request);
+        let _ = self.winhttp.win_http_close_handle(connection);
+        let _ = self.winhttp.win_http_close_handle(session);
+        result
+    }
+
+    /// Send the request, map the HTTP status onto the URLMON error table
+    /// and read the whole response body.
+    fn mf_url_fetch_request(&mut self, request: u64) -> std::result::Result<Vec<u8>, u32> {
+        if self
+            .winhttp
+            .win_http_send_request(request, None, None)
+            .is_err()
+        {
+            return Err(INET_E_CANNOT_CONNECT);
+        }
+        let status = self.winhttp.request_status_code(request);
+        if status >= 400 {
+            return Err(if status == 404 {
+                INET_E_OBJECT_NOT_FOUND
+            } else {
+                INET_E_DOWNLOAD_FAILURE
+            });
+        }
+        let mut body = Vec::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = self
+                .winhttp
+                .win_http_read_data(request, &mut buffer)
+                .map_err(|_| INET_E_DOWNLOAD_FAILURE)?; // coverage: unreachable — a live completed request always answers reads
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&buffer[..read as usize]);
+        }
+        Ok(body)
+    }
+
+    /// Build the byte-stream + media-source + reader graph over bytes
+    /// fetched from the network: the payload must be a container the
+    /// runtime's parser models or the documented unsupported-bytestream
+    /// answer is returned.  The byte stream handed back (and used as the
+    /// source's backing stream) is a real memory-backed IMFByteStream over
+    /// the fetched payload with the URL as its origin name.
+    fn mf_open_fetched_source_graph(
+        &mut self,
+        memory: &mut MemoryImage,
+        url: &str,
+        bytes: Vec<u8>,
+    ) -> AppResult<Result<(u64, u64, u64), u32>> {
+        let length = bytes.len() as u64;
+        let stream_payload = bytes.clone();
+        let reader = match crate::media::SourceReader::from_data(bytes) {
+            Ok(reader) => reader,
+            Err(_) => return Ok(Err(MF_E_UNSUPPORTED_BYTESTREAM_TYPE)),
+        };
+        let content_type = crate::media::mime_type_for_path(url).map(str::to_string);
+        let presentation = reader.presentation(length, content_type.as_deref());
+        let metadata = reader.metadata().clone();
+        let byte_stream = self
+            .mf_alloc_byte_stream_object(memory, ImfByteStreamState::from_bytes(stream_payload))?;
+        if byte_stream == 0 {
+            return Ok(Err(E_OUTOFMEMORY)); // coverage: unreachable — allocator fault not injected
+        }
+        if let Some(stream) = self.mf_byte_streams.get_mut(&byte_stream) {
+            stream.origin_name = Some(url.to_string());
+            stream.content_type = content_type;
+        }
+        let source = self.mf_alloc_media_source_object(memory, presentation, byte_stream)?;
+        if source == 0 {
+            return Ok(Err(E_OUTOFMEMORY)); // coverage: unreachable — allocator fault not injected
+        }
+        if let Some(source_state) = self.mf_media_sources.get_mut(&source) {
+            source_state.set_metadata(metadata);
+        }
+        let reader_object = self.mf_alloc_source_reader_object(memory, reader, source)?;
+        if reader_object == 0 {
+            return Ok(Err(E_OUTOFMEMORY)); // coverage: unreachable — allocator fault not injected
+        }
+        Ok(Ok((byte_stream, source, reader_object)))
+    }
+
     /// `MFCreateSourceReaderFromURL(pwszURL, pAttributes, ppReader)` — opens
     /// the file through the runtime file tables and creates the real byte
     /// stream + media source + source reader graph.
@@ -1721,6 +1995,7 @@ impl PeHostRuntime {
         }
         self.mf_sink_writers
             .insert(object, crate::media::SinkWriter::new());
+        record_mf_sink_writer(self.guest_pid, object, None);
         write_guest_pointer(memory, out, object, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -1789,6 +2064,7 @@ impl PeHostRuntime {
         let sink = crate::media::SinkWriter::from_url(&url)
             .unwrap_or_else(|_| crate::media::SinkWriter::new());
         self.mf_sink_writers.insert(object, sink);
+        record_mf_sink_writer(self.guest_pid, object, Some(url));
         write_guest_pointer(memory, out, object, self.guest_arch).ok();
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -2923,9 +3199,24 @@ impl PeHostRuntime {
     }
 
     /// `IMFSinkWriter::GetServiceForStream(dwStreamIndex, guidService,
-    /// riid, ppvObject)` — the runtime exposes no sink-writer stream
-    /// service, so the documented unsupported-service answer is returned
-    /// with a null interface.
+    /// riid, ppvObject)` — resolve the services the runtime's sink writer
+    /// actually exposes instead of blanket-refusing everything:
+    ///
+    /// - `GUID_NULL` follows the documented contract and behaves like
+    ///   `QueryInterface` of the writer itself (`IMFSinkWriter`/`IUnknown`);
+    /// - `MF_PD_DURATION` hands out a real `IMFAttributes` store carrying
+    ///   the writer's written-presentation duration in 100-ns units (the
+    ///   end timestamp of the timed samples the writer really wrote);
+    /// - `MF_BYTESTREAM_SERVICE` hands out a real `IMFByteStream` over the
+    ///   writer's output target file (URL writers only);
+    /// - every other GUID — including the quality-manager service
+    ///   (`MF_QUALITY_SERVICES`, which no runtime object models) — keeps
+    ///   the documented `MF_E_UNSUPPORTED_SERVICE` with a null interface.
+    ///
+    /// A stream selector outside `{MF_SINK_WRITER_ALL_STREAMS,
+    /// MF_SINK_WRITER_MEDIASINK, live stream}` keeps the exact
+    /// `MF_E_INVALIDSTREAMNUMBER` (checked first, so a bad stream always
+    /// wins over the service answer).
     pub(crate) fn dispatch_mf_sink_writer_get_service_for_stream(
         &mut self,
         state: &mut CpuState,
@@ -2933,8 +3224,8 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let this = guest_call_arg(state, memory, 0)?;
         let stream = guest_call_arg_u32(state, memory, 1)?;
-        let _service = guest_call_arg(state, memory, 2)?;
-        let _iid = guest_call_arg(state, memory, 3)?;
+        let service_ptr = guest_call_arg(state, memory, 2)?;
+        let iid_ptr = guest_call_arg(state, memory, 3)?;
         let out = guest_call_arg(state, memory, 4)?;
         let Some(sink) = self.mf_sink_writers.get(&this) else {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
@@ -2945,10 +3236,109 @@ impl PeHostRuntime {
             return Ok(());
         }
         write_guest_pointer(memory, out, 0, self.guest_arch).ok();
-        if stream != MF_SINK_WRITER_ALL_STREAMS && !sink.has_stream(stream) {
+        if stream != MF_SINK_WRITER_ALL_STREAMS
+            && stream != MF_SINK_WRITER_MEDIASINK
+            && !sink.has_stream(stream)
+        {
             state.set(Register::Rax, u64::from(MF_E_INVALIDSTREAMNUMBER));
             return Ok(());
         }
+        if service_ptr == 0 || iid_ptr == 0 {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let Ok(service_bytes) = memory.read_bytes(service_ptr, 16) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let Ok(iid_bytes) = memory.read_bytes(iid_ptr, 16) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        let mut service = [0_u8; 16];
+        service.copy_from_slice(&service_bytes[..16]);
+        let mut iid = [0_u8; 16];
+        iid.copy_from_slice(&iid_bytes[..16]);
+        if service == [0_u8; 16] {
+            // GUID_NULL: QueryInterface the writer itself (the runtime
+            // object implements IMFSinkWriter and IUnknown).
+            if iid == IID_IMF_SINK_WRITER || iid == IID_IUNKNOWN {
+                self.add_ref_guest_object(this)?;
+                write_guest_pointer(memory, out, this, self.guest_arch).ok();
+                state.set(Register::Rax, u64::from(S_OK));
+            } else {
+                state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            }
+            return Ok(());
+        }
+        if mf_guid_from_bytes(&service) == crate::media::MF_PD_DURATION {
+            if iid != IID_IMF_ATTRIBUTES && iid != IID_IUNKNOWN {
+                state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+                return Ok(());
+            }
+            let duration = mf_sink_writer_services()
+                .get(&(self.guest_pid, this))
+                .map(|state| state.written_end_hns.max(0) as u64)
+                .unwrap_or(0);
+            let vtable = self.alloc_guest_vtable(memory, mf_attributes_methods())?;
+            let store = self
+                .alloc_guest_object(memory, GuestObjectKind::ImfAttributes, vtable)
+                .unwrap_or(0);
+            if store == 0 {
+                state.set(Register::Rax, u64::from(E_OUTOFMEMORY)); // coverage: unreachable — allocator fault not injected
+                return Ok(()); // coverage: unreachable — allocator fault not injected
+            }
+            let mut attributes = ImfMediaType::new();
+            attributes.set_uint64(crate::media::MF_PD_DURATION, duration);
+            self.mf_media_types.insert(store, attributes);
+            write_guest_pointer(memory, out, store, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        if service == SERVICE_MF_BYTESTREAM {
+            if iid != IID_IMF_BYTE_STREAM && iid != IID_IUNKNOWN {
+                state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+                return Ok(());
+            }
+            let target = mf_sink_writer_services()
+                .get(&(self.guest_pid, this))
+                .and_then(|state| state.output_path.clone());
+            let Some(target) = target else {
+                // A writer created directly over a media sink has no output
+                // file the byte-stream service could answer.
+                state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
+                return Ok(());
+            };
+            match std::fs::read(&target) {
+                Ok(payload) => {
+                    let mut stream = ImfByteStreamState::from_bytes(payload);
+                    stream.origin_name = Some(target.clone());
+                    stream.content_type =
+                        crate::media::mime_type_for_path(&target).map(str::to_string);
+                    let byte_stream = self.mf_alloc_byte_stream_object(memory, stream)?;
+                    if byte_stream == 0 {
+                        state.set(Register::Rax, u64::from(E_OUTOFMEMORY)); // coverage: unreachable — allocator fault not injected
+                        return Ok(()); // coverage: unreachable — allocator fault not injected
+                    }
+                    write_guest_pointer(memory, out, byte_stream, self.guest_arch).ok();
+                    state.set(Register::Rax, u64::from(S_OK));
+                }
+                Err(error) => {
+                    state.set(
+                        Register::Rax,
+                        u64::from(if error.kind() == std::io::ErrorKind::NotFound {
+                            0x8007_0002 // HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+                        } else {
+                            E_FAIL
+                        }),
+                    );
+                }
+            }
+            return Ok(());
+        }
+        // Unknown service GUID: the quality manager (MF_QUALITY_SERVICES)
+        // and every GUID no runtime object models keep the documented
+        // unsupported-service answer with the nulled interface.
         state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_SERVICE));
         Ok(())
     }
@@ -3680,7 +4070,10 @@ impl PeHostRuntime {
     /// `IMFSourceResolver::BeginCreateObjectFromURL` /
     /// `BeginCreateObjectFromByteStream` — resolve the real source graph now
     /// and publish the result through the async pump (or record it for a
-    /// callback-less `EndCreateObject*`).
+    /// callback-less `EndCreateObject*`).  Argument validation answers
+    /// synchronously; bind failures are carried by the produced
+    /// `IMFAsyncResult` status so `EndCreateObject*` reports them exactly
+    /// once (see `dispatch_mf_source_resolver_end`).
     pub(crate) fn dispatch_mf_source_resolver_begin(
         &mut self,
         state: &mut CpuState,
@@ -3748,14 +4141,17 @@ impl PeHostRuntime {
         };
         let resolved =
             self.mf_source_resolver_resolve(url.as_deref(), stream, flags, !from_url, memory)?;
-        let (object, object_type) = match resolved {
-            Ok(resolved) => resolved,
-            Err(hr) => {
-                state.set(Register::Rax, u64::from(hr));
-                return Ok(());
-            }
+        let (object, object_type, status) = match resolved {
+            Ok((object, object_type)) => (object, object_type, S_OK),
+            // Bind failures (missing file, transport error, unsupported
+            // container) are deferred into the async result exactly as the
+            // URL moniker transport reports them: Begin answers with the
+            // cookie (E_PENDING for a callback), the callback observes the
+            // failed status, and EndCreateObjectFromURL hands the failure
+            // back exactly once with a null object.
+            Err(hr) => (0, 0, hr),
         };
-        let result = self.alloc_mf_async_result(memory, state_object, S_OK)?;
+        let result = self.alloc_mf_async_result(memory, state_object, status)?;
         if result == 0 {
             state.set(Register::Rax, u64::from(E_OUTOFMEMORY)); // coverage: unreachable — allocator fault not injected
             return Ok(()); // coverage: unreachable — allocator fault not injected
@@ -3789,7 +4185,10 @@ impl PeHostRuntime {
 
     /// `IMFSourceResolver::EndCreateObjectFromURL` /
     /// `EndCreateObjectFromByteStream` — hand the resolved object and its
-    /// `MF_OBJECT_TYPE` to the caller exactly once.
+    /// `MF_OBJECT_TYPE` to the caller exactly once.  A bind failure the
+    /// Begin call recorded on the result is returned here (with a null
+    /// object and type), matching how the URL moniker transport surfaces
+    /// transport and container errors through the async form.
     pub(crate) fn dispatch_mf_source_resolver_end(
         &mut self,
         state: &mut CpuState,
@@ -3830,6 +4229,22 @@ impl PeHostRuntime {
                 self.release_guest_object(completion.object).ok();
             }
             state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        let status = self
+            .mf_async_results
+            .get(&completion.result)
+            .map(|result| result.status)
+            .unwrap_or(S_OK);
+        if status != S_OK {
+            // The bind failed: no object was produced, and the exact
+            // failure HRESULT is the End answer (S_OK status keeps the
+            // success path below).
+            if type_out != 0 {
+                write_guest_u32(memory, type_out, 0).ok();
+            }
+            write_guest_pointer(memory, object_out, 0, self.guest_arch).ok();
+            state.set(Register::Rax, u64::from(status));
             return Ok(());
         }
         if type_out != 0 {
@@ -6118,6 +6533,13 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_FAIL));
             return Ok(());
         }
+        // The service table observes the real sample timeline: the writer's
+        // MF_PD_DURATION follows the end of the written presentation.
+        track_mf_sink_writer_write(
+            self.guest_pid,
+            this,
+            sample.sample_time.saturating_add(sample.sample_duration),
+        );
         state.set(Register::Rax, u64::from(S_OK));
         let _ = memory;
         Ok(())
@@ -6390,7 +6812,16 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_FAIL));
             return Ok(());
         }
-        let mut capabilities = MFBYTESTREAM_IS_READABLE | MFBYTESTREAM_DOES_NOT_USE_NETWORK;
+        let mut capabilities = MFBYTESTREAM_IS_READABLE;
+        if !stream
+            .origin_name
+            .as_deref()
+            .is_some_and(|origin| origin.starts_with("http://") || origin.starts_with("https://"))
+        {
+            // The URL-bound stream really did use the network, so the
+            // DOES_NOT_USE_NETWORK flag stays clear for it.
+            capabilities |= MFBYTESTREAM_DOES_NOT_USE_NETWORK;
+        }
         if stream.seekable {
             capabilities |= MFBYTESTREAM_IS_SEEKABLE;
         }
@@ -7683,15 +8114,155 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `IMFMediaType::GetRepresentation` / `FreeRepresentation` — the video
-    /// representations are not exposed.
+    /// `IMFMediaType::GetRepresentation(guid, ppv)` / `FreeRepresentation
+    /// (guid, pv)` — the documented DirectShow representations for the
+    /// media types the runtime models.
+    ///
+    /// `GetRepresentation` converts the real `ImfMediaType` into a real
+    /// `AM_MEDIA_TYPE` (majortype/subtype/format block filled from the
+    /// attribute store) and allocates it for the caller, prefixing a
+    /// reference header that the release validates.  Answers follow the
+    /// documented Windows table: `MF_E_UNSUPPORTED_REPRESENTATION` for a
+    /// representation GUID outside {AM_MEDIA_TYPE_REPRESENTATION,
+    /// FORMAT_MFVideoFormat, FORMAT_VideoInfo, FORMAT_VideoInfo2,
+    /// FORMAT_WaveFormatEx}, `MF_E_ATTRIBUTENOTFOUND` when the media type
+    /// lacks MF_MT_MAJOR_TYPE/MF_MT_SUBTYPE, `E_INVALIDARG` for a format
+    /// structure the media type cannot pair with (video structure on an
+    /// audio type and vice versa) or a null argument, and the retained
+    /// `MF_E_INVALIDTYPE` only for a major type with no DirectShow
+    /// representation at all.
+    ///
+    /// `FreeRepresentation` releases exactly the allocation the paired Get
+    /// produced: the header must carry the magic and the same
+    /// representation GUID, and the release poisons the whole region — so a
+    /// double free, a foreign pointer and a use of the freed region all
+    /// answer `E_INVALIDARG` instead of corrupting anything.
     pub(crate) fn dispatch_mf_media_type_representation(
         &mut self,
         state: &mut CpuState,
         memory: &mut MemoryImage,
+        free: bool,
     ) -> AppResult<()> {
-        let _this = guest_call_arg(state, memory, 0)?;
-        state.set(Register::Rax, u64::from(MF_E_INVALIDTYPE));
+        let this = guest_call_arg(state, memory, 0)?;
+        let guid_ptr = guest_call_arg(state, memory, 1)?;
+        let value = guest_call_arg(state, memory, 2)?;
+        let Some(mt) = self.mf_media_types.get(&this).cloned() else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        };
+        if guid_ptr == 0 || value == 0 {
+            if !free && value != 0 {
+                write_guest_pointer(memory, value, 0, self.guest_arch).ok();
+            }
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        }
+        if !free {
+            write_guest_pointer(memory, value, 0, self.guest_arch).ok();
+        }
+        let Ok(guid_bytes) = memory.read_bytes(guid_ptr, 16) else {
+            state.set(Register::Rax, u64::from(E_INVALIDARG));
+            return Ok(());
+        };
+        if free {
+            let Some(base) = value.checked_sub(MF_REPRESENTATION_HEADER) else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            let Ok(header) = memory.read_bytes(base, MF_REPRESENTATION_HEADER as usize) else {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            };
+            let magic = u32::from_le_bytes(header[0..4].try_into().expect("4 header bytes"));
+            let size = u64::from_le_bytes(header[24..32].try_into().expect("8 size bytes"));
+            if magic != MF_REPRESENTATION_MAGIC
+                || header[8..24] != guid_bytes[..]
+                || size < MF_REPRESENTATION_HEADER
+                || size > MF_REPRESENTATION_MAX_ALLOC
+            {
+                state.set(Register::Rax, u64::from(E_INVALIDARG));
+                return Ok(());
+            }
+            memory.map_bytes(base, &vec![0_u8; size as usize]);
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
+        let format = if guid_bytes == REP_AM_MEDIA_TYPE {
+            MfRepresentationFormat::Auto
+        } else if guid_bytes == REP_FORMAT_VIDEO_INFO {
+            MfRepresentationFormat::VideoInfo
+        } else if guid_bytes == REP_FORMAT_VIDEO_INFO2 {
+            MfRepresentationFormat::VideoInfo2
+        } else if guid_bytes == REP_FORMAT_WAVE_FORMAT_EX {
+            MfRepresentationFormat::WaveFormatEx
+        } else if guid_bytes == REP_FORMAT_MF_VIDEO_FORMAT {
+            MfRepresentationFormat::MfVideoFormat
+        } else {
+            state.set(Register::Rax, u64::from(MF_E_UNSUPPORTED_REPRESENTATION));
+            return Ok(());
+        };
+        let Some(major) = mt.get_guid(&crate::media::MF_MT_MAJOR_TYPE) else {
+            state.set(Register::Rax, u64::from(MF_E_ATTRIBUTENOTFOUND));
+            return Ok(());
+        };
+        let Some(subtype) = mt.get_guid(&crate::media::MF_MT_SUBTYPE) else {
+            state.set(Register::Rax, u64::from(MF_E_ATTRIBUTENOTFOUND));
+            return Ok(());
+        };
+        let built = if major == crate::media::MFMediaType_Video {
+            mf_build_video_representation(&mt, &subtype, format)
+        } else if major == crate::media::MFMediaType_Audio {
+            mf_build_audio_representation(&mt, &subtype, format)
+        } else {
+            // The DirectShow conversion the runtime models knows only the
+            // audio and video major types: any other major type has no
+            // representation — the retained MF_E_INVALIDTYPE answer.
+            Err(MF_E_INVALIDTYPE)
+        };
+        let (formattype, block) = match built {
+            Ok(built) => built,
+            Err(hr) => {
+                state.set(Register::Rax, u64::from(hr));
+                return Ok(());
+            }
+        };
+        let pointer_bytes = self.guest_arch.pointer_bytes() as u64;
+        let am_size = if pointer_bytes == 4 { 72 } else { 88 };
+        let total = MF_REPRESENTATION_HEADER + am_size + block.len() as u64;
+        let base = self.alloc_zeroed(memory, total as usize, 8)?;
+        write_guest_u32(memory, base, MF_REPRESENTATION_MAGIC).ok();
+        for (index, byte) in guid_bytes.iter().enumerate() {
+            memory.write_u8(base + 8 + index as u64, *byte);
+        }
+        write_guest_u64(memory, base + 24, total).ok();
+        let am = base + MF_REPRESENTATION_HEADER;
+        write_guest_guid(memory, am, major);
+        write_guest_guid(memory, am + 16, mf_am_subtype(&subtype));
+        // bFixedSizeSamples and lSampleSize stay 0 and bTemporalCompression
+        // is TRUE: MF_MT_FIXED_SIZE_SAMPLES, MF_MT_SAMPLE_SIZE and
+        // MF_MT_ALL_SAMPLES_INDEPENDENT are attributes the runtime does not
+        // model, and the conversion reports their absence exactly like the
+        // Windows conversion does (GetUINT32 -> 0).
+        write_guest_u32(memory, am + 32, 0).ok();
+        write_guest_u32(memory, am + 36, 1).ok();
+        write_guest_u32(memory, am + 40, 0).ok();
+        memory.map_bytes(am + 44, &formattype);
+        let p_unk_offset = (60 + pointer_bytes - 1) / pointer_bytes * pointer_bytes;
+        let cb_offset = p_unk_offset + pointer_bytes;
+        let pb_offset = (cb_offset + 4 + pointer_bytes - 1) / pointer_bytes * pointer_bytes;
+        write_guest_pointer(memory, am + p_unk_offset, 0, self.guest_arch).ok();
+        write_guest_u32(memory, am + cb_offset, block.len() as u32).ok();
+        let block_address = am + am_size;
+        write_guest_pointer(memory, am + pb_offset, block_address, self.guest_arch).ok();
+        memory.map_bytes(block_address, &block);
+        write_guest_pointer(
+            memory,
+            value,
+            base + MF_REPRESENTATION_HEADER,
+            self.guest_arch,
+        )
+        .ok();
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
@@ -7804,8 +8375,11 @@ impl PeHostRuntime {
                 self.dispatch_mf_media_type_is_compressed_format(state, memory)
             }
             MfMediaTypeIsEqual => self.dispatch_mf_media_type_is_equal(state, memory),
-            MfMediaTypeGetRepresentation | MfMediaTypeFreeRepresentation => {
-                self.dispatch_mf_media_type_representation(state, memory)
+            MfMediaTypeGetRepresentation => {
+                self.dispatch_mf_media_type_representation(state, memory, false)
+            }
+            MfMediaTypeFreeRepresentation => {
+                self.dispatch_mf_media_type_representation(state, memory, true)
             }
             MfBufferGetMaxLength => self.dispatch_mf_buffer_get_max_length(state, memory),
             MfBufferLock => self.dispatch_mf_buffer_lock(state, memory),
@@ -8565,6 +9139,262 @@ fn mf_guid_from_bytes(bytes: &[u8]) -> Guid {
     )
 }
 
+/// The directshow facts the AM_MEDIA_TYPE conversion derives for a
+/// modeled video subtype: (bits per pixel, BITMAPINFOHEADER biCompression
+/// with `u32::MAX` meaning "the subtype FourCC itself", uncompressed?).
+/// `MFVideoFormat_RGB32` and `MFVideoFormat_NV12` are the uncompressed
+/// formats the runtime models; every other modeled subtype (H264, H265,
+/// VP90, WMV3) is a compressed FourCC format with no fixed bit count.
+fn mf_directshow_video_format(subtype: &Guid) -> (u16, u32, bool) {
+    if *subtype == crate::media::MFVideoFormat_RGB32 {
+        (32, 0, true) // BI_RGB
+    } else if *subtype == crate::media::MFVideoFormat_NV12 {
+        (12, u32::MAX, true)
+    } else {
+        (0, u32::MAX, false)
+    }
+}
+
+/// (width, height, bits per pixel, biCompression, biSizeImage) for the
+/// bitmap header of a video representation.  The geometry comes from
+/// MF_MT_FRAME_SIZE; with no DEFAULT_STRIDE attribute modeled, the Windows
+/// conversion's stride folding leaves the raw width/height in the header,
+/// and biSizeImage is derivable only for the uncompressed formats.
+fn mf_video_geometry(mt: &ImfMediaType, subtype: &Guid) -> (u32, u32, u16, u32, u32) {
+    let (width, height) = mt.get_frame_size().unwrap_or((0, 0));
+    let (bpp, compression, uncompressed) = mf_directshow_video_format(subtype);
+    let compression = if compression != u32::MAX {
+        compression
+    } else {
+        subtype.data1 // the FourCC compression (H264, NV12, ...)
+    };
+    let size_image = if uncompressed {
+        ((width as u64 * height as u64 * u64::from(bpp)) / 8) as u32
+    } else {
+        0
+    };
+    (width, height, bpp, compression, size_image)
+}
+
+/// The VIDEOINFOHEADER AvgTimePerFrame (FRAME_DURATION) in 100-ns units:
+/// the documented `round(10000000 * denominator / numerator)` of
+/// MF_MT_FRAME_RATE, 0 when the type carries no frame rate.
+fn mf_avg_time_per_frame(mt: &ImfMediaType) -> i64 {
+    let (numerator, denominator) = mt.get_frame_rate().unwrap_or((0, 0));
+    if numerator == 0 {
+        0
+    } else {
+        (((10_000_000_u128 * denominator as u128) + numerator as u128 / 2) / numerator as u128)
+            as i64
+    }
+}
+
+/// Write the little-endian u16/u32/u64 into a format-block slice.
+fn mf_put_u16(block: &mut [u8], offset: usize, value: u16) {
+    block[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn mf_put_u32(block: &mut [u8], offset: usize, value: u32) {
+    block[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn mf_put_u64(block: &mut [u8], offset: usize, value: u64) {
+    block[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Fill the 40-byte BITMAPINFOHEADER at `out[0..40]` with the real DirectShow
+/// fields (biPlanes is always 1; the color-table fields stay 0).
+fn mf_write_bitmap_header(
+    out: &mut [u8],
+    bi_size: u32,
+    width: u32,
+    height: u32,
+    bpp: u16,
+    compression: u32,
+    size_image: u32,
+) {
+    mf_put_u32(out, 0, bi_size);
+    mf_put_u32(out, 4, width);
+    mf_put_u32(out, 8, height);
+    mf_put_u16(out, 12, 1); // biPlanes
+    mf_put_u16(out, 14, bpp);
+    mf_put_u32(out, 16, compression);
+    mf_put_u32(out, 20, size_image);
+}
+
+/// The VIDEOINFOHEADER format block (88 bytes + MF_MT_USER_DATA): the
+/// modeled attributes fill dwBitRate, AvgTimePerFrame and the bitmap
+/// header; everything the runtime does not model (bit-error rate, color
+/// info, the color table) answers as absent (0).
+fn mf_build_videoinfoheader(mt: &ImfMediaType, subtype: &Guid) -> Vec<u8> {
+    let user: &[u8] = mt.get_blob(&crate::media::MF_MT_USER_DATA).unwrap_or(&[]);
+    let (width, height, bpp, compression, size_image) = mf_video_geometry(mt, subtype);
+    let mut block = vec![0_u8; 88 + user.len()];
+    mf_put_u32(
+        &mut block,
+        32,
+        mt.get_uint32(&crate::media::MF_MT_AVG_BITRATE).unwrap_or(0),
+    );
+    mf_put_u64(&mut block, 40, mf_avg_time_per_frame(mt) as u64);
+    mf_write_bitmap_header(
+        &mut block[48..],
+        40 + user.len() as u32,
+        width,
+        height,
+        bpp,
+        compression,
+        size_image,
+    );
+    block[88..].copy_from_slice(user);
+    block
+}
+
+/// The VIDEOINFOHEADER2 format block (112 bytes + MF_MT_USER_DATA): the
+/// extended video fields (interlace flags, copy protection, picture aspect
+/// ratio, color control) correspond to attributes the runtime does not
+/// model and stay 0.
+fn mf_build_videoinfoheader2(mt: &ImfMediaType, subtype: &Guid) -> Vec<u8> {
+    let user: &[u8] = mt.get_blob(&crate::media::MF_MT_USER_DATA).unwrap_or(&[]);
+    let (width, height, bpp, compression, size_image) = mf_video_geometry(mt, subtype);
+    let mut block = vec![0_u8; 112 + user.len()];
+    mf_put_u32(
+        &mut block,
+        32,
+        mt.get_uint32(&crate::media::MF_MT_AVG_BITRATE).unwrap_or(0),
+    );
+    mf_put_u64(&mut block, 40, mf_avg_time_per_frame(mt) as u64);
+    mf_write_bitmap_header(
+        &mut block[72..],
+        40 + user.len() as u32,
+        width,
+        height,
+        bpp,
+        compression,
+        size_image,
+    );
+    block[112..].copy_from_slice(user);
+    block
+}
+
+/// The MFVIDEOFORMAT format block (172 bytes + MF_MT_USER_DATA): dwSize
+/// covers the trailing user data the Windows conversion appends after the
+/// single palette entry.
+fn mf_build_mfvideoformat(mt: &ImfMediaType, subtype: &Guid) -> Vec<u8> {
+    let user: &[u8] = mt.get_blob(&crate::media::MF_MT_USER_DATA).unwrap_or(&[]);
+    let (width, height) = mt.get_frame_size().unwrap_or((0, 0));
+    let (frame_numerator, frame_denominator) = mt.get_frame_rate().unwrap_or((0, 0));
+    let mut block = vec![0_u8; 172 + user.len()];
+    mf_put_u32(&mut block, 0, (172 + user.len()) as u32); // dwSize
+    mf_put_u32(&mut block, 8, width); // videoInfo.dwWidth
+    mf_put_u32(&mut block, 12, height); // videoInfo.dwHeight
+    mf_put_u32(&mut block, 48, frame_numerator); // videoInfo.FramesPerSecond
+    mf_put_u32(&mut block, 52, frame_denominator);
+    block[120..136].copy_from_slice(&subtype.to_bytes_le()); // guidFormat
+    mf_put_u64(
+        &mut block,
+        136, // compressedInfo.AvgBitrate
+        u64::from(mt.get_uint32(&crate::media::MF_MT_AVG_BITRATE).unwrap_or(0)),
+    );
+    mf_put_u32(&mut block, 160, subtype.data1); // surfaceInfo.Format
+    block[172..].copy_from_slice(user);
+    block
+}
+
+/// The WAVEFORMATEX (18 bytes) or WAVEFORMATEXTENSIBLE (40 bytes) format
+/// block + MF_MT_USER_DATA.  A subtype in the plain WAVE-tag GUID shape
+/// with at most two channels converts to the plain struct; anything else
+/// (channel counts above 2, non-WAVE-shaped subtype GUIDs) forces
+/// WAVE_FORMAT_EXTENSIBLE exactly like
+/// `MFCreateWaveFormatExFromMFMediaType`.  nAvgBytesPerSec and nBlockAlign
+/// answer 0 because MF_MT_AUDIO_AVG_BYTES_PER_SECOND and
+/// MF_MT_AUDIO_BLOCK_ALIGNMENT are attributes the runtime does not model.
+fn mf_build_waveformatex(mt: &ImfMediaType, subtype: &Guid) -> Vec<u8> {
+    let user: &[u8] = mt.get_blob(&crate::media::MF_MT_USER_DATA).unwrap_or(&[]);
+    let channels = mt.get_uint32(&crate::media::MF_MT_CHANNELS).unwrap_or(0);
+    let sample_rate = mt.get_uint32(&crate::media::MF_MT_SAMPLE_RATE).unwrap_or(0);
+    let bits = mt
+        .get_uint32(&crate::media::MF_MT_AUDIO_BITS_PER_SAMPLE)
+        .unwrap_or(0);
+    let plain_wave_subtype = subtype.data1 >> 16 == 0
+        && subtype.data2 == 0
+        && subtype.data3 == 0x10
+        && subtype.data4 == MF_GUID_WAVE_SUFFIX;
+    if channels > 2 || !plain_wave_subtype {
+        let mut block = vec![0_u8; 40 + user.len()];
+        mf_put_u16(&mut block, 0, 0xFFFE); // WAVE_FORMAT_EXTENSIBLE
+        mf_put_u16(&mut block, 2, channels as u16);
+        mf_put_u32(&mut block, 4, sample_rate);
+        mf_put_u16(&mut block, 14, bits as u16);
+        mf_put_u16(&mut block, 16, (22 + user.len()) as u16); // cbSize
+        block[24..40].copy_from_slice(&subtype.to_bytes_le()); // SubFormat
+        block[40..].copy_from_slice(user);
+        block
+    } else {
+        let mut block = vec![0_u8; 18 + user.len()];
+        mf_put_u16(&mut block, 0, subtype.data1 as u16); // wFormatTag
+        mf_put_u16(&mut block, 2, channels as u16);
+        mf_put_u32(&mut block, 4, sample_rate);
+        mf_put_u16(&mut block, 14, bits as u16);
+        mf_put_u16(&mut block, 16, user.len() as u16); // cbSize
+        block[18..].copy_from_slice(user);
+        block
+    }
+}
+
+/// The DirectShow AM subtype for an MF subtype: every modeled codec GUID
+/// shares the DirectShow FourCC GUID space already; the RGB family maps to
+/// the DirectShow RGB subtype (MFVideoFormat_RGB32 -> MEDIASUBTYPE_RGB32).
+fn mf_am_subtype(subtype: &Guid) -> Guid {
+    if *subtype == crate::media::MFVideoFormat_RGB32 {
+        mf_guid_from_bytes(&DSHOW_SUBTYPE_RGB32)
+    } else {
+        *subtype
+    }
+}
+
+/// `(format GUID, format block)` for a video media type.  The video-only
+/// structures cannot pair with the audio major type — the Windows
+/// conversion rejects that combination with `E_INVALIDARG`.
+fn mf_build_video_representation(
+    mt: &ImfMediaType,
+    subtype: &Guid,
+    format: MfRepresentationFormat,
+) -> std::result::Result<([u8; 16], Vec<u8>), u32> {
+    match format {
+        MfRepresentationFormat::WaveFormatEx => Err(E_INVALIDARG),
+        MfRepresentationFormat::MfVideoFormat => Ok((
+            REP_FORMAT_MF_VIDEO_FORMAT,
+            mf_build_mfvideoformat(mt, subtype),
+        )),
+        MfRepresentationFormat::VideoInfo2 => Ok((
+            REP_FORMAT_VIDEO_INFO2,
+            mf_build_videoinfoheader2(mt, subtype),
+        )),
+        MfRepresentationFormat::VideoInfo | MfRepresentationFormat::Auto => {
+            Ok((REP_FORMAT_VIDEO_INFO, mf_build_videoinfoheader(mt, subtype)))
+        }
+    }
+}
+
+/// `(format GUID, format block)` for an audio media type: the video
+/// structures cannot pair with the audio major type (`E_INVALIDARG`), and
+/// the auto selection picks the WAVEFORMATEX representation.
+fn mf_build_audio_representation(
+    mt: &ImfMediaType,
+    subtype: &Guid,
+    format: MfRepresentationFormat,
+) -> std::result::Result<([u8; 16], Vec<u8>), u32> {
+    match format {
+        MfRepresentationFormat::VideoInfo
+        | MfRepresentationFormat::VideoInfo2
+        | MfRepresentationFormat::MfVideoFormat => Err(E_INVALIDARG),
+        MfRepresentationFormat::WaveFormatEx | MfRepresentationFormat::Auto => Ok((
+            REP_FORMAT_WAVE_FORMAT_EX,
+            mf_build_waveformatex(mt, subtype),
+        )),
+    }
+}
+
 /// The PROPVARIANT (vt, bytes) for an attribute value.
 fn mf_attribute_propvariant(mt: &ImfMediaType, key: Guid) -> Option<(u32, Vec<u8>)> {
     use crate::media::MediaTypeValue;
@@ -8601,6 +9431,8 @@ fn mf_attribute_propvariant(mt: &ImfMediaType, key: Guid) -> Option<(u32, Vec<u8
 mod tests {
     use super::*;
     use crate::ge::{GameEnvironment, GeArch};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use tempfile::TempDir;
 
     fn mf_test_runtime(name: &str) -> (PeHostRuntime, TempDir) {
@@ -9219,6 +10051,41 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create sandbox dir");
         }
         std::fs::write(&host_path, bytes).expect("write sandbox file");
+    }
+
+    /// A one-shot loopback HTTP server serving `status` + `body`, for the
+    /// source resolver's WinHTTP bind legs (mirrors the URL moniker tests).
+    fn http_server(
+        status: &'static str,
+        body: Vec<u8>,
+        requests: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let address = listener.local_addr().expect("loopback address");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().expect("accept loopback");
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).expect("write headers");
+                stream.write_all(&body).expect("write body");
+                stream.flush().expect("flush response");
+            }
+        });
+        (format!("http://{address}/clip.mp4"), handle)
+    }
+
+    /// A closed loopback URL: the connect leg fails immediately and
+    /// deterministically (no external DNS or network).
+    fn closed_loopback_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind closed port");
+        let address = listener.local_addr().expect("closed address");
+        drop(listener);
+        format!("http://{address}/unreachable")
     }
 
     fn write_utf16(memory: &mut MemoryImage, address: u64, value: &str) {
@@ -11676,16 +12543,18 @@ mod tests {
                     representation,
                     &[mt as u32, 0, out as u32]
                 ),
-                u64::from(MF_E_INVALIDTYPE)
+                u64::from(E_INVALIDARG),
+                "a null representation GUID pointer is invalid input"
             );
             assert_eq!(
                 dispatch_x86_thunk(
                     &mut runtime,
                     &mut memory,
                     free_representation,
-                    &[mt as u32, 0]
+                    &[mt as u32, 0, 0]
                 ),
-                u64::from(MF_E_INVALIDTYPE)
+                u64::from(E_INVALIDARG),
+                "a null representation pointer cannot be released"
             );
 
             let create_buffer: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMemoryBuffer);
@@ -13481,7 +14350,7 @@ mod tests {
                 0x8007_0002
             );
             let network = 0x92_600_u64;
-            write_utf16(&mut memory, network, "https://example.invalid/clip.mp4");
+            write_utf16(&mut memory, network, &closed_loopback_url());
             assert_eq!(
                 call_mf_slot(
                     &mut runtime,
@@ -13496,7 +14365,8 @@ mod tests {
                         object_out as u32
                     ]
                 ),
-                u64::from(MF_E_UNSUPPORTED_BYTESTREAM_TYPE)
+                u64::from(INET_E_CANNOT_CONNECT),
+                "the http bind answers the URLMON connect failure exactly"
             );
             let unsupported = 0x92_700_u64;
             write_utf16(&mut memory, unsupported, "C:\\media\\resolver.bin");
@@ -13987,7 +14857,34 @@ mod tests {
                     3,
                     &[missing as u32, 1, 0, cookie as u32, 0, 0]
                 ),
-                0x8007_0002
+                0,
+                "a deferred bind failure still produces the async cookie"
+            );
+            let failed = read_guest_pointer(&memory, cookie, GuestArch::X86).unwrap();
+            assert_ne!(failed, 0);
+            assert_eq!(
+                runtime.guest_object_kind(failed).unwrap(),
+                GuestObjectKind::ImfAsyncResult
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end_url,
+                    &[
+                        resolver as u32,
+                        failed as u32,
+                        type_out as u32,
+                        object_out as u32
+                    ]
+                ),
+                0x8007_0002_u64,
+                "EndCreateObjectFromURL hands the bind failure back exactly once"
+            );
+            assert_eq!(read_guest_u32(&memory, type_out).unwrap(), 0);
+            assert_eq!(
+                read_guest_pointer(&memory, object_out, GuestArch::X86).unwrap(),
+                0
             );
             assert_eq!(
                 dispatch_x86_thunk(
@@ -14240,7 +15137,8 @@ mod tests {
                     11,
                     &[0, 0, 0, service_out as u32]
                 ),
-                u64::from(MF_E_UNSUPPORTED_SERVICE)
+                u64::from(E_INVALIDARG),
+                "a null service GUID pointer is invalid input"
             );
             assert_eq!(
                 read_guest_pointer(&memory, service_out, GuestArch::X86).unwrap(),
@@ -14555,6 +15453,1776 @@ mod tests {
                 call_mf_slot(&mut runtime, &mut memory, transform, 19, &[0, 0]),
                 0xC00D_36C4,
                 "slot 19 is the model's unsupported transform method"
+            );
+        })
+    }
+
+    // ── IMFMediaType::GetRepresentation / FreeRepresentation ────────────────
+
+    /// A freshly created `IMFMediaType` guest object.
+    fn create_media_type_object(runtime: &mut PeHostRuntime, memory: &mut MemoryImage) -> u64 {
+        let create: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateMediaType);
+        let out = 0xA0_000_u64;
+        assert_eq!(
+            dispatch_x86_thunk(runtime, memory, create, &[out as u32]),
+            0
+        );
+        let mt = read_guest_pointer(memory, out, GuestArch::X86).unwrap();
+        assert_ne!(mt, 0);
+        assert_eq!(
+            runtime.guest_object_kind(mt).unwrap(),
+            GuestObjectKind::ImfMediaType
+        );
+        mt
+    }
+
+    fn call_get_representation(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        mt: u64,
+        guid: &[u8; 16],
+        out: u64,
+    ) -> u64 {
+        let get_representation: u64 =
+            runtime.alloc_host_thunk(HostThunk::MfMediaTypeGetRepresentation);
+        let guid_ptr = 0xA0_180_u64;
+        write_guest_guid_bytes(memory, guid_ptr, guid);
+        dispatch_x86_thunk(
+            runtime,
+            memory,
+            get_representation,
+            &[mt as u32, guid_ptr as u32, out as u32],
+        )
+    }
+
+    fn call_free_representation(
+        runtime: &mut PeHostRuntime,
+        memory: &mut MemoryImage,
+        mt: u64,
+        guid: &[u8; 16],
+        pv: u64,
+    ) -> u64 {
+        let free_representation: u64 =
+            runtime.alloc_host_thunk(HostThunk::MfMediaTypeFreeRepresentation);
+        let guid_ptr = 0xA0_190_u64;
+        write_guest_guid_bytes(memory, guid_ptr, guid);
+        dispatch_x86_thunk(
+            runtime,
+            memory,
+            free_representation,
+            &[mt as u32, guid_ptr as u32, pv as u32],
+        )
+    }
+
+    #[test]
+    fn mf_media_type_representation_builds_real_am_types_and_rejects_unrepresentable() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-representation");
+            let mut memory = MemoryImage::default();
+            let am_out = 0xA0_300_u64;
+            let get_representation: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaTypeGetRepresentation);
+
+            // A video H264 type with the attributes the runtime models.
+            let video = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime
+                    .mf_media_types
+                    .get_mut(&video)
+                    .expect("video media type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    crate::media::MFMediaType_Video,
+                );
+                store.set_guid(
+                    crate::media::MF_MT_SUBTYPE,
+                    crate::media::MFVideoFormat_H264,
+                );
+                store.set_frame_size(640, 480);
+                store.set_frame_rate(30, 1);
+                store.set_uint32(crate::media::MF_MT_AVG_BITRATE, 4_000_000);
+                store.set_blob(crate::media::MF_MT_USER_DATA, vec![1, 2, 3, 4]);
+            }
+
+            // AM_MEDIA_TYPE_REPRESENTATION: a real VIDEOINFOHEADER AM type.
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_AM_MEDIA_TYPE,
+                    am_out
+                ),
+                0
+            );
+            let am = read_guest_pointer(&memory, am_out, GuestArch::X86).unwrap();
+            assert_ne!(am, 0);
+            assert_eq!(
+                memory.read_bytes(am, 16).unwrap(),
+                crate::media::MFMediaType_Video.to_bytes_le().to_vec(),
+                "majortype is MEDIATYPE_Video"
+            );
+            assert_eq!(
+                memory.read_bytes(am + 16, 16).unwrap(),
+                crate::media::MFVideoFormat_H264.to_bytes_le().to_vec(),
+                "the H264 subtype carries the DirectShow FourCC GUID"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, am + 32).unwrap(),
+                0,
+                "bFixedSizeSamples: MF_MT_FIXED_SIZE_SAMPLES is absent"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, am + 36).unwrap(),
+                1,
+                "bTemporalCompression: MF_MT_ALL_SAMPLES_INDEPENDENT is absent"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, am + 40).unwrap(),
+                0,
+                "lSampleSize: MF_MT_SAMPLE_SIZE is absent"
+            );
+            assert_eq!(
+                memory.read_bytes(am + 44, 16).unwrap(),
+                REP_FORMAT_VIDEO_INFO.to_vec(),
+                "the auto selection picks FORMAT_VideoInfo"
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, am + 60, GuestArch::X86).unwrap(),
+                0,
+                "pUnk is null"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, am + 64).unwrap(),
+                88 + 4,
+                "cbFormat is VIDEOINFOHEADER + the MF_MT_USER_DATA append"
+            );
+            let block = read_guest_pointer(&memory, am + 68, GuestArch::X86).unwrap();
+            assert_ne!(block, 0);
+            assert_eq!(
+                read_guest_u32(&memory, block + 32).unwrap(),
+                4_000_000,
+                "dwBitRate from MF_MT_AVG_BITRATE"
+            );
+            assert_eq!(
+                read_guest_u64(&memory, block + 40).unwrap() as i64,
+                333_333,
+                "AvgTimePerFrame is round(10^7 / 30)"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 48).unwrap(),
+                44,
+                "biSize = 40 + the user-data append"
+            );
+            assert_eq!(read_guest_u32(&memory, block + 52).unwrap(), 640, "biWidth");
+            assert_eq!(
+                read_guest_u32(&memory, block + 56).unwrap(),
+                480,
+                "biHeight"
+            );
+            assert_eq!(read_guest_u16(&memory, block + 60).unwrap(), 1, "biPlanes");
+            assert_eq!(
+                read_guest_u16(&memory, block + 62).unwrap(),
+                0,
+                "biBitCount is 0 for a compressed format"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 64).unwrap(),
+                crate::media::MFVideoFormat_H264.data1,
+                "biCompression is the codec FourCC"
+            );
+            assert_eq!(
+                memory.read_bytes(block + 88, 4).unwrap(),
+                vec![1, 2, 3, 4],
+                "the user data trails the struct"
+            );
+            assert_eq!(
+                call_free_representation(&mut runtime, &mut memory, video, &REP_AM_MEDIA_TYPE, am),
+                0
+            );
+
+            // FORMAT_VideoInfo2 selects the VIDEOINFOHEADER2 block.
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_FORMAT_VIDEO_INFO2,
+                    am_out
+                ),
+                0
+            );
+            let am = read_guest_pointer(&memory, am_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                memory.read_bytes(am + 44, 16).unwrap(),
+                REP_FORMAT_VIDEO_INFO2.to_vec()
+            );
+            assert_eq!(read_guest_u32(&memory, am + 64).unwrap(), 112 + 4);
+            let block = read_guest_pointer(&memory, am + 68, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_guest_u32(&memory, block + 72).unwrap(),
+                44,
+                "biSize lives at the VIDEOINFOHEADER2 offset"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 76).unwrap(),
+                640,
+                "biWidth lives at the VIDEOINFOHEADER2 offset"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 48).unwrap(),
+                0,
+                "dwInterlaceFlags: the interlace attribute is not modeled"
+            );
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_FORMAT_VIDEO_INFO2,
+                    am
+                ),
+                0
+            );
+
+            // FORMAT_MFVideoFormat selects the MFVIDEOFORMAT block.
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_FORMAT_MF_VIDEO_FORMAT,
+                    am_out
+                ),
+                0
+            );
+            let am = read_guest_pointer(&memory, am_out, GuestArch::X86).unwrap();
+            assert_eq!(read_guest_u32(&memory, am + 64).unwrap(), 172 + 4);
+            let block = read_guest_pointer(&memory, am + 68, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_guest_u32(&memory, block).unwrap(),
+                176,
+                "dwSize covers the trailing user data"
+            );
+            assert_eq!(read_guest_u32(&memory, block + 8).unwrap(), 640, "dwWidth");
+            assert_eq!(
+                read_guest_u32(&memory, block + 12).unwrap(),
+                480,
+                "dwHeight"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 48).unwrap(),
+                30,
+                "FramesPerSecond.Numerator"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 52).unwrap(),
+                1,
+                "FramesPerSecond.Denominator"
+            );
+            assert_eq!(
+                memory.read_bytes(block + 120, 16).unwrap(),
+                crate::media::MFVideoFormat_H264.to_bytes_le().to_vec(),
+                "guidFormat is the MF subtype"
+            );
+            assert_eq!(
+                read_guest_u64(&memory, block + 136).unwrap(),
+                4_000_000,
+                "compressedInfo.AvgBitrate"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 160).unwrap(),
+                crate::media::MFVideoFormat_H264.data1,
+                "surfaceInfo.Format is the FourCC"
+            );
+            assert_eq!(memory.read_bytes(block + 172, 4).unwrap(), vec![1, 2, 3, 4]);
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_FORMAT_MF_VIDEO_FORMAT,
+                    am
+                ),
+                0
+            );
+
+            // The uncompressed formats the runtime models convert with their
+            // real DirectShow facts; an RGB32 type without a frame rate
+            // leaves AvgTimePerFrame at the absent-attribute 0.
+            let rgb = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime.mf_media_types.get_mut(&rgb).expect("rgb type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    crate::media::MFMediaType_Video,
+                );
+                store.set_guid(
+                    crate::media::MF_MT_SUBTYPE,
+                    crate::media::MFVideoFormat_RGB32,
+                );
+                store.set_frame_size(2, 2);
+            }
+            assert_eq!(
+                call_get_representation(&mut runtime, &mut memory, rgb, &REP_AM_MEDIA_TYPE, am_out),
+                0
+            );
+            let am = read_guest_pointer(&memory, am_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                memory.read_bytes(am + 16, 16).unwrap(),
+                DSHOW_SUBTYPE_RGB32.to_vec(),
+                "MFVideoFormat_RGB32 maps to MEDIASUBTYPE_RGB32"
+            );
+            let block = read_guest_pointer(&memory, am + 68, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_guest_u64(&memory, block + 40).unwrap(),
+                0,
+                "no frame rate"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 68).unwrap(),
+                16,
+                "biSizeImage = 2*2*4"
+            );
+            assert_eq!(read_guest_u32(&memory, block + 64).unwrap(), 0, "BI_RGB");
+            assert_eq!(
+                read_guest_u16(&memory, block + 62).unwrap(),
+                32,
+                "biBitCount"
+            );
+            assert_eq!(read_guest_u32(&memory, block + 56).unwrap(), 2, "biHeight");
+            assert_eq!(
+                call_free_representation(&mut runtime, &mut memory, rgb, &REP_AM_MEDIA_TYPE, am),
+                0
+            );
+
+            let nv12 = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime.mf_media_types.get_mut(&nv12).expect("nv12 type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    crate::media::MFMediaType_Video,
+                );
+                store.set_guid(
+                    crate::media::MF_MT_SUBTYPE,
+                    crate::media::MFVideoFormat_NV12,
+                );
+                store.set_frame_size(4, 4);
+            }
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    nv12,
+                    &REP_AM_MEDIA_TYPE,
+                    am_out
+                ),
+                0
+            );
+            let am = read_guest_pointer(&memory, am_out, GuestArch::X86).unwrap();
+            let block = read_guest_pointer(&memory, am + 68, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_guest_u16(&memory, block + 62).unwrap(),
+                12,
+                "NV12 carries 12 bits per pixel"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 64).unwrap(),
+                crate::media::MFVideoFormat_NV12.data1,
+                "the NV12 FourCC compression"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, block + 68).unwrap(),
+                24,
+                "biSizeImage = 4*4*12/8"
+            );
+            assert_eq!(
+                call_free_representation(&mut runtime, &mut memory, nv12, &REP_AM_MEDIA_TYPE, am),
+                0
+            );
+
+            // Audio types convert to WAVEFORMATEX: the plain WAVE-tag shape
+            // with at most two channels stays plain.
+            let audio = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime.mf_media_types.get_mut(&audio).expect("audio type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    crate::media::MFMediaType_Audio,
+                );
+                store.set_guid(crate::media::MF_MT_SUBTYPE, crate::media::MFAudioFormat_PCM);
+                store.set_uint32(crate::media::MF_MT_CHANNELS, 2);
+                store.set_uint32(crate::media::MF_MT_SAMPLE_RATE, 48_000);
+                store.set_uint32(crate::media::MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            }
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    audio,
+                    &REP_AM_MEDIA_TYPE,
+                    am_out
+                ),
+                0
+            );
+            let am = read_guest_pointer(&memory, am_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                memory.read_bytes(am + 44, 16).unwrap(),
+                REP_FORMAT_WAVE_FORMAT_EX.to_vec(),
+                "audio auto selection picks FORMAT_WaveFormatEx"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, am + 64).unwrap(),
+                18,
+                "plain WAVEFORMATEX"
+            );
+            let block = read_guest_pointer(&memory, am + 68, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_guest_u16(&memory, block).unwrap(),
+                1,
+                "wFormatTag = PCM"
+            );
+            assert_eq!(read_guest_u16(&memory, block + 2).unwrap(), 2, "nChannels");
+            assert_eq!(
+                read_guest_u32(&memory, block + 4).unwrap(),
+                48_000,
+                "nSamplesPerSec"
+            );
+            assert_eq!(
+                read_guest_u16(&memory, block + 14).unwrap(),
+                16,
+                "wBitsPerSample"
+            );
+            assert_eq!(read_guest_u16(&memory, block + 16).unwrap(), 0, "cbSize");
+            assert_eq!(
+                call_free_representation(&mut runtime, &mut memory, audio, &REP_AM_MEDIA_TYPE, am),
+                0
+            );
+
+            // More than two channels forces WAVE_FORMAT_EXTENSIBLE.
+            let surround = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime
+                    .mf_media_types
+                    .get_mut(&surround)
+                    .expect("surround type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    crate::media::MFMediaType_Audio,
+                );
+                store.set_guid(crate::media::MF_MT_SUBTYPE, crate::media::MFAudioFormat_PCM);
+                store.set_uint32(crate::media::MF_MT_CHANNELS, 6);
+            }
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    surround,
+                    &REP_AM_MEDIA_TYPE,
+                    am_out
+                ),
+                0
+            );
+            let am = read_guest_pointer(&memory, am_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_guest_u32(&memory, am + 64).unwrap(),
+                40,
+                "extensible size"
+            );
+            let block = read_guest_pointer(&memory, am + 68, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_guest_u16(&memory, block).unwrap(),
+                0xFFFE,
+                "WAVE_FORMAT_EXTENSIBLE"
+            );
+            assert_eq!(read_guest_u16(&memory, block + 2).unwrap(), 6, "nChannels");
+            assert_eq!(
+                read_guest_u16(&memory, block + 16).unwrap(),
+                22,
+                "cbSize is the extensible tail"
+            );
+            assert_eq!(
+                memory.read_bytes(block + 24, 16).unwrap(),
+                crate::media::MFAudioFormat_PCM.to_bytes_le().to_vec(),
+                "SubFormat is the MF subtype"
+            );
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    surround,
+                    &REP_AM_MEDIA_TYPE,
+                    am
+                ),
+                0
+            );
+
+            // An AAC type with a magic cookie appends it behind the struct.
+            let aac = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime.mf_media_types.get_mut(&aac).expect("aac type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    crate::media::MFMediaType_Audio,
+                );
+                store.set_guid(crate::media::MF_MT_SUBTYPE, crate::media::MFAudioFormat_AAC);
+                store.set_blob(crate::media::MF_MT_USER_DATA, vec![9, 8, 7]);
+            }
+            assert_eq!(
+                call_get_representation(&mut runtime, &mut memory, aac, &REP_AM_MEDIA_TYPE, am_out),
+                0
+            );
+            let am = read_guest_pointer(&memory, am_out, GuestArch::X86).unwrap();
+            assert_eq!(read_guest_u32(&memory, am + 64).unwrap(), 21);
+            let block = read_guest_pointer(&memory, am + 68, GuestArch::X86).unwrap();
+            assert_eq!(
+                read_guest_u16(&memory, block).unwrap() as u32,
+                crate::media::MFAudioFormat_AAC.data1,
+                "the WAVE tag comes from the subtype"
+            );
+            assert_eq!(read_guest_u16(&memory, block + 16).unwrap(), 3, "cbSize");
+            assert_eq!(memory.read_bytes(block + 18, 3).unwrap(), vec![9, 8, 7]);
+            assert_eq!(
+                call_free_representation(&mut runtime, &mut memory, aac, &REP_AM_MEDIA_TYPE, am),
+                0
+            );
+
+            // A representation GUID the method does not implement keeps the
+            // documented unsupported-representation answer and a null out.
+            let unknown_rep = 0xA0_400_u64;
+            write_guest_guid_bytes(&mut memory, unknown_rep, &[0xEE; 16]);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_representation,
+                    &[video as u32, unknown_rep as u32, am_out as u32]
+                ),
+                u64::from(MF_E_UNSUPPORTED_REPRESENTATION)
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, am_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            // The detail attributes every representation needs are required.
+            let major_only = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime
+                    .mf_media_types
+                    .get_mut(&major_only)
+                    .expect("major-only type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    crate::media::MFMediaType_Video,
+                );
+            }
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    major_only,
+                    &REP_AM_MEDIA_TYPE,
+                    am_out
+                ),
+                u64::from(MF_E_ATTRIBUTENOTFOUND),
+                "a missing MF_MT_SUBTYPE is a details mismatch"
+            );
+            let empty = create_media_type_object(&mut runtime, &mut memory);
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    empty,
+                    &REP_AM_MEDIA_TYPE,
+                    am_out
+                ),
+                u64::from(MF_E_ATTRIBUTENOTFOUND),
+                "a missing MF_MT_MAJOR_TYPE is a details mismatch"
+            );
+
+            // A major type outside {audio, video} has no DirectShow
+            // representation: the retained MF_E_INVALIDTYPE answer.
+            let text = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime.mf_media_types.get_mut(&text).expect("text type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    Guid::new(0x7465_7874, 0, 0, [0; 8]),
+                );
+                store.set_guid(
+                    crate::media::MF_MT_SUBTYPE,
+                    crate::media::MFVideoFormat_H264,
+                );
+            }
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    text,
+                    &REP_AM_MEDIA_TYPE,
+                    am_out
+                ),
+                u64::from(MF_E_INVALIDTYPE)
+            );
+
+            // A format structure cannot pair with the other major type.
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    audio,
+                    &REP_FORMAT_VIDEO_INFO,
+                    am_out
+                ),
+                u64::from(E_INVALIDARG),
+                "VIDEOINFOHEADER cannot pair with an audio media type"
+            );
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_FORMAT_WAVE_FORMAT_EX,
+                    am_out
+                ),
+                u64::from(E_INVALIDARG),
+                "WAVEFORMATEX cannot pair with a video media type"
+            );
+
+            // Null arguments and foreign objects are invalid input.
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_representation,
+                    &[video as u32, 0, am_out as u32]
+                ),
+                u64::from(E_INVALIDARG),
+                "a null representation GUID pointer"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_representation,
+                    &[video as u32, 0xA0_180, 0]
+                ),
+                u64::from(E_INVALIDARG),
+                "a null output pointer"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_representation,
+                    &[video as u32, 0xA0_900, am_out as u32]
+                ),
+                u64::from(E_INVALIDARG),
+                "an unmapped representation GUID pointer"
+            );
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    0xDEAD_BEEF,
+                    &REP_AM_MEDIA_TYPE,
+                    am_out
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+        })
+    }
+
+    #[test]
+    fn mf_representation_reference_lifecycle_double_free_and_foreign_pointer_are_exact() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-representation-lifetime");
+            let mut memory = MemoryImage::default();
+            let out_one = 0xB0_100_u64;
+            let out_two = 0xB0_200_u64;
+            let foreign = 0xB0_300_u64;
+            memory.map_bytes(foreign, &[0_u8; 64]);
+            let crafted = 0xB0_400_u64;
+
+            let video = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime.mf_media_types.get_mut(&video).expect("video type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    crate::media::MFMediaType_Video,
+                );
+                store.set_guid(
+                    crate::media::MF_MT_SUBTYPE,
+                    crate::media::MFVideoFormat_H264,
+                );
+                store.set_frame_size(640, 480);
+            }
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_AM_MEDIA_TYPE,
+                    out_one
+                ),
+                0
+            );
+            let first = read_guest_pointer(&memory, out_one, GuestArch::X86).unwrap();
+            assert_eq!(
+                call_get_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_FORMAT_VIDEO_INFO,
+                    out_two
+                ),
+                0
+            );
+            let second = read_guest_pointer(&memory, out_two, GuestArch::X86).unwrap();
+            assert_ne!(first, second, "each Get allocates its own reference");
+
+            // The matching release succeeds and poisons the allocation: a
+            // later use of the freed region observes nothing.
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_AM_MEDIA_TYPE,
+                    first
+                ),
+                0
+            );
+            assert_eq!(
+                memory.read_bytes(first - 40, 40).unwrap(),
+                vec![0_u8; 40],
+                "the release poisoned the reference header"
+            );
+
+            // A double free cannot happen: the poisoned header refuses.
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_AM_MEDIA_TYPE,
+                    first
+                ),
+                u64::from(E_INVALIDARG),
+                "double free is refused"
+            );
+
+            // The wrong representation GUID does not release the reference.
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_FORMAT_VIDEO_INFO2,
+                    second
+                ),
+                u64::from(E_INVALIDARG),
+                "a mismatched GUID is not the allocating reference"
+            );
+
+            // Foreign pointers carry no reference header.
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_AM_MEDIA_TYPE,
+                    foreign + 40
+                ),
+                u64::from(E_INVALIDARG),
+                "an unmapped-foreign region is not an allocation"
+            );
+
+            // A crafted header claiming an absurd allocation size is refused
+            // instead of driving a huge host allocation.
+            let mut header = vec![0_u8; 40];
+            header[0..4].copy_from_slice(&MF_REPRESENTATION_MAGIC.to_le_bytes());
+            header[8..24].copy_from_slice(&REP_AM_MEDIA_TYPE);
+            header[24..32].copy_from_slice(&0x0200_0000_u64.to_le_bytes());
+            memory.map_bytes(crafted, &header);
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_AM_MEDIA_TYPE,
+                    crafted + 40
+                ),
+                u64::from(E_INVALIDARG),
+                "a crafted oversized header is refused"
+            );
+
+            // The matching release of the second reference still works.
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_FORMAT_VIDEO_INFO,
+                    second
+                ),
+                0
+            );
+
+            // Freeing below the header base, and null arguments, are
+            // refused; a foreign object cannot release either.
+            let free_representation: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfMediaTypeFreeRepresentation);
+            assert_eq!(
+                call_free_representation(&mut runtime, &mut memory, video, &REP_AM_MEDIA_TYPE, 20),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                call_free_representation(&mut runtime, &mut memory, video, &REP_AM_MEDIA_TYPE, 0),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    free_representation,
+                    &[video as u32, 0, 0xB0_500]
+                ),
+                u64::from(E_INVALIDARG),
+                "a null representation GUID pointer"
+            );
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    video,
+                    &REP_AM_MEDIA_TYPE,
+                    0xB0_900
+                ),
+                u64::from(E_INVALIDARG),
+                "an unmapped pointer carries no reference header"
+            );
+            assert_eq!(
+                call_free_representation(
+                    &mut runtime,
+                    &mut memory,
+                    0xDEAD_BEEF,
+                    &REP_AM_MEDIA_TYPE,
+                    0xB0_500
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+        })
+    }
+
+    // ── IMFSinkWriter::GetServiceForStream ─────────────────────────────────
+
+    #[test]
+    fn mf_sink_writer_services_resolve_real_duration_and_bytestream_or_exact_unsupported() {
+        with_big_stack(|| {
+            let (mut runtime, tmp) = mf_test_runtime("mf-sink-services");
+            let mut memory = MemoryImage::default();
+            let output = tmp.path().join("sink-services.bin");
+            let output_text = output.to_str().expect("utf-8 path").to_string();
+            let url_ptr = 0xC0_010_u64;
+            write_utf16(&mut memory, url_ptr, &output_text);
+
+            let create_url: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateSinkWriterFromUrl);
+            let writer_out = 0xC0_020_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_url,
+                    &[url_ptr as u32, 0, 0, writer_out as u32]
+                ),
+                0
+            );
+            let writer = read_guest_pointer(&memory, writer_out, GuestArch::X86).unwrap();
+            assert_ne!(writer, 0);
+
+            let null_guid = 0xC0_030_u64;
+            let iid_writer = 0xC0_040_u64;
+            let iid_attributes = 0xC0_050_u64;
+            let iid_byte_stream = 0xC0_060_u64;
+            let duration_guid = 0xC0_070_u64;
+            let bytestream_guid = 0xC0_080_u64;
+            let quality_guid = 0xC0_090_u64;
+            let unknown_service = 0xC0_0A0_u64;
+            let service_out = 0xC0_0B0_u64;
+            let key_ptr = 0xC0_0C0_u64;
+            let value_out = 0xC0_0D0_u64;
+            write_guest_guid_bytes(&mut memory, null_guid, &[0; 16]);
+            write_guest_guid_bytes(&mut memory, iid_writer, &IID_IMF_SINK_WRITER);
+            write_guest_guid_bytes(&mut memory, iid_attributes, &IID_IMF_ATTRIBUTES);
+            write_guest_guid_bytes(&mut memory, iid_byte_stream, &IID_IMF_BYTE_STREAM);
+            write_guest_guid_bytes(
+                &mut memory,
+                duration_guid,
+                &crate::media::MF_PD_DURATION.to_bytes_le(),
+            );
+            write_guest_guid_bytes(&mut memory, bytestream_guid, &SERVICE_MF_BYTESTREAM);
+            write_guest_guid_bytes(
+                &mut memory,
+                quality_guid,
+                // MF_QUALITY_SERVICES {b7e2be11-2f96-4640-b52c-282365bdf16c}.
+                &[
+                    0x11, 0xbe, 0xe2, 0xb7, 0x96, 0x2f, 0x40, 0x46, 0xb5, 0x2c, 0x28, 0x23, 0x65,
+                    0xbd, 0xf1, 0x6c,
+                ],
+            );
+            write_guest_guid_bytes(&mut memory, unknown_service, &[0xEE; 16]);
+            let all_streams = MF_SINK_WRITER_ALL_STREAMS;
+
+            // GUID_NULL follows the documented QueryInterface contract.
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        null_guid as u32,
+                        iid_writer as u32,
+                        service_out as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, service_out, GuestArch::X86).unwrap(),
+                writer,
+                "GUID_NULL + IMFSinkWriter hands back the writer itself"
+            );
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        null_guid as u32,
+                        iid_attributes as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(E_NOINTERFACE),
+                "the writer does not implement IMFAttributes"
+            );
+
+            // MF_PD_DURATION resolves to a real attribute store; an iid the
+            // store does not implement keeps the unsupported-service answer.
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        duration_guid as u32,
+                        iid_byte_stream as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(MF_E_UNSUPPORTED_SERVICE)
+            );
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        MF_SINK_WRITER_MEDIASINK,
+                        duration_guid as u32,
+                        iid_attributes as u32,
+                        service_out as u32
+                    ]
+                ),
+                0,
+                "MF_SINK_WRITER_MEDIASINK is a valid stream selector"
+            );
+            let duration_store = read_guest_pointer(&memory, service_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                runtime.guest_object_kind(duration_store).unwrap(),
+                GuestObjectKind::ImfAttributes
+            );
+            write_guest_guid_bytes(
+                &mut memory,
+                key_ptr,
+                &crate::media::MF_PD_DURATION.to_bytes_le(),
+            );
+            let get_u64: u64 = runtime.alloc_host_thunk(HostThunk::MfAttrGetUint64);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_u64,
+                    &[duration_store as u32, key_ptr as u32, value_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u64(&memory, value_out).unwrap(),
+                0,
+                "nothing is written yet: the presentation duration is 0"
+            );
+
+            // The byte-stream service before the output file exists is the
+            // real file error, not a blanket refusal.
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        bytestream_guid as u32,
+                        iid_byte_stream as u32,
+                        service_out as u32
+                    ]
+                ),
+                0x8007_0002_u64,
+                "the output file does not exist before BeginWriting"
+            );
+            assert_eq!(
+                read_guest_pointer(&memory, service_out, GuestArch::X86).unwrap(),
+                0
+            );
+
+            // Unknown service GUIDs and the unmodeled quality manager keep
+            // the documented MF_E_UNSUPPORTED_SERVICE.
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        unknown_service as u32,
+                        iid_attributes as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(MF_E_UNSUPPORTED_SERVICE)
+            );
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        quality_guid as u32,
+                        iid_attributes as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(MF_E_UNSUPPORTED_SERVICE),
+                "no IMFQualityManager is modeled in the runtime graph"
+            );
+
+            // Null pointers, unknown stream indexes and foreign writers keep
+            // the exact invalid-input/invalid-stream answers.
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[all_streams, 0, iid_attributes as u32, service_out as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[all_streams, duration_guid as u32, 0, service_out as u32]
+                ),
+                u64::from(E_INVALIDARG)
+            );
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        0xC1_0000,
+                        iid_attributes as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(E_INVALIDARG),
+                "an unmapped service GUID pointer is invalid input"
+            );
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        duration_guid as u32,
+                        0xC1_0000,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(E_INVALIDARG),
+                "an unmapped IID pointer is invalid input"
+            );
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        bytestream_guid as u32,
+                        iid_attributes as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(MF_E_UNSUPPORTED_SERVICE),
+                "the byte-stream service is not an IMFAttributes store"
+            );
+            let get_service: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfSinkWriterGetServiceForStream);
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_service,
+                    &[
+                        0xDEAD_BEEF,
+                        all_streams,
+                        duration_guid as u32,
+                        iid_attributes as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(E_NOINTERFACE),
+                "a foreign writer object is not a sink writer"
+            );
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        9,
+                        duration_guid as u32,
+                        iid_attributes as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(MF_E_INVALIDSTREAMNUMBER),
+                "an unknown stream index wins over the service answer"
+            );
+
+            // A writer created directly over a media sink has no output
+            // target the byte-stream service could answer.
+            let create_sink: u64 =
+                runtime.alloc_host_thunk(HostThunk::MfCreateSinkWriterFromMediaSink);
+            let sink_writer_out = 0xC0_0E0_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_sink,
+                    &[0, 0, sink_writer_out as u32]
+                ),
+                0
+            );
+            let sink_writer = read_guest_pointer(&memory, sink_writer_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    sink_writer,
+                    11,
+                    &[
+                        all_streams,
+                        bytestream_guid as u32,
+                        iid_byte_stream as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(MF_E_UNSUPPORTED_SERVICE),
+                "a media-sink writer has no output file target"
+            );
+
+            // A writer whose output target is a directory answers the real
+            // read failure of the byte-stream service.
+            let dir_url = 0xC0_0F0_u64;
+            write_utf16(
+                &mut memory,
+                dir_url,
+                &tmp.path().to_str().expect("dir utf-8"),
+            );
+            let dir_writer_out = 0xC0_100_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_url,
+                    &[dir_url as u32, 0, 0, dir_writer_out as u32]
+                ),
+                0
+            );
+            let dir_writer = read_guest_pointer(&memory, dir_writer_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    dir_writer,
+                    11,
+                    &[
+                        all_streams,
+                        bytestream_guid as u32,
+                        iid_byte_stream as u32,
+                        service_out as u32
+                    ]
+                ),
+                u64::from(E_FAIL),
+                "reading a directory target fails for real"
+            );
+
+            // The real write path feeds the services: one stream, a timed
+            // sample, then duration and byte stream resolve the write.
+            let mt = create_media_type_object(&mut runtime, &mut memory);
+            {
+                let store = runtime.mf_media_types.get_mut(&mt).expect("audio type");
+                store.set_guid(
+                    crate::media::MF_MT_MAJOR_TYPE,
+                    crate::media::MFMediaType_Audio,
+                );
+                store.set_guid(crate::media::MF_MT_SUBTYPE, crate::media::MFAudioFormat_PCM);
+                store.set_uint32(crate::media::MF_MT_CHANNELS, 2);
+            }
+            let stream_out = 0xC0_110_u64;
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    3,
+                    &[mt as u32, stream_out as u32]
+                ),
+                0
+            );
+            let stream = read_guest_u32(&memory, stream_out).unwrap();
+            assert_eq!(
+                call_mf_slot(&mut runtime, &mut memory, writer, 4, &[stream, mt as u32]),
+                0
+            );
+            assert_eq!(call_mf_slot(&mut runtime, &mut memory, writer, 5, &[]), 0);
+
+            let create_sample: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateSample);
+            let sample_out = 0xC0_120_u64;
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    create_sample,
+                    &[sample_out as u32]
+                ),
+                0
+            );
+            let sample = read_guest_pointer(&memory, sample_out, GuestArch::X86).unwrap();
+            {
+                let state = runtime.mf_samples.get_mut(&sample).expect("sample");
+                state.buffer = b"abc".to_vec();
+                state.sample_time = 2_000_000;
+                state.sample_duration = 50_000;
+            }
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    6,
+                    &[stream, sample as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        duration_guid as u32,
+                        iid_attributes as u32,
+                        service_out as u32
+                    ]
+                ),
+                0
+            );
+            let duration_store = read_guest_pointer(&memory, service_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    get_u64,
+                    &[duration_store as u32, key_ptr as u32, value_out as u32]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u64(&memory, value_out).unwrap(),
+                2_050_000,
+                "MF_PD_DURATION is the end of the written presentation"
+            );
+
+            // The byte-stream service hands out the real output payload.
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    writer,
+                    11,
+                    &[
+                        all_streams,
+                        bytestream_guid as u32,
+                        iid_byte_stream as u32,
+                        service_out as u32
+                    ]
+                ),
+                0
+            );
+            let byte_stream = read_guest_pointer(&memory, service_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                runtime.guest_object_kind(byte_stream).unwrap(),
+                GuestObjectKind::ImfByteStream
+            );
+            {
+                let stream_state = runtime
+                    .mf_byte_streams
+                    .get(&byte_stream)
+                    .expect("byte stream state");
+                assert_eq!(
+                    stream_state.origin_name.as_deref(),
+                    Some(output_text.as_str())
+                );
+            }
+            let buffer = 0xC0_140_u64;
+            let read_out = 0xC0_150_u64;
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    byte_stream,
+                    9,
+                    &[buffer as u32, 3, read_out as u32]
+                ),
+                0,
+                "IMFByteStream::Read of the sink's output"
+            );
+            assert_eq!(read_guest_u32(&memory, read_out).unwrap(), 3);
+            assert_eq!(
+                memory.read_bytes(buffer, 3).unwrap(),
+                b"abc".to_vec(),
+                "the service stream carries the real written bytes"
+            );
+            let caps_out = 0xC0_160_u64;
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    byte_stream,
+                    3,
+                    &[caps_out as u32]
+                ),
+                0
+            );
+            let capabilities = read_guest_u32(&memory, caps_out).unwrap();
+            assert_ne!(capabilities & MFBYTESTREAM_IS_READABLE, 0);
+            assert_eq!(
+                capabilities & MFBYTESTREAM_DOES_NOT_USE_NETWORK,
+                MFBYTESTREAM_DOES_NOT_USE_NETWORK,
+                "a real file-backed stream does not use the network"
+            );
+        })
+    }
+
+    // ── IMFSourceResolver http/https binding ───────────────────────────────
+
+    #[test]
+    fn mf_source_resolver_http_urls_bind_over_winhttp_and_pin_transport_errors() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-resolver-http");
+            let mut memory = MemoryImage::default();
+            let create: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateSourceResolver);
+            let resolver_out = 0xD0_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, create, &[resolver_out as u32]),
+                0
+            );
+            let resolver = read_guest_pointer(&memory, resolver_out, GuestArch::X86).unwrap();
+            let url_ptr = 0xD0_010_u64;
+            let type_out = 0xD0_100_u64;
+            let object_out = 0xD0_110_u64;
+
+            let create_url =
+                |runtime: &mut PeHostRuntime, memory: &mut MemoryImage, url: &str| -> u64 {
+                    write_utf16(memory, url_ptr, url);
+                    call_mf_slot(
+                        runtime,
+                        memory,
+                        resolver,
+                        8,
+                        &[
+                            url_ptr as u32,
+                            MF_RESOLUTION_MEDIASOURCE,
+                            0,
+                            type_out as u32,
+                            object_out as u32,
+                        ],
+                    )
+                };
+
+            // The full http bind: a real media source over the fetched MP4.
+            let (url, server) = http_server("200 OK", minimal_mp4_file(), 3);
+            assert_eq!(create_url(&mut runtime, &mut memory, &url), 0);
+            assert_eq!(
+                read_guest_u32(&memory, type_out).unwrap(),
+                MF_OBJECT_MEDIASOURCE
+            );
+            let source = read_guest_pointer(&memory, object_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                runtime.guest_object_kind(source).unwrap(),
+                GuestObjectKind::ImfMediaSource
+            );
+            // The same URL resolves to the byte stream over the payload.
+            write_utf16(&mut memory, url_ptr, &url);
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    resolver,
+                    8,
+                    &[
+                        url_ptr as u32,
+                        MF_RESOLUTION_BYTESTREAM,
+                        0,
+                        type_out as u32,
+                        object_out as u32
+                    ]
+                ),
+                0
+            );
+            assert_eq!(
+                read_guest_u32(&memory, type_out).unwrap(),
+                MF_OBJECT_BYTESTREAM
+            );
+            let byte_stream = read_guest_pointer(&memory, object_out, GuestArch::X86).unwrap();
+            assert_eq!(
+                runtime.guest_object_kind(byte_stream).unwrap(),
+                GuestObjectKind::ImfByteStream
+            );
+            let caps_out = 0xD0_120_u64;
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    byte_stream,
+                    3,
+                    &[caps_out as u32]
+                ),
+                0
+            );
+            let capabilities = read_guest_u32(&memory, caps_out).unwrap();
+            assert_ne!(capabilities & MFBYTESTREAM_IS_READABLE, 0);
+            assert_eq!(
+                capabilities & MFBYTESTREAM_DOES_NOT_USE_NETWORK,
+                0,
+                "the URL-bound stream really used the network"
+            );
+            // A query string survives into the request target.
+            write_utf16(&mut memory, url_ptr, &format!("{url}?cachebust=7"));
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    resolver,
+                    8,
+                    &[
+                        url_ptr as u32,
+                        MF_RESOLUTION_MEDIASOURCE,
+                        0,
+                        type_out as u32,
+                        object_out as u32
+                    ]
+                ),
+                0,
+                "the query string binds like the bare path"
+            );
+            server.join().expect("http server");
+
+            // Payloads the parser does not model keep the exact container
+            // error (and a nulled object/type).
+            let (garbage_url, server) = http_server("200 OK", b"not a media container".to_vec(), 1);
+            assert_eq!(
+                create_url(&mut runtime, &mut memory, &garbage_url),
+                u64::from(MF_E_UNSUPPORTED_BYTESTREAM_TYPE)
+            );
+            assert_eq!(read_guest_u32(&memory, type_out).unwrap(), 0);
+            assert_eq!(
+                read_guest_pointer(&memory, object_out, GuestArch::X86).unwrap(),
+                0
+            );
+            server.join().expect("http server");
+
+            // HTTP error statuses map onto the URLMON error table.
+            let (missing_url, server) = http_server("404 Not Found", b"gone".to_vec(), 1);
+            assert_eq!(
+                create_url(&mut runtime, &mut memory, &missing_url),
+                u64::from(INET_E_OBJECT_NOT_FOUND)
+            );
+            server.join().expect("http server");
+
+            let (failed_url, server) =
+                http_server("500 Internal Server Error", b"boom".to_vec(), 1);
+            assert_eq!(
+                create_url(&mut runtime, &mut memory, &failed_url),
+                u64::from(INET_E_DOWNLOAD_FAILURE)
+            );
+            server.join().expect("http server");
+
+            // A refused connection is INET_E_CANNOT_CONNECT, an unknown
+            // scheme is INET_E_UNKNOWN_PROTOCOL and an unparseable URL is
+            // INET_E_INVALID_URL.
+            assert_eq!(
+                create_url(&mut runtime, &mut memory, &closed_loopback_url()),
+                u64::from(INET_E_CANNOT_CONNECT)
+            );
+            assert_eq!(
+                create_url(&mut runtime, &mut memory, "ftp://127.0.0.1/clip.mp4"),
+                u64::from(INET_E_UNKNOWN_PROTOCOL)
+            );
+            assert_eq!(
+                create_url(&mut runtime, &mut memory, "https://"),
+                u64::from(INET_E_INVALID_URL)
+            );
+        })
+    }
+
+    #[test]
+    fn mf_source_resolver_async_http_failures_surface_through_end_and_cancel_exactly_once() {
+        with_big_stack(|| {
+            let (mut runtime, _tmp) = mf_test_runtime("mf-resolver-http-async");
+            let mut memory = MemoryImage::default();
+            install_mf_async_callback(&mut memory);
+            let create: u64 = runtime.alloc_host_thunk(HostThunk::MfCreateSourceResolver);
+            let resolver_out = 0xE0_000_u64;
+            assert_eq!(
+                dispatch_x86_thunk(&mut runtime, &mut memory, create, &[resolver_out as u32]),
+                0
+            );
+            let resolver = read_guest_pointer(&memory, resolver_out, GuestArch::X86).unwrap();
+            let mut state = CpuState::new(GuestArch::X86);
+            state.set(Register::Rsp, MF_CB_STACK);
+            let end_url: u64 = runtime.alloc_host_thunk(HostThunk::MfSourceResolverEndFromUrl);
+
+            let url_ptr = 0xE0_010_u64;
+            let cookie = 0xE0_100_u64;
+            let type_out = 0xE0_110_u64;
+            let object_out = 0xE0_120_u64;
+            let status_out = 0xE0_130_u64;
+
+            // A failing transport with a callback parks as E_PENDING; the
+            // pump delivers the failed completion exactly once and End hands
+            // back the exact URLMON failure with a null object.
+            write_utf16(&mut memory, url_ptr, &closed_loopback_url());
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    resolver,
+                    3,
+                    &[
+                        url_ptr as u32,
+                        MF_RESOLUTION_MEDIASOURCE,
+                        0,
+                        cookie as u32,
+                        MF_CB_OBJECT as u32,
+                        0
+                    ]
+                ),
+                u64::from(E_PENDING)
+            );
+            let failed = read_guest_pointer(&memory, cookie, GuestArch::X86).unwrap();
+            assert_ne!(failed, 0);
+            assert_eq!(
+                mf_callback_count(&memory),
+                0,
+                "nothing fires before a servicing point"
+            );
+            drain_mf(&mut runtime, &mut state, &mut memory);
+            assert_eq!(
+                mf_callback_count(&memory),
+                1,
+                "the failure completion fires the callback once"
+            );
+            assert_eq!(
+                call_mf_slot(&mut runtime, &mut memory, failed, 4, &[status_out as u32]),
+                0,
+                "IMFAsyncResult::GetStatus"
+            );
+            assert_eq!(
+                read_guest_u32(&memory, status_out).unwrap(),
+                INET_E_CANNOT_CONNECT,
+                "the callback observes the exact failure status"
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end_url,
+                    &[
+                        resolver as u32,
+                        failed as u32,
+                        type_out as u32,
+                        object_out as u32
+                    ]
+                ),
+                u64::from(INET_E_CANNOT_CONNECT),
+                "End reports the transport failure exactly once"
+            );
+            assert_eq!(read_guest_u32(&memory, type_out).unwrap(), 0);
+            assert_eq!(
+                read_guest_pointer(&memory, object_out, GuestArch::X86).unwrap(),
+                0
+            );
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end_url,
+                    &[
+                        resolver as u32,
+                        failed as u32,
+                        type_out as u32,
+                        object_out as u32
+                    ]
+                ),
+                u64::from(E_INVALIDARG),
+                "a second End cannot consume the result again"
+            );
+
+            // The callback-less form records the failure for End polling.
+            let (missing_url, server) = http_server("404 Not Found", b"gone".to_vec(), 1);
+            write_utf16(&mut memory, url_ptr, &missing_url);
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    resolver,
+                    3,
+                    &[
+                        url_ptr as u32,
+                        MF_RESOLUTION_MEDIASOURCE,
+                        0,
+                        cookie as u32,
+                        0,
+                        0
+                    ]
+                ),
+                0
+            );
+            let missing = read_guest_pointer(&memory, cookie, GuestArch::X86).unwrap();
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end_url,
+                    &[
+                        resolver as u32,
+                        missing as u32,
+                        type_out as u32,
+                        object_out as u32
+                    ]
+                ),
+                u64::from(INET_E_OBJECT_NOT_FOUND)
+            );
+            server.join().expect("http server");
+
+            // A successful http bind can still be cancelled: the queued
+            // completion is dropped, the callback never fires and the cookie
+            // reports the exact one-shot cancellation state.
+            let (url, server) = http_server("200 OK", minimal_mp4_file(), 1);
+            write_utf16(&mut memory, url_ptr, &url);
+            assert_eq!(
+                call_mf_slot(
+                    &mut runtime,
+                    &mut memory,
+                    resolver,
+                    3,
+                    &[
+                        url_ptr as u32,
+                        MF_RESOLUTION_MEDIASOURCE,
+                        0,
+                        cookie as u32,
+                        MF_CB_OBJECT as u32,
+                        0
+                    ]
+                ),
+                u64::from(E_PENDING)
+            );
+            let cancelled = read_guest_pointer(&memory, cookie, GuestArch::X86).unwrap();
+            assert_ne!(cancelled, 0);
+            assert_eq!(
+                call_mf_slot(&mut runtime, &mut memory, resolver, 7, &[cancelled as u32]),
+                0
+            );
+            drain_mf(&mut runtime, &mut state, &mut memory);
+            assert_eq!(
+                mf_callback_count(&memory),
+                1,
+                "the cancelled completion never fires the callback"
+            );
+            server.join().expect("http server");
+            assert_eq!(
+                dispatch_x86_thunk(
+                    &mut runtime,
+                    &mut memory,
+                    end_url,
+                    &[
+                        resolver as u32,
+                        cancelled as u32,
+                        type_out as u32,
+                        object_out as u32
+                    ]
+                ),
+                u64::from(E_INVALIDARG),
+                "a cancelled result is gone"
+            );
+            assert_eq!(
+                call_mf_slot(&mut runtime, &mut memory, resolver, 7, &[cancelled as u32]),
+                u64::from(S_FALSE),
+                "a second cancel reports the consumed cookie"
+            );
+            assert_eq!(
+                call_mf_slot(&mut runtime, &mut memory, resolver, 7, &[0]),
+                u64::from(S_FALSE),
+                "a null cookie is already consumed"
             );
         })
     }

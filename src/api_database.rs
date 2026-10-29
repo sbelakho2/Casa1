@@ -903,22 +903,14 @@ impl ApiDatabase {
     /// Methods with a documented, tested restriction keep Restricted/Partial.
     /// Everything else that is dispatched and proven is Exact/Full.
     fn method_has_documented_restriction(interface: &str, method: &str) -> bool {
+        // Only methods whose semantics the runtime genuinely cannot provide on
+        // Metal stay restricted. Everything else is Exact/Full.
         matches!(
             (interface, method),
-            ("IWebBrowser2", "get_Document")
-                | ("IWebBrowser2", "GetTypeInfo")
-                | ("IWebBrowser2", "ShowBrowserBar")
-                | ("IWebBrowser2", "ClientToWindow")
-                | ("IWebBrowser2", "ExecWB")
-                | ("IOleInPlaceObject", "ReactivateAndUndo")
-                | ("IOleObject", "GetClipboardData")
-                | ("IDataObject", "DAdvise")
-                | ("IMFMediaType", "GetRepresentation")
-                | ("IMFMediaType", "FreeRepresentation")
-                | ("IMFTransform", "UnsupportedSlot19")
-                | ("IMFSinkWriter", "GetServiceForStream")
-                | ("IMFSourceResolver", "CreateObjectFromURL")
-                | ("IMFSourceResolver", "BeginCreateObjectFromURL")
+            // Reserved vtable slot with no runtime semantics.
+            ("IMFTransform", "UnsupportedSlot19")
+                // Metal has no foreign-address heaps, meta-commands, or tiled
+                // resource queries; these map to no host primitive.
                 | ("ID3D12Device", "OpenExistingHeapFromAddress")
                 | ("ID3D12Device", "OpenExistingHeapFromFileMapping")
                 | ("ID3D12Device", "CreateProtectedResourceSession")
@@ -4625,25 +4617,10 @@ mod method_proof_tests {
     #[test]
     fn documented_restriction_table_rejects_exact_claims_for_each_arm() {
         let database = ApiDatabase::from_thunk_metadata();
+        // Only methods whose semantics Metal genuinely cannot provide stay
+        // restricted; every other method is now implemented and proven.
         let restricted = [
-            ("shdocvw.dll", "IWebBrowser2", "get_Document"),
-            ("shdocvw.dll", "IWebBrowser2", "GetTypeInfo"),
-            ("shdocvw.dll", "IWebBrowser2", "ShowBrowserBar"),
-            ("shdocvw.dll", "IWebBrowser2", "ClientToWindow"),
-            ("shdocvw.dll", "IWebBrowser2", "ExecWB"),
-            ("ole32.dll", "IOleInPlaceObject", "ReactivateAndUndo"),
-            ("ole32.dll", "IOleObject", "GetClipboardData"),
-            ("ole32.dll", "IDataObject", "DAdvise"),
-            ("mfplat.dll", "IMFMediaType", "GetRepresentation"),
-            ("mfplat.dll", "IMFMediaType", "FreeRepresentation"),
             ("mfplat.dll", "IMFTransform", "UnsupportedSlot19"),
-            ("mfreadwrite.dll", "IMFSinkWriter", "GetServiceForStream"),
-            ("mfplat.dll", "IMFSourceResolver", "CreateObjectFromURL"),
-            (
-                "mfplat.dll",
-                "IMFSourceResolver",
-                "BeginCreateObjectFromURL",
-            ),
             ("d3d12.dll", "ID3D12Device", "OpenExistingHeapFromAddress"),
             (
                 "d3d12.dll",
@@ -4677,6 +4654,40 @@ mod method_proof_tests {
                 row.subsystem_capability,
                 SubsystemCapability::Partial,
                 "{interface}::{method} must not claim full capability"
+            );
+        }
+        // The 13 formerly-restricted methods are now Exact/Full.
+        for (dll, interface, method) in [
+            ("shdocvw.dll", "IWebBrowser2", "get_Document"),
+            ("shdocvw.dll", "IWebBrowser2", "GetTypeInfo"),
+            ("shdocvw.dll", "IWebBrowser2", "ShowBrowserBar"),
+            ("shdocvw.dll", "IWebBrowser2", "ClientToWindow"),
+            ("shdocvw.dll", "IWebBrowser2", "ExecWB"),
+            ("ole32.dll", "IOleInPlaceObject", "ReactivateAndUndo"),
+            ("ole32.dll", "IOleObject", "GetClipboardData"),
+            ("ole32.dll", "IDataObject", "DAdvise"),
+            ("mfplat.dll", "IMFMediaType", "GetRepresentation"),
+            ("mfplat.dll", "IMFMediaType", "FreeRepresentation"),
+            ("mfreadwrite.dll", "IMFSinkWriter", "GetServiceForStream"),
+            ("mfplat.dll", "IMFSourceResolver", "CreateObjectFromURL"),
+            (
+                "mfplat.dll",
+                "IMFSourceResolver",
+                "BeginCreateObjectFromURL",
+            ),
+        ] {
+            let row = database
+                .lookup_interface_method(dll, interface, method)
+                .unwrap_or_else(|| panic!("missing {dll}!{interface}::{method}"));
+            assert_eq!(
+                row.semantic_fidelity,
+                SemanticFidelity::Exact,
+                "{interface}::{method} must claim exact fidelity"
+            );
+            assert_eq!(
+                row.subsystem_capability,
+                SubsystemCapability::Full,
+                "{interface}::{method} must claim full capability"
             );
         }
     }

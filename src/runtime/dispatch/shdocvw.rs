@@ -20,17 +20,39 @@
 //!   readiness transitions and the complete `get_`/`put_` property surface.
 //! - `IDispatch::GetIDsOfNames`/`Invoke` drive the same state machine through
 //!   the browser's dispatch table; unknown names answer `DISP_E_UNKNOWNNAME`.
-//! - `QueryStatusWB`/`ExecWB` report and act on the commands the control can
-//!   perform (refresh/stop); unsupported commands keep the documented
-//!   `OLECMDERR_E_NOTSUPPORTED`.
+//! - `QueryStatusWB`/`ExecWB` dispatch the OLE commands the control models
+//!   (`OLECMDID_NEW`/`OLECMDID_REFRESH`/`OLECMDID_STOP`); an unsupported
+//!   `OLECMDID` keeps the documented `OLECMDERR_E_NOTSUPPORTED`, a modeled
+//!   command on a closed control answers `OLECMDERR_E_DISABLED`, and a
+//!   malformed command argument is a `DISP_E_TYPEMISMATCH`.
+//! - `GetTypeInfo` loads the real WebBrowser type library image through the
+//!   oleaut `LoadTypeLib`/MSFTypLib path and hands back the live `ITypeInfo`
+//!   over its `IWebBrowser2` member table; an unknown index is
+//!   `TYPE_E_ELEMENTNOTFOUND`, a null out-pointer is `E_INVALIDARG`, and a
+//!   type library that cannot be materialized is `TYPE_E_CANTLOADLIBRARY`.
+//! - `get_Document` returns a real HTML document guest object over the
+//!   navigation state (URL/referrer/ready-state derived from the committed
+//!   history) once a page has loaded; `S_FALSE` with a null document only
+//!   while no document is loaded, `E_INVALIDARG` for a null out-pointer, and
+//!   the document's `QueryInterface` answers `E_NOINTERFACE` for a wrong IID.
+//! - `ClientToWindow` converts client coordinates with the real window
+//!   geometry model (the frame metrics the runtime's `AdjustWindowRect`
+//!   computes for the front-most guest window at its DPI); `E_INVALIDARG`
+//!   for null coordinate pointers and `E_FAIL` when no window exists.
+//! - `ShowBrowserBar` validates the argument variants: an empty/NULL class
+//!   id dismisses the (never-shown) bar with `S_OK`, a null class-id pointer
+//!   is `E_INVALIDARG`, an unsupported variant is `DISP_E_TYPEMISMATCH`, and
+//!   any real bar class id keeps `OLECMDERR_E_NOTSUPPORTED` (this runtime
+//!   models no hosted browser bar object).
 //!
-//! What the host genuinely cannot provide: HTML rendering.  `get_Document`
-//! therefore reports `S_FALSE` with a null document, `GetTypeInfo` answers
-//! `E_NOTIMPL` (no generated type library), `ShowBrowserBar` and
-//! `ClientToWindow` answer `E_NOTIMPL` (no hosted browser bar/window) rather
-//! than pretending the operation happened.
+//! What the host genuinely cannot provide: HTML rendering and a DOM.  The
+//! document object therefore answers `E_NOTIMPL` for every `IHTMLDocument2`
+//! member outside the navigation-state surface (body/all/title/cookie/...),
+//! and its `IDispatch::GetTypeInfoCount` reports `0` (no generated mshtml
+//! type library).
 
 use super::super::*;
+use super::com::ComMethod;
 use std::collections::BTreeMap;
 
 /// S_OK.
@@ -43,16 +65,24 @@ const HR_E_INVALIDARG: u64 = 0x8007_0057;
 const HR_E_NOTIMPL: u64 = 0x8000_4001;
 /// E_NOINTERFACE.
 const HR_E_NOINTERFACE: u64 = 0x8000_4002;
+/// E_FAIL.
+const HR_E_FAIL: u64 = 0x8000_4005;
 /// DISP_E_MEMBERNOTFOUND.
 const HR_DISP_E_MEMBERNOTFOUND: u64 = 0x8002_0003;
 /// DISP_E_TYPEMISMATCH.
 const HR_DISP_E_TYPEMISMATCH: u64 = 0x8002_0005;
 /// DISP_E_UNKNOWNNAME.
 const HR_DISP_E_UNKNOWNNAME: u64 = 0x8002_0006;
+/// TYPE_E_ELEMENTNOTFOUND.
+const HR_TYPE_E_ELEMENTNOTFOUND: u64 = 0x8002_802b;
+/// TYPE_E_CANTLOADLIBRARY.
+const HR_TYPE_E_CANTLOADLIBRARY: u64 = 0x8002_8c05;
 /// INET_E_INVALID_URL.
 const HR_INET_E_INVALID_URL: u64 = 0x800c_0002;
 /// OLECMDERR_E_NOTSUPPORTED.
 const HR_OLECMDERR_E_NOTSUPPORTED: u64 = 0x8004_0100;
+/// OLECMDERR_E_DISABLED.
+const HR_OLECMDERR_E_DISABLED: u64 = 0x8004_0101;
 
 /// DISPID_UNKNOWN.
 const DISPID_UNKNOWN: i32 = -1;
@@ -67,6 +97,13 @@ const OLECMDF_SUPPORTED: u32 = 0x1;
 /// `OLECMDF_ENABLED`.
 const OLECMDF_ENABLED: u32 = 0x2;
 
+/// `OLECMDID_NEW` — the control models the new-instance command.
+const OLECMDID_NEW: u32 = 2;
+/// `OLECMDID_REFRESH` (docobj.h).
+const OLECMDID_REFRESH: u32 = 22;
+/// `OLECMDID_STOP` (docobj.h).
+const OLECMDID_STOP: u32 = 23;
+
 /// DISPATCH_METHOD.
 const DISPATCH_METHOD: u16 = 0x1;
 /// DISPATCH_PROPERTYGET.
@@ -80,6 +117,261 @@ const IID_IDISPATCH: &str = "{00020400-0000-0000-C000-000000000046}";
 const IID_IWEBBROWSER: &str = "{EAB22AC1-30C1-11CF-A7EB-0000C05BAE0B}";
 const IID_IWEBBROWSERAPP: &str = "{0002DF05-0000-0000-C000-000000000046}";
 const IID_IWEBBROWSER2: &str = "{D30C1661-CDAF-11D0-8A3E-00C04FC9E26E}";
+const IID_IHTMLDOCUMENT: &str = "{626FC520-A41E-11CF-A731-00A0C9082637}";
+const IID_IHTMLDOCUMENT2: &str = "{332C4425-26CB-11D0-B483-00C04FD90119}";
+
+/// The `IDispatch` vtable slots every guest COM object starts with.
+const IDISPATCH_SLOTS: usize = 7;
+
+/// The deterministic local dispatch ids the HTML document's `IDispatch`
+/// assigns: `DOC_DISPID_BASE + table-row index` (put/get pairs share the
+/// row of their first occurrence).  The same local-assignment convention
+/// the browser control's table uses.
+const DOC_DISPID_BASE: i32 = 1000;
+
+/// `IHTMLDocument2` member access bits for [`DOC_MEMBERS`]: a property get,
+/// a property put, or a method (the three `INVOKE_*` shapes).
+const DOC_ACCESS_GET: u8 = 1;
+const DOC_ACCESS_PUT: u8 = 2;
+const DOC_ACCESS_METHOD: u8 = 4;
+
+/// One `IHTMLDocument2` vtable member beyond the `IDispatch` preamble:
+/// member name, access bits, and the number of declared parameters (the
+/// stdcall byte count for the slot is `4 * (parameters + 1)` for `this`).
+///
+/// The order is the real `IHTMLDocument2` vtable layout (`IHTMLDocument`'s
+/// single `Script` member first, then the `IHTMLDocument2` members in IDL
+/// order), so a guest calling at a real offset lands on the matching host
+/// thunk: the three navigation-state getters answer real values and every
+/// other member answers `E_NOTIMPL` (the runtime models no DOM/renderer).
+type DocMember = (&'static str, u8, u8);
+const DOC_MEMBERS: &[DocMember] = &[
+    ("Script", 1, 1),
+    ("all", 1, 1),
+    ("body", 1, 1),
+    ("activeElement", 1, 1),
+    ("images", 1, 1),
+    ("applets", 1, 1),
+    ("links", 1, 1),
+    ("forms", 1, 1),
+    ("anchors", 1, 1),
+    ("title", 2, 1),
+    ("title", 1, 1),
+    ("scripts", 1, 1),
+    ("designMode", 2, 1),
+    ("designMode", 1, 1),
+    ("selection", 1, 1),
+    ("readyState", 1, 1),
+    ("frames", 1, 1),
+    ("embeds", 1, 1),
+    ("plugins", 1, 1),
+    ("alinkColor", 2, 1),
+    ("alinkColor", 1, 1),
+    ("bgColor", 2, 1),
+    ("bgColor", 1, 1),
+    ("fgColor", 2, 1),
+    ("fgColor", 1, 1),
+    ("linkColor", 2, 1),
+    ("linkColor", 1, 1),
+    ("vlinkColor", 2, 1),
+    ("vlinkColor", 1, 1),
+    ("referrer", 1, 1),
+    ("location", 1, 1),
+    ("lastModified", 1, 1),
+    ("URL", 2, 1),
+    ("URL", 1, 1),
+    ("domain", 2, 1),
+    ("domain", 1, 1),
+    ("cookie", 2, 1),
+    ("cookie", 1, 1),
+    ("expando", 2, 1),
+    ("expando", 1, 1),
+    ("charset", 2, 1),
+    ("charset", 1, 1),
+    ("defaultCharset", 2, 1),
+    ("defaultCharset", 1, 1),
+    ("mimeType", 1, 1),
+    ("fileSize", 1, 1),
+    ("fileCreatedDate", 1, 1),
+    ("fileModifiedDate", 1, 1),
+    ("fileUpdatedDate", 1, 1),
+    ("security", 1, 1),
+    ("protocol", 1, 1),
+    ("nameProp", 1, 1),
+    ("write", 4, 1),
+    ("writeln", 4, 1),
+    ("open", 4, 5),
+    ("close", 4, 0),
+    ("clear", 4, 0),
+    ("queryCommandSupported", 4, 2),
+    ("queryCommandEnabled", 4, 2),
+    ("queryCommandState", 4, 2),
+    ("queryCommandIndeterm", 4, 2),
+    ("queryCommandText", 4, 2),
+    ("queryCommandValue", 4, 2),
+    ("execCommand", 4, 4),
+    ("execCommandShowHelp", 4, 2),
+    ("createElement", 4, 2),
+    ("onhelp", 2, 1),
+    ("onhelp", 1, 1),
+    ("onclick", 2, 1),
+    ("onclick", 1, 1),
+    ("ondblclick", 2, 1),
+    ("ondblclick", 1, 1),
+    ("onkeyup", 2, 1),
+    ("onkeyup", 1, 1),
+    ("onkeydown", 2, 1),
+    ("onkeydown", 1, 1),
+    ("onkeypress", 2, 1),
+    ("onkeypress", 1, 1),
+    ("onmouseup", 2, 1),
+    ("onmouseup", 1, 1),
+    ("onmousedown", 2, 1),
+    ("onmousedown", 1, 1),
+    ("onmousemove", 2, 1),
+    ("onmousemove", 1, 1),
+    ("onmouseout", 2, 1),
+    ("onmouseout", 1, 1),
+    ("onmouseover", 2, 1),
+    ("onmouseover", 1, 1),
+    ("onreadystatechange", 2, 1),
+    ("onreadystatechange", 1, 1),
+    ("onafterupdate", 2, 1),
+    ("onafterupdate", 1, 1),
+    ("onrowexit", 2, 1),
+    ("onrowexit", 1, 1),
+    ("onrowenter", 2, 1),
+    ("onrowenter", 1, 1),
+    ("ondragstart", 2, 1),
+    ("ondragstart", 1, 1),
+    ("onselectstart", 2, 1),
+    ("onselectstart", 1, 1),
+    ("elementFromPoint", 4, 3),
+    ("parentWindow", 1, 1),
+    ("styleSheets", 1, 1),
+    ("onbeforeupdate", 2, 1),
+    ("onbeforeupdate", 1, 1),
+    ("onerrorupdate", 2, 1),
+    ("onerrorupdate", 1, 1),
+    ("toString", 4, 1),
+    ("createStyleSheet", 4, 3),
+];
+
+/// The vtable slot (relative to the object) of the navigation-state getters
+/// the document genuinely implements: `IDISPATCH_SLOTS + member index`.
+const DOC_SLOT_READYSTATE: usize = IDISPATCH_SLOTS + 15;
+const DOC_SLOT_REFERRER: usize = IDISPATCH_SLOTS + 29;
+const DOC_SLOT_URL: usize = IDISPATCH_SLOTS + 33;
+
+/// Resolve a document member name to its dispatch id: the first table row
+/// with that name — put/get pairs share one id and are told apart at
+/// `Invoke` time by the invocation kind (the COM rule).
+fn doc_dispid_of_name(name: &str) -> Option<i32> {
+    DOC_MEMBERS
+        .iter()
+        .position(|(member, _, _)| member.eq_ignore_ascii_case(name))
+        .map(|index| DOC_DISPID_BASE + index as i32)
+}
+
+/// The member name behind a document dispatch id.
+fn doc_name_of_dispid(dispid: i32) -> Option<&'static str> {
+    let index = i64::from(dispid) - i64::from(DOC_DISPID_BASE);
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| DOC_MEMBERS.get(index))
+        .map(|(name, _, _)| *name)
+}
+
+/// The referrer of the page at `index` in `history`: the previous entry
+/// when it is an http(s) URL, empty otherwise (a document records its
+/// page-load referrer exactly once).
+fn page_referrer(history: &[String], index: usize) -> String {
+    let Some(previous) = index.checked_sub(1).and_then(|index| history.get(index)) else {
+        return String::new();
+    };
+    if previous.starts_with("http://") || previous.starts_with("https://") {
+        previous.clone()
+    } else {
+        String::new()
+    }
+}
+
+/// A document's ready state: live from the owning control while attached,
+/// the frozen snapshot once the control is gone.
+fn document_ready_state(runtime: &PeHostRuntime, document: &WebBrowserState) -> i32 {
+    runtime
+        .web_browsers
+        .get(&document.parent)
+        .map_or(document.ready_state, |parent| parent.ready_state)
+}
+
+/// The `_READYSTATE` name a ready-state value reports as (`BSTR`).
+fn ready_state_string(ready_state: i32) -> &'static str {
+    match ready_state {
+        0 => "uninitialized",
+        1 => "loading",
+        2 => "loaded",
+        3 => "interactive",
+        4 => "complete",
+        _ => "uninitialized",
+    }
+}
+
+/// `ExecWB`'s OLE command dispatch: the modeled commands
+/// (`OLECMDID_NEW`/`OLECMDID_REFRESH`/`OLECMDID_STOP`) run against the
+/// control's state, a malformed VARIANT argument is a type mismatch, a
+/// closed control reports the command disabled
+/// (`OLECMDERR_E_DISABLED`, matching `QueryStatusWB`'s cleared `ENABLED`
+/// bit), and every other `OLECMDID` keeps `OLECMDERR_E_NOTSUPPORTED`.
+fn exec_wb_command(
+    memory: &MemoryImage,
+    browser: &mut WebBrowserState,
+    command: u32,
+    command_in: u64,
+) -> u64 {
+    match command {
+        OLECMDID_NEW | OLECMDID_REFRESH | OLECMDID_STOP => {
+            if !variant_accepted_as_command_arg(memory, command_in) {
+                return HR_DISP_E_TYPEMISMATCH;
+            }
+            if browser.closed {
+                return HR_OLECMDERR_E_DISABLED;
+            }
+            browser.ready_state = READYSTATE_COMPLETE;
+            if command != OLECMDID_NEW {
+                browser.status_text = "Done".to_string();
+            }
+            HR_S_OK
+        }
+        _ => HR_OLECMDERR_E_NOTSUPPORTED,
+    }
+}
+
+/// The optional `pvaIn` command argument accepts a null pointer and the
+/// empty and VT_I4 VARIANT forms (the modeled commands read refresh flags
+/// as a long); every other type is a mismatch.
+fn variant_accepted_as_command_arg(memory: &MemoryImage, variant: u64) -> bool {
+    if variant == 0 {
+        return true;
+    }
+    matches!(memory.read_u16(variant).unwrap_or(u16::MAX), 0 | 1 | 3)
+}
+
+/// `ShowBrowserBar`'s outcome for validated argument variants: an
+/// unsupported VARIANT type is `DISP_E_TYPEMISMATCH`; a real bar class id
+/// (VT_BSTR) keeps `OLECMDERR_E_NOTSUPPORTED` because this runtime models
+/// no hosted browser bar object; an empty/NULL class id dismisses the
+/// (never-shown) bar with `S_OK`.
+fn show_browser_bar_result(class_vt: u16, replacement_vt: u16) -> u64 {
+    if !matches!(class_vt, 0 | 1 | 8) || !matches!(replacement_vt, 0 | 1 | 8) {
+        return HR_DISP_E_TYPEMISMATCH;
+    }
+    if class_vt == 8 {
+        HR_OLECMDERR_E_NOTSUPPORTED
+    } else {
+        HR_S_OK
+    }
+}
 
 /// One slot of the `IWebBrowser2` vtable (the `IUnknown` + `IDispatch`
 /// preamble followed by the 46 browser-control methods).
@@ -138,9 +430,60 @@ pub enum WebBrowserMethod {
     PutAddressBar,
     GetResizable,
     PutResizable,
+    // ── IHTMLDocument2 document-object slots (never part of `ALL`; they
+    //    only appear in the document vtable built by `html_document_vtable`)
+    DocumentGetReadyState,
+    DocumentGetReferrer,
+    DocumentGetUrl,
+    /// An `IHTMLDocument2` member this runtime does not model (no DOM):
+    /// the stdcall argument byte count rides on the thunk so an x86 guest
+    /// pops exactly the bytes the real member declares.
+    DocumentUnsupported {
+        arg_bytes: u64,
+    },
+}
+
+/// Which guest object a [`WebBrowserMethod`] slot belongs to: the browser
+/// control vtable, the HTML document vtable, or both (the shared
+/// `IUnknown`/`IDispatch` preamble every COM object starts with).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MethodSurface {
+    Shared,
+    Control,
+    Document,
 }
 
 impl WebBrowserMethod {
+    /// Which object surface carries this slot.
+    fn surface(self) -> MethodSurface {
+        match self {
+            Self::QueryInterface
+            | Self::AddRef
+            | Self::Release
+            | Self::GetTypeInfoCount
+            | Self::GetTypeInfo
+            | Self::GetIDsOfNames
+            | Self::Invoke => MethodSurface::Shared,
+            Self::DocumentGetReadyState
+            | Self::DocumentGetReferrer
+            | Self::DocumentGetUrl
+            | Self::DocumentUnsupported { .. } => MethodSurface::Document,
+            // Every remaining slot of the enum is a browser-control slot.
+            _ => MethodSurface::Control,
+        }
+    }
+
+    /// Whether a live object in `role` dispatches this slot.  A cross-role
+    /// call (a document calling `Navigate`, a control calling a document
+    /// getter) is `E_INVALIDARG` — the slot does not exist on that object.
+    fn available_to(self, role: WebBrowserRole) -> bool {
+        match self.surface() {
+            MethodSurface::Shared => true,
+            MethodSurface::Control => role == WebBrowserRole::Control,
+            MethodSurface::Document => role == WebBrowserRole::Document,
+        }
+    }
+
     /// The 53 vtable slots in ABI order.
     pub(crate) const ALL: [WebBrowserMethod; 53] = [
         Self::QueryInterface,
@@ -253,6 +596,10 @@ impl WebBrowserMethod {
             Self::Navigate | Self::Navigate2 => 24,
             Self::GetIDsOfNames => 24,
             Self::Invoke => 36,
+            // The document getters return through one out pointer; the
+            // unmodeled members carry their real stdcall byte count.
+            Self::DocumentGetReadyState | Self::DocumentGetReferrer | Self::DocumentGetUrl => 8,
+            Self::DocumentUnsupported { arg_bytes } => arg_bytes,
         }
     }
 
@@ -312,6 +659,10 @@ impl WebBrowserMethod {
             Self::PutAddressBar => "AddressBar",
             Self::GetResizable => "Resizable",
             Self::PutResizable => "Resizable",
+            Self::DocumentGetReadyState => "readyState",
+            Self::DocumentGetReferrer => "referrer",
+            Self::DocumentGetUrl => "URL",
+            Self::DocumentUnsupported { .. } => "DocumentMember",
         }
     }
 
@@ -373,6 +724,13 @@ impl WebBrowserMethod {
             Self::PutAddressBar => 50,
             Self::GetResizable => 51,
             Self::PutResizable => 52,
+            // Document slots carry their dispatch id through the document
+            // table (`DOC_DISPID_BASE + slot`); these enum-local values only
+            // keep the total function well-formed.
+            Self::DocumentGetReadyState => 95,
+            Self::DocumentGetReferrer => 96,
+            Self::DocumentGetUrl => 97,
+            Self::DocumentUnsupported { arg_bytes } => 98 + (arg_bytes / 4) as i32,
         }
     }
 
@@ -409,6 +767,10 @@ impl WebBrowserMethod {
             | Self::PutTheaterMode
             | Self::PutAddressBar
             | Self::PutResizable => DISPATCH_PROPERTYPUT,
+            Self::DocumentGetReadyState | Self::DocumentGetReferrer | Self::DocumentGetUrl => {
+                DISPATCH_PROPERTYGET
+            }
+            Self::DocumentUnsupported { .. } => DISPATCH_METHOD,
             _ => DISPATCH_METHOD,
         }
     }
@@ -427,9 +789,310 @@ pub(crate) fn web_browser_vtable() -> Vec<HostThunk> {
         .collect()
 }
 
-/// One live browser-control object.
+/// The real `IHTMLDocument2` vtable: the shared `IDispatch` preamble, then
+/// one host thunk per member of [`DOC_MEMBERS`] at its real slot offset.
+fn html_document_vtable() -> Vec<HostThunk> {
+    let mut methods: Vec<HostThunk> = [
+        WebBrowserMethod::QueryInterface,
+        WebBrowserMethod::AddRef,
+        WebBrowserMethod::Release,
+        WebBrowserMethod::GetTypeInfoCount,
+        WebBrowserMethod::GetTypeInfo,
+        WebBrowserMethod::GetIDsOfNames,
+        WebBrowserMethod::Invoke,
+    ]
+    .into_iter()
+    .map(HostThunk::WebBrowserMethod)
+    .collect();
+    for (index, &(_, access, parameters)) in DOC_MEMBERS.iter().enumerate() {
+        let slot = IDISPATCH_SLOTS + index;
+        let method = match slot {
+            DOC_SLOT_READYSTATE => WebBrowserMethod::DocumentGetReadyState,
+            DOC_SLOT_REFERRER => WebBrowserMethod::DocumentGetReferrer,
+            DOC_SLOT_URL if access & DOC_ACCESS_GET != 0 => WebBrowserMethod::DocumentGetUrl,
+            _ => WebBrowserMethod::DocumentUnsupported {
+                arg_bytes: 4 * u64::from(parameters) + 4,
+            },
+        };
+        methods.push(HostThunk::WebBrowserMethod(method));
+    }
+    methods
+}
+
+/// The `com_service_map` cache key holding the control's loaded
+/// `ITypeInfo` guest object (OLEAUT keeps loaded type libraries loaded for
+/// the lifetime of the process).
+const SHDOCVW_TYPEINFO_KEY: &str = "\u{1}shdocvw-webbrowser-typeinfo";
+
+/// The Internet Controls type-library LIBID (the library this image
+/// models).
+const SHDOCVW_LIBID: &str = "{EAB22AC0-30C1-11CF-A7EB-0000C05BAE0B}";
+
+/// One row of the type-library signature table: how a member's parameters
+/// appear in the generated `FUNCDESC`.  By-value arguments carry their
+/// Windows VT (BSTR=8, VARIANT=12, VARIANT_BOOL=11, LONG=3); reference,
+/// out, and struct-pointer parameters carry VT_PTR (26) — the MSFT reader
+/// this runtime uses stores a single VT per parameter, so pointer pointees
+/// are not chained typedescs.  Property gets take their one `[out,
+/// retval]` pointer.
+fn web_browser_typelib_signature(method: WebBrowserMethod) -> (u8, &'static [i32]) {
+    let invkind = match method.supported_kinds() {
+        DISPATCH_PROPERTYGET => 2_u8, // INVOKE_PROPERTYGET
+        DISPATCH_PROPERTYPUT => 4_u8, // INVOKE_PROPERTYPUT
+        _ => 1_u8,                    // INVOKE_FUNC
+    };
+    let params: &[i32] = match method {
+        WebBrowserMethod::Navigate => &[8, 26, 8, 26, 26],
+        WebBrowserMethod::Navigate2 => &[26, 26, 26, 26, 26],
+        WebBrowserMethod::Refresh2 => &[26],
+        WebBrowserMethod::QueryStatusWB => &[3, 26],
+        WebBrowserMethod::ExecWB => &[3, 3, 26, 26],
+        WebBrowserMethod::ShowBrowserBar => &[26, 26, 26],
+        WebBrowserMethod::ClientToWindow => &[26, 26],
+        WebBrowserMethod::PutProperty => &[8, 12],
+        WebBrowserMethod::GetProperty => &[8, 26],
+        WebBrowserMethod::PutStatusText => &[8],
+        WebBrowserMethod::PutToolBar => &[3],
+        _ if invkind == 2 => &[26],
+        _ if invkind == 4 => &[11],
+        _ => &[],
+    };
+    (invkind, params)
+}
+
+/// Build the runtime's WebBrowser type-library image: one MSFT segment
+/// directory, the LIBID and `IWebBrowser2` IIDs, the library/interface
+/// names, and one `FUNCDESC` per control member (memid = the runtime's
+/// local dispatch id, oVft = the vtable slot, HRESULT return) so the
+/// oleaut `LoadTypeLib` path parses it into a live `ITypeInfo`.
+fn shdocvw_typelib_image() -> Vec<u8> {
+    // Name segment: library name first (the header points at offset 0),
+    // then the interface name and every member name (put/get pairs repeat
+    // the name at their own offsets, as MSFT name tables do).
+    let mut names = Vec::new();
+    let lib_name_offset = push_msft_name(&mut names, "Microsoft Internet Controls");
+    debug_assert_eq!(lib_name_offset, 0);
+    let type_name_offset = push_msft_name(&mut names, "IWebBrowser2");
+    let mut member_name_offsets = Vec::new();
+    for method in &WebBrowserMethod::ALL[7..] {
+        member_name_offsets.push(push_msft_name(&mut names, method.dispatch_name()));
+    }
+    // String segment: library documentation first, then the interface
+    // documentation and the (modeled) help file name.
+    let mut strings = Vec::new();
+    let lib_doc_offset = push_msft_string(
+        &mut strings,
+        "Microsoft Internet Controls type library (Casa1 runtime model)",
+    );
+    let type_doc_offset = push_msft_string(&mut strings, "IWebBrowser2 browser-control interface");
+    let help_file_offset = push_msft_string(&mut strings, "shdocvw.hlp");
+    // GUID segment: two 24-byte records (16-byte GUID + two link fields).
+    let mut guids = Vec::new();
+    let lib_id = crate::real_win32::guid_from_string(SHDOCVW_LIBID)
+        .expect("the Internet Controls LIBID parses");
+    let interface_id =
+        crate::real_win32::guid_from_string(IID_IWEBBROWSER2).expect("the IWebBrowser2 IID parses");
+    for guid in [lib_id, interface_id] {
+        guids.extend_from_slice(&guid);
+        guids.extend_from_slice(&(-1_i32).to_le_bytes());
+        guids.extend_from_slice(&(-1_i32).to_le_bytes());
+    }
+    // Member records: one per control member after the IDispatch preamble.
+    let methods = &WebBrowserMethod::ALL[7..];
+    let mut records = Vec::new();
+    let mut memids = Vec::new();
+    for (index, method) in methods.iter().enumerate() {
+        let (invkind, params) = web_browser_typelib_signature(*method);
+        let record_len = 24 + params.len() * 12;
+        records.extend_from_slice(&(record_len as u32).to_le_bytes());
+        records.extend_from_slice(&(-25_i32).to_le_bytes()); // data_type: VT_HRESULT
+        records.extend_from_slice(&0_u16.to_le_bytes()); // func flags
+        records.extend_from_slice(&0_u16.to_le_bytes());
+        records.extend_from_slice(&((IDISPATCH_SLOTS + index) as u16).to_le_bytes()); // oVft slot
+        records.extend_from_slice(&0_u16.to_le_bytes());
+        // FKCCIC: FUNCKIND=4 | INVOKEKIND<<3 | CALLCONV_STDCALL<<8 — the
+        // same encoding the oleaut test images use.
+        let fkccic = 4_u32 | (u32::from(invkind) << 3) | (4 << 8);
+        records.extend_from_slice(&fkccic.to_le_bytes());
+        records.extend_from_slice(&(params.len() as u16).to_le_bytes());
+        records.extend_from_slice(&0_u16.to_le_bytes()); // cParamsOpt
+        for vt in params {
+            records.extend_from_slice(&(-i32::from(*vt)).to_le_bytes());
+            records.extend_from_slice(&u32::MAX.to_le_bytes()); // no per-parameter names
+            records.extend_from_slice(&0_u16.to_le_bytes());
+            records.extend_from_slice(&0_u16.to_le_bytes());
+        }
+        memids.push(method.dispid());
+    }
+    // The members segment: info-length header, the records, then the
+    // memid and member-name offset arrays (the reader's layout: a leading
+    // hole word, `cFuncs` memids, `cFuncs` name offsets).
+    let mut members = Vec::new();
+    members.extend_from_slice(&0_u32.to_le_bytes()); // info length, filled below
+    members.extend_from_slice(&records);
+    let info_len = members.len();
+    members[0..4].copy_from_slice(&(info_len as u32).to_le_bytes());
+    members.extend_from_slice(&0_u32.to_le_bytes());
+    for memid in &memids {
+        members.extend_from_slice(&(*memid as u32).to_le_bytes());
+    }
+    for offset in &member_name_offsets {
+        members.extend_from_slice(&offset.to_le_bytes());
+    }
+    // Segment layout after the header: offsets table, segment directory,
+    // then GUID, name, string, typeinfo, and members segments.
+    let guid_offset = 0x54 + 4 + 0x100;
+    let name_offset = guid_offset + guids.len();
+    let string_offset = name_offset + names.len();
+    let typeinfo_offset = string_offset + strings.len();
+    let members_offset = typeinfo_offset + 100;
+    let total = members_offset + members.len();
+    let mut image = vec![0_u8; total];
+    put_u32(&mut image, 0x00, 0x5446_534d); // "MSFT"
+    put_u32(&mut image, 0x04, 0x0001_0002); // supported version
+    put_i32(&mut image, 0x08, 0); // posguid: the LIBID at GUID offset 0
+    put_u32(&mut image, 0x0c, 0x409); // lcid
+    put_u32(&mut image, 0x10, 0x409); // lcid2
+    put_u32(&mut image, 0x14, 0x41); // varflags: syskind SYS_WIN32, no help DLL
+    put_u32(&mut image, 0x18, 1); // library version 1.0
+    put_u32(&mut image, 0x1c, 0); // flags
+    put_u32(&mut image, 0x20, 1); // one type: IWebBrowser2
+    put_i32(&mut image, 0x24, lib_doc_offset); // helpstring
+    put_u32(&mut image, 0x28, 0); // help context
+    put_u32(&mut image, 0x2c, lib_name_offset); // library name
+    put_i32(&mut image, 0x30, help_file_offset); // help file
+    put_u32(&mut image, 0x54, 0); // typeinfo offset table: type 0 at segment start
+    // The segment directory at 0x58: (slot, offset, length) — slot 2/4/6
+    // stay zeroed (unused by the reader).
+    for (slot, offset, length) in [
+        (0_usize, typeinfo_offset as i32, 100_u32), // typeinfo
+        (1, 0, 0),                                  // impinfo (kind checked)
+        (3, 0, 0),                                  // references
+        (5, guid_offset as i32, guids.len() as u32),
+        (7, name_offset as i32, names.len() as u32),
+        (8, string_offset as i32, strings.len() as u32),
+        (9, 0, 0), // typedesc (direct VTs only)
+    ] {
+        let base = 0x58 + slot * 16;
+        put_i32(&mut image, base, offset);
+        put_u32(&mut image, base + 4, length);
+        put_u32(&mut image, base + 12, 0x0f);
+    }
+    // The IWebBrowser2 type record.
+    put_u32(&mut image, typeinfo_offset, 3); // TKIND_INTERFACE
+    put_i32(&mut image, typeinfo_offset + 4, members_offset as i32);
+    put_i32(&mut image, typeinfo_offset + 8, -1); // no inheritance/impl data
+    put_u32(
+        &mut image,
+        typeinfo_offset + 24,
+        methods.len() as u32, // cFuncs | cVars<<16
+    );
+    put_i32(&mut image, typeinfo_offset + 44, 24); // posguid: the IID record
+    put_u16(&mut image, typeinfo_offset + 48, 0); // type flags
+    put_u32(&mut image, typeinfo_offset + 52, type_name_offset);
+    put_u16(&mut image, typeinfo_offset + 56, 1); // element version
+    put_i32(&mut image, typeinfo_offset + 60, type_doc_offset);
+    put_u32(&mut image, typeinfo_offset + 68, 0); // help context
+    put_u16(&mut image, typeinfo_offset + 76, 0); // cImplTypes
+    put_u16(
+        &mut image,
+        typeinfo_offset + 78,
+        ((IDISPATCH_SLOTS + methods.len()) * 4) as u16, // cbSizeVft (WIN32)
+    );
+    put_u32(&mut image, typeinfo_offset + 80, 0); // cbSizeInstance: interface
+    // Segments are written in place.
+    image[guid_offset..guid_offset + guids.len()].copy_from_slice(&guids);
+    image[name_offset..name_offset + names.len()].copy_from_slice(&names);
+    image[string_offset..string_offset + strings.len()].copy_from_slice(&strings);
+    image[members_offset..members_offset + members.len()].copy_from_slice(&members);
+    image
+}
+
+/// Write one little-endian `u32` into the image.
+fn put_u32(image: &mut [u8], offset: usize, value: u32) {
+    image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Write one little-endian `i32` into the image.
+fn put_i32(image: &mut [u8], offset: usize, value: i32) {
+    image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Write one little-endian `u16` into the image.
+fn put_u16(image: &mut [u8], offset: usize, value: u16) {
+    image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+/// The host-side cache path of the WebBrowser type-library image:
+/// content-addressed so every load of the same image shares one file.
+fn shdocvw_typelib_cache_path() -> std::path::PathBuf {
+    let image = shdocvw_typelib_image();
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64; // FNV-1a offset basis
+    for byte in &image {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    std::env::temp_dir().join(format!("casa1-shdocvw-{hash:016x}.tlb"))
+}
+
+/// Materialize the WebBrowser type-library image at `path`: skip an
+/// existing file, otherwise write a sibling temporary and atomically
+/// rename it into place (two processes may race; the content is
+/// identical).  Fails when `path` cannot hold a regular file.
+fn shdocvw_sync_typelib_file(path: &std::path::Path) -> std::io::Result<()> {
+    if path.is_file() {
+        return Ok(());
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, shdocvw_typelib_image())?;
+    std::fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })?;
+    Ok(())
+}
+
+/// Append one MSFT name-segment entry (`hash`, `next`, `u16` length,
+/// text, padded to a 4-byte boundary) and return its offset.
+fn push_msft_name(segment: &mut Vec<u8>, text: &str) -> u32 {
+    let offset = segment.len() as u32;
+    segment.extend_from_slice(&(-1_i32).to_le_bytes());
+    segment.extend_from_slice(&(-1_i32).to_le_bytes());
+    segment.extend_from_slice(&(text.len() as u16).to_le_bytes());
+    segment.extend_from_slice(&0_u16.to_le_bytes()); // pad to the text slot at +12
+    segment.extend_from_slice(text.as_bytes());
+    let piece = (12 + text.len()).next_multiple_of(4);
+    segment.resize(offset as usize + piece, 0);
+    offset
+}
+
+/// Append one MSFT string-segment entry (`u16` length, text, padded to a
+/// 4-byte boundary with an 8-byte floor) and return its offset.
+fn push_msft_string(segment: &mut Vec<u8>, text: &str) -> i32 {
+    let offset = segment.len() as i32;
+    segment.extend_from_slice(&(text.len() as u16).to_le_bytes());
+    segment.extend_from_slice(text.as_bytes());
+    let piece = (2 + text.len()).max(8).next_multiple_of(4);
+    segment.resize(offset as usize + piece, 0);
+    offset
+}
+
+/// Which guest object a live entry in `web_browsers` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebBrowserRole {
+    /// The `IWebBrowser2` browser control itself.
+    Control,
+    /// An `IHTMLDocument2` HTML document handed out by `get_Document`.
+    Document,
+}
+
+/// One live browser-control (or document) object.
 #[derive(Debug, Clone)]
 pub(crate) struct WebBrowserState {
+    /// Which object this entry is (control vs. HTML document).
+    pub(crate) role: WebBrowserRole,
+    /// The owning control of a document entry (0 once detached: the
+    /// document then answers from its own snapshot of the page).
+    pub(crate) parent: u64,
     /// Current location (the committed navigation URL).
     pub(crate) location: String,
     /// Navigation history.
@@ -448,6 +1111,15 @@ pub(crate) struct WebBrowserState {
     pub(crate) register_as_browser: bool,
     pub(crate) register_as_drop_target: bool,
     pub(crate) ready_state: i32,
+    /// Whether a committed navigation has loaded a page document.
+    pub(crate) document_loaded: bool,
+    /// The document guest object for the loaded page (the control holds one
+    /// reference; 0 until `get_Document` materializes it).
+    pub(crate) document_object: u64,
+    /// The document's referrer: the previous history entry when it was an
+    /// http(s) URL, empty otherwise (the page-load property, fixed at
+    /// document creation).
+    pub(crate) referrer: String,
     /// Named properties set through `PutProperty`.
     pub(crate) properties: BTreeMap<String, String>,
     /// Set by `Quit`.
@@ -462,6 +1134,8 @@ impl WebBrowserState {
             location.to_string()
         };
         Self {
+            role: WebBrowserRole::Control,
+            parent: 0,
             history: vec![location.clone()],
             location,
             history_index: 0,
@@ -477,6 +1151,9 @@ impl WebBrowserState {
             register_as_browser: false,
             register_as_drop_target: false,
             ready_state: READYSTATE_COMPLETE,
+            document_loaded: false,
+            document_object: 0,
+            referrer: String::new(),
             properties: BTreeMap::new(),
             closed: false,
         }
@@ -488,6 +1165,12 @@ impl WebBrowserState {
 
     fn can_go_forward(&self) -> bool {
         self.history_index + 1 < self.history.len()
+    }
+
+    /// Whether `get_Document` hands out a document: a committed navigation
+    /// loaded a page and the control has finished loading it.
+    fn document_available(&self) -> bool {
+        self.document_loaded && self.ready_state == READYSTATE_COMPLETE
     }
 }
 
@@ -607,6 +1290,12 @@ impl PeHostRuntime {
             self.last_error = 0;
             return Ok(());
         };
+        if !method.available_to(browser.role) {
+            // A cross-role slot does not exist on this object.
+            state.set(Register::Rax, HR_E_INVALIDARG);
+            self.last_error = 0;
+            return Ok(());
+        }
         let result = match method {
             WebBrowserMethod::QueryInterface => {
                 self.web_browser_query_interface(memory, this, state, &browser)?
@@ -615,6 +1304,14 @@ impl PeHostRuntime {
             WebBrowserMethod::Release => {
                 let remaining = self.release_guest_object(this)?;
                 state.set(Register::Rax, u64::from(remaining));
+                if remaining == 0 && browser.document_object != 0 {
+                    // The last control reference fell: freeze its document
+                    // at the page it last observed and drop the control's
+                    // own reference to it.  The type library cache is
+                    // runtime-wide state (like OLEAUT's own typelib cache)
+                    // and outlives the control.
+                    self.detach_document(&mut browser)?;
+                }
                 self.last_error = 0;
                 return Ok(());
             }
@@ -623,25 +1320,46 @@ impl PeHostRuntime {
                 if out == 0 {
                     HR_E_INVALIDARG
                 } else {
-                    write_u32(memory, out, 1);
+                    // The control exposes its type library; the HTML
+                    // document has no generated mshtml type library.
+                    let count = match browser.role {
+                        WebBrowserRole::Control => 1,
+                        WebBrowserRole::Document => 0,
+                    };
+                    write_u32(memory, out, count);
                     HR_S_OK
                 }
             }
             WebBrowserMethod::GetTypeInfo => {
+                let index = guest_call_arg_u32(state, memory, 1)?;
                 let out = guest_call_arg(state, memory, 3)?;
                 if out == 0 {
                     HR_E_INVALIDARG
                 } else {
                     write_guest_pointer(memory, out, 0, self.guest_arch)?;
-                    HR_E_NOTIMPL
+                    match browser.role {
+                        WebBrowserRole::Document => HR_TYPE_E_ELEMENTNOTFOUND,
+                        WebBrowserRole::Control if index != 0 => HR_TYPE_E_ELEMENTNOTFOUND,
+                        WebBrowserRole::Control => match self.web_browser_type_info(memory)? {
+                            Some(type_info) => {
+                                self.add_ref_guest_object(type_info)?;
+                                write_guest_pointer(memory, out, type_info, self.guest_arch)?;
+                                HR_S_OK
+                            }
+                            None => HR_TYPE_E_CANTLOADLIBRARY,
+                        },
+                    }
                 }
             }
-            WebBrowserMethod::GetIDsOfNames => self.web_browser_get_ids_of_names(memory, state)?,
+            WebBrowserMethod::GetIDsOfNames => {
+                self.web_browser_get_ids_of_names(memory, state, browser.role)?
+            }
             WebBrowserMethod::Invoke => {
                 self.web_browser_invoke(memory, state, this, &mut browser)?
             }
             WebBrowserMethod::GoBack => {
                 if browser.can_go_back() {
+                    self.detach_document(&mut browser)?;
                     browser.history_index -= 1;
                     browser.location = browser.history[browser.history_index].clone();
                     browser.ready_state = READYSTATE_COMPLETE;
@@ -652,6 +1370,7 @@ impl PeHostRuntime {
             }
             WebBrowserMethod::GoForward => {
                 if browser.can_go_forward() {
+                    self.detach_document(&mut browser)?;
                     browser.history_index += 1;
                     browser.location = browser.history[browser.history_index].clone();
                     browser.ready_state = READYSTATE_COMPLETE;
@@ -675,7 +1394,7 @@ impl PeHostRuntime {
                     .and_then(|value| value.data.as_str().map(str::to_string))
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "about:blank".to_string());
-                self.web_browser_navigate(&mut browser, &home)
+                self.web_browser_navigate(&mut browser, &home)?
             }
             WebBrowserMethod::GoSearch => {
                 let search = self
@@ -692,7 +1411,7 @@ impl PeHostRuntime {
                     .and_then(|value| value.data.as_str().map(str::to_string))
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "about:blank".to_string());
-                self.web_browser_navigate(&mut browser, &search)
+                self.web_browser_navigate(&mut browser, &search)?
             }
             WebBrowserMethod::Navigate => {
                 let url_ptr = guest_call_arg(state, memory, 1)?;
@@ -700,7 +1419,7 @@ impl PeHostRuntime {
                     HR_E_INVALIDARG
                 } else {
                     let url = read_utf16_string(memory, url_ptr)?;
-                    self.web_browser_navigate(&mut browser, &url)
+                    self.web_browser_navigate(&mut browser, &url)?
                 }
             }
             WebBrowserMethod::Navigate2 => {
@@ -708,9 +1427,9 @@ impl PeHostRuntime {
                 let url = variant_to_url(self, memory, url_variant);
                 match url {
                     Some(url) if url.trim().is_empty() => {
-                        self.web_browser_navigate(&mut browser, "about:blank")
+                        self.web_browser_navigate(&mut browser, "about:blank")?
                     }
-                    Some(url) => self.web_browser_navigate(&mut browser, &url),
+                    Some(url) => self.web_browser_navigate(&mut browser, &url)?,
                     None => HR_DISP_E_TYPEMISMATCH,
                 }
             }
@@ -750,6 +1469,11 @@ impl PeHostRuntime {
                 let out = guest_call_arg(state, memory, 1)?;
                 if out == 0 {
                     HR_E_INVALIDARG
+                } else if browser.document_available() {
+                    let document = self.web_browser_document_object(memory, this, &mut browser)?;
+                    self.add_ref_guest_object(document)?;
+                    write_guest_pointer(memory, out, document, self.guest_arch)?;
+                    HR_S_OK
                 } else {
                     write_guest_pointer(memory, out, 0, self.guest_arch)?;
                     HR_S_FALSE
@@ -835,7 +1559,7 @@ impl PeHostRuntime {
                     HR_E_INVALIDARG
                 } else {
                     let flags = match command {
-                        2 | 0x17 | 0x16 => {
+                        OLECMDID_NEW | OLECMDID_REFRESH | OLECMDID_STOP => {
                             let mut flags = OLECMDF_SUPPORTED;
                             if !browser.closed {
                                 flags |= OLECMDF_ENABLED;
@@ -850,20 +1574,24 @@ impl PeHostRuntime {
             }
             WebBrowserMethod::ExecWB => {
                 let command = guest_call_arg_u32(state, memory, 1)?;
-                match command {
-                    0x16 => {
-                        browser.ready_state = READYSTATE_COMPLETE;
-                        browser.status_text = "Done".to_string();
-                        HR_S_OK
-                    }
-                    2 => {
-                        browser.ready_state = READYSTATE_COMPLETE;
-                        HR_S_OK
-                    }
-                    _ => HR_OLECMDERR_E_NOTSUPPORTED,
+                let command_in = guest_call_arg(state, memory, 3)?;
+                exec_wb_command(memory, &mut browser, command, command_in)
+            }
+            WebBrowserMethod::ShowBrowserBar => {
+                let class_id = guest_call_arg(state, memory, 1)?;
+                let replacement = guest_call_arg(state, memory, 2)?;
+                if class_id == 0 {
+                    HR_E_INVALIDARG
+                } else {
+                    let class_vt = memory.read_u16(class_id).unwrap_or(0);
+                    let replacement_vt = if replacement == 0 {
+                        0
+                    } else {
+                        memory.read_u16(replacement).unwrap_or(0)
+                    };
+                    show_browser_bar_result(class_vt, replacement_vt)
                 }
             }
-            WebBrowserMethod::ShowBrowserBar => HR_E_NOTIMPL,
             WebBrowserMethod::GetReadyState => {
                 let out = guest_call_arg(state, memory, 1)?;
                 if out == 0 {
@@ -882,7 +1610,42 @@ impl PeHostRuntime {
                     HR_S_OK
                 }
             }
-            WebBrowserMethod::ClientToWindow => HR_E_NOTIMPL,
+            WebBrowserMethod::ClientToWindow => {
+                let client_x = guest_call_arg(state, memory, 1)?;
+                let client_y = guest_call_arg(state, memory, 2)?;
+                if client_x == 0 || client_y == 0 {
+                    HR_E_INVALIDARG
+                } else {
+                    // The control converts against the front-most guest
+                    // window (the host window at the top of the z-order):
+                    // client coordinates become window coordinates by the
+                    // non-client frame the window's own geometry models.
+                    match self.user32.get_top_window(None) {
+                        None => HR_E_FAIL,
+                        Some(hwnd) => {
+                            let x = memory.read_u32(client_x).unwrap_or(0) as i32;
+                            let y = memory.read_u32(client_y).unwrap_or(0) as i32;
+                            let style = self.user32.get_window_style(hwnd).unwrap_or(0);
+                            let ex_style = self.user32.get_window_ex_style(hwnd).unwrap_or(0);
+                            let dpi = self.user32.dpi_for_window(hwnd).unwrap_or(96);
+                            let mut frame = crate::user32::Rect {
+                                left: 0,
+                                top: 0,
+                                right: 0,
+                                bottom: 0,
+                            };
+                            self.user32
+                                .adjust_window_rect_for_dpi(&mut frame, style, 0, ex_style, dpi);
+                            // The adjusted frame maps the client origin to
+                            // (frame.left, frame.top) in window space;
+                            // coordinates saturate at the integer bounds.
+                            write_u32(memory, client_x, x.saturating_sub(frame.left) as u32);
+                            write_u32(memory, client_y, y.saturating_sub(frame.top) as u32);
+                            HR_S_OK
+                        }
+                    }
+                }
+            }
             WebBrowserMethod::PutProperty => {
                 let name_ptr = guest_call_arg(state, memory, 1)?;
                 let value_ptr = guest_call_arg(state, memory, 2)?;
@@ -949,6 +1712,19 @@ impl PeHostRuntime {
                 browser.resizable = bool_arg(state, memory, 1)?;
                 HR_S_OK
             }
+            WebBrowserMethod::DocumentGetReadyState => {
+                let value = ready_state_string(document_ready_state(self, &browser)).to_string();
+                self.copy_bstr_out(memory, state, value)?
+            }
+            WebBrowserMethod::DocumentGetReferrer => {
+                let value = browser.referrer.clone();
+                self.copy_bstr_out(memory, state, value)?
+            }
+            WebBrowserMethod::DocumentGetUrl => {
+                let value = browser.location.clone();
+                self.copy_bstr_out(memory, state, value)?
+            }
+            WebBrowserMethod::DocumentUnsupported { .. } => HR_E_NOTIMPL,
         };
         if method != WebBrowserMethod::Release {
             self.web_browsers.insert(this, browser);
@@ -971,36 +1747,221 @@ impl PeHostRuntime {
             return Ok(HR_E_INVALIDARG);
         }
         let iid = read_guid_string(memory, iid_ptr)?;
-        let supported = iid.eq_ignore_ascii_case(IID_IUNKNOWN)
-            || iid.eq_ignore_ascii_case(IID_IDISPATCH)
-            || iid.eq_ignore_ascii_case(IID_IWEBBROWSER)
-            || iid.eq_ignore_ascii_case(IID_IWEBBROWSERAPP)
-            || iid.eq_ignore_ascii_case(IID_IWEBBROWSER2);
+        let supported = match browser.role {
+            WebBrowserRole::Control => {
+                iid.eq_ignore_ascii_case(IID_IUNKNOWN)
+                    || iid.eq_ignore_ascii_case(IID_IDISPATCH)
+                    || iid.eq_ignore_ascii_case(IID_IWEBBROWSER)
+                    || iid.eq_ignore_ascii_case(IID_IWEBBROWSERAPP)
+                    || iid.eq_ignore_ascii_case(IID_IWEBBROWSER2)
+            }
+            WebBrowserRole::Document => {
+                iid.eq_ignore_ascii_case(IID_IUNKNOWN)
+                    || iid.eq_ignore_ascii_case(IID_IDISPATCH)
+                    || iid.eq_ignore_ascii_case(IID_IHTMLDOCUMENT)
+                    || iid.eq_ignore_ascii_case(IID_IHTMLDOCUMENT2)
+            }
+        };
         if !supported {
             write_guest_pointer(memory, out, 0, self.guest_arch)?;
             return Ok(HR_E_NOINTERFACE);
         }
-        let _ = browser;
         self.add_ref_guest_object(this)?;
         write_guest_pointer(memory, out, this, self.guest_arch)?;
         Ok(HR_S_OK)
     }
 
-    fn web_browser_navigate(&mut self, browser: &mut WebBrowserState, url: &str) -> u64 {
+    /// Detach the control's current document object: the document freezes
+    /// at the page it represents (its own snapshot of URL and ready state)
+    /// and the next `get_Document` materializes the new page's document.
+    /// Called before the control's location moves to the new page.
+    fn detach_document(&mut self, browser: &mut WebBrowserState) -> AppResult<()> {
+        let document = browser.document_object;
+        browser.document_object = 0;
+        if document == 0 {
+            return Ok(());
+        }
+        if let Some(state) = self.web_browsers.get_mut(&document) {
+            state.parent = 0;
+            state.location = browser.location.clone();
+            state.ready_state = browser.ready_state;
+        }
+        // The control drops its reference; a guest handout (if any) keeps
+        // the frozen document alive.
+        self.release_guest_object(document)?;
+        Ok(())
+    }
+
+    /// The HTML document object for the control's loaded page, created on
+    /// the first `get_Document` (the control holds one reference; the
+    /// document names the control as its parent for live state reads).
+    fn web_browser_document_object(
+        &mut self,
+        memory: &mut MemoryImage,
+        owner: u64,
+        browser: &mut WebBrowserState,
+    ) -> AppResult<u64> {
+        if browser.document_object == 0 {
+            let vtable = self.alloc_guest_vtable(memory, html_document_vtable())?;
+            let object = self.alloc_guest_object(memory, GuestObjectKind::WebBrowser, vtable)?;
+            let mut document = WebBrowserState::new(&browser.location);
+            document.role = WebBrowserRole::Document;
+            document.parent = owner;
+            document.ready_state = browser.ready_state;
+            document.referrer = page_referrer(&browser.history, browser.history_index);
+            self.web_browsers.insert(object, document);
+            browser.document_object = object;
+        }
+        Ok(browser.document_object)
+    }
+
+    /// `IDispatch::Invoke` on the HTML document.  Dispatch ids resolve
+    /// through the `IHTMLDocument2` member table (put/get pairs share one
+    /// id, selected by invocation kind — the COM rule); the
+    /// navigation-state getters answer real values, every other member is
+    /// `E_NOTIMPL` (the runtime models no DOM), a wrong invocation kind or
+    /// unknown id is `DISP_E_MEMBERNOTFOUND`, and a missing result pointer
+    /// on a getter is `E_INVALIDARG`.
+    fn web_browser_invoke_document(
+        &mut self,
+        memory: &mut MemoryImage,
+        state: &CpuState,
+        document: &WebBrowserState,
+    ) -> AppResult<u64> {
+        let dispid = guest_call_arg(state, memory, 1)? as i32;
+        let flags = guest_call_arg_u32(state, memory, 4)? as u16;
+        let result = guest_call_arg(state, memory, 6)?;
+        let Some(name) = doc_name_of_dispid(dispid) else {
+            return Ok(HR_DISP_E_MEMBERNOTFOUND);
+        };
+        let access = DOC_MEMBERS
+            .iter()
+            .filter(|(member, _, _)| member.eq_ignore_ascii_case(name))
+            .fold(0_u8, |bits, (_, member_bits, _)| bits | *member_bits);
+        let kind = if flags & DISPATCH_PROPERTYGET != 0 {
+            DOC_ACCESS_GET
+        } else if flags & DISPATCH_PROPERTYPUT != 0 {
+            DOC_ACCESS_PUT
+        } else if flags & DISPATCH_METHOD != 0 {
+            DOC_ACCESS_METHOD
+        } else {
+            return Ok(HR_DISP_E_MEMBERNOTFOUND);
+        };
+        if (access & kind) == 0 {
+            return Ok(HR_DISP_E_MEMBERNOTFOUND);
+        }
+        if kind != DOC_ACCESS_GET {
+            return Ok(HR_E_NOTIMPL);
+        }
+        if result == 0 {
+            return Ok(HR_E_INVALIDARG);
+        }
+        let value = match name {
+            "readyState" => ready_state_string(document_ready_state(self, document)).to_string(),
+            "referrer" => document.referrer.clone(),
+            "URL" => document.location.clone(),
+            _ => return Ok(HR_E_NOTIMPL),
+        };
+        write_variant_bstr(self, memory, result, &value)
+    }
+
+    /// The control's `ITypeInfo`: the real WebBrowser type-library image
+    /// loaded through the oleaut `LoadTypeLib` path and cached for the
+    /// lifetime of the runtime (OLEAUT keeps loaded type libraries loaded
+    /// too).  `Ok(None)` = the type library could not be materialized or
+    /// loaded (`TYPE_E_CANTLOADLIBRARY` for the caller).
+    fn web_browser_type_info(&mut self, memory: &mut MemoryImage) -> AppResult<Option<u64>> {
+        if let Some(&type_info) = self.com_service_map.get(SHDOCVW_TYPEINFO_KEY) {
+            return Ok(Some(type_info));
+        }
+        let path = shdocvw_typelib_cache_path();
+        let loaded = match shdocvw_sync_typelib_file(&path) {
+            Ok(()) => self.shdocvw_load_type_info(memory, &path)?,
+            Err(_) => None,
+        };
+        if let Some(type_info) = loaded {
+            self.com_service_map
+                .insert(SHDOCVW_TYPEINFO_KEY.to_string(), type_info);
+        }
+        Ok(loaded)
+    }
+
+    /// `LoadTypeLib(path)` + `ITypeLib::GetTypeInfo(0)` through the oleaut
+    /// dispatch: the image always holds exactly the `IWebBrowser2` type.
+    fn shdocvw_load_type_info(
+        &mut self,
+        memory: &mut MemoryImage,
+        path: &std::path::Path,
+    ) -> AppResult<Option<u64>> {
+        let path_text = path.to_string_lossy().into_owned();
+        let path_ptr = self.alloc_utf16_string(memory, &path_text)?;
+        let out = self.alloc_zeroed(memory, 16, 8)?;
+        let mut load = self.prepare_guest_call(memory, &[path_ptr, out])?;
+        self.dispatch_ole_load_type_lib(&mut load, memory)?;
+        if load.get(Register::Rax) != HR_S_OK {
+            return Ok(None);
+        }
+        let type_lib = read_guest_pointer(memory, out, self.guest_arch)?;
+        let mut get_info = self.prepare_guest_call(memory, &[type_lib, 0, out])?;
+        self.dispatch_com_method(ComMethod::TypeLibGetTypeInfo, &mut get_info, memory)?;
+        debug_assert_eq!(
+            get_info.get(Register::Rax),
+            HR_S_OK,
+            "the WebBrowser type library always holds type 0"
+        );
+        Ok(Some(read_guest_pointer(memory, out, self.guest_arch)?))
+    }
+
+    /// Synthesize the caller CPU state for a direct host-method call with
+    /// `args` laid out per the guest ABI: x86 pushes a return address then
+    /// the arguments on the stack, x64 passes them in the four argument
+    /// registers (both dispatch handlers read at most four arguments).
+    fn prepare_guest_call(
+        &mut self,
+        memory: &mut MemoryImage,
+        args: &[u64],
+    ) -> AppResult<CpuState> {
+        debug_assert!(
+            args.len() <= 4,
+            "host-method calls pass at most four arguments"
+        );
+        let mut state = CpuState::new(self.guest_arch);
+        match self.guest_arch {
+            GuestArch::X86 => {
+                // The handlers are invoked directly (no `dispatch_import`
+                // return-address pop), so argument 0 lives at [Rsp].
+                let frame = self.alloc_zeroed(memory, (args.len() + 1) * 4, 16)?;
+                for (index, arg) in args.iter().enumerate() {
+                    write_guest_pointer(memory, frame + (index as u64) * 4, *arg, GuestArch::X86)?;
+                }
+                state.set(Register::Rsp, frame);
+            }
+            GuestArch::X64 => {
+                const ARGUMENTS: [Register; 4] =
+                    [Register::Rcx, Register::Rdx, Register::R8, Register::R9];
+                for (register, arg) in ARGUMENTS.iter().zip(args.iter()) {
+                    state.set(*register, *arg);
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    fn web_browser_navigate(&mut self, browser: &mut WebBrowserState, url: &str) -> AppResult<u64> {
         if browser.closed {
-            return HR_E_INVALIDARG;
+            return Ok(HR_E_INVALIDARG);
         }
         let trimmed = url.trim();
         if trimmed.is_empty() {
-            return HR_E_INVALIDARG;
+            return Ok(HR_E_INVALIDARG);
         }
         if !browser_url_supported(self, trimmed) {
-            return HR_INET_E_INVALID_URL;
+            return Ok(HR_INET_E_INVALID_URL);
         }
         let resolved = if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':' {
             match self.win32.guest_path_to_host_path(trimmed) {
                 Ok(path) => format!("file:///{}", path.to_string_lossy().replace('\\', "/")),
-                Err(_) => return HR_INET_E_INVALID_URL,
+                Err(_) => return Ok(HR_INET_E_INVALID_URL),
             }
         } else if let Some(rest) = trimmed
             .to_ascii_lowercase()
@@ -1010,11 +1971,16 @@ impl PeHostRuntime {
             let path = rest.trim_start_matches('/');
             match self.win32.guest_path_to_host_path(path) {
                 Ok(path) => format!("file:///{}", path.to_string_lossy().replace('\\', "/")),
-                Err(_) => return HR_INET_E_INVALID_URL,
+                Err(_) => return Ok(HR_INET_E_INVALID_URL),
             }
         } else {
             trimmed.to_string()
         };
+        // The committed navigation leaves the loaded document behind: the
+        // old document object freezes at the page being left, and the next
+        // `get_Document` materializes the document of the new page.
+        self.detach_document(browser)?;
+        browser.document_loaded = true;
         browser.ready_state = READYSTATE_LOADING;
         browser.location = resolved.clone();
         browser.history.truncate(browser.history_index + 1);
@@ -1022,7 +1988,7 @@ impl PeHostRuntime {
         browser.history_index = browser.history.len() - 1;
         browser.ready_state = READYSTATE_COMPLETE;
         browser.status_text = "Done".to_string();
-        HR_S_OK
+        Ok(HR_S_OK)
     }
 
     fn copy_bstr_out(
@@ -1058,6 +2024,7 @@ impl PeHostRuntime {
         &mut self,
         memory: &mut MemoryImage,
         state: &CpuState,
+        role: WebBrowserRole,
     ) -> AppResult<u64> {
         let names = guest_call_arg(state, memory, 2)?;
         let count = guest_call_arg_u32(state, memory, 3)?;
@@ -1074,11 +2041,15 @@ impl PeHostRuntime {
                 return Ok(HR_E_INVALIDARG);
             }
             let name = read_utf16_string(memory, name_ptr)?;
-            match WebBrowserMethod::ALL
-                .into_iter()
-                .find(|method| method.dispatch_name().eq_ignore_ascii_case(&name))
-            {
-                Some(method) => resolved.push(method.dispid()),
+            let dispid = match role {
+                WebBrowserRole::Control => WebBrowserMethod::ALL
+                    .into_iter()
+                    .find(|method| method.dispatch_name().eq_ignore_ascii_case(&name))
+                    .map(|method| method.dispid()),
+                WebBrowserRole::Document => doc_dispid_of_name(&name),
+            };
+            match dispid {
+                Some(dispid) => resolved.push(dispid),
                 None => {
                     for slot in 0..count as u64 {
                         write_u32(memory, ids + slot * 4, DISPID_UNKNOWN as u32);
@@ -1100,6 +2071,9 @@ impl PeHostRuntime {
         this: u64,
         browser: &mut WebBrowserState,
     ) -> AppResult<u64> {
+        if browser.role == WebBrowserRole::Document {
+            return self.web_browser_invoke_document(memory, state, browser);
+        }
         let dispid = guest_call_arg(state, memory, 1)? as i32;
         let flags = guest_call_arg_u32(state, memory, 4)? as u16;
         let params = guest_call_arg(state, memory, 5)?;
@@ -1197,8 +2171,14 @@ impl PeHostRuntime {
                 if result == 0 {
                     return Ok(HR_E_INVALIDARG);
                 }
-                memory.map_bytes(result, &vec![0; self.browser_variant_size()]);
-                Ok(HR_S_FALSE)
+                if browser.document_available() {
+                    let document = self.web_browser_document_object(memory, this, browser)?;
+                    self.add_ref_guest_object(document)?;
+                    Ok(write_variant_dispatch(self, memory, result, document))
+                } else {
+                    memory.map_bytes(result, &vec![0; self.browser_variant_size()]);
+                    Ok(HR_S_FALSE)
+                }
             }
             WebBrowserMethod::PutVisible
             | WebBrowserMethod::PutStatusBar
@@ -1255,6 +2235,7 @@ impl PeHostRuntime {
             }
             WebBrowserMethod::GoBack => {
                 if browser.can_go_back() {
+                    self.detach_document(browser)?;
                     browser.history_index -= 1;
                     browser.location = browser.history[browser.history_index].clone();
                     Ok(HR_S_OK)
@@ -1264,6 +2245,7 @@ impl PeHostRuntime {
             }
             WebBrowserMethod::GoForward => {
                 if browser.can_go_forward() {
+                    self.detach_document(browser)?;
                     browser.history_index += 1;
                     browser.location = browser.history[browser.history_index].clone();
                     Ok(HR_S_OK)
@@ -1285,7 +2267,7 @@ impl PeHostRuntime {
                     .flatten()
                     .and_then(|value| value.data.as_str().map(str::to_string))
                     .unwrap_or_else(|| "about:blank".to_string());
-                Ok(self.web_browser_navigate(browser, &home))
+                self.web_browser_navigate(browser, &home)
             }
             WebBrowserMethod::GoSearch => {
                 let search = self
@@ -1301,7 +2283,7 @@ impl PeHostRuntime {
                     .flatten()
                     .and_then(|value| value.data.as_str().map(str::to_string))
                     .unwrap_or_else(|| "about:blank".to_string());
-                Ok(self.web_browser_navigate(browser, &search))
+                self.web_browser_navigate(browser, &search)
             }
             WebBrowserMethod::Navigate | WebBrowserMethod::Navigate2 => {
                 let url_ptr = dispatch_param(self, memory, params, 0);
@@ -1313,7 +2295,7 @@ impl PeHostRuntime {
                 } else {
                     url
                 };
-                Ok(self.web_browser_navigate(browser, &url))
+                self.web_browser_navigate(browser, &url)
             }
             WebBrowserMethod::Refresh => {
                 browser.ready_state = READYSTATE_COMPLETE;
@@ -1351,8 +2333,45 @@ impl PeHostRuntime {
             | WebBrowserMethod::ShowBrowserBar
             | WebBrowserMethod::ClientToWindow => Ok(HR_OLECMDERR_E_NOTSUPPORTED),
             WebBrowserMethod::GetTypeInfoCount => Ok(write_variant_i4(memory, result, 1)),
-            WebBrowserMethod::GetTypeInfo => Ok(HR_E_NOTIMPL),
-            WebBrowserMethod::GetIDsOfNames | WebBrowserMethod::Invoke => {
+            WebBrowserMethod::GetTypeInfo => {
+                if result == 0 {
+                    return Ok(HR_E_INVALIDARG);
+                }
+                // The invoked member takes the type-info index as its first
+                // (and only meaningful) argument; a missing argument is the
+                // documented index 0.
+                let index = if params == 0 {
+                    0_u32
+                } else {
+                    let argument = dispatch_param(self, memory, params, 0);
+                    match memory.read_u16(argument).unwrap_or(0) {
+                        0 | 1 => 0_u32,
+                        3 => memory.read_u32(argument + 8).unwrap_or(0),
+                        _ => return Ok(HR_DISP_E_TYPEMISMATCH),
+                    }
+                };
+                memory.map_bytes(result, &vec![0; self.browser_variant_size()]);
+                if index != 0 {
+                    return Ok(HR_TYPE_E_ELEMENTNOTFOUND);
+                }
+                match self.web_browser_type_info(memory)? {
+                    Some(type_info) => {
+                        self.add_ref_guest_object(type_info)?;
+                        memory.write_u16(result, 13); // VT_UNKNOWN
+                        write_guest_pointer(memory, result + 8, type_info, self.guest_arch)?;
+                        Ok(HR_S_OK)
+                    }
+                    None => Ok(HR_TYPE_E_CANTLOADLIBRARY),
+                }
+            }
+            WebBrowserMethod::GetIDsOfNames
+            | WebBrowserMethod::Invoke
+            // Document-only members never resolve on a control's dispatch
+            // table (they are not automation members of IWebBrowser2).
+            | WebBrowserMethod::DocumentGetReadyState
+            | WebBrowserMethod::DocumentGetReferrer
+            | WebBrowserMethod::DocumentGetUrl
+            | WebBrowserMethod::DocumentUnsupported { .. } => {
                 Ok(HR_DISP_E_MEMBERNOTFOUND)
             }
             WebBrowserMethod::QueryInterface
@@ -2143,21 +3162,46 @@ mod tests {
                 HR_E_INVALIDARG
             );
 
+            // ShowBrowserBar: a null class-id pointer is invalid; an empty
+            // class id dismisses; a real bar class id keeps the OLE error.
             assert_eq!(
                 call(
                     &mut fixture,
                     WebBrowserMethod::ShowBrowserBar,
                     &[object as u32, 0, 0, 0]
                 ),
-                HR_E_NOTIMPL
+                HR_E_INVALIDARG
             );
+            map(&mut fixture, VAR, 24);
+            fixture.memory.write_u16(VAR, 0); // VT_EMPTY
+            map(&mut fixture, OUT, 8);
+            fixture.memory.write_u16(OUT, 0);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ShowBrowserBar,
+                    &[object as u32, VAR as u32, 0, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            // ClientToWindow: no window exists in this fixture yet.
+            write_u32(&mut fixture.memory, OUT, 10);
+            write_u32(&mut fixture.memory, OUT + 4, 10);
             assert_eq!(
                 call(
                     &mut fixture,
                     WebBrowserMethod::ClientToWindow,
                     &[object as u32, OUT as u32, OUT as u32 + 4]
                 ),
-                HR_E_NOTIMPL
+                HR_E_FAIL
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ClientToWindow,
+                    &[object as u32, 0, OUT as u32 + 4]
+                ),
+                HR_E_INVALIDARG
             );
         });
     }
@@ -2165,6 +3209,8 @@ mod tests {
     #[test]
     fn web_browser_dispatch_names_invoke_and_documented_errors_pin_exact_results() {
         with_big_stack(|| {
+            // This test materializes the shared type-library cache file.
+            let _lock = typelib_lock();
             let mut fixture = x86_fixture("browser-dispatch");
             let object = object(&mut fixture);
             map(&mut fixture, NAMES, 8);
@@ -2392,7 +3438,9 @@ mod tests {
                 }
             }
 
-            // GetTypeInfoCount/GetTypeInfo through Invoke.
+            // GetTypeInfoCount/GetTypeInfo through Invoke: the invoked
+            // member hands out the real type library typeinfo as
+            // VT_UNKNOWN (a missing argument is the documented index 0).
             map(&mut fixture, VAR2, 24);
             assert_eq!(
                 call(
@@ -2429,8 +3477,10 @@ mod tests {
                         0
                     ]
                 ),
-                HR_E_NOTIMPL
+                HR_S_OK
             );
+            assert_eq!(fixture.memory.read_u16(VAR2).unwrap(), 13); // VT_UNKNOWN
+            assert_ne!(fixture.memory.read_u32(VAR2 + 8).unwrap(), 0);
 
             // Control members through Invoke: MEMBERNOTFOUND for the IDispatch
             // preamble, documented command errors for host-only members.
@@ -2638,6 +3688,8 @@ mod tests {
     #[test]
     fn web_browser_query_status_and_put_get_property_pin_exact_values() {
         with_big_stack(|| {
+            // This test materializes the shared type-library cache file.
+            let _lock = typelib_lock();
             let mut fixture = x86_fixture("browser-property-bag");
             let object = object(&mut fixture);
             map(&mut fixture, OUT, 4);
@@ -2797,7 +3849,17 @@ mod tests {
                     WebBrowserMethod::GetTypeInfo,
                     &[object as u32, 0, 0, OUT as u32]
                 ),
-                HR_E_NOTIMPL
+                HR_S_OK
+            );
+            let type_info = read_out_pointer(&fixture, OUT);
+            assert_ne!(type_info, 0);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfo,
+                    &[object as u32, 1, 0, OUT as u32]
+                ),
+                HR_TYPE_E_ELEMENTNOTFOUND
             );
             assert_eq!(read_out_pointer(&fixture, OUT), 0);
             assert_eq!(
@@ -2808,6 +3870,14 @@ mod tests {
                 ),
                 HR_E_INVALIDARG
             );
+            // Drop the handout reference again (the runtime-wide typeinfo
+            // cache keeps the object alive at its baseline).
+            let released = dispatch_x86(
+                &mut fixture,
+                HostThunk::GuestObjectRelease,
+                &[type_info as u32],
+            ) as u32;
+            assert_eq!(released, 2);
 
             // File navigation through the real guest filesystem.
             let temp = fixture._temp.path().join("target.exe");
@@ -3330,6 +4400,1593 @@ mod tests {
                 dispatch_param(&fixture.runtime, &fixture.memory, x64_params, 0),
                 ARGS
             );
+        });
+    }
+
+    /// The type-library image materializes into one shared cache file per
+    /// image version; tests that create or sabotage that file serialize
+    /// here (cargo runs a test binary's threads concurrently).
+    fn typelib_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Removes whatever stands at the type-library cache path when the
+    /// sabotaging test ends (even through a panic).
+    struct CachePathCleanup(std::path::PathBuf);
+
+    impl Drop for CachePathCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir(&self.0);
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn web_browser_get_type_info_loads_real_typelib_and_rejects_bad_indexes() {
+        with_big_stack(|| {
+            // This test materializes the shared type-library cache file.
+            let _lock = typelib_lock();
+            let mut fixture = x86_fixture("browser-typelib");
+            let object = object(&mut fixture);
+            map(&mut fixture, OUT, 8);
+            write_u32(&mut fixture.memory, OUT, 0xdead_beef);
+            // A null out-pointer is E_INVALIDARG, an unknown index is
+            // TYPE_E_ELEMENTNOTFOUND with the out-pointer zeroed.
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfo,
+                    &[object as u32, 0, 0, 0]
+                ),
+                HR_E_INVALIDARG
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfo,
+                    &[object as u32, 7, 0, OUT as u32]
+                ),
+                HR_TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(read_out_pointer(&fixture, OUT), 0);
+            // Index 0 hands out the live IWebBrowser2 type info.
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfo,
+                    &[object as u32, 0, 0, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            let type_info = read_out_pointer(&fixture, OUT);
+            assert_ne!(type_info, 0);
+            assert_eq!(fixture.runtime.guest_objects[&type_info].refcount, 3);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfo,
+                    &[object as u32, 0, 0, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_pointer(&fixture, OUT), type_info);
+            assert_eq!(fixture.runtime.guest_objects[&type_info].refcount, 4);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GuestObjectRelease,
+                    &[type_info as u32]
+                ) as u32,
+                3
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GuestObjectRelease,
+                    &[type_info as u32]
+                ) as u32,
+                2
+            );
+            // GetTypeAttr: the IWebBrowser2 IID and the 46-member table.
+            map(&mut fixture, OUT, 64);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetTypeAttr),
+                    &[type_info as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            let attr = read_out_pointer(&fixture, OUT);
+            assert_ne!(attr, 0);
+            let iid_bytes =
+                crate::real_win32::guid_from_string(IID_IWEBBROWSER2).expect("iid bytes");
+            for (index, expected) in iid_bytes.iter().enumerate() {
+                assert_eq!(
+                    fixture.memory.read_u8(attr + index as u64).unwrap(),
+                    *expected,
+                    "type guid byte {index}"
+                );
+            }
+            assert_eq!(fixture.memory.read_u16(attr + 44).unwrap(), 46); // cFuncs
+            assert_eq!(fixture.memory.read_u16(attr + 50).unwrap(), 212); // cbSizeVft
+            // FUNCDESC of the first member: GoBack at vtable slot 7.
+            map(&mut fixture, OUT, 8);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetFuncDesc),
+                    &[type_info as u32, 0, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            let descriptor = read_out_pointer(&fixture, OUT);
+            assert_ne!(descriptor, 0);
+            assert_eq!(
+                fixture.memory.read_u32(descriptor).unwrap(),
+                WebBrowserMethod::GoBack.dispid() as u32
+            );
+            assert_eq!(fixture.memory.read_u32(descriptor + 16).unwrap(), 1); // INVOKE_FUNC
+            assert_eq!(fixture.memory.read_u16(descriptor + 28).unwrap(), 7); // oVft slot
+            // Navigate keeps its five parameters.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetFuncDesc),
+                    &[type_info as u32, 4, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            let descriptor = read_out_pointer(&fixture, OUT);
+            assert_eq!(
+                fixture.memory.read_u32(descriptor).unwrap(),
+                WebBrowserMethod::Navigate.dispid() as u32
+            );
+            assert_eq!(fixture.memory.read_u16(descriptor + 24).unwrap(), 5); // cParams
+            // Past the end of the table is the documented failure.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetFuncDesc),
+                    &[type_info as u32, 46, OUT as u32]
+                ),
+                HR_TYPE_E_ELEMENTNOTFOUND
+            );
+            // GetIDsOfNames through the type info: the member resolves to
+            // the runtime's local dispatch id, unknown names do not.
+            map(&mut fixture, NAMES, 8);
+            map(&mut fixture, IDS, 4);
+            let navigate = wide(&mut fixture, "Navigate");
+            write_u32(&mut fixture.memory, NAMES, navigate as u32);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetIDsOfNames),
+                    &[type_info as u32, NAMES as u32, 1, IDS as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(
+                fixture.memory.read_u32(IDS).unwrap(),
+                WebBrowserMethod::Navigate.dispid() as u32
+            );
+            let unknown = wide(&mut fixture, "NoSuchMember");
+            write_u32(&mut fixture.memory, NAMES, unknown as u32);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetIDsOfNames),
+                    &[type_info as u32, NAMES as u32, 1, IDS as u32]
+                ),
+                HR_DISP_E_UNKNOWNNAME
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), DISPID_UNKNOWN as u32);
+            // GetDocumentation: interface name, documentation, help file.
+            map(&mut fixture, TEXT, 16);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetDocumentation),
+                    &[
+                        type_info as u32,
+                        DISPID_UNKNOWN as u32,
+                        TEXT as u32,
+                        (TEXT + 4) as u32,
+                        (TEXT + 8) as u32,
+                        (TEXT + 12) as u32,
+                    ]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, TEXT), "IWebBrowser2");
+            assert_eq!(
+                read_out_string(&fixture, TEXT + 4),
+                "IWebBrowser2 browser-control interface"
+            );
+            assert_eq!(fixture.memory.read_u32(TEXT + 8).unwrap(), 0);
+            assert_eq!(read_out_string(&fixture, TEXT + 12), "shdocvw.hlp");
+            // GetNames: the member name plus its unnamed parameters (the
+            // image carries no per-parameter names).
+            map(&mut fixture, NAMES, 32);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::ComMethod(ComMethod::TypeInfoGetNames),
+                    &[
+                        type_info as u32,
+                        WebBrowserMethod::Navigate.dispid() as u32,
+                        NAMES as u32,
+                        8,
+                        IDS as u32,
+                    ]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), 6);
+            assert_eq!(
+                read_utf16_string(
+                    &fixture.memory,
+                    read_guest_pointer(&fixture.memory, NAMES, GuestArch::X86).expect("name")
+                )
+                .expect("name"),
+                "Navigate"
+            );
+            assert_eq!(
+                read_utf16_string(
+                    &fixture.memory,
+                    read_guest_pointer(&fixture.memory, NAMES + 4, GuestArch::X86)
+                        .expect("param name")
+                )
+                .expect("param name"),
+                ""
+            );
+            // Invoked GetTypeInfo: a VT_I4 argument carries the index
+            // (0 and missing are the documented index 0), other argument
+            // types are a mismatch, and a missing result pointer is
+            // E_INVALIDARG.
+            map(&mut fixture, PARAMS, 24);
+            map(&mut fixture, ARGS, 24);
+            map(&mut fixture, VAR2, 24);
+            write_variant_i4_value(&mut fixture, ARGS, 0);
+            write_u32(&mut fixture.memory, PARAMS, ARGS as u32);
+            write_u32(&mut fixture.memory, PARAMS + 8, 1);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        object as u32,
+                        WebBrowserMethod::GetTypeInfo.dispid() as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_METHOD),
+                        PARAMS as u32,
+                        VAR2 as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.memory.read_u16(VAR2).unwrap(), 13); // VT_UNKNOWN
+            fixture.memory.write_u16(ARGS, 0); // VT_EMPTY argument
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        object as u32,
+                        WebBrowserMethod::GetTypeInfo.dispid() as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_METHOD),
+                        PARAMS as u32,
+                        VAR2 as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_S_OK
+            );
+            write_variant_i4_value(&mut fixture, ARGS, 7);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        object as u32,
+                        WebBrowserMethod::GetTypeInfo.dispid() as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_METHOD),
+                        PARAMS as u32,
+                        VAR2 as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_TYPE_E_ELEMENTNOTFOUND
+            );
+            write_variant_wide(&mut fixture, ARGS, "7");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        object as u32,
+                        WebBrowserMethod::GetTypeInfo.dispid() as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_METHOD),
+                        PARAMS as u32,
+                        VAR2 as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_DISP_E_TYPEMISMATCH
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        object as u32,
+                        WebBrowserMethod::GetTypeInfo.dispid() as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_METHOD),
+                        PARAMS as u32,
+                        0,
+                        0,
+                        0
+                    ]
+                ),
+                HR_E_INVALIDARG
+            );
+            // A type library that cannot be read loads as None (the
+            // dispatch reports TYPE_E_CANTLOADLIBRARY).
+            let absent = fixture._temp.path().join("absent-shdocvw.tlb");
+            assert_eq!(
+                fixture
+                    .runtime
+                    .shdocvw_load_type_info(&mut fixture.memory, &absent)
+                    .expect("bogus load"),
+                None
+            );
+            // The cache outlives individual controls.
+            assert!(
+                fixture
+                    .runtime
+                    .com_service_map
+                    .contains_key(SHDOCVW_TYPEINFO_KEY)
+            );
+        });
+    }
+
+    #[test]
+    fn web_browser_type_info_cache_path_failure_is_cantloadlibrary() {
+        with_big_stack(|| {
+            // This test sabotages the shared type-library cache file.
+            let _lock = typelib_lock();
+            let path = shdocvw_typelib_cache_path();
+            let _cleanup = CachePathCleanup(path.clone());
+            let _ = std::fs::remove_file(&path);
+            std::fs::create_dir_all(&path).expect("cache path becomes a directory");
+            let mut fixture = x86_fixture("browser-typelib-fail");
+            let object = object(&mut fixture);
+            map(&mut fixture, OUT, 8);
+            write_u32(&mut fixture.memory, OUT, 0xdead_beef);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfo,
+                    &[object as u32, 0, 0, OUT as u32]
+                ),
+                HR_TYPE_E_CANTLOADLIBRARY
+            );
+            assert_eq!(read_out_pointer(&fixture, OUT), 0);
+            assert!(
+                !fixture
+                    .runtime
+                    .com_service_map
+                    .contains_key(SHDOCVW_TYPEINFO_KEY)
+            );
+            // The invoked member reports the same load failure.
+            map(&mut fixture, PARAMS, 24);
+            map(&mut fixture, ARGS, 24);
+            map(&mut fixture, VAR2, 24);
+            write_variant_i4_value(&mut fixture, ARGS, 0);
+            write_u32(&mut fixture.memory, PARAMS, ARGS as u32);
+            write_u32(&mut fixture.memory, PARAMS + 8, 1);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        object as u32,
+                        WebBrowserMethod::GetTypeInfo.dispid() as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_METHOD),
+                        PARAMS as u32,
+                        VAR2 as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_TYPE_E_CANTLOADLIBRARY
+            );
+            // The failure is not cached: dropping the obstruction
+            // materializes the library on the next call.
+            std::fs::remove_dir(&path).expect("sabotage directory removed");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfo,
+                    &[object as u32, 0, 0, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_ne!(read_out_pointer(&fixture, OUT), 0);
+            assert!(
+                fixture
+                    .runtime
+                    .com_service_map
+                    .contains_key(SHDOCVW_TYPEINFO_KEY)
+            );
+        });
+    }
+
+    #[test]
+    fn web_browser_get_document_returns_html_document_and_rejects_wrong_iids() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("browser-document");
+            let object = object(&mut fixture);
+            map(&mut fixture, OUT, 8);
+            write_u32(&mut fixture.memory, OUT, 0xdead_beef);
+            // No page has loaded: S_FALSE with a null document.
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[object as u32, OUT as u32]
+                ),
+                HR_S_FALSE
+            );
+            assert_eq!(read_out_pointer(&fixture, OUT), 0);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[object as u32, 0]
+                ),
+                HR_E_INVALIDARG
+            );
+            // The invoked getter reports the same empty state as a
+            // cleared VT_EMPTY result.
+            map(&mut fixture, VAR, 24);
+            fixture.memory.write_u16(VAR, 11); // stale contents
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        object as u32,
+                        WebBrowserMethod::GetDocument.dispid() as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_PROPERTYGET),
+                        0,
+                        VAR as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_S_FALSE
+            );
+            assert_eq!(fixture.memory.read_u16(VAR).unwrap(), 0);
+            // Cross-role: document slots never exist on the control.
+            map(&mut fixture, OUT, 8);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[object as u32, OUT as u32]
+                ),
+                HR_E_INVALIDARG
+            );
+            // A committed navigation loads a document.
+            let url = wide(&mut fixture, "http://example.com/");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Navigate,
+                    &[object as u32, url as u32, 0, 0, 0, 0]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[object as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            let document = read_out_pointer(&fixture, OUT);
+            assert_ne!(document, 0);
+            assert_eq!(fixture.runtime.guest_objects[&document].refcount, 2);
+            // QueryInterface: both document IIDs resolve, a wrong IID is
+            // E_NOINTERFACE with a null out-pointer.
+            map(&mut fixture, TEXT, 8);
+            write_iid(&mut fixture, IID, IID_IHTMLDOCUMENT2);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::QueryInterface,
+                    &[document as u32, IID as u32, TEXT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_pointer(&fixture, TEXT), document);
+            assert_eq!(fixture.runtime.guest_objects[&document].refcount, 3);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GuestObjectRelease,
+                    &[document as u32]
+                ) as u32,
+                2
+            );
+            write_iid(&mut fixture, IID, IID_IHTMLDOCUMENT);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::QueryInterface,
+                    &[document as u32, IID as u32, TEXT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GuestObjectRelease,
+                    &[document as u32]
+                ) as u32,
+                2
+            );
+            write_iid(&mut fixture, IID, "{12345678-1234-1234-1234-1234567890ab}");
+            write_u32(&mut fixture.memory, TEXT, 0xdead_beef);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::QueryInterface,
+                    &[document as u32, IID as u32, TEXT as u32]
+                ),
+                HR_E_NOINTERFACE
+            );
+            assert_eq!(read_out_pointer(&fixture, TEXT), 0);
+            // The document's members answer the navigation state.
+            map(&mut fixture, OUT, 8);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[document as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "http://example.com/");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetReferrer,
+                    &[document as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetReadyState,
+                    &[document as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "complete");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[document as u32, 0]
+                ),
+                HR_E_INVALIDARG
+            );
+            // The document's IDispatch surface: no generated type library.
+            map(&mut fixture, OUT, 8);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfoCount,
+                    &[document as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 0);
+            write_u32(&mut fixture.memory, OUT, 0xdead_beef);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfo,
+                    &[document as u32, 0, 0, OUT as u32]
+                ),
+                HR_TYPE_E_ELEMENTNOTFOUND
+            );
+            assert_eq!(read_out_pointer(&fixture, OUT), 0);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetTypeInfo,
+                    &[document as u32, 0, 0, 0]
+                ),
+                HR_E_INVALIDARG
+            );
+            // GetIDsOfNames over the IHTMLDocument2 member table: the URL
+            // pair shares the id of its first row, unknown names do not.
+            map(&mut fixture, NAMES, 8);
+            map(&mut fixture, IDS, 4);
+            let url_name = wide(&mut fixture, "URL");
+            write_u32(&mut fixture.memory, NAMES, url_name as u32);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetIDsOfNames,
+                    &[document as u32, 0, NAMES as u32, 1, 0, IDS as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(
+                fixture.memory.read_u32(IDS).unwrap(),
+                (DOC_DISPID_BASE + 32) as u32 // the URL put/get pair
+            );
+            let unknown = wide(&mut fixture, "nosuchmember");
+            write_u32(&mut fixture.memory, NAMES, unknown as u32);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetIDsOfNames,
+                    &[document as u32, 0, NAMES as u32, 1, 0, IDS as u32]
+                ),
+                HR_DISP_E_UNKNOWNNAME
+            );
+            assert_eq!(fixture.memory.read_u32(IDS).unwrap(), DISPID_UNKNOWN as u32);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetIDsOfNames,
+                    &[document as u32, 0, NAMES as u32, 1, 0, 0]
+                ),
+                HR_E_INVALIDARG
+            );
+            // Invoke: real getters, unmodeled members, kind rules, and
+            // unknown ids.
+            map(&mut fixture, VAR, 24);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        document as u32,
+                        (DOC_DISPID_BASE + 32) as u32, // URL
+                        0,
+                        0,
+                        u32::from(DISPATCH_PROPERTYGET),
+                        0,
+                        VAR as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.memory.read_u16(VAR).unwrap(), 8);
+            assert_eq!(
+                read_utf16_string(
+                    &fixture.memory,
+                    read_guest_pointer(&fixture.memory, VAR + 8, GuestArch::X86).expect("bstr")
+                )
+                .expect("bstr"),
+                "http://example.com/"
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        document as u32,
+                        (DOC_DISPID_BASE + 15) as u32, // readyState
+                        0,
+                        0,
+                        u32::from(DISPATCH_PROPERTYGET),
+                        0,
+                        VAR as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_S_OK
+            );
+            // body exists in the table but is not modeled: E_NOTIMPL.
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        document as u32,
+                        (DOC_DISPID_BASE + 1) as u32, // body
+                        0,
+                        0,
+                        u32::from(DISPATCH_PROPERTYGET),
+                        0,
+                        VAR as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_E_NOTIMPL
+            );
+            // URL has a setter row but no modeled setter.
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        document as u32,
+                        (DOC_DISPID_BASE + 32) as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_PROPERTYPUT),
+                        0,
+                        VAR as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_E_NOTIMPL
+            );
+            // URL is not a method: wrong kind is MEMBERNOTFOUND.
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        document as u32,
+                        (DOC_DISPID_BASE + 32) as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_METHOD),
+                        0,
+                        VAR as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_DISP_E_MEMBERNOTFOUND
+            );
+            // No flags and unknown ids are MEMBERNOTFOUND too.
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        document as u32,
+                        (DOC_DISPID_BASE + 32) as u32,
+                        0,
+                        0,
+                        0,
+                        0,
+                        VAR as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_DISP_E_MEMBERNOTFOUND
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        document as u32,
+                        4321,
+                        0,
+                        0,
+                        u32::from(DISPATCH_PROPERTYGET),
+                        0,
+                        VAR as u32,
+                        0,
+                        0
+                    ]
+                ),
+                HR_DISP_E_MEMBERNOTFOUND
+            );
+            // A getter without a result pointer is E_INVALIDARG.
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Invoke,
+                    &[
+                        document as u32,
+                        (DOC_DISPID_BASE + 32) as u32,
+                        0,
+                        0,
+                        u32::from(DISPATCH_PROPERTYGET),
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                ),
+                HR_E_INVALIDARG
+            );
+            // A directly-called unmodeled member slot answers E_NOTIMPL
+            // (its stdcall byte count rides on the thunk).
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentUnsupported { arg_bytes: 4 },
+                    &[document as u32, VAR as u32]
+                ),
+                HR_E_NOTIMPL
+            );
+            // The enum identities of the document slots.
+            assert_eq!(
+                WebBrowserMethod::DocumentGetReadyState.dispatch_name(),
+                "readyState"
+            );
+            assert_eq!(
+                WebBrowserMethod::DocumentGetReferrer.dispatch_name(),
+                "referrer"
+            );
+            assert_eq!(WebBrowserMethod::DocumentGetUrl.dispatch_name(), "URL");
+            assert_eq!(
+                WebBrowserMethod::DocumentUnsupported { arg_bytes: 4 }.dispatch_name(),
+                "DocumentMember"
+            );
+            assert_eq!(
+                WebBrowserMethod::DocumentUnsupported { arg_bytes: 8 }.x86_arg_bytes(),
+                8
+            );
+            assert_eq!(WebBrowserMethod::DocumentGetReadyState.dispid(), 96);
+            assert_eq!(WebBrowserMethod::DocumentGetReferrer.dispid(), 97);
+            assert_eq!(WebBrowserMethod::DocumentGetUrl.dispid(), 98);
+            assert_eq!(
+                WebBrowserMethod::DocumentUnsupported { arg_bytes: 8 }.dispid(),
+                101
+            );
+            assert_eq!(
+                WebBrowserMethod::DocumentGetUrl.supported_kinds(),
+                DISPATCH_PROPERTYGET
+            );
+            assert_eq!(
+                WebBrowserMethod::DocumentUnsupported { arg_bytes: 4 }.supported_kinds(),
+                DISPATCH_METHOD
+            );
+            // Cross-role the other way: control slots on the document.
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Navigate,
+                    &[document as u32, url as u32, 0, 0, 0, 0]
+                ),
+                HR_E_INVALIDARG
+            );
+            assert_eq!(
+                call(&mut fixture, WebBrowserMethod::Quit, &[document as u32]),
+                HR_E_INVALIDARG
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[document as u32, OUT as u32]
+                ),
+                HR_E_INVALIDARG
+            );
+        });
+    }
+
+    #[test]
+    fn web_browser_document_navigation_races_and_lifetime_freeze_exact() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("browser-document-race");
+            let object = object(&mut fixture);
+            map(&mut fixture, OUT, 8);
+            let first = wide(&mut fixture, "http://example.com/one");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Navigate,
+                    &[object as u32, first as u32, 0, 0, 0, 0]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[object as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            let doc_one = read_out_pointer(&fixture, OUT);
+            assert_ne!(doc_one, 0);
+            assert_eq!(fixture.runtime.guest_objects[&doc_one].refcount, 2);
+            // Async load race: while the control reports loading there is
+            // no document, but a held document reflects the live state.
+            fixture
+                .runtime
+                .web_browsers
+                .get_mut(&object)
+                .unwrap()
+                .ready_state = READYSTATE_LOADING;
+            write_u32(&mut fixture.memory, OUT, 0xdead_beef);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[object as u32, OUT as u32]
+                ),
+                HR_S_FALSE
+            );
+            assert_eq!(read_out_pointer(&fixture, OUT), 0);
+            for (value, expected) in [
+                (1, "loading"),
+                (7, "uninitialized"),
+                (0, "uninitialized"),
+                (2, "loaded"),
+                (3, "interactive"),
+                (4, "complete"),
+            ] {
+                fixture
+                    .runtime
+                    .web_browsers
+                    .get_mut(&object)
+                    .unwrap()
+                    .ready_state = value;
+                assert_eq!(
+                    call(
+                        &mut fixture,
+                        WebBrowserMethod::DocumentGetReadyState,
+                        &[doc_one as u32, OUT as u32]
+                    ),
+                    HR_S_OK,
+                    "ready state {value}"
+                );
+                assert_eq!(
+                    read_out_string(&fixture, OUT),
+                    expected,
+                    "ready state name for {value}"
+                );
+            }
+            // Refresh completes the load without replacing the document.
+            fixture
+                .runtime
+                .web_browsers
+                .get_mut(&object)
+                .unwrap()
+                .ready_state = READYSTATE_LOADING;
+            assert_eq!(
+                call(&mut fixture, WebBrowserMethod::Refresh, &[object as u32]),
+                HR_S_OK
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[object as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_pointer(&fixture, OUT), doc_one);
+            // A new navigation freezes the old document at its page and
+            // the control drops its reference to it.
+            let second = wide(&mut fixture, "http://example.com/two");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::Navigate,
+                    &[object as u32, second as u32, 0, 0, 0, 0]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.runtime.guest_objects[&doc_one].refcount, 2);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[object as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            let doc_two = read_out_pointer(&fixture, OUT);
+            assert_ne!(doc_two, doc_one);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[doc_one as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "http://example.com/one");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[doc_two as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "http://example.com/two");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetReferrer,
+                    &[doc_two as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "http://example.com/one");
+            // History races detach the document too: each GoBack leaves
+            // the held document frozen and hands out a fresh one.
+            assert_eq!(
+                call(&mut fixture, WebBrowserMethod::GoBack, &[object as u32]),
+                HR_S_OK
+            );
+            assert_eq!(fixture.runtime.guest_objects[&doc_two].refcount, 1);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[object as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            let doc_three = read_out_pointer(&fixture, OUT);
+            assert_ne!(doc_three, doc_two);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[doc_two as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "http://example.com/two");
+            assert_eq!(
+                call(&mut fixture, WebBrowserMethod::GoBack, &[object as u32]),
+                HR_S_OK
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::GetDocument,
+                    &[object as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            let doc_four = read_out_pointer(&fixture, OUT);
+            assert_ne!(doc_four, doc_three);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[doc_four as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "about:blank");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetReferrer,
+                    &[doc_four as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "");
+            // Control teardown: the held document freezes at the last
+            // page and keeps answering from its snapshot.
+            assert_eq!(
+                call(&mut fixture, WebBrowserMethod::Release, &[object as u32]),
+                0
+            );
+            assert_eq!(fixture.runtime.guest_objects[&doc_four].refcount, 1);
+            assert!(!fixture.runtime.web_browsers.contains_key(&object));
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[doc_four as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "about:blank");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetReadyState,
+                    &[doc_four as u32, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(read_out_string(&fixture, OUT), "complete");
+            // Dropping the last handout frees the documents: later calls
+            // on them are E_INVALIDARG.
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GuestObjectRelease,
+                    &[doc_one as u32]
+                ) as u32,
+                1
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GuestObjectRelease,
+                    &[doc_one as u32]
+                ) as u32,
+                0
+            );
+            assert!(!fixture.runtime.guest_objects.contains_key(&doc_one));
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[doc_one as u32, OUT as u32]
+                ),
+                HR_E_INVALIDARG
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GuestObjectRelease,
+                    &[doc_two as u32]
+                ) as u32,
+                0
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GuestObjectRelease,
+                    &[doc_three as u32]
+                ) as u32,
+                0
+            );
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GuestObjectRelease,
+                    &[doc_four as u32]
+                ) as u32,
+                0
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::DocumentGetUrl,
+                    &[doc_four as u32, OUT as u32]
+                ),
+                HR_E_INVALIDARG
+            );
+        });
+    }
+
+    #[test]
+    fn web_browser_exec_wb_dispatches_modeled_ole_commands_and_rejects_unsupported() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("browser-olecmd");
+            let object = object(&mut fixture);
+            map(&mut fixture, OUT, 4);
+            map(&mut fixture, VAR, 24);
+            // REFRESH/STOP complete the modeled load.
+            fixture
+                .runtime
+                .web_browsers
+                .get_mut(&object)
+                .unwrap()
+                .ready_state = READYSTATE_LOADING;
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, OLECMDID_REFRESH, 0, 0, 0]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(
+                fixture.runtime.web_browsers[&object].ready_state,
+                READYSTATE_COMPLETE
+            );
+            assert_eq!(fixture.runtime.web_browsers[&object].status_text, "Done");
+            fixture
+                .runtime
+                .web_browsers
+                .get_mut(&object)
+                .unwrap()
+                .ready_state = READYSTATE_LOADING;
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, OLECMDID_STOP, 0, 0, 0]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(
+                fixture.runtime.web_browsers[&object].ready_state,
+                READYSTATE_COMPLETE
+            );
+            // OLECMDID_NEW completes readiness but leaves the status text.
+            let status = wide(&mut fixture, "busy");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::PutStatusText,
+                    &[object as u32, status as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, OLECMDID_NEW, 0, 0, 0]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.runtime.web_browsers[&object].status_text, "busy");
+            // The pvaIn argument accepts null, VT_EMPTY/VT_NULL/VT_I4 and
+            // rejects every other VARIANT type.
+            write_variant_i4_value(&mut fixture, VAR, 3);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, OLECMDID_REFRESH, 0, VAR as u32, 0]
+                ),
+                HR_S_OK
+            );
+            fixture.memory.write_u16(VAR, 0); // VT_EMPTY
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, OLECMDID_REFRESH, 0, VAR as u32, 0]
+                ),
+                HR_S_OK
+            );
+            fixture.memory.write_u16(VAR, 1); // VT_NULL
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, OLECMDID_REFRESH, 0, VAR as u32, 0]
+                ),
+                HR_S_OK
+            );
+            fixture.memory.write_u16(VAR, 5); // VT_R8
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, OLECMDID_REFRESH, 0, VAR as u32, 0]
+                ),
+                HR_DISP_E_TYPEMISMATCH
+            );
+            // An unmodeled command stays unsupported, even with a bad
+            // argument attached (the command is checked first).
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, 6, 0, VAR as u32, 0]
+                ),
+                HR_OLECMDERR_E_NOTSUPPORTED
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, 99, 0, 0, 0]
+                ),
+                HR_OLECMDERR_E_NOTSUPPORTED
+            );
+            // A closed control reports the modeled commands disabled —
+            // exactly the cleared ENABLED bit of QueryStatusWB.
+            assert_eq!(
+                call(&mut fixture, WebBrowserMethod::Quit, &[object as u32]),
+                HR_S_OK
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, OLECMDID_REFRESH, 0, 0, 0]
+                ),
+                HR_OLECMDERR_E_DISABLED
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ExecWB,
+                    &[object as u32, 99, 0, 0, 0]
+                ),
+                HR_OLECMDERR_E_NOTSUPPORTED
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::QueryStatusWB,
+                    &[object as u32, OLECMDID_REFRESH, OUT as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), OLECMDF_SUPPORTED);
+            // ShowBrowserBar: validated variants, real bar class ids stay
+            // unsupported, empty class ids dismiss.
+            map(&mut fixture, OUT, 4);
+            fixture.memory.write_u16(OUT, 3); // VT_I4 replacement
+            fixture.memory.write_u16(VAR, 0); // VT_EMPTY class id
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ShowBrowserBar,
+                    &[object as u32, VAR as u32, 0, 0]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ShowBrowserBar,
+                    &[object as u32, VAR as u32, OUT as u32, 0]
+                ),
+                HR_DISP_E_TYPEMISMATCH
+            );
+            fixture.memory.write_u16(VAR, 3); // VT_I4 class id
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ShowBrowserBar,
+                    &[object as u32, VAR as u32, 0, 0]
+                ),
+                HR_DISP_E_TYPEMISMATCH
+            );
+            write_variant_wide(&mut fixture, VAR, "{C2F03A33-21F5-47FA-B4BB-156362A2F239}");
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ShowBrowserBar,
+                    &[object as u32, VAR as u32, 0, 0]
+                ),
+                HR_OLECMDERR_E_NOTSUPPORTED
+            );
+            fixture.memory.write_u16(VAR, 1); // VT_NULL class id
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ShowBrowserBar,
+                    &[object as u32, VAR as u32, 0, 0]
+                ),
+                HR_S_OK
+            );
+        });
+    }
+
+    #[test]
+    fn web_browser_client_to_window_uses_window_geometry_and_rejects_missing_window() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("browser-client-to-window");
+            let object = object(&mut fixture);
+            map(&mut fixture, OUT, 8);
+            // No window exists yet: E_FAIL and the coordinates stay put.
+            write_u32(&mut fixture.memory, OUT, 10);
+            write_u32(&mut fixture.memory, OUT + 4, 10);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ClientToWindow,
+                    &[object as u32, OUT as u32, (OUT + 4) as u32]
+                ),
+                HR_E_FAIL
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 10);
+            assert_eq!(fixture.memory.read_u32(OUT + 4).unwrap(), 10);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ClientToWindow,
+                    &[object as u32, 0, (OUT + 4) as u32]
+                ),
+                HR_E_INVALIDARG
+            );
+            // With the front-most guest window, client coordinates move by
+            // the window's non-client frame (border 4 + title 23 at 96 DPI).
+            let hwnd = fixture
+                .runtime
+                .user32
+                .create_window_ex_w("static", "host", 640, 480, true, false, None, 0)
+                .expect("window");
+            assert_eq!(
+                fixture.runtime.user32.dpi_for_window(hwnd).expect("dpi"),
+                96
+            );
+            write_u32(&mut fixture.memory, OUT, 10);
+            write_u32(&mut fixture.memory, OUT + 4, 10);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ClientToWindow,
+                    &[object as u32, OUT as u32, (OUT + 4) as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 14);
+            assert_eq!(fixture.memory.read_u32(OUT + 4).unwrap(), 37);
+            // The conversion is frame-based: moving the window does not
+            // change it.
+            fixture
+                .runtime
+                .user32
+                .set_window_position(hwnd, 50, 60)
+                .expect("move");
+            write_u32(&mut fixture.memory, OUT, 10);
+            write_u32(&mut fixture.memory, OUT + 4, 10);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ClientToWindow,
+                    &[object as u32, OUT as u32, (OUT + 4) as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), 14);
+            assert_eq!(fixture.memory.read_u32(OUT + 4).unwrap(), 37);
+            // Boundary coordinates: negative inputs stay relative, huge
+            // inputs saturate instead of wrapping.
+            write_u32(&mut fixture.memory, OUT, (-8_i32) as u32);
+            write_u32(&mut fixture.memory, OUT + 4, i32::MAX as u32);
+            assert_eq!(
+                call(
+                    &mut fixture,
+                    WebBrowserMethod::ClientToWindow,
+                    &[object as u32, OUT as u32, (OUT + 4) as u32]
+                ),
+                HR_S_OK
+            );
+            assert_eq!(fixture.memory.read_u32(OUT).unwrap(), (-4_i32) as u32);
+            assert_eq!(fixture.memory.read_u32(OUT + 4).unwrap(), i32::MAX as u32);
+        });
+    }
+
+    #[test]
+    fn web_browser_x64_typeinfo_and_document_dispatch_edges_are_exact() {
+        with_big_stack(|| {
+            // This test materializes the shared type-library cache file.
+            let _lock = typelib_lock();
+            let mut fixture = x86_fixture("browser-x64-dispatch");
+            fixture.runtime.guest_arch = GuestArch::X64;
+            let object = fixture
+                .runtime
+                .alloc_web_browser_object(&mut fixture.memory, "about:blank")
+                .expect("allocate browser");
+            map(&mut fixture, OUT, 8);
+            // GetTypeInfo through the x64 register calling convention.
+            let mut type_info_call = CpuState::new(GuestArch::X64);
+            type_info_call.set(Register::Rcx, object);
+            type_info_call.set(Register::Rdx, 0); // index 0
+            type_info_call.set(Register::R8, 0); // lcid
+            type_info_call.set(Register::R9, OUT); // out
+            fixture
+                .runtime
+                .dispatch_web_browser_method(
+                    WebBrowserMethod::GetTypeInfo,
+                    &mut type_info_call,
+                    &mut fixture.memory,
+                )
+                .expect("x64 GetTypeInfo");
+            assert_eq!(type_info_call.get(Register::Rax), HR_S_OK);
+            assert_ne!(
+                read_guest_pointer(&fixture.memory, OUT, GuestArch::X64).expect("type info"),
+                0
+            );
+            // Null out-pointer stays E_INVALIDARG on x64.
+            let mut null_out = CpuState::new(GuestArch::X64);
+            null_out.set(Register::Rcx, object);
+            null_out.set(Register::Rdx, 7); // index 7
+            null_out.set(Register::R8, 0);
+            null_out.set(Register::R9, 0);
+            fixture
+                .runtime
+                .dispatch_web_browser_method(
+                    WebBrowserMethod::GetTypeInfo,
+                    &mut null_out,
+                    &mut fixture.memory,
+                )
+                .expect("x64 GetTypeInfo null out");
+            assert_eq!(null_out.get(Register::Rax), HR_E_INVALIDARG);
+            // Navigate, then materialize and read the document on x64.
+            let url = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "http://example.com/x64")
+                .expect("url");
+            let mut navigate = CpuState::new(GuestArch::X64);
+            navigate.set(Register::Rcx, object);
+            navigate.set(Register::Rdx, url);
+            fixture
+                .runtime
+                .dispatch_web_browser_method(
+                    WebBrowserMethod::Navigate,
+                    &mut navigate,
+                    &mut fixture.memory,
+                )
+                .expect("x64 Navigate");
+            assert_eq!(navigate.get(Register::Rax), HR_S_OK);
+            let mut get_document = CpuState::new(GuestArch::X64);
+            get_document.set(Register::Rcx, object);
+            get_document.set(Register::Rdx, OUT);
+            fixture
+                .runtime
+                .dispatch_web_browser_method(
+                    WebBrowserMethod::GetDocument,
+                    &mut get_document,
+                    &mut fixture.memory,
+                )
+                .expect("x64 GetDocument");
+            assert_eq!(get_document.get(Register::Rax), HR_S_OK);
+            let document =
+                read_guest_pointer(&fixture.memory, OUT, GuestArch::X64).expect("document");
+            assert_ne!(document, 0);
+            let mut document_url = CpuState::new(GuestArch::X64);
+            document_url.set(Register::Rcx, document);
+            document_url.set(Register::Rdx, OUT);
+            fixture
+                .runtime
+                .dispatch_web_browser_method(
+                    WebBrowserMethod::DocumentGetUrl,
+                    &mut document_url,
+                    &mut fixture.memory,
+                )
+                .expect("x64 document URL");
+            assert_eq!(document_url.get(Register::Rax), HR_S_OK);
+            assert_eq!(
+                read_utf16_string(
+                    &fixture.memory,
+                    read_guest_pointer(&fixture.memory, OUT, GuestArch::X64).expect("bstr")
+                )
+                .expect("bstr"),
+                "http://example.com/x64"
+            );
+            let mut null_bstr = CpuState::new(GuestArch::X64);
+            null_bstr.set(Register::Rcx, document);
+            null_bstr.set(Register::Rdx, 0);
+            fixture
+                .runtime
+                .dispatch_web_browser_method(
+                    WebBrowserMethod::DocumentGetUrl,
+                    &mut null_bstr,
+                    &mut fixture.memory,
+                )
+                .expect("x64 document URL null out");
+            assert_eq!(null_bstr.get(Register::Rax), HR_E_INVALIDARG);
         });
     }
 }
