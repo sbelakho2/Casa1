@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Tests stay on the byte-for-byte deterministic cooperative pump; release
+  # and manual runner invocations use the production worker pool by default.
+  CASA1_COOPERATIVE_SCHEDULER: "1"
 
 jobs:
   integration-tests:
@@ -25,9 +28,13 @@ jobs:
   all-features-test:
     name: All Features Test
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # `nightly_alloc_error_hook` uses std::alloc::set_alloc_error_hook,
+      # which is nightly-only; the all-features matrix must not run it on
+      # stable (that produced E0658 in the stable all-features Clippy job).
+      - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install FFmpeg system dependencies (all-features build needs them)
         run: |

@@ -15,6 +15,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Tests stay on the byte-for-byte deterministic cooperative pump; release
+  # and manual runner invocations use the production worker pool by default.
+  CASA1_COOPERATIVE_SCHEDULER: "1"
 
 jobs:
   fmt:
@@ -97,7 +100,7 @@ jobs:
             fi
           done
       - name: Run Clippy (all features)
-        run: cargo clippy --all-targets --features angle,dev-insecure-tls,ffmpeg,ffmpeg-next,moltenvk,nightly_alloc_error_hook,opengl,proptest,tungstenite,vulkan,websocket -- -D warnings -A future-incompatible
+        run: cargo clippy --all-targets --features angle,dev-insecure-tls,ffmpeg,ffmpeg-next,moltenvk,opengl,proptest,tungstenite,vulkan,websocket -- -D warnings -A future-incompatible
 
   # Dedicated FFmpeg binding lane. The all-features jobs must never follow
   # whatever `brew install ffmpeg` happens to ship; this matrix names the exact

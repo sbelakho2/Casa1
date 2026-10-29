@@ -201,6 +201,67 @@ where
     }
 }
 
+/// Scheduler workers for real (non-test) runner executions.
+///
+/// Production scheduling is the release default: it runs runnable guest
+/// threads on the bounded native pool and only crosses the process-owner
+/// barrier for owner-only operations. Deterministic cooperative scheduling
+/// stays available for conformance/debug runs via
+/// `CASA1_COOPERATIVE_SCHEDULER=1`. `CASA1_PRODUCTION_WORKERS` pins the pool.
+fn scheduler_workers_from(
+    cooperative: bool,
+    pinned: Option<&str>,
+    available: usize,
+) -> Option<usize> {
+    if cooperative {
+        return None;
+    }
+    if let Some(workers) = pinned.and_then(|value| value.parse::<usize>().ok()) {
+        return Some(workers.clamp(1, 8));
+    }
+    // Cap the guest execution pool so the JIT/owner thread always has a core.
+    Some(available.clamp(2, 8))
+}
+
+fn default_scheduler_workers() -> Option<usize> {
+    let cooperative =
+        std::env::var_os("CASA1_COOPERATIVE_SCHEDULER").is_some_and(|value| value == "1");
+    let pinned = std::env::var("CASA1_PRODUCTION_WORKERS").ok();
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(2);
+    scheduler_workers_from(cooperative, pinned.as_deref(), available)
+}
+
+#[cfg(test)]
+mod scheduler_default_tests {
+    use super::scheduler_workers_from;
+
+    #[test]
+    fn default_scheduler_workers_reads_the_environment_once() {
+        let selected = super::default_scheduler_workers();
+        if std::env::var("CASA1_COOPERATIVE_SCHEDULER").as_deref() == Ok("1") {
+            assert_eq!(selected, None);
+        } else {
+            let workers = selected.expect("production scheduling is the default");
+            assert!((1..=8).contains(&workers));
+        }
+    }
+
+    #[test]
+    fn scheduler_worker_selection_pins_clamps_and_honors_the_kill_switch() {
+        assert_eq!(scheduler_workers_from(true, Some("4"), 8), None);
+        assert_eq!(scheduler_workers_from(true, None, 8), None);
+        assert_eq!(scheduler_workers_from(false, Some("4"), 8), Some(4));
+        assert_eq!(scheduler_workers_from(false, Some("1"), 8), Some(1));
+        assert_eq!(scheduler_workers_from(false, Some("99"), 8), Some(8));
+        assert_eq!(scheduler_workers_from(false, Some("garbage"), 8), Some(8));
+        assert_eq!(scheduler_workers_from(false, None, 1), Some(2));
+        assert_eq!(scheduler_workers_from(false, None, 6), Some(6));
+        assert_eq!(scheduler_workers_from(false, None, 64), Some(8));
+    }
+}
+
 pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     // Run identity: generated ONCE at job start and carried through the whole
     // run, so every artifact of this run shares one id and two concurrent
@@ -467,6 +528,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
                 thread_start: job
                     .thread_start
                     .map(|start| (start.address, start.parameter)),
+                scheduler_workers: default_scheduler_workers(),
                 ..pe_runtime::PeExecutionOptions::default()
             };
             // Steam workload wiring: Steam.exe and steamwebhelper child runs
@@ -949,6 +1011,7 @@ fn execute_live_pe_job(
                 jit_mode: Some(jit_mode),
                 steam_ipc,
                 thread_start,
+                scheduler_workers: default_scheduler_workers(),
                 ..pe_runtime::PeExecutionOptions::default()
             };
             // Steam workload wiring (see the non-live path): the observer

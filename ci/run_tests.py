@@ -159,6 +159,9 @@ def select(
 
 
 def main() -> int:
+    # Sanctioned test runs keep the deterministic cooperative scheduler;
+    # release runner invocations use the production worker pool.
+    os.environ.setdefault("CASA1_COOPERATIVE_SCHEDULER", "1")
     parser = argparse.ArgumentParser()
     parser.add_argument("--lib", action="store_true")
     parser.add_argument("--bins", action="store_true")

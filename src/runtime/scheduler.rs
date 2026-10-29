@@ -1870,12 +1870,12 @@ impl PeHostRuntime {
 // for execution on the runtime thread, where wait consumption and guest-state
 // mutation remain single-threaded and atomic.
 //
-// A guest *slice* still executes under the runtime's exclusive `&mut` engine;
-// simultaneous guest-code execution would require splitting `PeHostRuntime`
-// into shared `Arc`-locked subsystems (memory, win32 handles, JIT caches, D3D
-// state).  Production mode therefore provides real native workers, real
-// park/wake events and concurrent parked guest threads, with guest execution
-// serialized by the runtime's single owner.
+// Worker-safe guest slices execute concurrently on the native pool against
+// `ProcessShared` (guest memory, per-subsystem locks, code caches); a thread
+// that needs process-owner state is requeued for the cooperative pump, which
+// executes host thunks exactly once.  Production mode is the release default
+// (`CASA1_COOPERATIVE_SCHEDULER=1` keeps deterministic scheduling available
+// for conformance/debug runs).
 
 /// Which scheduler drives parked guest threads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

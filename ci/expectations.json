@@ -3067,6 +3067,9 @@
   "(backend.translation_stats().staged_copies, 0)",
   "(backend.translation_stats().zero_copy_updates, 1)"
  ],
+ "default_scheduler_workers_reads_the_environment_once": [
+  "(selected, None)"
+ ],
  "deferred_context_double_finish_clears_commands": [
   "(list.commands.len(), 1)"
  ],
@@ -11609,6 +11612,14 @@
   "(read_u32_guest(&session, FLAG_PTR), 1)",
   "( read_u32_guest(&session, teb_main + teb_last_error_offset(GuestArch::X86)), 0x1234, \"the outgoing thread's last error was not parked in its TEB\" )",
   "( session.runtime.last_error, 0x1234, \"the incoming thread's last error was not restored from its TEB\" )"
+ ],
+ "scheduler_worker_selection_pins_clamps_and_honors_the_kill_switch": [
+  "(scheduler_workers_from(true, Some(\"4\"), 8), None)",
+  "(scheduler_workers_from(true, None, 8), None)",
+  "(scheduler_workers_from(false, Some(\"4\"), 8), Some(4))",
+  "(scheduler_workers_from(false, Some(\"1\"), 8), Some(1))",
+  "(scheduler_workers_from(false, Some(\"99\"), 8), Some(8))",
+  "(scheduler_workers_from(false, Some(\"garbage\"), 8), Some(8))"
  ],
  "scm_controller_initialises_with_default_config": [
   "(controller.vm_state, VmState::Stopped)",
