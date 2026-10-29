@@ -125,7 +125,7 @@ unsafe impl Sync for GuestMemoryStore {}
 impl GuestMemoryStore {
     pub(crate) fn new() -> Self {
         // Try the full 256 GiB window first and degrade to the guaranteed
-        // 64 GiB minimum when the host refuses the larger reservation.
+        // 128 GiB minimum when the host refuses the larger reservation.
         let (reserved_size, flat_base) = reserve_flat_window_candidates(
             &[GUEST_FLAT_SIZE, GUEST_FLAT_MIN_SIZE],
             GUEST_FLAT_ALIGN,

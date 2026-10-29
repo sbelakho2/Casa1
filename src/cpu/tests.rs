@@ -3699,7 +3699,7 @@ fn flat_window_reservation_is_aligned_sparse_and_rejects_overflow() {
     );
 
     // When the preferred size is impossible, the next candidate (the
-    // guaranteed 64 GiB minimum) must be reserved instead.
+    // guaranteed 128 GiB minimum) must be reserved instead.
     let (fallback_size, fallback_base) = reserve_flat_window_candidates(
         &[usize::MAX - GUEST_FLAT_ALIGN, GUEST_FLAT_MIN_SIZE],
         GUEST_FLAT_ALIGN,

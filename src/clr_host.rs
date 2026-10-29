@@ -148,7 +148,6 @@ pub(crate) enum ClrHostError {
     /// No CoreCLR installation was found on the host.
     NoRuntime,
     /// No legacy .NET Framework CLR is installed on the host.
-    #[allow(dead_code)] // constructed by the provider contract, which no caller can reach here
     FrameworkUnavailable,
     /// The requested managed assembly does not exist or is not a file.
     AssemblyNotFound(PathBuf),

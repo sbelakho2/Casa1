@@ -191,6 +191,23 @@ jobs:
       - name: Test nightly UBSAN if supported
         run: bash ci/run_nightly_ubsan_if_supported.sh
 
+  corpus-smoke:
+    name: Real Corpus Smoke
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Runs the real PE inventory + corpus harness over the checked-in Tetris
+      # binaries: proves the harness is deterministic and resume-safe against
+      # real PE32/PE32+ images (the app itself is expected to hit the timeout).
+      - name: Inventory and corpus determinism
+        env:
+          CASA1_CORPUS_DIR: games/windows_tetris/dist
+          CASA1_CORPUS_TIMEOUT_MS: "8000"
+        run: bash ci/check_corpus.sh
+
   fuzz-build:
     name: Fuzz Build (nightly)
     runs-on: macos-latest
