@@ -1041,6 +1041,15 @@
   "(host.last_send_operation, None)",
   "(host.last_send_context, 0)"
  ],
+ "cancellation_and_timeout_are_exact": [
+  "( proxy.read(handle, &mut [0_u8; 4], None, &cancelled), Err(ProxyError::Cancelled) )",
+  "(ProxyError::Cancelled.ntstatus(), STATUS_CANCELLED)",
+  "( proxy.read(handle, &mut [0_u8; 4], Some(expired), &CancelToken::new()), Err(ProxyError::Timeout { timeout_ms: 0 }) )",
+  "( ProxyError::Timeout { timeout_ms: 0 }.ntstatus(), STATUS_TIMEOUT )"
+ ],
+ "cancellation_during_in_flight_read_is_exact": [
+  "(worker.join().expect(\"reader\"), Err(ProxyError::Cancelled))"
+ ],
  "cancellation_racing_a_completion_delivers_nothing": [
   "( host.host(&DplayAppDesc::new(\"Cancel Race\", 4), localhost()), S_OK )",
   "(client.connect(host_addr, \"Sender\", &[]), S_OK)",
@@ -4239,6 +4248,19 @@
   "(first.callback, 0x777)",
   "(second.callback, 0x777)"
  ],
+ "entitlement_and_unsupported_operations_fail_exactly": [
+  "( descriptor.require(ProxyOperation::Ioctl), Err(ProxyError::EntitlementRequired { family: DeviceFamily::Pci, operation: ProxyOperation::Ioctl, }) )",
+  "( ProxyError::EntitlementRequired { family: DeviceFamily::Pci, operation: ProxyOperation::Ioctl, } .ntstatus(), STATUS_PRIVILEGE_NOT_HELD )",
+  "( ProxyError::EntitlementRequired { family: DeviceFamily::Pci, operation: ProxyOperation::Ioctl, } .windows_error(), 1314 )",
+  "( descriptor.require(ProxyOperation::Write), Err(ProxyError::Unsupported { family: DeviceFamily::Pci, operation: ProxyOperation::Write, }) )",
+  "( ProxyError::Unsupported { family: DeviceFamily::Pci, operation: ProxyOperation::Write, } .ntstatus(), STATUS_NOT_SUPPORTED )",
+  "( ProxyError::Unsupported { family: DeviceFamily::Pci, operation: ProxyOperation::Write, } .windows_error(), 50 )"
+ ],
+ "entitlement_gated_families_report_privilege_not_held": [
+  "( usb.require(ProxyOperation::Read), Err(ProxyError::EntitlementRequired { family: DeviceFamily::Usb, operation: ProxyOperation::Read, }) )",
+  "( pci.require(ProxyOperation::Ioctl), Err(ProxyError::EntitlementRequired { family: DeviceFamily::Pci, operation: ProxyOperation::Ioctl, }) )",
+  "( network.require(ProxyOperation::Write), Err(ProxyError::EntitlementRequired { family: DeviceFamily::Network, operation: ProxyOperation::Write, }) )"
+ ],
  "enum_hosts_async_returns_pending_and_cancel_stops_responses": [
   "(host.host(&desc, localhost()), S_OK)",
   "(scout.cancel_async_operation(handle), S_OK)",
@@ -5825,6 +5847,9 @@
   "( manager.power_irp(absent, IRP_MN_SET_POWER, 1), Err(STATUS_DEVICE_NOT_READY) )",
   "( manager.set_power(started, PowerState::D1), Err(STATUS_DEVICE_HARDWARE_ERROR) )"
  ],
+ "host_unplug_during_in_flight_read_is_exact": [
+  "( worker.join().expect(\"reader\"), Err(ProxyError::Unplugged { id }) )"
+ ],
  "host_with_max_players_rejects_second_client_with_session_full": [
   "(host.host(&desc, localhost()), S_OK)",
   "(first.connect(host_addr, \"First\", &[]), S_OK)",
@@ -6135,6 +6160,12 @@
   "(err.code, ReasonCode::RcInvalidParameter)",
   "(err.message, \"hFile: expected non-zero handle\")"
  ],
+ "invalid_proxy_handle_reports_exact_status": [
+  "( proxy.read(ProxyHandle::from_raw(999), &mut [0_u8; 4], None, &cancel), Err(ProxyError::InvalidHandle) )",
+  "(ProxyError::InvalidHandle.ntstatus(), STATUS_INVALID_HANDLE)",
+  "(proxy.close(handle), Ok(()))",
+  "( proxy.close(handle), Err(ProxyError::InvalidHandle), \"double close is an invalid handle\" )"
+ ],
  "invalid_small_flat_view_bitmap_is_grown_on_attach": [
   "(flat.materialised.len(), 1)",
   "(flat.is_page_materialised(0), false)",
@@ -6208,6 +6239,11 @@
   "(counters.timeout_expirations, 1)",
   "(counters.packets_dequeued, 0)",
   "(CompletionPortWaitError::TimedOut.last_error(), WAIT_TIMEOUT)"
+ ],
+ "ioctl_code_mismatch_is_invalid_device_request": [
+  "( proxy.ioctl(handle, 0x0022_0004, b\"PING\", 8, None, &CancelToken::new()), Err(ProxyError::UnsupportedIoctl { code: 0x0022_0004 }) )",
+  "( ProxyError::UnsupportedIoctl { code: 1 }.ntstatus(), STATUS_INVALID_DEVICE_REQUEST )",
+  "(ProxyError::UnsupportedIoctl { code: 1 }.windows_error(), 1)"
  ],
  "iole_in_place_object_and_active_object_state_machines_are_real": [
   "( call_slot( &mut fixture, object, 11, &[object as u32, (-5_i32) as u32, 0, 0, 0, 0x4321, 0] ), S_OK )",
@@ -6283,6 +6319,14 @@
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::NtAlpcConnectPort, &[handle_pointer, 0, 0, 0, 0, 0, 0], ), STATUS_INVALID_PARAMETER )",
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::NtAlpcConnectPort, &[handle_pointer, malformed, 0, 0, 0, 0, 0], ), STATUS_INVALID_PARAMETER )"
  ],
+ "island_attach_open_read_write_and_detach": [
+  "(open_device(island, device, None).expect(\"open\"), handle)",
+  "( write_device(island, device, &[9, 8, 7], None, &CancelToken::new()), Ok(3) )",
+  "( read_device(island, device, &mut buffer, None, &CancelToken::new()), Ok(3) )",
+  "(buffer, [9, 8, 7])",
+  "( device_descriptor(island, device) .expect(\"descriptor\") .family, DeviceFamily::Serial )",
+  "(close_device(island, device), Ok(()))"
+ ],
  "island_etw_registration_write_and_unregister_are_real": [
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::EtwRegister, &[guid_pointer, 0, 0, handle_pointer], ), STATUS_SUCCESS )",
   "(island.inner.borrow().diagnostics.provider_count(), 1)",
@@ -6314,6 +6358,13 @@
   "(state.process.query_thread(thread).unwrap().process, process)",
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::PsGetCurrentProcessId, &[], ) as u32, process.0 )",
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::PsGetCurrentThreadId, &[], ) as u32, thread.0 )"
+ ],
+ "island_proxy_generation_prunes_stale_devices_on_address_reuse": [
+  "( read_device(island, 1, &mut [0_u8; 1], None, &CancelToken::new()), Err(ProxyError::InvalidHandle) )",
+  "(first, second)"
+ ],
+ "island_unplug_during_in_flight_read_is_exact": [
+  "( read_device(island, device, &mut [0_u8; 4], None, &CancelToken::new()), Err(ProxyError::Unplugged { id: StableDeviceId::derive( DeviceFamily::Virtual.device_class(), &[\"CasaChildB\", &format!(\"casa-device-{device}\")], ), }) )"
  ],
  "item_bind_paths_report_missing_and_unsupported_interfaces": [
   "( call_slot( &mut fixture, container, 6, &[ container as u32, NAME as u32, BINDSPEED_INDEFINITE, 0, IID_PTR as u32, OUT as u32 ] ), S_OK )",
@@ -7825,6 +7876,10 @@
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::ExFreeToNPagedLookasideList, &[lookaside, 0xDEAD], ), STATUS_INVALID_ADDRESS )",
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::ExInitializeNPagedLookasideList, &[0x59_100, 1, 0, 0, 0x40, 0x31747343, 4], ), STATUS_NOT_SUPPORTED )"
  ],
+ "loopback_capacity_overflow_and_missing_ioctl_are_exact": [
+  "( channel.write(&[1, 2, 3], None, &CancelToken::new()), Err(ProxyError::InvalidParameter { field: \"loopback device capacity\", }) )",
+  "( channel.ioctl(0xDEAD, &[], 4, None, &CancelToken::new()), Err(ProxyError::UnsupportedIoctl { code: 0xDEAD }) )"
+ ],
  "loopback_capture_reads_back_the_render_stream_frames": [
   "(snapshot.direction, AudioDirection::Capture)",
   "(set_event_handle(pid, object, 0xE1), AUDCLNT_S_OK)",
@@ -7838,6 +7893,10 @@
  ],
  "loopback_is_rejected_on_a_capture_endpoint": [
   "( plan_initialize( pid, object, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 100_000, 0, &format, ), Err(AUDCLNT_E_WRONG_ENDPOINT_TYPE), \"loopback on a true capture endpoint is the wrong endpoint type\" )"
+ ],
+ "loopback_unplug_and_stall_fail_with_documented_statuses": [
+  "( channel.read(&mut [0_u8; 1], None, &CancelToken::new()), Err(ProxyError::Unplugged { id }) )",
+  "( second_channel.read(&mut [0_u8; 1], Some(Instant::now()), &CancelToken::new()), Err(ProxyError::Timeout { timeout_ms: 0 }) )"
  ],
  "low_fps_rejects_empty_and_pins_worst_outlier_average": [
   "(low_fps(&[], 0.01), None)",
@@ -9554,6 +9613,22 @@
   "(memory.load(0x1B00, 8), Some(expected))",
   "(context.last_error, 0)"
  ],
+ "parallel_api_fallback_reasons_are_accounted_exactly": [
+  "( invoke(&shared, &mut context, &memory, HostThunk::GetVersion), false )",
+  "( snapshot .fallbacks .iter() .find(|(reason, _)| *reason == BarrierReason::UnsupportedInput) .map(|(_, count)| *count), Some(1) )",
+  "(snapshot.totals.fallback_barriers, 1)",
+  "( snapshot .categories .iter() .find(|(category, _, _)| *category == WorkerCategory::Version) .map(|(_, _, fallbacks)| *fallbacks), Some(1) )",
+  "( invoke(&shared, &mut context, &memory, HostThunk::CreateFileW), false )",
+  "( snapshot .fallbacks .iter() .find(|(reason, _)| *reason == BarrierReason::OwnerOnly) .map(|(_, count)| *count), Some(1) )"
+ ],
+ "parallel_api_interlocked_hammer_is_lock_free_and_exact": [
+  "(memory.store(CELL, &0_u32.to_le_bytes()), true)",
+  "( memory.store( STACK - pointer, &RETURN_ADDRESS.to_le_bytes()[..pointer as usize] ), true )",
+  "(memory.store(STACK, &(CELL as u32).to_le_bytes()), true)",
+  "( shared.run_worker_api(&mut context, memory.as_ref(), address), true )",
+  "(memory.load(CELL, 4), Some(u64::from(THREADS * ROUNDS)))",
+  "( snapshot.totals.parallel_dispatched, u64::from(THREADS * ROUNDS) )"
+ ],
  "parallel_api_invalid_arguments_boundary_outcomes_are_exact": [
   "( invoke( &shared, &mut context, &memory, HostThunk::QueryPerformanceCounter ), true )",
   "(context.state.get(Register::Rax), 0)",
@@ -9567,6 +9642,12 @@
   "(context.last_error, expected)",
   "(metrics.parallel_dispatched, u64::from(THREADS * 2))",
   "(metrics.barrier_calls, 0)"
+ ],
+ "parallel_api_lock_contention_and_writer_reader_race_stay_exact": [
+  "(memory.store(REG_LEN, &16_u32.to_le_bytes()), true)",
+  "(completed.load(Ordering::Relaxed) > 0, true)",
+  "(snapshot.totals.barrier_calls > 0, true)",
+  "( snapshot .fallbacks .iter() .find(|(reason, _)| *reason == BarrierReason::LockContention) .map(|(_, count)| *count) .is_some(), true )"
  ],
  "parallel_api_missing_state_and_memory_fall_back_to_barrier": [
   "( invoke(&shared, &mut context, &memory, HostThunk::GetVersion), false )",
@@ -9584,6 +9665,29 @@
   "(metrics.barrier_calls, u64::from(THREADS * ROUNDS))",
   "(shared.process_operations(), u64::from(THREADS * ROUNDS))"
  ],
+ "parallel_api_mixed_parallel_barrier_new_categories_no_deadlock": [
+  "( call_published( &shared, &mut context, &memory, thread, W_FILE_SIZE_EX, &[0x10, W_SIZE_OUT] ), true )",
+  "( call_published(&shared, &mut context, &memory, thread, W_OWNER_ONLY, &[]), false )",
+  "( call_published(&shared, &mut context, &memory, thread, W_TLS, &[3]), true )",
+  "( started.elapsed() < std::time::Duration::from_secs(5), true, \"mixed parallel/barrier dispatch must not deadlock\" )",
+  "( snapshot.totals.parallel_dispatched, u64::from(THREADS * ROUNDS * 2) )",
+  "(snapshot.totals.barrier_calls, u64::from(THREADS * ROUNDS))"
+ ],
+ "parallel_api_mixed_workload_ratio_and_serial_reference_match": [
+  "( parallel_results, reference_results, \"worker results must match the serial owner reference byte-for-byte\" )",
+  "( snapshot.totals.parallel_dispatched, u64::from(THREADS * ITERATIONS * (W_COUNT as u32 - 1)) )",
+  "( snapshot.totals.barrier_calls, u64::from(THREADS * ITERATIONS) )",
+  "( snapshot .fallbacks .iter() .find(|(reason, _)| *reason == BarrierReason::OwnerOnly) .map(|(_, count)| *count), Some(u64::from(THREADS * ITERATIONS)) )",
+  "(snapshot.totals.fallback_barriers, 0)",
+  "( snapshot .categories .iter() .find(|(category, _, _)| *category == WorkerCategory::FileSystem) .map(|(_, dispatched, _)| *dispatched), Some(u64::from(THREADS * ITERATIONS * 5)) )"
+ ],
+ "parallel_api_new_categories_match_owner_error_codes": [
+  "( call_published( &shared, &mut context, &memory, 0x1200, W_FILE_EX, &[0, 0, W_ATTR_OUT] ), true )",
+  "(context.state.get(Register::Rax), 0)",
+  "(context.last_error, ERROR_PATH_NOT_FOUND)",
+  "( call_published( &shared, &mut context, &memory, 0x1200, W_FILE_EX, &[W_FILE_PATH, 1, W_ATTR_OUT] ), true )",
+  "(context.last_error, ERROR_INVALID_PARAMETER)"
+ ],
  "parallel_api_out_of_bounds_reads_and_writes_fail_closed": [
   "(format!(\"{:?}\", ProcessShared::new()).is_empty(), false)",
   "(shared.run_worker_api(&mut context, &memory, entry), false)",
@@ -9598,12 +9702,12 @@
   "(metrics.owner_only_barriers, 1)"
  ],
  "parallel_api_read_mostly_readers_race_writer_consistency": [
-  "( invoke( &shared, &mut context, &memory, HostThunk::GetCurrentProcessId ), true )",
   "(pid == 100 || pid == 101, true)",
-  "( invoke_x86( &shared, &mut context, &memory, HostThunk::GetEnvironmentVariableW, &[ENV_NAME, ENV_BUFFER, 16], ), true )",
   "(context.state.get(Register::Rax), 5)",
   "(first == Some(0x76) || first == Some(0x6f), true)",
-  "(memory.store(REG_LEN, &16_u32.to_le_bytes()), true)"
+  "(memory.store(REG_LEN, &16_u32.to_le_bytes()), true)",
+  "(context.state.get(Register::Rax), 0)",
+  "(memory.load(REG_LEN, 4), Some(12))"
  ],
  "parallel_api_stateless_hammer_has_exact_per_thread_results": [
   "( metrics.parallel_dispatched, u64::from(THREADS * (X64_CALLS * 20 + X86_CALLS * 7)) )",
@@ -14460,6 +14564,10 @@
   "(aggregate.subsystem_capability, SubsystemCapability::Full)",
   "( database.interface_completeness_gate().len(), 0, \"a conservative (understated) aggregate must not fail the interface gate\" )"
  ],
+ "unentitled_families_expose_real_operations_and_audio_is_unsupported": [
+  "( audio.require(ProxyOperation::Read), Err(ProxyError::Unsupported { family: DeviceFamily::Audio, operation: ProxyOperation::Read, }) )",
+  "( audio.require(ProxyOperation::Read).unwrap_err().ntstatus(), crate::casak::status::STATUS_NOT_SUPPORTED )"
+ ],
  "unknown_command_and_pre_startup_command_are_rejected": [
   "(rc(&run(&mut tpm, &get_random)), TPM_RC_INITIALIZE)",
   "(rc(&run(&mut tpm, &unknown)), TPM_RC_COMMAND_CODE)"
@@ -14478,6 +14586,10 @@
  ],
  "unload_error_restores_registration_and_reports_invalid_parameter": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtUnloadDriver, &[service_path], ), STATUS_INVALID_PARAMETER, \"a failed DriverUnload must be reported as INVALID_PARAMETER\" )"
+ ],
+ "unplug_during_in_flight_read_reports_device_not_connected": [
+  "( proxy.read(handle, &mut [0_u8; 4], None, &CancelToken::new()), Err(ProxyError::Unplugged { id }) )",
+  "( ProxyError::Unplugged { id }.ntstatus(), STATUS_DEVICE_NOT_CONNECTED )"
  ],
  "unplug_race_reconcile_removes_once_and_never_synthesizes_devices": [
   "( table.reconcile(vec![device.clone()]), vec![HotplugEvent::Arrived(device.clone())] )",
@@ -15887,5 +15999,13 @@
  ],
  "xwb_rejects_truncated_buffers": [
   "( WaveBank::parse(&bytes[..cut]), Err(XACTENGINE_E_INVALIDDATA), \"truncated at {cut} must be invalid\" )"
+ ],
+ "zero_and_oversized_transfers_are_rejected_with_exact_status": [
+  "( proxy.write(handle, &[], None, &cancel), Err(ProxyError::ZeroLength) )",
+  "( proxy.read(handle, &mut [], None, &cancel), Err(ProxyError::ZeroLength) )",
+  "(ProxyError::ZeroLength.ntstatus(), STATUS_INVALID_PARAMETER)",
+  "( proxy.write(handle, &oversized, None, &cancel), Err(ProxyError::Oversized { requested: MAX_TRANSFER_BYTES + 1, maximum: MAX_TRANSFER_BYTES, }) )",
+  "( ProxyError::Oversized { requested: 1, maximum: 0, } .ntstatus(), STATUS_INVALID_BUFFER_SIZE )",
+  "( proxy.ioctl(handle, 1, &[], MAX_TRANSFER_BYTES + 1, None, &cancel), Err(ProxyError::Oversized { requested: MAX_TRANSFER_BYTES + 1, maximum: MAX_TRANSFER_BYTES, }) )"
  ]
 }

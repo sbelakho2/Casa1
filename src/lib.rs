@@ -260,6 +260,8 @@ pub mod workloads {
     pub mod steam;
 }
 pub mod casak;
+pub mod device_proxy;
+pub mod devicekit;
 pub mod driver_image;
 pub mod driver_island;
 pub mod umdf;

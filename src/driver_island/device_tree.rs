@@ -80,9 +80,28 @@ impl IslandState {
                 Err(status) => return Ok(Err(status)),
             };
 
+        if device_name
+            .as_deref()
+            .is_some_and(|name| name.starts_with("CasaChild"))
+        {
+            let family = crate::device_proxy::DeviceFamily::from_nt_device_type(device_type);
+            let mut live_devices: Vec<u64> = self.device_ids.values().map(|id| id.0).collect();
+            live_devices.push(device.0);
+            if let Err(error) = crate::device_proxy::attach_device(
+                self.proxy_key(),
+                device.0,
+                device_name.as_deref().unwrap_or(""),
+                family,
+                &live_devices,
+            ) {
+                let _ = self.io.delete_device(device);
+                return Ok(Err(error.ntstatus()));
+            }
+        }
         let guest = match self.arena.alloc(memory, 0x180, 16) {
             Ok(guest) => guest,
             Err(_) => {
+                crate::device_proxy::detach_device(self.proxy_key(), device.0);
                 let _ = self.io.delete_device(device);
                 return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
             }
@@ -91,6 +110,7 @@ impl IslandState {
             match self.arena.alloc(memory, extension_size, 8) {
                 Ok(extension_guest) => extension_guest,
                 Err(_) => {
+                    crate::device_proxy::detach_device(self.proxy_key(), device.0);
                     let _ = self.io.delete_device(device);
                     return Ok(Err(STATUS_INSUFFICIENT_RESOURCES));
                 }
@@ -166,6 +186,7 @@ impl IslandState {
             Err(status) => status,
         };
         if status == STATUS_SUCCESS {
+            crate::device_proxy::detach_device(self.proxy_key(), device.0);
             if let Some(record) = self
                 .devices
                 .iter_mut()
@@ -242,5 +263,14 @@ impl IslandState {
             set_status(state, STATUS_SUCCESS);
         }
         Ok(())
+    }
+}
+
+impl IslandState {
+    /// Stable identity of this island for the process-wide host-device proxy
+    /// registry.  The island is single-host-threaded, so its address is a
+    /// valid key for as long as the device objects it owns exist.
+    pub(crate) fn proxy_key(&self) -> usize {
+        self as *const IslandState as usize
     }
 }

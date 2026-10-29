@@ -331,11 +331,181 @@ pub(crate) fn close_directory_object(runtime: &PeHostRuntime, handle: u32) -> bo
 /// path).
 pub(crate) fn close_island_device_handle(runtime: &PeHostRuntime, handle: u32) -> bool {
     let runtime_id = runtime_identity(runtime);
-    lock_registry()
+    let record = lock_registry()
         .device_handles
         .get_mut(&runtime_id)
-        .and_then(|handles| handles.remove(&handle))
-        .is_some()
+        .and_then(|handles| handles.remove(&handle));
+    let Some(record) = record else {
+        return false;
+    };
+    if let Some(island_key) = island_key_for_device(runtime, &record) {
+        let _ = crate::device_proxy::close_device(island_key, record.device_id.0);
+    }
+    true
+}
+
+/// The island that owns a live device handle, for proxy teardown.
+fn island_key_for_device(runtime: &PeHostRuntime, device: &IslandDeviceHandle) -> Option<usize> {
+    let runtime_id = runtime_identity(runtime);
+    let registry = lock_registry();
+    for island in registry
+        .services
+        .get(&runtime_id)
+        .into_iter()
+        .flat_map(|services| services.values())
+    {
+        let state = island.0.inner.borrow();
+        if state.driver_name == device.service_name
+            && state.device_ids.get(&device.device_guest) == Some(&device.device_id)
+        {
+            return Some(state.proxy_key());
+        }
+    }
+    None
+}
+
+/// Routes a proxy-backed device object's IRP through its host transport.
+///
+/// This is the real path for CasaK PnP devices: the bytes cross the Windows
+/// IRP boundary into the transport, and every outcome is the transport's
+/// exact NTSTATUS.  Non-proxy devices return `None` and keep the driver's own
+/// dispatch path.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_proxy_irp(
+    runtime: &mut PeHostRuntime,
+    memory: &mut MemoryImage,
+    device: &IslandDeviceHandle,
+    major: IrpMajorFunction,
+    io_control_code: u32,
+    input_ptr: u64,
+    input_len: u32,
+    output_ptr: u64,
+    output_len: u32,
+) -> AppResult<Option<(i32, usize)>> {
+    let IslandDeviceHandle {
+        service_name,
+        device_guest,
+        device_id,
+    } = device;
+    let island_key = {
+        let runtime_id = runtime_identity(runtime);
+        let registry = lock_registry();
+        let Some(island) = registry
+            .services
+            .get(&runtime_id)
+            .and_then(|services| services.get(&service_name.to_ascii_lowercase()))
+        else {
+            return Ok(None);
+        };
+        let state = island.0.inner.borrow();
+        if state.device_ids.get(device_guest) != Some(device_id) {
+            return Ok(None);
+        }
+        state.proxy_key()
+    };
+    if !crate::device_proxy::is_attached(island_key, device_id.0) {
+        return Ok(None);
+    }
+    let deadline = Some(Instant::now() + crate::device_proxy::IRP_TIMEOUT);
+    let cancel = crate::device_proxy::CancelToken::new();
+    match major {
+        IrpMajorFunction::Create => Ok(Some(
+            match crate::device_proxy::open_device(island_key, device_id.0, deadline) {
+                Ok(_) => (STATUS_SUCCESS, 0),
+                Err(error) => (error.ntstatus(), 0),
+            },
+        )),
+        IrpMajorFunction::Close => Ok(Some(
+            match crate::device_proxy::close_device(island_key, device_id.0) {
+                Ok(()) => (STATUS_SUCCESS, 0),
+                Err(error) => (error.ntstatus(), 0),
+            },
+        )),
+        IrpMajorFunction::Read => {
+            if output_len > 0
+                && (output_ptr == 0
+                    || crate::host_thunks::validate_guest_pointer(
+                        memory,
+                        output_ptr,
+                        output_len as usize,
+                    )
+                    .is_err())
+            {
+                return Ok(Some((STATUS_INVALID_PARAMETER, 0)));
+            }
+            let mut buffer = vec![0_u8; output_len as usize];
+            match crate::device_proxy::read_device(
+                island_key,
+                device_id.0,
+                &mut buffer,
+                deadline,
+                &cancel,
+            ) {
+                Ok(count) => {
+                    if count > 0 {
+                        memory.map_bytes(output_ptr, &buffer[..count]);
+                    }
+                    Ok(Some((STATUS_SUCCESS, count)))
+                }
+                Err(error) => Ok(Some((error.ntstatus(), 0))),
+            }
+        }
+        IrpMajorFunction::Write => {
+            let mut buffer = vec![0_u8; input_len as usize];
+            if input_len > 0 {
+                if input_ptr == 0 || memory.read_into(input_ptr, &mut buffer).is_err() {
+                    return Ok(Some((STATUS_ACCESS_VIOLATION, 0)));
+                }
+            }
+            match crate::device_proxy::write_device(
+                island_key,
+                device_id.0,
+                &buffer,
+                deadline,
+                &cancel,
+            ) {
+                Ok(count) => Ok(Some((STATUS_SUCCESS, count))),
+                Err(error) => Ok(Some((error.ntstatus(), 0))),
+            }
+        }
+        IrpMajorFunction::DeviceControl => {
+            if output_len > 0
+                && (output_ptr == 0
+                    || crate::host_thunks::validate_guest_pointer(
+                        memory,
+                        output_ptr,
+                        output_len as usize,
+                    )
+                    .is_err())
+            {
+                return Ok(Some((STATUS_INVALID_PARAMETER, 0)));
+            }
+            let mut input = vec![0_u8; input_len as usize];
+            if input_len > 0 {
+                if input_ptr == 0 || memory.read_into(input_ptr, &mut input).is_err() {
+                    return Ok(Some((STATUS_ACCESS_VIOLATION, 0)));
+                }
+            }
+            match crate::device_proxy::ioctl_device(
+                island_key,
+                device_id.0,
+                io_control_code,
+                &input,
+                output_len as usize,
+                deadline,
+                &cancel,
+            ) {
+                Ok(output) => {
+                    if !output.is_empty() {
+                        memory.map_bytes(output_ptr, &output);
+                    }
+                    Ok(Some((STATUS_SUCCESS, output.len())))
+                }
+                Err(error) => Ok(Some((error.ntstatus(), 0))),
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 /// `NtCreateFile` island hook: when `raw_path` names a loaded island device
@@ -348,10 +518,15 @@ pub(crate) fn nt_open_island_device(
     raw_path: &str,
     handle_ptr: u64,
 ) -> Option<i32> {
-    let device = resolve_island_device(runtime, raw_path)?;
+    let (device, island_key) = resolve_island_device_with_key(runtime, raw_path)?;
     if handle_ptr == 0 || crate::host_thunks::validate_guest_pointer(memory, handle_ptr, 4).is_err()
     {
         return Some(STATUS_INVALID_PARAMETER);
+    }
+    if crate::device_proxy::is_attached(island_key, device.device_id.0)
+        && let Err(error) = crate::device_proxy::open_device(island_key, device.device_id.0, None)
+    {
+        return Some(error.ntstatus());
     }
     let runtime_id = runtime_identity(runtime);
     let mut registry = lock_registry();
@@ -413,6 +588,19 @@ pub(crate) fn dispatch_island_device_io(
     if !live {
         return Ok(Some((STATUS_INVALID_HANDLE, 0)));
     }
+    if let Some((status, information)) = dispatch_proxy_irp(
+        runtime,
+        memory,
+        &device,
+        major,
+        io_control_code,
+        input_ptr,
+        input_len,
+        output_ptr,
+        output_len,
+    )? {
+        return Ok(Some((status, information)));
+    }
     let result = DriverIsland { inner }.dispatch_irp(
         runtime,
         memory,
@@ -443,10 +631,20 @@ pub(crate) fn normalize_device_path(raw: &str) -> String {
     path
 }
 
+#[allow(dead_code)] // test-facing wrapper; the open path needs the island key
 pub(crate) fn resolve_island_device(
     runtime: &PeHostRuntime,
     raw_path: &str,
 ) -> Option<IslandDeviceHandle> {
+    resolve_island_device_with_key(runtime, raw_path).map(|(device, _)| device)
+}
+
+/// Resolves a device and the island that owns it, so the host-device proxy
+/// registry can be addressed by island identity.
+pub(crate) fn resolve_island_device_with_key(
+    runtime: &PeHostRuntime,
+    raw_path: &str,
+) -> Option<(IslandDeviceHandle, usize)> {
     let path = normalize_device_path(raw_path);
     if path.is_empty() {
         return None;
@@ -496,11 +694,15 @@ pub(crate) fn resolve_island_device(
             .get(&device.guest_pointer)
             .copied()
             .expect("live device object always has an island id");
-        return Some(IslandDeviceHandle {
-            service_name: state.driver_name.clone(),
-            device_guest: device.guest_pointer,
-            device_id,
-        });
+        let island_key = state.proxy_key();
+        return Some((
+            IslandDeviceHandle {
+                service_name: state.driver_name.clone(),
+                device_guest: device.guest_pointer,
+                device_id,
+            },
+            island_key,
+        ));
     }
     None
 }

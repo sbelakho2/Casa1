@@ -3211,6 +3211,32 @@ impl PeHostRuntime {
         } else {
             WorkerRegistry::default()
         };
+        let files = if self.host_thunks.values().any(|thunk| {
+            matches!(
+                thunk,
+                HostThunk::GetFileAttributesW
+                    | HostThunk::GetFileAttributesA
+                    | HostThunk::GetFileAttributesExW
+                    | HostThunk::GetFileSize
+                    | HostThunk::GetFileSizeEx
+            )
+        }) {
+            self.build_worker_filesystem()
+        } else {
+            WorkerFileSystem::default()
+        };
+        let objects = if self.host_thunks.values().any(|thunk| {
+            matches!(
+                thunk,
+                HostThunk::GetExitCodeThread
+                    | HostThunk::GetExitCodeProcess
+                    | HostThunk::GetThreadPriority
+            )
+        }) {
+            self.build_worker_object_status()
+        } else {
+            WorkerObjectStatus::default()
+        };
         self.process_shared.publish_environment(WorkerEnvironment {
             identity: WorkerIdentity {
                 process_id: self.win32.current_process_id(),
@@ -3235,6 +3261,8 @@ impl PeHostRuntime {
             environment: self.process_environment.clone(),
             heap,
             registry,
+            files,
+            objects,
         });
         self.process_shared.publish_parallel_thunks(
             self.host_thunks
@@ -3310,6 +3338,63 @@ impl PeHostRuntime {
             key: key.to_string(),
             values,
         }
+    }
+
+    /// Snapshot the filesystem metadata surface the attribute/size thunks can
+    /// service from a worker: every guest-visible metadata record plus the
+    /// current size of every open file handle.
+    fn build_worker_filesystem(&self) -> WorkerFileSystem {
+        let mut files = WorkerFileSystem::default();
+        for (path, record) in &self.win32.ge().config.fs_state.entries {
+            let is_directory = record.kind == crate::ge::FsEntryKind::Directory;
+            let size = if is_directory {
+                0
+            } else {
+                self.win32
+                    .guest_path_to_host_path(path)
+                    .ok()
+                    .and_then(|host_path| std::fs::metadata(host_path).ok())
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0)
+            };
+            files.entries.insert(
+                path.clone(),
+                WorkerFileMetadata {
+                    size,
+                    attributes: record.attributes.clone(),
+                    creation_time_ticks: record.creation_time_ticks,
+                    last_access_time_ticks: record.last_access_time_ticks,
+                    last_write_time_ticks: record.last_write_time_ticks,
+                    is_directory,
+                },
+            );
+        }
+        let upper = self.win32.next_handle_value();
+        for handle in 1..upper {
+            if let Ok(size) = self.win32.get_file_size_ex(handle) {
+                files.sizes.insert(handle, size);
+            }
+        }
+        files
+    }
+
+    /// Snapshot thread/process exit codes and thread priorities for the
+    /// simple object-status queries.
+    fn build_worker_object_status(&self) -> WorkerObjectStatus {
+        let mut objects = WorkerObjectStatus::default();
+        let upper = self.win32.next_handle_value();
+        for handle in 1..upper {
+            if let Ok(Some(exit_code)) = self.win32.get_exit_code_thread(handle) {
+                objects.thread_exit_codes.insert(handle, exit_code);
+            }
+            if let Ok(priority) = self.win32.get_thread_priority(handle) {
+                objects.thread_priorities.insert(handle, priority);
+            }
+            if let Ok(Some(exit_code)) = self.win32.get_exit_code_process(handle) {
+                objects.process_exit_codes.insert(handle, exit_code);
+            }
+        }
+        objects
     }
 
     /// Execute one round of concurrent guest slices for explicit per-thread

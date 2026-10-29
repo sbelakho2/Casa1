@@ -25,9 +25,10 @@
 
 use super::super::{
     ABBR_MONTHS, ABBR_WEEKDAYS, CP_ACP, ERROR_ENVVAR_NOT_FOUND, ERROR_FILE_NOT_FOUND,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, FULL_MONTHS,
-    FULL_WEEKDAYS, GuestThreadContext, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER,
-    HKEY_LOCAL_MACHINE, HKEY_USERS, HostThunk, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
+    ERROR_PATH_NOT_FOUND, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
+    FULL_MONTHS, FULL_WEEKDAYS, GuestThreadContext, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG,
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS, HostThunk, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
     PROCESS_HEAP_HANDLE, ProcessShared, WINDOWS_EPOCH_OFFSET_100NS, WorkerLocale, WorkerVersion,
     civil_day_of_week, current_guest_utc_components, current_host_ticks_100ns,
     current_host_time_zone_information, encode_registry_value_data,
@@ -35,10 +36,12 @@ use super::super::{
     locale_name_to_lcid, normalize_registry_runtime_key, registry_value_type_to_win32,
     shlwapi_format_time_interval,
 };
+use super::{BarrierReason, WorkerCategory};
 use crate::cpu::{GuestArch, Register};
 use crate::host_thunks::ThunkConcurrency;
 use crate::jit::GuestSliceMemory;
 use crate::win32::{CP_THREAD_ACP, CP_UTF8};
+use std::cell::Cell;
 
 /// The concurrency-safe worker implementation of one host thunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +90,21 @@ pub(crate) enum WorkerApi {
     GetEnvironmentVariableW,
     RegQueryValueExA,
     RegQueryValueExW,
+    GetFileAttributesW,
+    GetFileAttributesA,
+    GetFileAttributesExW,
+    GetFileSize,
+    GetFileSizeEx,
+    GetSystemTime,
+    GetComputerNameW,
+    TlsGetValue,
+    FlsGetValue,
+    InterlockedIncrement,
+    InterlockedDecrement,
+    InterlockedExchangeAdd,
+    GetExitCodeThread,
+    GetExitCodeProcess,
+    GetThreadPriority,
 }
 
 impl WorkerApi {
@@ -106,10 +124,116 @@ impl WorkerApi {
             | Self::HeapSize
             | Self::GetEnvironmentVariableW
             | Self::RegQueryValueExA
-            | Self::RegQueryValueExW => ThunkConcurrency::ReadMostly,
+            | Self::RegQueryValueExW
+            | Self::GetFileAttributesW
+            | Self::GetFileAttributesA
+            | Self::GetFileAttributesExW
+            | Self::GetFileSize
+            | Self::GetFileSizeEx
+            | Self::GetExitCodeThread
+            | Self::GetExitCodeProcess
+            | Self::GetThreadPriority => ThunkConcurrency::ReadMostly,
             _ => ThunkConcurrency::Stateless,
         }
     }
+
+    pub(crate) const fn category(self) -> WorkerCategory {
+        match self {
+            Self::GetLastError
+            | Self::SetLastError
+            | Self::GetCurrentThreadId
+            | Self::GetCurrentThread => WorkerCategory::ThreadState,
+            Self::GetCurrentProcessId | Self::GetCurrentProcess => WorkerCategory::Identity,
+            Self::GetTickCount
+            | Self::GetTickCount64
+            | Self::QueryPerformanceCounter
+            | Self::QueryPerformanceFrequency
+            | Self::GetSystemTimeAsFileTime
+            | Self::GetSystemTimePreciseAsFileTime
+            | Self::GetTimeZoneInformation
+            | Self::GetSystemTime => WorkerCategory::Clock,
+            Self::GetVersion | Self::GetVersionExW | Self::GetVersionExA => WorkerCategory::Version,
+            Self::IsWow64Process
+            | Self::GetSystemInfo
+            | Self::GetNativeSystemInfo
+            | Self::IsProcessorFeaturePresent
+            | Self::GetComputerNameW => WorkerCategory::SystemInfo,
+            Self::GlobalMemoryStatusEx => WorkerCategory::MemoryStatus,
+            Self::CharNextW
+            | Self::CharPrevW
+            | Self::StrFromTimeIntervalW
+            | Self::Strlen
+            | Self::LstrlenW
+            | Self::LstrcmpW
+            | Self::LstrcmpiW
+            | Self::CompareStringW
+            | Self::MultiByteToWideChar
+            | Self::WideCharToMultiByte => WorkerCategory::StringConversion,
+            Self::GetACP
+            | Self::GetOEMCP
+            | Self::GetCPInfo
+            | Self::IsValidCodePage
+            | Self::LocaleNameToLCID
+            | Self::GetDateFormatW
+            | Self::GetTimeFormatW => WorkerCategory::Nls,
+            Self::GetProcessHeap | Self::GetProcessHeaps | Self::HeapSize => WorkerCategory::Heap,
+            Self::GetEnvironmentVariableW => WorkerCategory::Environment,
+            Self::RegQueryValueExA | Self::RegQueryValueExW => WorkerCategory::Registry,
+            Self::GetFileAttributesW
+            | Self::GetFileAttributesA
+            | Self::GetFileAttributesExW
+            | Self::GetFileSize
+            | Self::GetFileSizeEx => WorkerCategory::FileSystem,
+            Self::TlsGetValue | Self::FlsGetValue => WorkerCategory::Tls,
+            Self::InterlockedIncrement
+            | Self::InterlockedDecrement
+            | Self::InterlockedExchangeAdd => WorkerCategory::Interlocked,
+            Self::GetExitCodeThread | Self::GetExitCodeProcess | Self::GetThreadPriority => {
+                WorkerCategory::ObjectStatus
+            }
+        }
+    }
+}
+
+/// Why a worker could not reproduce the owner's semantics for one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerFallback {
+    LockContention,
+    GuestMemoryWrite,
+    UnsupportedInput,
+}
+
+impl WorkerFallback {
+    pub(crate) const fn barrier_reason(self) -> BarrierReason {
+        match self {
+            Self::LockContention => BarrierReason::LockContention,
+            Self::GuestMemoryWrite => BarrierReason::GuestMemoryWrite,
+            Self::UnsupportedInput => BarrierReason::UnsupportedInput,
+        }
+    }
+}
+
+thread_local! {
+    /// The first concrete reason a worker path failed.  Helpers mark it at the
+    /// exact failing step; `execute` keeps returning `bool`, so a `false`
+    /// carries the precise cause to the dispatcher.
+    static WORKER_FALLBACK: Cell<Option<WorkerFallback>> = const { Cell::new(None) };
+}
+
+pub(super) fn mark_fallback(reason: WorkerFallback) {
+    WORKER_FALLBACK.with(|slot| {
+        if slot.get().is_none() {
+            slot.set(Some(reason));
+        }
+    });
+}
+
+fn take_fallback() -> WorkerFallback {
+    WORKER_FALLBACK.with(|slot| slot.take().unwrap_or(WorkerFallback::UnsupportedInput))
+}
+
+fn clear_fallback() {
+    WORKER_FALLBACK.with(|slot| slot.set(None));
 }
 
 /// Map a registered host thunk to its worker implementation, if it has one.
@@ -159,6 +283,21 @@ pub(crate) fn worker_api(thunk: &HostThunk) -> Option<WorkerApi> {
         HostThunk::GetEnvironmentVariableW => WorkerApi::GetEnvironmentVariableW,
         HostThunk::RegQueryValueExA => WorkerApi::RegQueryValueExA,
         HostThunk::RegQueryValueExW => WorkerApi::RegQueryValueExW,
+        HostThunk::GetFileAttributesW => WorkerApi::GetFileAttributesW,
+        HostThunk::GetFileAttributesA => WorkerApi::GetFileAttributesA,
+        HostThunk::GetFileAttributesExW => WorkerApi::GetFileAttributesExW,
+        HostThunk::GetFileSize => WorkerApi::GetFileSize,
+        HostThunk::GetFileSizeEx => WorkerApi::GetFileSizeEx,
+        HostThunk::GetSystemTime => WorkerApi::GetSystemTime,
+        HostThunk::GetComputerNameW => WorkerApi::GetComputerNameW,
+        HostThunk::TlsGetValue => WorkerApi::TlsGetValue,
+        HostThunk::FlsGetValue => WorkerApi::FlsGetValue,
+        HostThunk::InterlockedIncrement => WorkerApi::InterlockedIncrement,
+        HostThunk::InterlockedDecrement => WorkerApi::InterlockedDecrement,
+        HostThunk::InterlockedExchangeAdd => WorkerApi::InterlockedExchangeAdd,
+        HostThunk::GetExitCodeThread => WorkerApi::GetExitCodeThread,
+        HostThunk::GetExitCodeProcess => WorkerApi::GetExitCodeProcess,
+        HostThunk::GetThreadPriority => WorkerApi::GetThreadPriority,
         _ => return None,
     })
 }
@@ -168,10 +307,27 @@ pub(crate) fn thunk_class(thunk: &HostThunk) -> ThunkConcurrency {
     worker_api(thunk).map_or(ThunkConcurrency::OwnerOnly, WorkerApi::class)
 }
 
+/// Why a lock-free guest-memory operation could not be serviced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicGuestError {
+    /// The view has no lock-free primitive (fall back to the owner).
+    Unavailable,
+    /// The address range is not mapped for atomic access.
+    Fault,
+}
+
 /// A worker-safe view of guest memory.
 pub(crate) trait WorkerMemoryView {
     fn load(&self, address: u64, len: usize) -> Option<u64>;
     fn store(&self, address: u64, bytes: &[u8]) -> bool;
+
+    /// Lock-free 32-bit fetch-add; returns the PREVIOUS value.  Views that
+    /// cannot guarantee atomicity return [`AtomicGuestError::Unavailable`] so
+    /// the thunk falls back to the owner barrier instead of guessing.
+    fn atomic_fetch_add_u32(&self, address: u64, value: u32) -> Result<u32, AtomicGuestError> {
+        let _ = (address, value);
+        Err(AtomicGuestError::Unavailable)
+    }
 }
 
 impl WorkerMemoryView for GuestSliceMemory {
@@ -181,6 +337,12 @@ impl WorkerMemoryView for GuestSliceMemory {
 
     fn store(&self, address: u64, bytes: &[u8]) -> bool {
         GuestSliceMemory::store(self, address, bytes).is_ok()
+    }
+
+    fn atomic_fetch_add_u32(&self, address: u64, value: u32) -> Result<u32, AtomicGuestError> {
+        self.atomic_fetch_add(address, u64::from(value), 4)
+            .map(|(previous, _)| previous as u32)
+            .map_err(|_| AtomicGuestError::Fault)
     }
 }
 
@@ -197,22 +359,35 @@ pub(crate) fn invoke_parallel_api(
     memory: &dyn WorkerMemoryView,
     entry: &super::super::ParallelThunk,
 ) -> bool {
+    try_invoke_parallel_api(shared, context, memory, entry).is_ok()
+}
+
+/// Execute `entry` on the calling worker, reporting the exact fallback reason
+/// when the owner barrier is required.
+pub(crate) fn try_invoke_parallel_api(
+    shared: &ProcessShared,
+    context: &mut GuestThreadContext,
+    memory: &dyn WorkerMemoryView,
+    entry: &super::super::ParallelThunk,
+) -> Result<(), WorkerFallback> {
+    clear_fallback();
     let Some(api) = entry.api else {
-        return false;
+        return Err(WorkerFallback::UnsupportedInput);
     };
     let rsp = context.state.get(Register::Rsp);
     if rsp == 0 {
-        return false;
+        return Err(WorkerFallback::UnsupportedInput);
     }
     let pointer_bytes = context.state.arch.pointer_bytes() as u64;
     let Some(return_address) = memory.load(rsp, pointer_bytes as usize) else {
-        return false;
+        mark_fallback(WorkerFallback::UnsupportedInput);
+        return Err(take_fallback());
     };
     context
         .state
         .set(Register::Rsp, rsp.wrapping_add(pointer_bytes));
     if !execute(api, shared, context, memory) {
-        return false;
+        return Err(take_fallback());
     }
     if context.state.arch == GuestArch::X86 {
         context.state.set(
@@ -224,7 +399,7 @@ pub(crate) fn invoke_parallel_api(
         );
     }
     context.state.rip = return_address;
-    true
+    Ok(())
 }
 
 fn execute(
@@ -261,7 +436,9 @@ fn execute(
             true
         }
         WorkerApi::GetCurrentProcessId => {
-            let identity = shared.identity_snapshot();
+            let Some(identity) = shared.worker_identity_snapshot() else {
+                return false;
+            };
             context
                 .state
                 .set(Register::Rax, u64::from(identity.process_id));
@@ -269,7 +446,9 @@ fn execute(
             true
         }
         WorkerApi::GetCurrentProcess => {
-            let identity = shared.identity_snapshot();
+            let Some(identity) = shared.worker_identity_snapshot() else {
+                return false;
+            };
             context
                 .state
                 .set(Register::Rax, u64::from(identity.process_handle));
@@ -277,7 +456,9 @@ fn execute(
             true
         }
         WorkerApi::GetTickCount => {
-            let clock = shared.clock_snapshot();
+            let Some(clock) = shared.worker_clock_snapshot() else {
+                return false;
+            };
             context.state.set(
                 Register::Rax,
                 clock.clock.tick_count64() & u64::from(u32::MAX),
@@ -286,7 +467,9 @@ fn execute(
             true
         }
         WorkerApi::GetTickCount64 => {
-            let clock = shared.clock_snapshot();
+            let Some(clock) = shared.worker_clock_snapshot() else {
+                return false;
+            };
             context.state.set(Register::Rax, clock.clock.tick_count64());
             context.last_error = 0;
             true
@@ -299,7 +482,9 @@ fn execute(
                 context.state.set(Register::Rax, 0);
                 context.last_error = ERROR_INVALID_PARAMETER;
             } else {
-                let clock = shared.clock_snapshot();
+                let Some(clock) = shared.worker_clock_snapshot() else {
+                    return false;
+                };
                 if !write_u64(
                     memory,
                     pointer,
@@ -320,7 +505,9 @@ fn execute(
                 context.state.set(Register::Rax, 0);
                 context.last_error = ERROR_INVALID_PARAMETER;
             } else {
-                let clock = shared.clock_snapshot();
+                let Some(clock) = shared.worker_clock_snapshot() else {
+                    return false;
+                };
                 if !write_u64(
                     memory,
                     pointer,
@@ -337,7 +524,9 @@ fn execute(
             let Some(pointer) = read_arg(context, memory, 0) else {
                 return false;
             };
-            let clock = shared.clock_snapshot();
+            let Some(clock) = shared.worker_clock_snapshot() else {
+                return false;
+            };
             let ticks = if clock.dtm {
                 WINDOWS_EPOCH_OFFSET_100NS
                     .saturating_add(clock.deterministic_tick_ms.saturating_mul(10_000))
@@ -355,7 +544,9 @@ fn execute(
             let Some(pointer) = read_arg(context, memory, 0) else {
                 return false;
             };
-            let clock = shared.clock_snapshot();
+            let Some(clock) = shared.worker_clock_snapshot() else {
+                return false;
+            };
             let ticks = clock.clock.system_time_precise_file_time();
             if pointer != 0 && !write_u64(memory, pointer, ticks) {
                 return false;
@@ -365,7 +556,10 @@ fn execute(
             true
         }
         WorkerApi::GetVersion => {
-            let Some(version) = shared.version_snapshot() else {
+            let Some(version) = shared.worker_version_snapshot() else {
+                return false;
+            };
+            let Some(version) = version else {
                 return false;
             };
             let packed = (version.build << 16)
@@ -380,7 +574,10 @@ fn execute(
             let Some(pointer) = read_arg(context, memory, 0) else {
                 return false;
             };
-            let Some(version) = shared.version_snapshot() else {
+            let Some(version) = shared.worker_version_snapshot() else {
+                return false;
+            };
+            let Some(version) = version else {
                 return false;
             };
             if pointer == 0 {
@@ -394,7 +591,10 @@ fn execute(
             let Some(pointer) = read_arg(context, memory, 0) else {
                 return false;
             };
-            let Some(version) = shared.version_snapshot() else {
+            let Some(version) = shared.worker_version_snapshot() else {
+                return false;
+            };
+            let Some(version) = version else {
                 return false;
             };
             if pointer == 0 {
@@ -445,7 +645,10 @@ fn execute(
                 context.last_error = ERROR_INVALID_PARAMETER;
                 return true;
             }
-            let Some(status) = shared.memory_status_snapshot() else {
+            let Some(status) = shared.worker_memory_status_snapshot() else {
+                return false;
+            };
+            let Some(status) = status else {
                 return false;
             };
             let total_virt: u64 = 2 * 1024 * 1024 * 1024;
@@ -675,7 +878,9 @@ fn execute(
                 };
                 bytes
             };
-            let locale = shared.locale_snapshot();
+            let Some(locale) = shared.worker_locale_snapshot() else {
+                return false;
+            };
             let converted = multi_byte_to_wide(normalized_code_page, &multi_bytes, locale);
             match converted {
                 Conversion::Value(wide_units) => {
@@ -749,7 +954,9 @@ fn execute(
                 };
                 units
             };
-            let locale = shared.locale_snapshot();
+            let Some(locale) = shared.worker_locale_snapshot() else {
+                return false;
+            };
             let converted = wide_to_multi_byte(normalized_code_page, &wide_units, locale);
             match converted {
                 Conversion::Value(encoded) => {
@@ -778,16 +985,18 @@ fn execute(
             }
         }
         WorkerApi::GetACP => {
-            context
-                .state
-                .set(Register::Rax, u64::from(shared.locale_snapshot().acp));
+            let Some(locale) = shared.worker_locale_snapshot() else {
+                return false;
+            };
+            context.state.set(Register::Rax, u64::from(locale.acp));
             context.last_error = 0;
             true
         }
         WorkerApi::GetOEMCP => {
-            context
-                .state
-                .set(Register::Rax, u64::from(shared.locale_snapshot().oemcp));
+            let Some(locale) = shared.worker_locale_snapshot() else {
+                return false;
+            };
+            context.state.set(Register::Rax, u64::from(locale.oemcp));
             context.last_error = 0;
             true
         }
@@ -871,10 +1080,10 @@ fn execute(
                 return false;
             };
             let size = if heap == PROCESS_HEAP_HANDLE {
-                shared
-                    .heap_snapshot()
-                    .get(&address)
-                    .map(|size| *size as u64)
+                let Some(heap_snapshot) = shared.worker_heap_snapshot() else {
+                    return false;
+                };
+                heap_snapshot.get(&address).map(|size| *size as u64)
             } else {
                 None
             };
@@ -894,7 +1103,10 @@ fn execute(
             let Some([time_zone_information_ptr]) = read_args::<1>(context, memory) else {
                 return false;
             };
-            let dtm = shared.clock_snapshot().dtm;
+            let Some(clock) = shared.worker_clock_snapshot() else {
+                return false;
+            };
+            let dtm = clock.dtm;
             let info = current_host_time_zone_information(dtm);
             if time_zone_information_ptr != 0
                 && !write_time_zone_information_worker(memory, time_zone_information_ptr, &info)
@@ -1039,7 +1251,9 @@ fn execute(
             let Some(name) = read_utf16_lossy(memory, name_ptr) else {
                 return false;
             };
-            let environment = shared.environment_snapshot();
+            let Some(environment) = shared.worker_environment_snapshot() else {
+                return false;
+            };
             let value = environment
                 .iter()
                 .find(|(key, _)| key.eq_ignore_ascii_case(&name))
@@ -1075,7 +1289,484 @@ fn execute(
         WorkerApi::RegQueryValueExA | WorkerApi::RegQueryValueExW => {
             query_registry_value(api, shared, context, memory)
         }
+        WorkerApi::GetFileAttributesW => {
+            let Some(path_ptr) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            let Some(raw_path) = read_utf16_lossy(memory, path_ptr) else {
+                return false;
+            };
+            if raw_path.is_empty() {
+                context.state.set(Register::Rax, INVALID_FILE_ATTRIBUTES);
+                context.last_error = ERROR_PATH_NOT_FOUND;
+                return true;
+            }
+            if !is_canonical_guest_absolute(&raw_path) {
+                return false;
+            }
+            let Some(files) = shared.worker_filesystem_snapshot() else {
+                return false;
+            };
+            let Some(metadata) = files.entries.get(&raw_path) else {
+                return false;
+            };
+            context.state.set(
+                Register::Rax,
+                u64::from(attributes_mask_w(&metadata.attributes)),
+            );
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetFileAttributesA => {
+            let Some(path_ptr) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            let Some(raw_path) = read_c_string_lossy(memory, path_ptr) else {
+                return false;
+            };
+            if raw_path.is_empty() {
+                context.state.set(Register::Rax, INVALID_FILE_ATTRIBUTES);
+                context.last_error = ERROR_PATH_NOT_FOUND;
+                return true;
+            }
+            if !is_canonical_guest_absolute(&raw_path) {
+                return false;
+            }
+            let Some(files) = shared.worker_filesystem_snapshot() else {
+                return false;
+            };
+            let Some(metadata) = files.entries.get(&raw_path) else {
+                return false;
+            };
+            context.state.set(
+                Register::Rax,
+                u64::from(attributes_mask_a(&metadata.attributes)),
+            );
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetFileAttributesExW => {
+            let Some([path_ptr, info_level, information_ptr]) = read_args::<3>(context, memory)
+            else {
+                return false;
+            };
+            let Some(raw_path) = read_utf16_lossy(memory, path_ptr) else {
+                return false;
+            };
+            if raw_path.is_empty() {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_PATH_NOT_FOUND;
+                return true;
+            }
+            if info_level != 0 {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            if !is_canonical_guest_absolute(&raw_path) {
+                return false;
+            }
+            let Some(files) = shared.worker_filesystem_snapshot() else {
+                return false;
+            };
+            let Some(metadata) = files.entries.get(&raw_path) else {
+                return false;
+            };
+            if information_ptr != 0
+                && !write_file_attribute_data_worker(memory, information_ptr, metadata)
+            {
+                return false;
+            }
+            context.state.set(Register::Rax, 1);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetFileSize => {
+            let Some([handle, high_ptr]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            let handle = handle as u32;
+            if handle == 0 {
+                context.state.set(Register::Rax, u64::from(u32::MAX));
+                context.last_error = ERROR_INVALID_HANDLE;
+                return true;
+            }
+            let Some(files) = shared.worker_filesystem_snapshot() else {
+                return false;
+            };
+            let Some(size) = files.sizes.get(&handle).copied() else {
+                return false;
+            };
+            if high_ptr != 0 && !write_u32(memory, high_ptr, (size >> 32) as u32) {
+                return false;
+            }
+            context.state.set(Register::Rax, (size as u32) as u64);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetFileSizeEx => {
+            let Some([handle, size_ptr]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            let Some(files) = shared.worker_filesystem_snapshot() else {
+                return false;
+            };
+            let Some(size) = files.sizes.get(&(handle as u32)).copied() else {
+                return false;
+            };
+            if size_ptr != 0 && !write_pointer(memory, size_ptr, size, context.state.arch) {
+                return false;
+            }
+            // The owner preserves last-error on success for GetFileSizeEx.
+            context.state.set(Register::Rax, 1);
+            true
+        }
+        WorkerApi::GetSystemTime => {
+            let Some(system_time_ptr) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            if system_time_ptr == 0 {
+                return true;
+            }
+            let (year, month, day, hour, minute, second, millis) = host_utc_components();
+            if !write_u16(memory, system_time_ptr, year)
+                || !write_u16(memory, system_time_ptr + 2, month)
+                || !write_u16(memory, system_time_ptr + 4, 0)
+                || !write_u16(memory, system_time_ptr + 6, day)
+                || !write_u16(memory, system_time_ptr + 8, hour)
+                || !write_u16(memory, system_time_ptr + 10, minute)
+                || !write_u16(memory, system_time_ptr + 12, second)
+                || !write_u16(memory, system_time_ptr + 14, millis)
+            {
+                return false;
+            }
+            // The owner preserves last-error on GetSystemTime success.
+            true
+        }
+        WorkerApi::GetComputerNameW => {
+            let Some([buffer_ptr, size_ptr]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            if size_ptr == 0 {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            let Some(buffer_size) = read_u32(memory, size_ptr) else {
+                return false;
+            };
+            let Some(result) =
+                write_utf16_api_string_worker(memory, buffer_ptr, buffer_size, "CASA1")
+            else {
+                return false;
+            };
+            if !write_u32(memory, size_ptr, result + 1) {
+                return false;
+            }
+            if buffer_size > 0 && result >= buffer_size {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_MORE_DATA;
+            } else {
+                context.state.set(Register::Rax, 1);
+                context.last_error = 0;
+            }
+            true
+        }
+        WorkerApi::TlsGetValue => {
+            let Some(slot) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            let slot = slot as u32;
+            if slot >= 4096 {
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_PARAMETER;
+                return true;
+            }
+            let value = if context.tls_vector_ptr != 0 {
+                let pointer_bytes = context.state.arch.pointer_bytes() as u64;
+                let address = context
+                    .tls_vector_ptr
+                    .wrapping_add(u64::from(slot) * pointer_bytes);
+                let Some(value) = memory.load(address, context.state.arch.pointer_bytes()) else {
+                    return false;
+                };
+                value
+            } else {
+                context.tls_slots.get(&slot).copied().unwrap_or(0)
+            };
+            context.state.set(Register::Rax, value);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::FlsGetValue => {
+            let Some(slot) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            match context.fls_slots.get(&(slot as u32)).copied() {
+                Some(value) => {
+                    context.state.set(Register::Rax, value);
+                    context.last_error = 0;
+                }
+                None => {
+                    context.state.set(Register::Rax, 0);
+                    context.last_error = ERROR_INVALID_PARAMETER;
+                }
+            }
+            true
+        }
+        WorkerApi::InterlockedIncrement
+        | WorkerApi::InterlockedDecrement
+        | WorkerApi::InterlockedExchangeAdd => {
+            let Some([destination, operand]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            let addend = match api {
+                WorkerApi::InterlockedIncrement => 1,
+                WorkerApi::InterlockedDecrement => u32::MAX,
+                _ => operand as u32,
+            };
+            match memory.atomic_fetch_add_u32(destination, addend) {
+                Ok(previous) => {
+                    let result = match api {
+                        WorkerApi::InterlockedIncrement => previous.wrapping_add(1),
+                        WorkerApi::InterlockedDecrement => previous.wrapping_sub(1),
+                        _ => previous,
+                    };
+                    context.state.set(Register::Rax, u64::from(result));
+                    context.last_error = 0;
+                    true
+                }
+                Err(AtomicGuestError::Fault) => {
+                    // The owner reports an unmapped destination as
+                    // ERROR_INVALID_PARAMETER and returns 0.
+                    context.state.set(Register::Rax, 0);
+                    context.last_error = ERROR_INVALID_PARAMETER;
+                    true
+                }
+                Err(AtomicGuestError::Unavailable) => false,
+            }
+        }
+        WorkerApi::GetExitCodeThread => {
+            let Some([handle, exit_code_ptr]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            let handle = handle as u32;
+            if handle == 0 {
+                if exit_code_ptr != 0 && !write_u32(memory, exit_code_ptr, 0) {
+                    return false;
+                }
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_HANDLE;
+                return true;
+            }
+            let Some(objects) = shared.worker_object_status_snapshot() else {
+                return false;
+            };
+            let Some(exit_code) = objects.thread_exit_codes.get(&handle).copied() else {
+                return false;
+            };
+            if exit_code_ptr != 0 && !write_u32(memory, exit_code_ptr, exit_code) {
+                return false;
+            }
+            context.state.set(Register::Rax, 1);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetExitCodeProcess => {
+            let Some([handle, exit_code_ptr]) = read_args::<2>(context, memory) else {
+                return false;
+            };
+            let handle = handle as u32;
+            if handle == 0 {
+                if exit_code_ptr != 0 && !write_u32(memory, exit_code_ptr, 0) {
+                    return false;
+                }
+                context.state.set(Register::Rax, 0);
+                context.last_error = ERROR_INVALID_HANDLE;
+                return true;
+            }
+            let Some(objects) = shared.worker_object_status_snapshot() else {
+                return false;
+            };
+            let Some(exit_code) = objects.process_exit_codes.get(&handle).copied() else {
+                return false;
+            };
+            if exit_code_ptr != 0 && !write_u32(memory, exit_code_ptr, exit_code) {
+                return false;
+            }
+            context.state.set(Register::Rax, 1);
+            context.last_error = 0;
+            true
+        }
+        WorkerApi::GetThreadPriority => {
+            let Some(handle) = read_arg(context, memory, 0) else {
+                return false;
+            };
+            let handle = handle as u32;
+            if handle == 0 {
+                context.state.set(Register::Rax, u64::from(u32::MAX));
+                context.last_error = ERROR_INVALID_HANDLE;
+                return true;
+            }
+            let Some(objects) = shared.worker_object_status_snapshot() else {
+                return false;
+            };
+            let Some(priority) = objects.thread_priorities.get(&handle).copied() else {
+                return false;
+            };
+            context.state.set(Register::Rax, priority as u64);
+            context.last_error = 0;
+            true
+        }
     }
+}
+
+const INVALID_FILE_ATTRIBUTES: u64 = u32::MAX as u64;
+
+/// The owner resolves a drive-absolute path to itself.  Only that exact form
+/// is serviced on the worker; relative/UNC/`.`/`..`/duplicate-separator input
+/// falls back so the owner's resolver stays authoritative.
+fn is_canonical_guest_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return false;
+    }
+    if bytes.len() == 3 {
+        return true;
+    }
+    if path.contains('/') || path.ends_with('\\') || path.contains("\\\\") {
+        return false;
+    }
+    !path
+        .split('\\')
+        .skip(1)
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+}
+
+fn attributes_mask_w(attributes: &[String]) -> u32 {
+    let mut raw = 0_u32;
+    for attribute in attributes {
+        match attribute.as_str() {
+            "directory" => raw |= FILE_ATTRIBUTE_DIRECTORY,
+            "readonly" => raw |= FILE_ATTRIBUTE_READONLY,
+            "hidden" => raw |= 0x0000_0002,
+            "system" => raw |= 0x0000_0004,
+            "archive" => raw |= 0x0000_0020,
+            "reparse_point" => raw |= 0x0000_0400,
+            _ => {}
+        }
+    }
+    if raw == 0 { FILE_ATTRIBUTE_NORMAL } else { raw }
+}
+
+fn attributes_mask_a(attributes: &[String]) -> u32 {
+    let mut raw = 0x80_u32; // FILE_ATTRIBUTE_NORMAL
+    for attribute in attributes {
+        match attribute.as_str() {
+            "readonly" => raw |= 0x01,
+            "hidden" => raw |= 0x02,
+            "system" => raw |= 0x04,
+            "directory" => raw |= 0x10,
+            "archive" => raw |= 0x20,
+            "device" => raw |= 0x40,
+            "temporary" => raw |= 0x100,
+            "compressed" => raw |= 0x800,
+            "offline" => raw |= 0x1000,
+            _ => {}
+        }
+    }
+    raw
+}
+
+fn filetime_worker(memory: &dyn WorkerMemoryView, address: u64, ticks: u64) -> bool {
+    write_u32(memory, address, ticks as u32) && write_u32(memory, address + 4, (ticks >> 32) as u32)
+}
+
+fn write_file_attribute_data_worker(
+    memory: &dyn WorkerMemoryView,
+    address: u64,
+    data: &super::WorkerFileMetadata,
+) -> bool {
+    let attributes = if data.is_directory {
+        attributes_mask_w(&data.attributes) | FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        attributes_mask_w(&data.attributes)
+    };
+    write_u32(memory, address, attributes)
+        && filetime_worker(memory, address + 4, data.creation_time_ticks)
+        && filetime_worker(memory, address + 12, data.last_access_time_ticks)
+        && filetime_worker(memory, address + 20, data.last_write_time_ticks)
+        && write_u32(memory, address + 28, (data.size >> 32) as u32)
+        && write_u32(memory, address + 32, data.size as u32)
+}
+
+/// Mirrors `write_utf16_api_string`: size-query/truncation/success contract.
+fn write_utf16_api_string_worker(
+    memory: &dyn WorkerMemoryView,
+    buffer: u64,
+    size: u32,
+    value: &str,
+) -> Option<u32> {
+    let units: Vec<u16> = value.encode_utf16().collect();
+    let required_without_nul = units.len() as u32;
+    let required_with_nul = required_without_nul + 1;
+    if buffer != 0 && size != 0 {
+        let copy_units = units.len().min(size.saturating_sub(1) as usize);
+        let mut bytes = vec![0_u8; (copy_units + 1) * 2];
+        for (index, unit) in units.iter().take(copy_units).enumerate() {
+            bytes[index * 2..index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        if !write_bytes(memory, buffer, &bytes) {
+            return None;
+        }
+    }
+    Some(if size <= required_without_nul {
+        required_with_nul
+    } else {
+        required_without_nul
+    })
+}
+
+fn host_utc_components() -> (u16, u16, u16, u16, u16, u16, u16) {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let days = duration.as_secs() / 86_400;
+    let mut year = 1970_i64;
+    let mut remaining = days as i64;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days_in_year = if leap { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days: [i64; 12] = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 1_i64;
+    for days_in_month in month_days {
+        if remaining < days_in_month {
+            break;
+        }
+        remaining -= days_in_month;
+        month += 1;
+    }
+    let secs_of_day = duration.as_secs() % 86_400;
+    (
+        year as u16,
+        month as u16,
+        (remaining + 1) as u16,
+        (secs_of_day / 3_600) as u16,
+        ((secs_of_day % 3_600) / 60) as u16,
+        (secs_of_day % 60) as u16,
+        (duration.as_millis() % 1000) as u16,
+    )
 }
 
 fn take_utf16_prefix(text: String, length: i32) -> String {
@@ -1371,7 +2062,11 @@ fn read_c_string_lossy(memory: &dyn WorkerMemoryView, address: u64) -> Option<St
     let mut bytes = Vec::new();
     let mut cursor = address;
     loop {
-        let byte = memory.load(cursor, 1)? as u8;
+        let Some(byte) = memory.load(cursor, 1) else {
+            mark_fallback(WorkerFallback::UnsupportedInput);
+            return None;
+        };
+        let byte = byte as u8;
         if byte == 0 {
             break;
         }
@@ -1388,7 +2083,11 @@ fn read_utf16_lossy(memory: &dyn WorkerMemoryView, address: u64) -> Option<Strin
     let mut units = Vec::new();
     let mut cursor = address;
     loop {
-        let unit = memory.load(cursor, 2)? as u16;
+        let Some(unit) = memory.load(cursor, 2) else {
+            mark_fallback(WorkerFallback::UnsupportedInput);
+            return None;
+        };
+        let unit = unit as u16;
         if unit == 0 {
             break;
         }
@@ -1405,7 +2104,11 @@ fn read_utf16_units(
 ) -> Option<Vec<u16>> {
     let mut units = Vec::with_capacity(length);
     for index in 0..length {
-        units.push(memory.load(address.wrapping_add((index as u64) * 2), 2)? as u16);
+        let Some(unit) = memory.load(address.wrapping_add((index as u64) * 2), 2) else {
+            mark_fallback(WorkerFallback::UnsupportedInput);
+            return None;
+        };
+        units.push(unit as u16);
     }
     Some(units)
 }
@@ -1415,7 +2118,10 @@ fn read_raw(memory: &dyn WorkerMemoryView, address: u64, length: usize) -> Optio
     let mut offset = 0usize;
     while offset < length {
         let chunk = (length - offset).min(8);
-        let value = memory.load(address.wrapping_add(offset as u64), chunk)?;
+        let Some(value) = memory.load(address.wrapping_add(offset as u64), chunk) else {
+            mark_fallback(WorkerFallback::UnsupportedInput);
+            return None;
+        };
         for index in 0..chunk {
             bytes.push((value >> (index * 8)) as u8);
         }
@@ -1620,7 +2326,9 @@ fn query_registry_value(
         };
         name
     };
-    let registry = shared.registry_snapshot();
+    let Some(registry) = shared.worker_registry_snapshot() else {
+        return false;
+    };
     let key = if let Some((hive, base_key)) = root_registry_key(hkey as u32) {
         let view = worker_registry_view(0, context.state.arch);
         let normalized = normalize_registry_runtime_key(hive, base_key);
@@ -1698,7 +2406,7 @@ fn read_arg(
     index: usize,
 ) -> Option<u64> {
     let state = &context.state;
-    match state.arch {
+    let value = match state.arch {
         GuestArch::X64 => match index {
             0 => Some(state.get(Register::Rcx)),
             1 => Some(state.get(Register::Rdx)),
@@ -1710,11 +2418,19 @@ fn read_arg(
             ),
         },
         GuestArch::X86 => memory.load(state.get(Register::Rsp) + (index as u64 * 4), 4),
+    };
+    if value.is_none() {
+        mark_fallback(WorkerFallback::UnsupportedInput);
     }
+    value
 }
 
 fn read_u16(memory: &dyn WorkerMemoryView, address: u64) -> Option<u16> {
-    memory.load(address, 2).map(|value| value as u16)
+    let value = memory.load(address, 2).map(|value| value as u16);
+    if value.is_none() {
+        mark_fallback(WorkerFallback::UnsupportedInput);
+    }
+    value
 }
 
 fn write_bytes(memory: &dyn WorkerMemoryView, address: u64, bytes: &[u8]) -> bool {
@@ -1722,6 +2438,7 @@ fn write_bytes(memory: &dyn WorkerMemoryView, address: u64, bytes: &[u8]) -> boo
     while offset < bytes.len() {
         let end = (offset + 8).min(bytes.len());
         if !memory.store(address + offset as u64, &bytes[offset..end]) {
+            mark_fallback(WorkerFallback::GuestMemoryWrite);
             return false;
         }
         offset = end;
@@ -1812,7 +2529,11 @@ fn write_version_info_a(
 }
 
 fn read_u32(memory: &dyn WorkerMemoryView, address: u64) -> Option<u32> {
-    memory.load(address, 4).map(|value| value as u32)
+    let value = memory.load(address, 4).map(|value| value as u32);
+    if value.is_none() {
+        mark_fallback(WorkerFallback::UnsupportedInput);
+    }
+    value
 }
 
 fn write_system_info(memory: &dyn WorkerMemoryView, pointer: u64, guest_arch: GuestArch) -> bool {
@@ -1864,8 +2585,9 @@ mod tests {
     use crate::cpu::CpuState;
     use crate::ge::StoredRegistryValue;
     use crate::runtime::{
-        GuestThreadContext, ParallelThunk, ProcessShared, WorkerClock, WorkerEnvironment,
-        WorkerIdentity, WorkerLocale, WorkerMemoryStatus, WorkerRegistry, WorkerRegistryKey,
+        BarrierReason, GuestThreadContext, ParallelThunk, ProcessShared, WorkerCategory,
+        WorkerClock, WorkerEnvironment, WorkerFileMetadata, WorkerFileSystem, WorkerIdentity,
+        WorkerLocale, WorkerMemoryStatus, WorkerObjectStatus, WorkerRegistry, WorkerRegistryKey,
         WorkerVersion,
     };
     use serde_json::json;
@@ -1914,6 +2636,17 @@ mod tests {
             }
             slot[..bytes.len()].copy_from_slice(bytes);
             true
+        }
+
+        fn atomic_fetch_add_u32(&self, address: u64, value: u32) -> Result<u32, AtomicGuestError> {
+            let start = usize::try_from(address).map_err(|_| AtomicGuestError::Fault)?;
+            let mut target = self.bytes.borrow_mut();
+            let Some(slot) = target.get_mut(start..start + 4) else {
+                return Err(AtomicGuestError::Fault);
+            };
+            let previous = u32::from_le_bytes(slot.try_into().expect("four bytes"));
+            slot.copy_from_slice(&previous.wrapping_add(value).to_le_bytes());
+            Ok(previous)
         }
     }
 
@@ -1975,6 +2708,42 @@ mod tests {
         registry
     }
 
+    fn filesystem_snapshot() -> WorkerFileSystem {
+        let mut files = WorkerFileSystem::default();
+        files.entries.insert(
+            "C:\\game\\data.bin".to_string(),
+            WorkerFileMetadata {
+                size: 12_345,
+                attributes: vec!["readonly".to_string()],
+                creation_time_ticks: 0x0102_0304_0506_0708,
+                last_access_time_ticks: 0x1112_1314_1516_1718,
+                last_write_time_ticks: 0x2122_2324_2526_2728,
+                is_directory: false,
+            },
+        );
+        files.entries.insert(
+            "C:\\game".to_string(),
+            WorkerFileMetadata {
+                size: 0,
+                attributes: vec!["directory".to_string()],
+                creation_time_ticks: 1,
+                last_access_time_ticks: 2,
+                last_write_time_ticks: 3,
+                is_directory: true,
+            },
+        );
+        files.sizes.insert(0x10, 12_345);
+        files
+    }
+
+    fn object_status_snapshot() -> WorkerObjectStatus {
+        let mut objects = WorkerObjectStatus::default();
+        objects.thread_exit_codes.insert(0x20, 0x1234);
+        objects.process_exit_codes.insert(0x21, 0x5678);
+        objects.thread_priorities.insert(0x22, -2);
+        objects
+    }
+
     fn environment(process_id: u32) -> WorkerEnvironment {
         let mut environment = BTreeMap::new();
         environment.insert("CASA_TEST".to_string(), "value".to_string());
@@ -2012,6 +2781,8 @@ mod tests {
             environment,
             heap,
             registry: registry_with_value("hello"),
+            files: filesystem_snapshot(),
+            objects: object_status_snapshot(),
         }
     }
 
@@ -2494,50 +3265,50 @@ mod tests {
                 let memory = TestMemory::new();
                 prepare_hammer_memory(&memory);
                 while !stop.load(Ordering::Acquire) {
-                    assert_eq!(
-                        invoke(
-                            &shared,
-                            &mut context,
-                            &memory,
-                            HostThunk::GetCurrentProcessId
-                        ),
-                        true
-                    );
+                    // A writer holding the per-subsystem lock makes the worker
+                    // fall back to the owner barrier by design; only inspect
+                    // the value when the worker actually serviced the read.
+                    if !invoke(
+                        &shared,
+                        &mut context,
+                        &memory,
+                        HostThunk::GetCurrentProcessId,
+                    ) {
+                        continue;
+                    }
                     let pid = context.state.get(Register::Rax);
                     assert_eq!(pid == 100 || pid == 101, true);
 
-                    assert_eq!(
-                        invoke_x86(
-                            &shared,
-                            &mut context,
-                            &memory,
-                            HostThunk::GetEnvironmentVariableW,
-                            &[ENV_NAME, ENV_BUFFER, 16],
-                        ),
-                        true
-                    );
+                    if !invoke_x86(
+                        &shared,
+                        &mut context,
+                        &memory,
+                        HostThunk::GetEnvironmentVariableW,
+                        &[ENV_NAME, ENV_BUFFER, 16],
+                    ) {
+                        continue;
+                    }
                     assert_eq!(context.state.get(Register::Rax), 5);
                     let first = memory.load(ENV_BUFFER, 2);
                     assert_eq!(first == Some(0x76) || first == Some(0x6f), true);
 
                     assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
-                    assert_eq!(
-                        invoke_x86(
-                            &shared,
-                            &mut context,
-                            &memory,
-                            HostThunk::RegQueryValueExW,
-                            &[
-                                u64::from(HKEY_CURRENT_USER),
-                                REG_NAME,
-                                0,
-                                REG_TYPE,
-                                REG_BUF,
-                                REG_LEN,
-                            ],
-                        ),
-                        true
-                    );
+                    if !invoke_x86(
+                        &shared,
+                        &mut context,
+                        &memory,
+                        HostThunk::RegQueryValueExW,
+                        &[
+                            u64::from(HKEY_CURRENT_USER),
+                            REG_NAME,
+                            0,
+                            REG_TYPE,
+                            REG_BUF,
+                            REG_LEN,
+                        ],
+                    ) {
+                        continue;
+                    }
                     assert_eq!(context.state.get(Register::Rax), 0);
                     assert_eq!(memory.load(REG_LEN, 4), Some(12));
                     let first = memory.load(REG_BUF, 2);
@@ -4526,5 +5297,977 @@ mod tests {
         );
         assert_eq!(memory.load(0x1A00, 2), Some(0));
         assert_eq!(context.state.get(Register::Rsp), STACK + 4);
+    }
+
+    const W_THREAD_ID: usize = 0;
+    const W_VERSION: usize = 1;
+    const W_ENV: usize = 2;
+    const W_REGISTRY: usize = 3;
+    const W_FILE_EX: usize = 4;
+    const W_FILE_ATTR_W: usize = 5;
+    const W_FILE_ATTR_A: usize = 6;
+    const W_FILE_SIZE_EX: usize = 7;
+    const W_FILE_SIZE: usize = 8;
+    const W_COMPUTER_NAME: usize = 9;
+    const W_TLS: usize = 10;
+    const W_FLS: usize = 11;
+    const W_EXIT_THREAD: usize = 12;
+    const W_EXIT_PROCESS: usize = 13;
+    const W_THREAD_PRIORITY: usize = 14;
+    const W_INTERLOCKED: usize = 15;
+    const W_OWNER_ONLY: usize = 16;
+    const W_COUNT: usize = 17;
+
+    const W_FILE_PATH: u64 = 0x1F00;
+    const W_DIR_PATH: u64 = 0x1F40;
+    const W_ANSI_FILE_PATH: u64 = 0x1F80;
+    const W_ATTR_OUT: u64 = 0x1E00;
+    const W_SIZE_OUT: u64 = 0x1E80;
+    const W_HIGH_OUT: u64 = 0x1E84;
+    const W_COMPUTER_BUF: u64 = 0x1E90;
+    const W_COMPUTER_LEN: u64 = 0x1EC0;
+    const W_EXIT_THREAD_OUT: u64 = 0x1EC4;
+    const W_EXIT_PROCESS_OUT: u64 = 0x1EC8;
+    const W_INTERLOCKED_CELL: u64 = 0x1ED0;
+
+    fn workload_thunk(index: usize) -> HostThunk {
+        match index {
+            W_THREAD_ID => HostThunk::GetCurrentThreadId,
+            W_VERSION => HostThunk::GetVersion,
+            W_ENV => HostThunk::GetEnvironmentVariableW,
+            W_REGISTRY => HostThunk::RegQueryValueExW,
+            W_FILE_EX => HostThunk::GetFileAttributesExW,
+            W_FILE_ATTR_W => HostThunk::GetFileAttributesW,
+            W_FILE_ATTR_A => HostThunk::GetFileAttributesA,
+            W_FILE_SIZE_EX => HostThunk::GetFileSizeEx,
+            W_FILE_SIZE => HostThunk::GetFileSize,
+            W_COMPUTER_NAME => HostThunk::GetComputerNameW,
+            W_TLS => HostThunk::TlsGetValue,
+            W_FLS => HostThunk::FlsGetValue,
+            W_EXIT_THREAD => HostThunk::GetExitCodeThread,
+            W_EXIT_PROCESS => HostThunk::GetExitCodeProcess,
+            W_THREAD_PRIORITY => HostThunk::GetThreadPriority,
+            W_INTERLOCKED => HostThunk::InterlockedIncrement,
+            W_OWNER_ONLY => HostThunk::CreateFileW,
+            _ => HostThunk::GetLastError,
+        }
+    }
+
+    fn workload_address(thread: u32, index: usize) -> u64 {
+        0x4000 + u64::from(thread) * 0x100 + index as u64 * 8
+    }
+
+    fn publish_workload(shared: &ProcessShared, thread: u32) {
+        for index in 0..W_COUNT {
+            shared.publish_thunk(workload_address(thread, index), &workload_thunk(index));
+        }
+    }
+
+    fn prepare_workload_memory(memory: &TestMemory) {
+        prepare_hammer_memory(memory);
+        store_utf16(memory, W_FILE_PATH, "C:\\game\\data.bin");
+        store_utf16(memory, W_DIR_PATH, "C:\\game");
+        store_ascii(memory, W_ANSI_FILE_PATH, "C:\\game\\data.bin");
+        assert_eq!(memory.store(W_INTERLOCKED_CELL, &5_u32.to_le_bytes()), true);
+        assert_eq!(memory.store(W_COMPUTER_LEN, &16_u32.to_le_bytes()), true);
+    }
+
+    /// Call a pre-published thunk without touching the dispatch table, so the
+    /// measurement loop measures the API dispatch path with no writer traffic.
+    fn call_published(
+        shared: &ProcessShared,
+        context: &mut GuestThreadContext,
+        memory: &TestMemory,
+        thread: u32,
+        index: usize,
+        args: &[u64],
+    ) -> bool {
+        context.state.set(Register::Rsp, STACK);
+        for (arg_index, value) in args.iter().enumerate() {
+            set_x86_arg(memory, arg_index as u64, *value as u32);
+        }
+        let pointer = context.state.arch.pointer_bytes() as u64;
+        let pushed = STACK - pointer;
+        assert_eq!(
+            memory.store(pushed, &RETURN_ADDRESS.to_le_bytes()[..pointer as usize]),
+            true
+        );
+        context.state.set(Register::Rsp, pushed);
+        context.state.rip = workload_address(thread, index);
+        let executed = shared.run_worker_api(context, memory, workload_address(thread, index));
+        if !executed {
+            context.state.set(Register::Rsp, STACK);
+        }
+        executed
+    }
+
+    fn mixed_workload(
+        shared: &ProcessShared,
+        context: &mut GuestThreadContext,
+        memory: &TestMemory,
+        thread: u32,
+    ) -> Vec<(u64, u32)> {
+        let mut results = Vec::with_capacity(W_COUNT);
+        macro_rules! record {
+            ($index:expr, $args:expr) => {{
+                let executed = call_published(shared, context, memory, thread, $index, $args);
+                if executed {
+                    results.push((context.state.get(Register::Rax), context.last_error));
+                } else {
+                    results.push((0xDEAD, 0xDEAD));
+                }
+            }};
+        }
+        record!(W_THREAD_ID, &[]);
+        record!(W_VERSION, &[]);
+        record!(W_ENV, &[ENV_NAME, ENV_BUFFER, 16]);
+        assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+        record!(
+            W_REGISTRY,
+            &[
+                u64::from(HKEY_CURRENT_USER),
+                REG_NAME,
+                0,
+                REG_TYPE,
+                REG_BUF,
+                REG_LEN
+            ]
+        );
+        results.push((memory.load(REG_LEN, 4).unwrap_or(0), 0));
+        record!(W_FILE_EX, &[W_FILE_PATH, 0, W_ATTR_OUT]);
+        results.push((memory.load(W_ATTR_OUT, 4).unwrap_or(0), 0));
+        results.push((memory.load(W_ATTR_OUT + 32, 4).unwrap_or(0), 0));
+        record!(W_FILE_ATTR_W, &[W_DIR_PATH]);
+        record!(W_FILE_ATTR_A, &[W_ANSI_FILE_PATH]);
+        record!(W_FILE_SIZE_EX, &[0x10, W_SIZE_OUT]);
+        results.push((memory.load(W_SIZE_OUT, 8).unwrap_or(0), 0));
+        record!(W_FILE_SIZE, &[0x10, W_HIGH_OUT]);
+        record!(W_COMPUTER_NAME, &[W_COMPUTER_BUF, W_COMPUTER_LEN]);
+        results.push((memory.load(W_COMPUTER_BUF, 2).unwrap_or(0), 0));
+        record!(W_TLS, &[3]);
+        record!(W_FLS, &[2]);
+        record!(W_EXIT_THREAD, &[0x20, W_EXIT_THREAD_OUT]);
+        results.push((memory.load(W_EXIT_THREAD_OUT, 4).unwrap_or(0), 0));
+        record!(W_EXIT_PROCESS, &[0x21, W_EXIT_PROCESS_OUT]);
+        results.push((memory.load(W_EXIT_PROCESS_OUT, 4).unwrap_or(0), 0));
+        record!(W_THREAD_PRIORITY, &[0x22]);
+        record!(W_INTERLOCKED, &[W_INTERLOCKED_CELL]);
+        results.push((memory.load(W_INTERLOCKED_CELL, 4).unwrap_or(0), 0));
+        record!(W_OWNER_ONLY, &[]);
+        results
+    }
+
+    #[test]
+    fn parallel_api_mixed_workload_ratio_and_serial_reference_match() {
+        let shared = Arc::new(ProcessShared::new());
+        shared.publish_environment(environment(0x1234));
+        const THREADS: u32 = 8;
+        const ITERATIONS: u32 = 40;
+        for thread in 0..THREADS {
+            publish_workload(&shared, thread);
+        }
+        let mut workers = Vec::new();
+        for thread in 0..THREADS {
+            let shared = Arc::clone(&shared);
+            workers.push(std::thread::spawn(move || {
+                let mut context = x86_context(0x1000 + thread);
+                context.tls_slots.insert(3, 0xABCD);
+                context.fls_slots.insert(2, 0x77);
+                context.last_error = 0x99;
+                let memory = TestMemory::new();
+                prepare_workload_memory(&memory);
+                let mut parallel_results = Vec::new();
+                for _ in 0..ITERATIONS {
+                    parallel_results.extend(mixed_workload(&shared, &mut context, &memory, thread));
+                }
+
+                // Serial reference: identical environment, thread id and
+                // memory seed, run exactly once per iteration on the owner.
+                let reference = ProcessShared::new();
+                reference.publish_environment(environment(0x1234));
+                publish_workload(&reference, thread);
+                let mut reference_context = x86_context(0x1000 + thread);
+                reference_context.tls_slots.insert(3, 0xABCD);
+                reference_context.fls_slots.insert(2, 0x77);
+                reference_context.last_error = 0x99;
+                let reference_memory = TestMemory::new();
+                prepare_workload_memory(&reference_memory);
+                let mut reference_results = Vec::new();
+                for _ in 0..ITERATIONS {
+                    reference_results.extend(mixed_workload(
+                        &reference,
+                        &mut reference_context,
+                        &reference_memory,
+                        thread,
+                    ));
+                }
+                assert_eq!(
+                    parallel_results, reference_results,
+                    "worker results must match the serial owner reference byte-for-byte"
+                );
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("mixed workload worker");
+        }
+
+        let snapshot = shared.api_dispatch_snapshot();
+        assert!(
+            snapshot.parallel_percent() >= 90,
+            "parallel dispatch ratio must exceed the pinned 90% threshold: {}",
+            shared.api_dispatch_log_line()
+        );
+        assert_eq!(
+            snapshot.totals.parallel_dispatched,
+            u64::from(THREADS * ITERATIONS * (W_COUNT as u32 - 1))
+        );
+        assert_eq!(
+            snapshot.totals.barrier_calls,
+            u64::from(THREADS * ITERATIONS)
+        );
+        assert_eq!(
+            snapshot
+                .fallbacks
+                .iter()
+                .find(|(reason, _)| *reason == BarrierReason::OwnerOnly)
+                .map(|(_, count)| *count),
+            Some(u64::from(THREADS * ITERATIONS))
+        );
+        assert_eq!(snapshot.totals.fallback_barriers, 0);
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .find(|(category, _, _)| *category == WorkerCategory::FileSystem)
+                .map(|(_, dispatched, _)| *dispatched),
+            Some(u64::from(THREADS * ITERATIONS * 5))
+        );
+        let line = shared.api_dispatch_log_line();
+        assert_eq!(line.contains("filesystem:"), true);
+        assert_eq!(line.contains("owner-only:"), true);
+    }
+
+    #[test]
+    fn parallel_api_fallback_reasons_are_accounted_exactly() {
+        // Unsupported input: no published version snapshot.
+        let shared = ProcessShared::new();
+        let memory = TestMemory::new();
+        let mut context = x64_context(0xA00);
+        assert_eq!(
+            invoke(&shared, &mut context, &memory, HostThunk::GetVersion),
+            false
+        );
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(
+            snapshot
+                .fallbacks
+                .iter()
+                .find(|(reason, _)| *reason == BarrierReason::UnsupportedInput)
+                .map(|(_, count)| *count),
+            Some(1)
+        );
+        assert_eq!(snapshot.totals.fallback_barriers, 1);
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .find(|(category, _, _)| *category == WorkerCategory::Version)
+                .map(|(_, _, fallbacks)| *fallbacks),
+            Some(1)
+        );
+
+        // Owner-only: a thunk with no worker implementation.
+        let shared = ProcessShared::new();
+        shared.publish_environment(environment(5));
+        let mut context = x64_context(0xA10);
+        assert_eq!(
+            invoke(&shared, &mut context, &memory, HostThunk::CreateFileW),
+            false
+        );
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(
+            snapshot
+                .fallbacks
+                .iter()
+                .find(|(reason, _)| *reason == BarrierReason::OwnerOnly)
+                .map(|(_, count)| *count),
+            Some(1)
+        );
+        assert_eq!(snapshot.totals.owner_only_barriers, 1);
+
+        // Unsupported category: a known worker API deliberately classified
+        // owner-only must not execute and must be attributed separately.
+        let shared = ProcessShared::new();
+        shared.publish_environment(environment(6));
+        let address = workload_address(0xAA0, 0);
+        shared.thunks.write().unwrap().insert(
+            address,
+            ParallelThunk {
+                api: Some(WorkerApi::GetTickCount64),
+                class: crate::host_thunks::ThunkConcurrency::OwnerOnly,
+                x86_arg_bytes: 0,
+            },
+        );
+        let mut context = x64_context(0xAA0);
+        context.state.rip = address;
+        assert_eq!(shared.run_worker_api(&mut context, &memory, address), false);
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(
+            snapshot
+                .fallbacks
+                .iter()
+                .find(|(reason, _)| *reason == BarrierReason::UnsupportedCategory)
+                .map(|(_, count)| *count),
+            Some(1)
+        );
+
+        // Lock contention: a write-held subsystem lock must fall back rather
+        // than block, attributed to the filesystem category.
+        let shared = ProcessShared::new();
+        shared.publish_environment(environment(7));
+        let mut context = x86_context(0xAB0);
+        publish_workload(&shared, 0xAB0);
+        let guard = shared.files.write().unwrap();
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0xAB0,
+                W_FILE_SIZE_EX,
+                &[0x10, W_SIZE_OUT]
+            ),
+            false
+        );
+        drop(guard);
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(
+            snapshot
+                .fallbacks
+                .iter()
+                .find(|(reason, _)| *reason == BarrierReason::LockContention)
+                .map(|(_, count)| *count),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .find(|(category, _, _)| *category == WorkerCategory::FileSystem)
+                .map(|(_, _, fallbacks)| *fallbacks),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .category_reasons
+                .iter()
+                .find(|(category, reason, _)| {
+                    *category == WorkerCategory::FileSystem
+                        && *reason == BarrierReason::LockContention
+                })
+                .map(|(_, _, count)| *count),
+            Some(1)
+        );
+
+        // Guest-memory write fault: the first store fails.
+        let shared = ProcessShared::new();
+        shared.publish_environment(environment(8));
+        let mut context = x64_context(0xAC0);
+        let entry = prepare_call(&shared, &mut context, &memory, HostThunk::GetSystemInfo);
+        context.state.set(Register::Rcx, 0x1A00);
+        let failing = FailingMemory {
+            inner: &memory,
+            remaining: std::cell::Cell::new(0),
+        };
+        assert_eq!(shared.run_worker_api(&mut context, &failing, entry), false);
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(
+            snapshot
+                .fallbacks
+                .iter()
+                .find(|(reason, _)| *reason == BarrierReason::GuestMemoryWrite)
+                .map(|(_, count)| *count),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .find(|(category, _, _)| *category == WorkerCategory::SystemInfo)
+                .map(|(_, _, fallbacks)| *fallbacks),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parallel_api_new_categories_match_owner_error_codes() {
+        let shared = ProcessShared::new();
+        shared.publish_environment(environment(0x2222));
+        let memory = TestMemory::new();
+        prepare_workload_memory(&memory);
+        let mut context = x86_context(0x1200);
+        context.tls_slots.insert(3, 0xABCD);
+        context.fls_slots.insert(2, 0x77);
+        context.last_error = 0x99;
+        publish_workload(&shared, 0x1200);
+
+        // Filesystem: empty path and a non-zero info level.
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_FILE_EX,
+                &[0, 0, W_ATTR_OUT]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_PATH_NOT_FOUND);
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_FILE_EX,
+                &[W_FILE_PATH, 1, W_ATTR_OUT]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        // A canonical absolute path that is not in the cache falls back.
+        store_utf16(&memory, W_FILE_PATH, "C:\\game\\missing.bin");
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_FILE_EX,
+                &[W_FILE_PATH, 0, W_ATTR_OUT]
+            ),
+            false
+        );
+        // The owner's resolver would produce the same canonical string.
+        store_utf16(&memory, W_FILE_PATH, "C:\\game\\data.bin");
+        assert_eq!(is_canonical_guest_absolute("C:\\game\\data.bin"), true);
+        assert_eq!(is_canonical_guest_absolute("C:\\game\\..\\data.bin"), false);
+        assert_eq!(is_canonical_guest_absolute("data.bin"), false);
+
+        // Attribute formatting for both W and A.
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_FILE_ATTR_W,
+                &[W_DIR_PATH]
+            ),
+            true
+        );
+        assert_eq!(
+            context.state.get(Register::Rax),
+            u64::from(FILE_ATTRIBUTE_DIRECTORY)
+        );
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_FILE_ATTR_A,
+                &[W_ANSI_FILE_PATH]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0x81_u64);
+
+        // GetFileSizeEx preserves last-error; its size is the cache value.
+        context.last_error = 0x99;
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_FILE_SIZE_EX,
+                &[0x10, W_SIZE_OUT]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(memory.load(W_SIZE_OUT, 8), Some(12_345));
+        assert_eq!(context.last_error, 0x99);
+        // An unknown handle is not guessed.
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_FILE_SIZE_EX,
+                &[0x11, W_SIZE_OUT]
+            ),
+            false
+        );
+
+        // GetFileSize with a null handle reports the exact sentinel.
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_FILE_SIZE,
+                &[0, W_HIGH_OUT]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), u64::from(u32::MAX));
+        assert_eq!(context.last_error, ERROR_INVALID_HANDLE);
+
+        // TLS/FLS reads are thread-context exact and out-of-range TLS fails.
+        assert_eq!(
+            call_published(&shared, &mut context, &memory, 0x1200, W_TLS, &[3]),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0xABCD);
+        assert_eq!(
+            call_published(&shared, &mut context, &memory, 0x1200, W_TLS, &[4096]),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+        assert_eq!(
+            call_published(&shared, &mut context, &memory, 0x1200, W_FLS, &[2]),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0x77);
+        assert_eq!(
+            call_published(&shared, &mut context, &memory, 0x1200, W_FLS, &[9]),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        // Object status: exact exit codes and a sign-extended priority.
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_EXIT_THREAD,
+                &[0x20, W_EXIT_THREAD_OUT]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(memory.load(W_EXIT_THREAD_OUT, 4), Some(0x1234));
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_EXIT_PROCESS,
+                &[0x21, W_EXIT_PROCESS_OUT]
+            ),
+            true
+        );
+        assert_eq!(memory.load(W_EXIT_PROCESS_OUT, 4), Some(0x5678));
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_THREAD_PRIORITY,
+                &[0x22]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0xFFFF_FFFE_u64);
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_THREAD_PRIORITY,
+                &[0]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), u64::from(u32::MAX));
+        assert_eq!(context.last_error, ERROR_INVALID_HANDLE);
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_EXIT_THREAD,
+                &[0, W_EXIT_THREAD_OUT]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(memory.load(W_EXIT_THREAD_OUT, 4), Some(0));
+        assert_eq!(context.last_error, ERROR_INVALID_HANDLE);
+
+        // Interlocked: previous/add semantics and unmapped-address error.
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_INTERLOCKED,
+                &[W_INTERLOCKED_CELL]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 6);
+        assert_eq!(memory.load(W_INTERLOCKED_CELL, 4), Some(6));
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_INTERLOCKED,
+                &[0x3000]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_INVALID_PARAMETER);
+
+        // Computer name: exact success, size query and truncation.
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_COMPUTER_NAME,
+                &[W_COMPUTER_BUF, W_COMPUTER_LEN]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 1);
+        assert_eq!(memory.load(W_COMPUTER_BUF, 2), Some(u64::from(b'C' as u16)));
+        assert_eq!(memory.load(W_COMPUTER_LEN, 4), Some(6));
+        assert_eq!(memory.store(W_COMPUTER_LEN, &3_u32.to_le_bytes()), true);
+        assert_eq!(
+            call_published(
+                &shared,
+                &mut context,
+                &memory,
+                0x1200,
+                W_COMPUTER_NAME,
+                &[W_COMPUTER_BUF, W_COMPUTER_LEN]
+            ),
+            true
+        );
+        assert_eq!(context.state.get(Register::Rax), 0);
+        assert_eq!(context.last_error, ERROR_MORE_DATA);
+        // The owner reports the required size incl. the NUL (6) plus one for
+        // the truncation path.
+        assert_eq!(memory.load(W_COMPUTER_LEN, 4), Some(7));
+
+        // GetSystemTime writes a plausible SYSTEMTIME and, like the owner,
+        // preserves last-error.
+        context.last_error = 0x77;
+        assert_eq!(
+            invoke_x86(
+                &shared,
+                &mut context,
+                &memory,
+                HostThunk::GetSystemTime,
+                &[W_COMPUTER_BUF],
+            ),
+            true
+        );
+        assert_eq!(context.last_error, 0x77);
+        let year = memory.load(W_COMPUTER_BUF, 2).unwrap_or(0);
+        assert_eq!(year >= 2024, true);
+        assert_eq!(memory.load(W_COMPUTER_BUF + 2, 2).unwrap_or(0) >= 1, true);
+    }
+
+    fn adversary_locked_read(
+        shared: &ProcessShared,
+        lock_files: bool,
+        memory: &TestMemory,
+        context: &mut GuestThreadContext,
+        thread: u32,
+        index: usize,
+        args: &[u64],
+    ) -> bool {
+        if lock_files {
+            let guard = shared.files.write().unwrap();
+            let executed = call_published(shared, context, memory, thread, index, args);
+            drop(guard);
+            executed
+        } else {
+            let guard = shared.registry.write().unwrap();
+            let executed = call_published(shared, context, memory, thread, index, args);
+            drop(guard);
+            executed
+        }
+    }
+
+    #[test]
+    fn parallel_api_lock_contention_and_writer_reader_race_stay_exact() {
+        let shared = Arc::new(ProcessShared::new());
+        shared.publish_environment(environment(0x3333));
+        const THREADS: u32 = 4;
+        for thread in 0..THREADS {
+            publish_workload(&shared, thread);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicU64::new(0));
+        let mut readers = Vec::new();
+        for thread in 0..THREADS {
+            let shared = Arc::clone(&shared);
+            let stop = Arc::clone(&stop);
+            let completed = Arc::clone(&completed);
+            readers.push(std::thread::spawn(move || {
+                let mut context = x86_context(0x1300 + thread);
+                let memory = TestMemory::new();
+                prepare_workload_memory(&memory);
+                while !stop.load(Ordering::Acquire) {
+                    if thread % 2 == 0 {
+                        let _ = adversary_locked_read(
+                            &shared,
+                            true,
+                            &memory,
+                            &mut context,
+                            thread,
+                            W_FILE_SIZE_EX,
+                            &[0x10, W_SIZE_OUT],
+                        );
+                    } else {
+                        assert_eq!(memory.store(REG_LEN, &16_u32.to_le_bytes()), true);
+                        let _ = adversary_locked_read(
+                            &shared,
+                            false,
+                            &memory,
+                            &mut context,
+                            thread,
+                            W_REGISTRY,
+                            &[
+                                u64::from(HKEY_CURRENT_USER),
+                                REG_NAME,
+                                0,
+                                REG_TYPE,
+                                REG_BUF,
+                                REG_LEN,
+                            ],
+                        );
+                    }
+                    completed.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for iteration in 0..500 {
+            let mut environment = environment(0x3333);
+            environment.files.entries.insert(
+                "C:\\game\\data.bin".to_string(),
+                WorkerFileMetadata {
+                    size: 100 + iteration,
+                    attributes: vec!["readonly".to_string()],
+                    creation_time_ticks: iteration,
+                    last_access_time_ticks: iteration,
+                    last_write_time_ticks: iteration,
+                    is_directory: false,
+                },
+            );
+            shared.publish_environment(environment);
+        }
+        stop.store(true, Ordering::Release);
+        for reader in readers {
+            reader.join().expect("contended reader");
+        }
+        assert_eq!(completed.load(Ordering::Relaxed) > 0, true);
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(snapshot.totals.barrier_calls > 0, true);
+        assert_eq!(
+            snapshot
+                .fallbacks
+                .iter()
+                .find(|(reason, _)| *reason == BarrierReason::LockContention)
+                .map(|(_, count)| *count)
+                .is_some(),
+            true
+        );
+    }
+
+    #[test]
+    fn parallel_api_interlocked_hammer_is_lock_free_and_exact() {
+        struct SharedAtomicMemory {
+            bytes: std::sync::Mutex<Vec<u8>>,
+        }
+        impl WorkerMemoryView for SharedAtomicMemory {
+            fn load(&self, address: u64, len: usize) -> Option<u64> {
+                let start = usize::try_from(address).ok()?;
+                let bytes = self.bytes.lock().unwrap();
+                let slice = bytes.get(start..start.checked_add(len)?)?;
+                let mut value = 0_u64;
+                for (index, byte) in slice.iter().enumerate() {
+                    value |= u64::from(*byte) << (index * 8);
+                }
+                Some(value)
+            }
+
+            fn store(&self, address: u64, bytes: &[u8]) -> bool {
+                let Ok(start) = usize::try_from(address) else {
+                    return false;
+                };
+                let mut target = self.bytes.lock().unwrap();
+                let Some(slot) = target.get_mut(start..start + bytes.len()) else {
+                    return false;
+                };
+                slot.copy_from_slice(bytes);
+                true
+            }
+
+            fn atomic_fetch_add_u32(
+                &self,
+                address: u64,
+                value: u32,
+            ) -> Result<u32, AtomicGuestError> {
+                let start = usize::try_from(address).map_err(|_| AtomicGuestError::Fault)?;
+                let mut target = self.bytes.lock().unwrap();
+                let Some(slot) = target.get_mut(start..start + 4) else {
+                    return Err(AtomicGuestError::Fault);
+                };
+                let previous = u32::from_le_bytes(slot.try_into().expect("four bytes"));
+                slot.copy_from_slice(&previous.wrapping_add(value).to_le_bytes());
+                Ok(previous)
+            }
+        }
+
+        let shared = Arc::new(ProcessShared::new());
+        shared.publish_environment(environment(0x4444));
+        const CELL: u64 = 0x300;
+        let memory = Arc::new(SharedAtomicMemory {
+            bytes: std::sync::Mutex::new(vec![0_u8; 0x2000]),
+        });
+        assert_eq!(memory.store(CELL, &0_u32.to_le_bytes()), true);
+        const THREADS: u32 = 8;
+        const ROUNDS: u32 = 500;
+        for thread in 0..THREADS {
+            publish_workload(&shared, 0x1400 + thread);
+            let pointer = 4_u64;
+            assert_eq!(
+                memory.store(
+                    STACK - pointer,
+                    &RETURN_ADDRESS.to_le_bytes()[..pointer as usize]
+                ),
+                true
+            );
+            assert_eq!(memory.store(STACK, &(CELL as u32).to_le_bytes()), true);
+        }
+        let mut workers = Vec::new();
+        for thread in 0..THREADS {
+            let shared = Arc::clone(&shared);
+            let memory = Arc::clone(&memory);
+            workers.push(std::thread::spawn(move || {
+                let mut context = x86_context(0x1400 + thread);
+                for _ in 0..ROUNDS {
+                    let address = workload_address(0x1400 + thread, W_INTERLOCKED);
+                    context.state.set(Register::Rsp, STACK - 4);
+                    context.state.rip = address;
+                    assert_eq!(
+                        shared.run_worker_api(&mut context, memory.as_ref(), address),
+                        true
+                    );
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("interlocked worker");
+        }
+        assert_eq!(memory.load(CELL, 4), Some(u64::from(THREADS * ROUNDS)));
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(
+            snapshot.totals.parallel_dispatched,
+            u64::from(THREADS * ROUNDS)
+        );
+        assert_eq!(snapshot.totals.barrier_calls, 0);
+        assert_eq!(
+            snapshot
+                .categories
+                .iter()
+                .find(|(category, _, _)| *category == WorkerCategory::Interlocked)
+                .map(|(_, dispatched, _)| *dispatched),
+            Some(u64::from(THREADS * ROUNDS))
+        );
+    }
+
+    #[test]
+    fn parallel_api_mixed_parallel_barrier_new_categories_no_deadlock() {
+        let shared = Arc::new(ProcessShared::new());
+        shared.publish_environment(environment(0x5555));
+        const THREADS: u32 = 6;
+        const ROUNDS: u32 = 100;
+        for thread in 0..THREADS {
+            publish_workload(&shared, thread);
+        }
+        let started = std::time::Instant::now();
+        let mut workers = Vec::new();
+        for thread in 0..THREADS {
+            let shared = Arc::clone(&shared);
+            workers.push(std::thread::spawn(move || {
+                let mut context = x86_context(0x1500 + thread);
+                context.tls_slots.insert(3, 0xABCD);
+                let memory = TestMemory::new();
+                prepare_workload_memory(&memory);
+                for _ in 0..ROUNDS {
+                    assert_eq!(
+                        call_published(
+                            &shared,
+                            &mut context,
+                            &memory,
+                            thread,
+                            W_FILE_SIZE_EX,
+                            &[0x10, W_SIZE_OUT]
+                        ),
+                        true
+                    );
+                    shared.with_process(|| std::thread::yield_now());
+                    assert_eq!(
+                        call_published(&shared, &mut context, &memory, thread, W_OWNER_ONLY, &[]),
+                        false
+                    );
+                    assert_eq!(
+                        call_published(&shared, &mut context, &memory, thread, W_TLS, &[3]),
+                        true
+                    );
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("mixed new-category worker");
+        }
+        assert_eq!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            true,
+            "mixed parallel/barrier dispatch must not deadlock"
+        );
+        let snapshot = shared.api_dispatch_snapshot();
+        assert_eq!(
+            snapshot.totals.parallel_dispatched,
+            u64::from(THREADS * ROUNDS * 2)
+        );
+        assert_eq!(snapshot.totals.barrier_calls, u64::from(THREADS * ROUNDS));
+        assert_eq!(shared.process_operations(), u64::from(THREADS * ROUNDS));
     }
 }

@@ -86,6 +86,38 @@ pub(crate) struct WorkerLocale {
     pub(crate) oemcp: u32,
 }
 
+/// Read-only filesystem metadata cached for worker-side `GetFileAttributes*`
+/// and `GetFileSize*`.  The owner is the only writer; workers only read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkerFileMetadata {
+    pub(crate) size: u64,
+    pub(crate) attributes: Vec<String>,
+    pub(crate) creation_time_ticks: u64,
+    pub(crate) last_access_time_ticks: u64,
+    pub(crate) last_write_time_ticks: u64,
+    pub(crate) is_directory: bool,
+}
+
+/// Snapshot of the filesystem surface the worker may service without the
+/// process gate.  Paths are canonical drive-absolute guest paths (exactly the
+/// form `resolve_guest_path` produces for an absolute input); anything else
+/// falls back to the owner barrier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkerFileSystem {
+    pub(crate) entries: BTreeMap<String, WorkerFileMetadata>,
+    /// File handle -> current file size for `GetFileSize`/`GetFileSizeEx`.
+    pub(crate) sizes: BTreeMap<u32, u64>,
+}
+
+/// Read-only object-status snapshot for the simple synchronization queries:
+/// thread/process exit codes and thread priorities keyed by guest handle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkerObjectStatus {
+    pub(crate) thread_exit_codes: BTreeMap<u32, u32>,
+    pub(crate) process_exit_codes: BTreeMap<u32, u32>,
+    pub(crate) thread_priorities: BTreeMap<u32, i32>,
+}
+
 /// One registry key's read-only snapshot: its normalized runtime key and the
 /// values the owner enumerated when the round was published.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -117,6 +149,8 @@ pub(crate) struct WorkerEnvironment {
     pub(crate) environment: BTreeMap<String, String>,
     pub(crate) heap: BTreeMap<u64, usize>,
     pub(crate) registry: WorkerRegistry,
+    pub(crate) files: WorkerFileSystem,
+    pub(crate) objects: WorkerObjectStatus,
 }
 
 /// One registered thunk's worker-execution classification.
@@ -125,6 +159,137 @@ pub(crate) struct ParallelThunk {
     pub(crate) api: Option<WorkerApi>,
     pub(crate) class: ThunkConcurrency,
     pub(crate) x86_arg_bytes: u64,
+}
+
+/// The worker-safe API category a dispatched thunk belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WorkerCategory {
+    ThreadState,
+    Identity,
+    Clock,
+    Version,
+    SystemInfo,
+    MemoryStatus,
+    StringConversion,
+    Nls,
+    Heap,
+    Environment,
+    Registry,
+    FileSystem,
+    Tls,
+    Interlocked,
+    ObjectStatus,
+}
+
+impl WorkerCategory {
+    pub(crate) const COUNT: usize = 15;
+
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::ThreadState,
+        Self::Identity,
+        Self::Clock,
+        Self::Version,
+        Self::SystemInfo,
+        Self::MemoryStatus,
+        Self::StringConversion,
+        Self::Nls,
+        Self::Heap,
+        Self::Environment,
+        Self::Registry,
+        Self::FileSystem,
+        Self::Tls,
+        Self::Interlocked,
+        Self::ObjectStatus,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ThreadState => "thread",
+            Self::Identity => "identity",
+            Self::Clock => "clock",
+            Self::Version => "version",
+            Self::SystemInfo => "system",
+            Self::MemoryStatus => "memory",
+            Self::StringConversion => "string",
+            Self::Nls => "nls",
+            Self::Heap => "heap",
+            Self::Environment => "env",
+            Self::Registry => "registry",
+            Self::FileSystem => "filesystem",
+            Self::Tls => "tls",
+            Self::Interlocked => "interlocked",
+            Self::ObjectStatus => "objects",
+        }
+    }
+}
+
+/// Why a thunk that reached the worker still had to use the owner barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BarrierReason {
+    /// The thunk belongs to a category with no worker-safe implementation.
+    UnsupportedCategory,
+    /// A per-subsystem `RwLock` was write-held; fall back instead of blocking.
+    LockContention,
+    /// The thunk is explicitly owner-only (loader, handles, GPU, COM, ...).
+    OwnerOnly,
+    /// A guest-memory write could not be completed by the worker view.
+    GuestMemoryWrite,
+    /// The call's inputs (pointers, lengths, code page, path form, ...) could
+    /// not be reproduced exactly by the worker.
+    UnsupportedInput,
+}
+
+impl BarrierReason {
+    pub(crate) const COUNT: usize = 5;
+
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::UnsupportedCategory,
+        Self::LockContention,
+        Self::OwnerOnly,
+        Self::GuestMemoryWrite,
+        Self::UnsupportedInput,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedCategory => "unsupported-category",
+            Self::LockContention => "lock-contention",
+            Self::OwnerOnly => "owner-only",
+            Self::GuestMemoryWrite => "guest-write",
+            Self::UnsupportedInput => "unsupported-input",
+        }
+    }
+}
+
+/// Point-in-time copy of the per-category worker dispatch accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApiDispatchSnapshot {
+    pub(crate) totals: ApiDispatchMetrics,
+    /// `(category, worker_dispatched, barrier_fallbacks)`.
+    pub(crate) categories: Vec<(WorkerCategory, u64, u64)>,
+    /// `(reason, count)` across every category.
+    pub(crate) fallbacks: Vec<(BarrierReason, u64)>,
+    /// `(category, reason, count)` for the contended/failed calls.
+    pub(crate) category_reasons: Vec<(WorkerCategory, BarrierReason, u64)>,
+}
+
+impl ApiDispatchSnapshot {
+    /// Parallel share of all attempted host-thunk dispatches, in percent.
+    pub(crate) fn parallel_percent(&self) -> u64 {
+        let total = self.totals.parallel_dispatched + self.totals.barrier_calls;
+        if total == 0 {
+            return 0;
+        }
+        self.totals.parallel_dispatched.saturating_mul(100) / total
+    }
 }
 
 /// Published parallel-versus-barrier API dispatch split.
@@ -201,6 +366,10 @@ pub(crate) struct ProcessShared {
     heap: RwLock<BTreeMap<u64, usize>>,
     /// Read-only registry snapshot for the query thunks.
     registry: RwLock<WorkerRegistry>,
+    /// Read-only filesystem metadata cache for the attribute/size thunks.
+    files: RwLock<WorkerFileSystem>,
+    /// Read-only object-status snapshot for the synchronization queries.
+    objects: RwLock<WorkerObjectStatus>,
     /// Worker-execution classification for every registered host thunk, keyed
     /// by guest thunk address for the current dispatch round.
     thunks: RwLock<BTreeMap<u64, ParallelThunk>>,
@@ -212,6 +381,14 @@ pub(crate) struct ProcessShared {
     read_mostly_api_calls: AtomicU64,
     owner_only_api_calls: AtomicU64,
     fallback_api_calls: AtomicU64,
+    /// Per-category worker dispatches.
+    category_dispatched: [AtomicU64; WorkerCategory::COUNT],
+    /// Per-category owner-barrier fallbacks.
+    category_fallbacks: [AtomicU64; WorkerCategory::COUNT],
+    /// Per-reason owner-barrier fallbacks.
+    reason_fallbacks: [AtomicU64; BarrierReason::COUNT],
+    /// Per-category, per-reason owner-barrier fallbacks.
+    category_reason_fallbacks: [[AtomicU64; BarrierReason::COUNT]; WorkerCategory::COUNT],
 }
 
 impl std::fmt::Debug for ProcessShared {
@@ -258,6 +435,8 @@ impl ProcessShared {
             environment: RwLock::new(BTreeMap::new()),
             heap: RwLock::new(BTreeMap::new()),
             registry: RwLock::new(WorkerRegistry::default()),
+            files: RwLock::new(WorkerFileSystem::default()),
+            objects: RwLock::new(WorkerObjectStatus::default()),
             thunks: RwLock::new(BTreeMap::new()),
             parallel_api_calls: AtomicU64::new(0),
             barrier_api_calls: AtomicU64::new(0),
@@ -265,6 +444,12 @@ impl ProcessShared {
             read_mostly_api_calls: AtomicU64::new(0),
             owner_only_api_calls: AtomicU64::new(0),
             fallback_api_calls: AtomicU64::new(0),
+            category_dispatched: std::array::from_fn(|_| AtomicU64::new(0)),
+            category_fallbacks: std::array::from_fn(|_| AtomicU64::new(0)),
+            reason_fallbacks: std::array::from_fn(|_| AtomicU64::new(0)),
+            category_reason_fallbacks: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
         }
     }
 
@@ -303,6 +488,14 @@ impl ProcessShared {
             .registry
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.registry;
+        *self
+            .files
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.files;
+        *self
+            .objects
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment.objects;
     }
 
     /// Replace only the guest process identity (read-mostly writer path).
@@ -402,6 +595,74 @@ impl ProcessShared {
             .clone()
     }
 
+    pub(crate) fn filesystem_snapshot(&self) -> WorkerFileSystem {
+        self.files
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn object_status_snapshot(&self) -> WorkerObjectStatus {
+        self.objects
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Non-blocking snapshot for a worker: a writer holding the lock is
+    /// recorded as `LockContention` and the call falls back to the owner
+    /// barrier instead of stalling the worker.
+    fn worker_snapshot<T: Clone>(lock: &RwLock<T>) -> Option<T> {
+        match lock.try_read() {
+            Ok(guard) => Some(guard.clone()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().clone()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                parallel_api::mark_fallback(parallel_api::WorkerFallback::LockContention);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn worker_identity_snapshot(&self) -> Option<WorkerIdentity> {
+        Self::worker_snapshot(&self.identity)
+    }
+
+    pub(crate) fn worker_clock_snapshot(&self) -> Option<WorkerClock> {
+        Self::worker_snapshot(&self.clock)
+    }
+
+    pub(crate) fn worker_version_snapshot(&self) -> Option<Option<WorkerVersion>> {
+        Self::worker_snapshot(&self.version)
+    }
+
+    pub(crate) fn worker_memory_status_snapshot(&self) -> Option<Option<WorkerMemoryStatus>> {
+        Self::worker_snapshot(&self.memory_status)
+    }
+
+    pub(crate) fn worker_locale_snapshot(&self) -> Option<WorkerLocale> {
+        Self::worker_snapshot(&self.locale)
+    }
+
+    pub(crate) fn worker_environment_snapshot(&self) -> Option<BTreeMap<String, String>> {
+        Self::worker_snapshot(&self.environment)
+    }
+
+    pub(crate) fn worker_heap_snapshot(&self) -> Option<BTreeMap<u64, usize>> {
+        Self::worker_snapshot(&self.heap)
+    }
+
+    pub(crate) fn worker_registry_snapshot(&self) -> Option<WorkerRegistry> {
+        Self::worker_snapshot(&self.registry)
+    }
+
+    pub(crate) fn worker_filesystem_snapshot(&self) -> Option<WorkerFileSystem> {
+        Self::worker_snapshot(&self.files)
+    }
+
+    pub(crate) fn worker_object_status_snapshot(&self) -> Option<WorkerObjectStatus> {
+        Self::worker_snapshot(&self.objects)
+    }
+
     /// Parallel-versus-barrier API dispatch split.
     pub(crate) fn api_dispatch_metrics(&self) -> ApiDispatchMetrics {
         ApiDispatchMetrics {
@@ -412,6 +673,75 @@ impl ProcessShared {
             owner_only_barriers: self.owner_only_api_calls.load(Ordering::Relaxed),
             fallback_barriers: self.fallback_api_calls.load(Ordering::Relaxed),
         }
+    }
+
+    /// Per-category/per-reason dispatch accounting snapshot.
+    pub(crate) fn api_dispatch_snapshot(&self) -> ApiDispatchSnapshot {
+        ApiDispatchSnapshot {
+            totals: self.api_dispatch_metrics(),
+            categories: WorkerCategory::ALL
+                .into_iter()
+                .map(|category| {
+                    (
+                        category,
+                        self.category_dispatched[category.index()].load(Ordering::Relaxed),
+                        self.category_fallbacks[category.index()].load(Ordering::Relaxed),
+                    )
+                })
+                .collect(),
+            fallbacks: BarrierReason::ALL
+                .into_iter()
+                .map(|reason| {
+                    (
+                        reason,
+                        self.reason_fallbacks[reason.index()].load(Ordering::Relaxed),
+                    )
+                })
+                .collect(),
+            category_reasons: WorkerCategory::ALL
+                .into_iter()
+                .flat_map(|category| {
+                    BarrierReason::ALL.into_iter().map(move |reason| {
+                        (
+                            category,
+                            reason,
+                            self.category_reason_fallbacks[category.index()][reason.index()]
+                                .load(Ordering::Relaxed),
+                        )
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// One compact, deterministic log line for the dispatch split.
+    pub(crate) fn api_dispatch_log_line(&self) -> String {
+        let snapshot = self.api_dispatch_snapshot();
+        let categories = snapshot
+            .categories
+            .iter()
+            .filter(|(_, dispatched, fallbacks)| *dispatched != 0 || *fallbacks != 0)
+            .map(|(category, dispatched, fallbacks)| {
+                format!("{}:{dispatched}/{fallbacks}", category.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let reasons = snapshot
+            .fallbacks
+            .iter()
+            .map(|(reason, count)| format!("{}:{count}", reason.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "api-dispatch parallel={} barrier={} owner-only={} fallback={} ratio={}% categories=[{}] reasons=[{}]",
+            snapshot.totals.parallel_dispatched,
+            snapshot.totals.barrier_calls,
+            snapshot.totals.owner_only_barriers,
+            snapshot.totals.fallback_barriers,
+            snapshot.parallel_percent(),
+            categories,
+            reasons,
+        )
     }
 
     /// Service a host barrier on the calling worker when the thunk is
@@ -426,42 +756,72 @@ impl ProcessShared {
         self.try_execute_worker_api(context, memory, rip) == WorkerApiAttempt::Executed
     }
 
+    fn record_barrier(&self, entry: Option<ParallelThunk>, reason: BarrierReason) {
+        self.barrier_api_calls.fetch_add(1, Ordering::Relaxed);
+        self.reason_fallbacks[reason.index()].fetch_add(1, Ordering::Relaxed);
+        if let Some(api) = entry.and_then(|entry| entry.api) {
+            let category = api.category();
+            self.category_fallbacks[category.index()].fetch_add(1, Ordering::Relaxed);
+            self.category_reason_fallbacks[category.index()][reason.index()]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn try_execute_worker_api(
         &self,
         context: &mut super::thread_context::GuestThreadContext,
         memory: &dyn parallel_api::WorkerMemoryView,
         rip: u64,
     ) -> WorkerApiAttempt {
+        // The dispatch table is republished by the owner between rounds and is
+        // stable for the whole round, so a blocking read is correct here; the
+        // per-subsystem snapshots below are the contended state.
         let Some(entry) = self.parallel_thunk(rip) else {
             return WorkerApiAttempt::NotAThunk;
         };
+        if entry.api.is_none() || entry.class == ThunkConcurrency::OwnerOnly {
+            self.owner_only_api_calls.fetch_add(1, Ordering::Relaxed);
+            self.record_barrier(
+                Some(entry),
+                if entry.api.is_none() {
+                    BarrierReason::OwnerOnly
+                } else {
+                    BarrierReason::UnsupportedCategory
+                },
+            );
+            return WorkerApiAttempt::Blocked;
+        }
         let saved_state = context.state.clone();
         let saved_last_error = context.last_error;
-        if entry.class.allows_worker_execution()
-            && parallel_api::invoke_parallel_api(self, context, memory, &entry)
-        {
-            self.parallel_api_calls.fetch_add(1, Ordering::Relaxed);
-            // Only Stateless and ReadMostly reach this path (the guard above
-            // rejects OwnerOnly), so the two counters are exhaustive here.
-            if entry.class == ThunkConcurrency::Stateless {
-                self.stateless_api_calls.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.read_mostly_api_calls.fetch_add(1, Ordering::Relaxed);
-            }
-            WorkerApiAttempt::Executed
-        } else {
-            context.state = saved_state;
-            context.last_error = saved_last_error;
-            self.barrier_api_calls.fetch_add(1, Ordering::Relaxed);
-            match entry.class {
-                ThunkConcurrency::OwnerOnly => {
-                    self.owner_only_api_calls.fetch_add(1, Ordering::Relaxed);
+        match parallel_api::try_invoke_parallel_api(self, context, memory, &entry) {
+            Ok(()) => {
+                self.parallel_api_calls.fetch_add(1, Ordering::Relaxed);
+                if entry.class == ThunkConcurrency::Stateless {
+                    self.stateless_api_calls.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.read_mostly_api_calls.fetch_add(1, Ordering::Relaxed);
                 }
-                ThunkConcurrency::Stateless | ThunkConcurrency::ReadMostly => {
-                    self.fallback_api_calls.fetch_add(1, Ordering::Relaxed);
+                if let Some(api) = entry.api {
+                    self.category_dispatched[api.category().index()]
+                        .fetch_add(1, Ordering::Relaxed);
                 }
+                WorkerApiAttempt::Executed
             }
-            WorkerApiAttempt::Blocked
+            Err(reason) => {
+                context.state = saved_state;
+                context.last_error = saved_last_error;
+                self.fallback_api_calls.fetch_add(1, Ordering::Relaxed);
+                self.barrier_api_calls.fetch_add(1, Ordering::Relaxed);
+                let barrier_reason = reason.barrier_reason();
+                self.reason_fallbacks[barrier_reason.index()].fetch_add(1, Ordering::Relaxed);
+                if let Some(api) = entry.api {
+                    let category = api.category();
+                    self.category_fallbacks[category.index()].fetch_add(1, Ordering::Relaxed);
+                    self.category_reason_fallbacks[category.index()][barrier_reason.index()]
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                WorkerApiAttempt::Blocked
+            }
         }
     }
 
