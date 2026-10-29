@@ -22,10 +22,16 @@ name: windows-oracle
 
 on:
   push:
-    branches: ["*"]
+    branches: ["main"]
   pull_request:
     branches: ["*"]
   workflow_dispatch:
+
+# A newer push to the same ref makes older runs pure queue congestion; cancel
+# them so the runner queue stays responsive (the audit flagged oracle health).
+concurrency:
+  group: windows-oracle-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,6 +41,7 @@ jobs:
   generate-corpus:
     name: Generate Corpus
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,6 +58,7 @@ jobs:
     name: Reference Capture (Windows)
     needs: generate-corpus
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -101,6 +109,7 @@ jobs:
     name: Compare (fail on any diff)
     needs: reference-capture
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -120,6 +129,7 @@ jobs:
     if: always()
     needs: [generate-corpus, reference-capture, compare]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Require every oracle stage to succeed
         env:
