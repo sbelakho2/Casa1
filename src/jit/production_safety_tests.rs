@@ -31,6 +31,7 @@ fn skip_without_capability_for(test: &str, available: bool) -> bool {
 
 #[test]
 fn jit_capability_gate_reports_unavailable_host_without_running_native_code() {
+    let _serial = jit_test_serial();
     assert_eq!(skip_without_capability_for("fixture", true), false);
     assert_eq!(skip_without_capability_for("fixture", false), true);
     assert_eq!(
@@ -41,6 +42,7 @@ fn jit_capability_gate_reports_unavailable_host_without_running_native_code() {
 
 #[test]
 fn jit_construction_gate_rejects_deterministic_and_unavailable_hosts() {
+    let _serial = jit_test_serial();
     use crate::runner::JitMode;
     // Auto selects native execution only on a capable, non-deterministic
     // host.
@@ -79,6 +81,7 @@ fn jit_construction_gate_rejects_deterministic_and_unavailable_hosts() {
 
 #[test]
 fn auto_unavailable_host_and_deterministic_modes_fall_back() {
+    let _serial = jit_test_serial();
     use crate::runner::JitMode;
     // Incapable host: Auto never constructs the JIT runtime.
     assert_eq!(
@@ -186,6 +189,7 @@ fn run_self_modifying_code_case(available: bool) -> Option<()> {
 
 #[test]
 fn self_modifying_code_guest_store_invalidates_and_recompiles() {
+    let _serial = jit_test_serial();
     assert_eq!(
         run_self_modifying_code_case(false),
         None,
@@ -245,6 +249,7 @@ fn run_backedge_link_case(available: bool) -> Option<()> {
 
 #[test]
 fn backedge_link_falls_back_to_safepoint_when_requested() {
+    let _serial = jit_test_serial();
     assert_eq!(
         run_backedge_link_case(false),
         None,
@@ -272,6 +277,7 @@ extern "C" fn direct_thunk_target(
 
 #[test]
 fn direct_thunk_target_invalid_state_is_safe_and_pins_sentinel() {
+    let _serial = jit_test_serial();
     assert_eq!(
         direct_thunk_target(
             std::ptr::null_mut(),
@@ -297,6 +303,7 @@ fn direct_thunk_target_invalid_state_is_safe_and_pins_sentinel() {
 
 #[test]
 fn direct_resolved_thunk_call_bypasses_dispatcher() {
+    let _serial = jit_test_serial();
     if skip_without_capability("direct_resolved_thunk_call_bypasses_dispatcher") {
         return;
     }
@@ -374,6 +381,7 @@ fn run_invalid_block_installation_case(available: bool) -> Option<()> {
 
 #[test]
 fn invalid_block_installation_falls_back_to_interpreter() {
+    let _serial = jit_test_serial();
     assert_eq!(
         run_invalid_block_installation_case(false),
         None,
@@ -387,6 +395,7 @@ fn invalid_block_installation_falls_back_to_interpreter() {
 
 #[test]
 fn jit_block_and_interpreter_store_never_observe_a_stale_canonical_page() {
+    let _serial = jit_test_serial();
     if skip_without_capability(
         "jit_block_and_interpreter_store_never_observe_a_stale_canonical_page",
     ) {

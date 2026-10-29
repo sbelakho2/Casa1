@@ -76,8 +76,60 @@ jobs:
           # does not key on FFMPEG_DIR, so it can keep pointing at FFmpeg 8).
           rm -rf target/debug/build/ffmpeg-sys-next-* target/debug/build/ffmpeg-next-*
           cargo clean -p ffmpeg-sys-next -p ffmpeg-next || true
+      # ffmpeg-sys-next generates its FFI from the installed headers, so the
+      # resolved headers ARE the ABI pin. FFmpeg 7.1 exposes libavcodec /
+      # libavformat major 61; fail here instead of silently binding a newer
+      # major (FFmpeg 8 = 62) that the 7.1-era safe API was not written for.
+      - name: Verify pinned FFmpeg 7.1 ABI
+        run: |
+          set -euo pipefail
+          for lib in libavcodec libavformat; do
+            major="$(pkg-config --modversion "$lib" | cut -d. -f1)"
+            if [ "$major" != "61" ]; then
+              echo "::error::$lib major $major != 61; expected the pinned FFmpeg 7.1 ABI"
+              exit 1
+            fi
+          done
       - name: Run Clippy (all features)
         run: cargo clippy --all-targets --features angle,dev-insecure-tls,ffmpeg,ffmpeg-next,moltenvk,nightly_alloc_error_hook,opengl,proptest,tungstenite,vulkan,websocket -- -D warnings -A future-incompatible
+
+  # Dedicated FFmpeg binding lane. The all-features jobs must never follow
+  # whatever `brew install ffmpeg` happens to ship; this matrix names the exact
+  # supported ABI (crate minor == FFmpeg minor) and compiles the binding against
+  # it, so an accidental FFmpeg major bump fails loudly here.
+  ffmpeg-binding:
+    name: FFmpeg ${{ matrix.ffmpeg }} bindings
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ffmpeg: "7.1"
+            formula: "ffmpeg@7"
+            pkg_config_major: "61"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FFmpeg ${{ matrix.ffmpeg }} development libraries
+        run: |
+          brew install ${{ matrix.formula }}
+          echo "PKG_CONFIG_PATH=$(brew --prefix ${{ matrix.formula }})/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "FFMPEG_DIR=$(brew --prefix ${{ matrix.formula }})" >> "$GITHUB_ENV"
+          rm -rf target/debug/build/ffmpeg-sys-next-* target/debug/build/ffmpeg-next-*
+          cargo clean -p ffmpeg-sys-next -p ffmpeg-next || true
+      - name: Verify FFmpeg ABI major
+        run: |
+          set -euo pipefail
+          for lib in libavcodec libavformat; do
+            major="$(pkg-config --modversion "$lib" | cut -d. -f1)"
+            if [ "$major" != "${{ matrix.pkg_config_major }}" ]; then
+              echo "::error::$lib major $major != ${{ matrix.pkg_config_major }}; FFmpeg ${{ matrix.ffmpeg }} ABI pin is not satisfied"
+              exit 1
+            fi
+          done
+      - name: Check FFmpeg-backed library
+        run: cargo check --lib --features ffmpeg
 
   test:
     name: Test
@@ -244,6 +296,7 @@ jobs:
       - check
       - clippy
       - clippy-all-features
+      - ffmpeg-binding
       - test
       - api-gate
       - integration-tests

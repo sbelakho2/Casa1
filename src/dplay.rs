@@ -1891,32 +1891,49 @@ impl GroupReliability {
         };
         let mut completions = Vec::new();
         if let Some(handle) = completed.async_op {
+            let mut complete = false;
             if let Some(send) = self.pending_sends.get_mut(&handle) {
                 send.remaining.remove(&sequence);
-                if send.remaining.is_empty() {
-                    let send = self
-                        .pending_sends
-                        .remove(&handle)
-                        .expect("checked pending async send");
-                    completions.push(ReliableCompletion::Async {
-                        async_op: handle,
-                        context: send.context,
-                        result: S_OK,
-                    });
-                }
+                // Exactly-once: finish only when the bookkeeping set is
+                // empty *and* no fragment for this handle is still in the
+                // acknowledgement table. The second condition keeps a
+                // duplicate/late ACK from completing a send whose remaining
+                // fragments have not been acknowledged yet.
+                complete = send.remaining.is_empty()
+                    && !self
+                        .pending
+                        .values()
+                        .any(|pending| pending.async_op == Some(handle));
+            }
+            if complete {
+                let send = self
+                    .pending_sends
+                    .remove(&handle)
+                    .expect("checked pending async send");
+                completions.push(ReliableCompletion::Async {
+                    async_op: handle,
+                    context: send.context,
+                    result: S_OK,
+                });
             }
         }
         if let Some(relay) = completed.relay {
+            let mut complete = false;
             if let Some(pending) = self.pending_relays.get_mut(&relay) {
                 pending.remaining.remove(&sequence);
-                if pending.remaining.is_empty() {
-                    self.pending_relays.remove(&relay);
-                    completions.push(ReliableCompletion::Relay {
-                        origin: relay.0,
-                        message_id: relay.1,
-                        result: S_OK,
-                    });
-                }
+                complete = pending.remaining.is_empty()
+                    && !self
+                        .pending
+                        .values()
+                        .any(|pending| pending.relay == Some(relay));
+            }
+            if complete {
+                self.pending_relays.remove(&relay);
+                completions.push(ReliableCompletion::Relay {
+                    origin: relay.0,
+                    message_id: relay.1,
+                    result: S_OK,
+                });
             }
         }
         completions
@@ -7271,21 +7288,45 @@ mod tests {
         client.set_connect_timeout(Duration::from_secs(3));
         assert_eq!(client.connect(host_addr, "Sender", &[]), S_OK);
 
-        // Drop the first two fragment datagrams: the completion is deferred
-        // until the retransmitted fragments are really acknowledged.
-        host.set_group_packet_loss(2, 0);
+        // Arm the loss gate for every fragment. No ACK can be produced while
+        // it is armed, so "not completed yet" is a deterministic fact instead
+        // of a wall-clock guess that races the 50 ms retransmit timer.
+        host.set_group_packet_loss(1_000, 0);
         let context = 0xC0FFEE_u64;
         let handle = client.begin_send_operation(context);
         let payload = pattern(4_000);
         assert_eq!(client.send_to(HOST_PLAYER_ID, &payload), S_OK);
-        thread::sleep(Duration::from_millis(20));
         assert!(
             client
                 .poll_engine_events()
                 .into_iter()
                 .all(|event| !matches!(event, DplayEvent::SendComplete { .. })),
-            "no completion is emitted at enqueue time"
+            "no completion is emitted before any fragment is acknowledged"
         );
+        assert!(
+            client.async_operation_pending(handle),
+            "the unacknowledged send is still pending"
+        );
+        let sequences: Vec<u32> = {
+            let transport = client.client.as_ref().expect("client transport");
+            let reliability = transport
+                .reliability
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            assert!(
+                reliability
+                    .pending
+                    .values()
+                    .any(|pending| pending.async_op == Some(handle)),
+                "the fragments are tracked as in-flight"
+            );
+            reliability.pending.keys().copied().collect()
+        };
+        assert!(
+            sequences.len() > 1,
+            "the payload really spans multiple acknowledged fragments"
+        );
+        host.set_group_packet_loss(0, 0);
 
         let mut completions = Vec::new();
         assert!(
@@ -7315,13 +7356,33 @@ mod tests {
             DPNERR_CANNOTCANCEL,
             "the real handle was completed exactly once"
         );
+        // Replay every fragment acknowledgement as a late duplicate from the
+        // real host address. Each one targets an already-completed sequence,
+        // so none may produce a second completion (or reuse the handle).
+        let client_addr = client
+            .client
+            .as_ref()
+            .expect("client transport")
+            .socket
+            .local_addr()
+            .expect("client address");
+        let host_socket = Arc::clone(&host.session.as_ref().expect("host session").socket);
+        for sequence in &sequences {
+            host_socket
+                .send_to(&wire_group_ack(HOST_PLAYER_ID, *sequence), client_addr)
+                .expect("late duplicate ack");
+        }
         thread::sleep(Duration::from_millis(150));
         assert!(
             client
                 .poll_engine_events()
                 .into_iter()
                 .all(|event| !matches!(event, DplayEvent::SendComplete { .. })),
-            "late acks cannot produce a second completion"
+            "late duplicate acks cannot produce a second completion"
+        );
+        assert!(
+            !client.async_operation_pending(handle),
+            "the handle stays completed"
         );
         client.close();
         host.close();
@@ -7352,6 +7413,83 @@ mod tests {
         );
         assert!(reliability.pending_sends.is_empty());
         assert!(reliability.pending.is_empty());
+
+        // Drift the tracked sequence set (as a duplicate/early bookkeeping
+        // path would) and verify a single ACK still cannot complete a handle
+        // while another of its fragments is in the acknowledgement table.
+        let mut drifted = GroupReliability::default();
+        drifted.record_pending(
+            10,
+            b"ten".to_vec(),
+            BTreeSet::from([destination]),
+            Some((9, 0xCC)),
+            None,
+        );
+        drifted.record_pending(
+            11,
+            b"eleven".to_vec(),
+            BTreeSet::from([destination]),
+            Some((9, 0xCC)),
+            None,
+        );
+        drifted
+            .pending_sends
+            .get_mut(&9)
+            .expect("async send")
+            .remaining
+            .clear();
+        assert!(
+            drifted.acknowledge(10, None).is_empty(),
+            "an ack cannot complete a handle with another fragment in flight"
+        );
+        assert!(
+            drifted.acknowledge(11, None)
+                == vec![ReliableCompletion::Async {
+                    async_op: 9,
+                    context: 0xCC,
+                    result: S_OK,
+                }],
+            "the last in-flight fragment completes the send exactly once"
+        );
+        assert!(drifted.pending_sends.is_empty());
+        assert!(drifted.acknowledge(11, None).is_empty());
+
+        let relay = (12, 13);
+        let mut relayed = GroupReliability::default();
+        relayed.record_pending(
+            20,
+            b"twenty".to_vec(),
+            BTreeSet::from([destination]),
+            None,
+            Some(relay),
+        );
+        relayed.record_pending(
+            21,
+            b"twenty-one".to_vec(),
+            BTreeSet::from([destination]),
+            None,
+            Some(relay),
+        );
+        relayed
+            .pending_relays
+            .get_mut(&relay)
+            .expect("relay")
+            .remaining
+            .clear();
+        assert!(
+            relayed.acknowledge(20, None).is_empty(),
+            "an ack cannot complete a relay with another fragment in flight"
+        );
+        assert!(
+            relayed.acknowledge(21, None)
+                == vec![ReliableCompletion::Relay {
+                    origin: 12,
+                    message_id: 13,
+                    result: S_OK,
+                }],
+            "the last in-flight fragment completes the relay exactly once"
+        );
+        assert!(relayed.pending_relays.is_empty());
     }
 
     #[test]

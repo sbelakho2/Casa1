@@ -5550,7 +5550,11 @@ impl D3d12Runtime {
     }
 
     /// Bind a state object to a command list for `DispatchRays`.
-    #[rustfmt::skip]
+    ///
+    /// Bitcode libraries name their entry point explicitly; prefer the
+    /// conventional `raygen` export when present and otherwise use the first
+    /// defined function. This keeps the translated kernel name in sync with
+    /// the export rather than guessing `raygen` for every library.
     fn translate_ray_pipeline(dxil: &[u8]) -> AppResult<(Option<String>, Option<String>)> {
         if !matches!(
             crate::shader::ray_shader_stage(dxil),
@@ -5558,7 +5562,35 @@ impl D3d12Runtime {
         ) {
             return Ok((None, None));
         }
-        let entry = "raygen";
+        let discovered = crate::shader::ray_entry_points(dxil).unwrap_or_default();
+        let entry = if discovered.iter().any(|name| name == "raygen") {
+            "raygen".to_string()
+        } else {
+            discovered
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "raygen".to_string())
+        };
+        Self::translate_ray_pipeline_export(dxil, &entry, &entry)
+    }
+
+    /// Translate the raygen export named `export` from `source_entry`.
+    ///
+    /// `export_name` is the public state-object export (what the shader
+    /// identifier and shader record name), while `source_entry` is the LLVM
+    /// function that must be lowered. They differ for `ExportToRename`.
+    #[rustfmt::skip]
+    fn translate_ray_pipeline_export(
+        dxil: &[u8],
+        export_name: &str,
+        source_entry: &str,
+    ) -> AppResult<(Option<String>, Option<String>)> {
+        if !matches!(
+            crate::shader::ray_shader_stage(dxil),
+            Some(crate::shader::ShaderStage::RayGeneration)
+        ) {
+            return Ok((None, None));
+        }
         if let Some(offset) = dxil.windows(4).position(|window| window == b"BC\xc0\xde")
             && offset >= 20
             && dxil.len().saturating_sub(offset) > 16
@@ -5575,18 +5607,28 @@ impl D3d12Runtime {
                 && declared > 16
                 && dxil.get(offset + 4..offset + 8) != Some(b"SIG1")
             {
-                let source = crate::shader::translate_llvm_ray_program(&dxil[offset..end], entry)?;
-                return Ok((Some(source), Some(entry.to_string())));
+                let source =
+                    crate::shader::translate_llvm_ray_program(&dxil[offset..end], source_entry)?;
+                let source = if source_entry == export_name {
+                    source
+                } else {
+                    source.replacen(
+                        &format!("kernel void {source_entry}("),
+                        &format!("kernel void {export_name}("),
+                        1,
+                    )
+                };
+                return Ok((Some(source), Some(export_name.to_string())));
             } }
         let output = crate::shader::translate_ray_shader(
             dxil,
             crate::shader::ShaderStage::RayGeneration,
-            entry,
+            export_name,
         )
         .expect("ray-generation translation validated by shader_kind");
         let source = crate::shader::msl_source_from_library_bytes(&output.mtl_library_bytes)
             .expect("ray-generation translation emits an MSL artifact");
-        Ok((Some(source.to_string()), Some(entry.to_string())))
+        Ok((Some(source.to_string()), Some(export_name.to_string())))
     }
 
     /// Locate a top-level MSL function by name, including its body.
@@ -5713,24 +5755,30 @@ impl D3d12Runtime {
                 continue;
             };
             let defined = crate::shader::ray_entry_points(&library.bytecode)?;
-            let exports: Vec<String> = library
-                .exports
-                .iter()
-                .map(|export| {
-                    export
+            // Each explicit export is compiled from its rename target (the
+            // LLVM definition) but stored under its public export name. With
+            // no exports D3D12 exports every shader entry point, so translate
+            // each definition and skip non-entry helpers that cannot lower.
+            if !library.exports.is_empty() {
+                for export in &library.exports {
+                    let source_entry = export
                         .export_to_rename
-                        .clone()
-                        .unwrap_or_else(|| export.name.clone())
-                })
-                .collect();
-            let candidates: Vec<String> = if exports.is_empty() {
-                defined.clone()
-            } else {
-                exports.iter().chain(defined.iter()).cloned().collect()
-            };
+                        .as_deref()
+                        .unwrap_or(export.name.as_str());
+                    let mut artifact = Self::translate_ray_stage_artifact(
+                        &library.bytecode,
+                        stage,
+                        source_entry,
+                        stages.len() as u32,
+                    )?;
+                    artifact.entry = export.name.clone();
+                    stages.insert(export.name.clone(), artifact);
+                }
+                continue;
+            }
             let mut last_error = None;
             let mut translated = false;
-            for entry in candidates {
+            for entry in defined {
                 match Self::translate_ray_stage_artifact(
                     &library.bytecode,
                     stage,
@@ -5740,7 +5788,6 @@ impl D3d12Runtime {
                     Ok(artifact) => {
                         stages.insert(entry, artifact);
                         translated = true;
-                        break;
                     }
                     Err(error) => last_error = Some(error),
                 }
@@ -5772,11 +5819,57 @@ impl D3d12Runtime {
             ));
         }
         let dxil = object.first_dxil().unwrap_or(&[]).to_vec();
-        let (ray_msl, ray_entry) = Self::translate_ray_pipeline(&dxil)?;
+        // DispatchRays is not tied to library order: locate the library that
+        // actually declares raygeneration instead of assuming the first DXIL
+        // subobject is the raygen program.
+        let raygen_library = object
+            .subobjects
+            .iter()
+            .find_map(|subobject| match subobject {
+                D3d12StateSubobject::DxilLibrary(library)
+                    if matches!(
+                        crate::shader::ray_shader_stage(&library.bytecode),
+                        Some(crate::shader::ShaderStage::RayGeneration)
+                    ) =>
+                {
+                    Some(library)
+                }
+                _ => None,
+            });
+        let (ray_msl, ray_entry) = if let Some(library) = raygen_library {
+            let (export_name, source_entry) = library
+                .exports
+                .first()
+                .map(|export| {
+                    (
+                        export.name.clone(),
+                        export
+                            .export_to_rename
+                            .clone()
+                            .unwrap_or_else(|| export.name.clone()),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    let discovered =
+                        crate::shader::ray_entry_points(&library.bytecode).unwrap_or_default();
+                    let entry = if discovered.iter().any(|name| name == "raygen") {
+                        "raygen".to_string()
+                    } else {
+                        discovered
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "raygen".to_string())
+                    };
+                    (entry.clone(), entry)
+                });
+            Self::translate_ray_pipeline_export(&library.bytecode, &export_name, &source_entry)?
+        } else {
+            Self::translate_ray_pipeline(&dxil)?
+        };
         let ray_stages = Self::translate_ray_stage_artifacts(&object)?;
-        let bitcode_raygen = !crate::shader::ray_entry_points(&dxil)
-            .unwrap_or_default()
-            .is_empty();
+        let bitcode_raygen = raygen_library
+            .and_then(|library| crate::shader::ray_entry_points(&library.bytecode).ok())
+            .is_some_and(|entries| !entries.is_empty());
         let ray_msl = ray_msl.map(|source| {
             if bitcode_raygen {
                 Self::combine_ray_stages(&source, &ray_stages)
@@ -5784,12 +5877,15 @@ impl D3d12Runtime {
                 source
             }
         });
+        let params_source = raygen_library
+            .map(|library| library.bytecode.as_slice())
+            .unwrap_or(&dxil);
         let (max_recursion_depth, payload_size, attribute_size) =
             if let Some((depth, _flags)) = object.pipeline_config {
                 let (payload, attribute) = object.shader_config.unwrap_or((32, 8));
                 (depth, payload, attribute)
             } else {
-                Self::parse_raytracing_pipeline_params(&dxil)
+                Self::parse_raytracing_pipeline_params(params_source)
             };
         self.raytracing_pipeline_states.insert(
             state_object_ptr,
@@ -7029,6 +7125,14 @@ impl D3d12Runtime {
                 )); // coverage: unreachable — command signature creation only admits the handled argument types
             }
         };
+
+        if arguments.is_empty() {
+            // An empty argument buffer can only accompany a zero command count
+            // (the range check above proves required == 0): there is nothing
+            // to encode, and newBufferWithLength:0 returns nil, which the
+            // metal crate panics on — aborting the host process.
+            return Ok(0);
+        }
 
         let bridge = self.metal_raytracing()?;
         let mut inner = bridge
@@ -12496,6 +12600,39 @@ mod tests {
         );
     }
 
+    /// A zero command count with an empty argument buffer is a legal no-op:
+    /// it must return `Ok(0)` instead of reaching `newBufferWithLength:0`,
+    /// where the metal crate panics on the nil buffer (host abort).
+    #[test]
+    fn d3d12_execute_indirect_empty_argument_buffer_boundary_is_noop() {
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let dispatch_sig = runtime
+            .create_command_signature(D3D12CommandSignatureDesc {
+                byte_stride: 12,
+                node_mask: 0,
+                arguments: vec![D3D12IndirectArgumentDesc {
+                    ty: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                    root_parameter_index: 0,
+                    dest_offset_in_32bit_values: 0,
+                    num_32bit_values_to_set: 0,
+                }],
+            })
+            .expect("dispatch signature");
+        assert_eq!(
+            runtime
+                .execute_indirect_gpu(list, dispatch_sig, 0, &[], 0, None, None)
+                .expect("empty argument buffer with zero count must be a no-op"),
+            0
+        );
+        assert_eq!(
+            runtime
+                .execute_indirect_gpu(list, dispatch_sig, 0, &[], 0, Some(0), None)
+                .expect("explicit zero count with an empty argument buffer must be a no-op"),
+            0
+        );
+    }
+
     #[test]
     fn d3d12_execute_indirect_draw_rejects_missing_native_pipeline_and_matches_direct_draw() {
         if std::env::var_os("CI").is_some() {
@@ -13289,6 +13426,17 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
                 .contains("msl_intersection"),
             true
         );
+        let error = runtime
+            .create_state_object(D3d12StateObjectDesc {
+                object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+                subobjects: Vec::new(),
+            })
+            .expect_err("a raytracing state object without a DXIL library must be rejected");
+        assert_eq!(error.code, ReasonCode::RcD3dInvalidState);
+        assert_eq!(
+            error.message,
+            "raytracing pipeline state object has no DXIL library or collection"
+        );
     }
 
     #[test]
@@ -13302,7 +13450,7 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
                 D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
                     bytecode: container,
                     exports: vec![state_objects::D3d12ExportDesc {
-                        name: "missing_entry".into(),
+                        name: "other".into(),
                         export_to_rename: None,
                         flags: 0,
                     }],
@@ -13320,6 +13468,203 @@ fragment float4 fs_main() { return float4(1.0, 0.0, 0.0, 1.0); }"#
             .expect_err("bad stage bitcode");
         assert_eq!(error.code, ReasonCode::RcDxilInvalid);
         assert_eq!(error.message, "unsupported LLVM instruction fence");
+    }
+
+    #[test]
+    fn d3d12_ray_stage_artifacts_translate_every_export_and_reject_unknown_rename() {
+        let ir = r#"define void @chs_one() {
+entry:
+  call void @ray.storePayloadField(i32 0, i32 111)
+  ret void
+}
+define void @chs_two() {
+entry:
+  call void @ray.storePayloadField(i32 0, i32 222)
+  ret void
+}
+declare void @ray.storePayloadField(i32, ...)
+"#;
+        let bitcode = crate::shader::llvm_assemble_ir(ir).expect("multi-export bitcode");
+        let container = make_ray_llvm_container(&bitcode, "closesthit");
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let desc = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects: vec![
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: make_ray_dxil("raygeneration"),
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "raygen".into(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: container.clone(),
+                    exports: vec![
+                        state_objects::D3d12ExportDesc {
+                            name: "public_a".into(),
+                            export_to_rename: Some("chs_one".into()),
+                            flags: 0,
+                        },
+                        state_objects::D3d12ExportDesc {
+                            name: "public_b".into(),
+                            export_to_rename: Some("chs_two".into()),
+                            flags: 0,
+                        },
+                    ],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+            ],
+        };
+        let handle = runtime
+            .create_state_object(desc.clone())
+            .expect("multi-export RTSO");
+        runtime
+            .set_pipeline_state1_state_object(list, handle, desc)
+            .expect("bind multi-export RTSO");
+        let pso = runtime
+            .get_raytracing_pipeline_state(handle)
+            .expect("ray PSO");
+        assert_eq!(pso.ray_stages.len(), 3);
+        assert_eq!(pso.ray_stages["public_a"].stage, "closesthit");
+        assert_eq!(pso.ray_stages["public_a"].entry, "public_a");
+        assert_eq!(pso.ray_stages["public_b"].entry, "public_b");
+        assert_eq!(
+            pso.ray_stages["public_a"].source.contains("void chs_one("),
+            true
+        );
+        assert_eq!(
+            pso.ray_stages["public_b"].source.contains("void chs_two("),
+            true
+        );
+        assert_ne!(
+            pso.ray_stages["public_a"].function_index,
+            pso.ray_stages["public_b"].function_index
+        );
+        assert_eq!(pso.ray_stages.contains_key("chs_one"), false);
+        assert_eq!(pso.ray_stages.contains_key("chs_two"), false);
+
+        let missing = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects: vec![
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: make_ray_dxil("raygeneration"),
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "raygen".into(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: container,
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "missing".into(),
+                        export_to_rename: Some("absent".into()),
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+            ],
+        };
+        let bad_handle = runtime
+            .create_state_object(missing.clone())
+            .expect("bad rename RTSO");
+        let error = runtime
+            .set_pipeline_state1_state_object(list, bad_handle, missing)
+            .expect_err("an unknown ExportToRename must fail instead of selecting another export");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(error.message, "LLVM IR has no definition for @absent");
+    }
+
+    #[test]
+    fn d3d12_ray_state_object_rejects_missing_raygen_export_and_uses_later_raygen_library() {
+        let chs_ir = "define void @chs() {\nentry:\n  call void @ray.storePayloadField(i32 0, i32 111)\n  ret void\n}\ndeclare void @ray.storePayloadField(i32, ...)\n";
+        let chs_bitcode = crate::shader::llvm_assemble_ir(chs_ir).expect("closest-hit bitcode");
+        let chs_container = make_ray_llvm_container(&chs_bitcode, "closesthit");
+        let raygen_ir = r#"define void @entry() {
+entry:
+  call void @dx.op.traceRay(i32 0, ptr null, i32 3, i32 -1, i32 0, i32 1, i32 0, float 0.0, float 0.0, float -1.0, float 0.0, float 0.0, float 0.0, float 1.0, float 100.0, i32 0)
+  ret void
+}
+declare void @dx.op.traceRay(i32, ptr, i32, i32, i32, i32, i32, float, float, float, float, float, float, float, float, i32)
+"#;
+        let raygen_bitcode = crate::shader::llvm_assemble_ir(raygen_ir).expect("raygen bitcode");
+        let raygen_container = make_ray_llvm_container(&raygen_bitcode, "raygeneration");
+        let mut runtime = D3d12Runtime::new();
+        let list = runtime.create_graphics_command_list(0, 0, false);
+        let desc = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects: vec![
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: chs_container.clone(),
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "chs".into(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: raygen_container,
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "entry".into(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+            ],
+        };
+        let handle = runtime
+            .create_state_object(desc.clone())
+            .expect("raygen-after-hit RTSO");
+        runtime
+            .set_pipeline_state1_state_object(list, handle, desc)
+            .expect("bind raygen-after-hit RTSO");
+        let pso = runtime
+            .get_raytracing_pipeline_state(handle)
+            .expect("ray PSO");
+        assert_eq!(pso.ray_entry.as_deref(), Some("entry"));
+        let source = pso.ray_msl.as_deref().expect("translated raygen");
+        assert_eq!(source.contains("kernel void entry"), true);
+        assert_eq!(source.contains("query.intersect"), true);
+        assert_eq!(source.contains("msl_closest_hit"), true);
+        assert_eq!(pso.ray_stages.contains_key("chs"), true);
+        assert_eq!(pso.ray_stages.contains_key("entry"), true);
+
+        let missing = D3d12StateObjectDesc {
+            object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            subobjects: vec![
+                D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary {
+                    bytecode: make_ray_llvm_container(&raygen_bitcode, "raygeneration"),
+                    exports: vec![state_objects::D3d12ExportDesc {
+                        name: "missing_entry".into(),
+                        export_to_rename: None,
+                        flags: 0,
+                    }],
+                }),
+                D3d12StateSubobject::RaytracingPipelineConfig {
+                    max_trace_recursion_depth: 1,
+                },
+            ],
+        };
+        let bad_handle = runtime
+            .create_state_object(missing.clone())
+            .expect("missing raygen export RTSO");
+        let error = runtime
+            .set_pipeline_state1_state_object(list, bad_handle, missing)
+            .expect_err("an export that names no raygen definition must be rejected");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(
+            error.message,
+            "LLVM IR has no definition for @missing_entry"
+        );
     }
 
     fn ray_test_state_object(
@@ -13664,6 +14009,15 @@ declare void @dx.op.traceRay(i32, ptr, i32, i32, i32, i32, i32, float, float, fl
         );
         assert_eq!(misses[0].payload_word(0), Some(333));
         assert_eq!(misses[1].payload_word(0), Some(444));
+
+        let device = crate::metal_backend::MetalDevice::system_default().expect("Metal device");
+        let error = crate::metal_backend::MetalShaderTable::new(device.metal_device(), &[], 4)
+            .expect_err("an empty shader table must be rejected");
+        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(
+            error.message,
+            "shader table must contain at least one record"
+        );
     }
 
     #[test]

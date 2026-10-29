@@ -8408,6 +8408,12 @@ pub struct MetalSampler {
     pub handle: u64,
     /// The underlying Metal sampler state.
     pub sampler: metal::SamplerState,
+    /// Whether the sampler was created with `supportArgumentBuffers = true`.
+    ///
+    /// `MTLArgumentEncoder.setSamplerState:atIndex:` aborts the host process
+    /// (Metal validation and paravirtualized Metal both assert) when the
+    /// sampler lacks this flag, so argument-buffer binding validates it first.
+    pub supports_argument_buffers: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -10069,6 +10075,112 @@ impl ArgumentBufferLayout {
     }
 }
 
+/// `E_INVALIDARG` — a parameter value is out of range or of the wrong type for
+/// the requested operation (Windows SDK `winerror.h`).
+pub const E_INVALIDARG: u32 = 0x8007_0057;
+
+/// `DXGI_ERROR_INVALID_CALL` — the call is invalid for the object's current
+/// state (Windows SDK `winerror.h`).
+pub const DXGI_ERROR_INVALID_CALL: u32 = 0x887A_0001;
+
+/// Failure from argument-buffer validation.
+///
+/// Carries the exact Windows HRESULT the caller must observe. Validators in
+/// this module return this error *before* any Objective-C accessor is touched,
+/// so malformed guest state can never reach a Metal accessor that asserts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgumentBufferError {
+    /// Exact Windows HRESULT for this failure.
+    pub hresult: u32,
+    /// Human-readable failure detail (stable; tests pin these).
+    pub message: String,
+}
+
+impl ArgumentBufferError {
+    fn new(hresult: u32, message: impl Into<String>) -> Self {
+        Self {
+            hresult,
+            message: message.into(),
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::new(E_INVALIDARG, message)
+    }
+
+    fn invalid_call(message: impl Into<String>) -> Self {
+        Self::new(DXGI_ERROR_INVALID_CALL, message)
+    }
+}
+
+/// Result type for argument-buffer validation and binding operations.
+pub type ArgumentBufferResult<T> = Result<T, ArgumentBufferError>;
+
+/// The argument class an `MTLArgumentEncoder` was built from for one
+/// contiguous index range `[start, start + slots)`.
+///
+/// `MTLArgumentEncoder` exposes no reflection API, so this record — captured
+/// when the encoder is constructed — is the only Rust-side view of what the
+/// encoder actually holds. Setters validate against it before calling into
+/// Objective-C.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderArgumentKind {
+    /// A buffer pointer argument (also nested argument buffers).
+    Buffer,
+    /// A texture argument.
+    Texture,
+    /// A sampler argument.
+    Sampler,
+    /// Constant (inline) data. The Metal descriptor is a `UChar` array of
+    /// `slots` elements, so the writable capacity in bytes equals `slots`.
+    Constant,
+}
+
+/// One recorded argument of an `MTLArgumentEncoder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderArgument {
+    /// First index of the argument range.
+    pub start: u32,
+    /// Number of consecutive indices the argument occupies (≥ 1).
+    pub slots: u32,
+    /// Argument class at this range.
+    pub kind: EncoderArgumentKind,
+}
+
+/// Number of Metal encoder indices an entry occupies.
+///
+/// Resources occupy `array_length` slots (0 means a non-array argument per
+/// `MTLArgumentDescriptor`, which is still one slot); inline data occupies one
+/// slot per declared byte because it is encoded as a `UChar` array.
+fn entry_slot_count(entry: &ArgumentBufferEntry) -> u64 {
+    match &entry.resource_type {
+        ArgumentResourceType::InlineData(size) => u64::from(*size).max(1),
+        _ => u64::from(entry.array_length.max(1)),
+    }
+}
+
+/// Look up the layout entry whose index footprint contains `binding`.
+///
+/// Footprints match Metal's index space: an array at `[B, B+N)` also serves
+/// element indices `B+1..B+N`, and an inline blob at `B` of `N` bytes occupies
+/// `N` encoder indices (one per `UChar` element).
+fn layout_entry_at(layout: &ArgumentBufferLayout, binding: u32) -> Option<&ArgumentBufferEntry> {
+    let index = u64::from(binding);
+    layout.entries.iter().find(|entry| {
+        let start = u64::from(entry.binding);
+        index >= start && index < start + entry_slot_count(entry)
+    })
+}
+
+/// Look up the recorded encoder argument whose index footprint contains `binding`.
+fn encoder_arg_at(args: &[EncoderArgument], binding: u32) -> Option<&EncoderArgument> {
+    let index = u64::from(binding);
+    args.iter().find(|arg| {
+        let start = u64::from(arg.start);
+        index >= start && index < start + u64::from(arg.slots)
+    })
+}
+
 /// An allocated Metal argument buffer with its backing storage and encoder.
 ///
 /// Supports Tier 2 features including nested argument buffers and inline data.
@@ -10081,6 +10193,12 @@ pub struct MetalArgumentBuffer {
     pub encoder: metal::ArgumentEncoder,
     /// The layout describing the buffer's structure.
     pub layout: ArgumentBufferLayout,
+    /// The arguments the encoder was actually built from.
+    ///
+    /// `MTLArgumentEncoder` has no reflection API, so every indexed accessor
+    /// validates against this record first: it is what prevents a layout /
+    /// encoder mismatch from reaching an Objective-C accessor that asserts.
+    pub encoder_args: Vec<EncoderArgument>,
 }
 
 /// Create an argument buffer from a layout descriptor.
@@ -10088,16 +10206,93 @@ pub struct MetalArgumentBuffer {
 /// Allocates a Metal buffer of the required size and creates an argument encoder
 /// that matches the layout's entries. The encoder is used to write resource
 /// bindings into the buffer.
+///
+/// Every layout property that could make Metal assert inside
+/// `newArgumentEncoderWithArguments:` or `newBufferWithLength:` (empty entry
+/// list, zero-sized inline data, index-space overflow, duplicate/overlapping
+/// binding ranges, slot counts above the tier-2 limit, and buffer sizes above
+/// `maxBufferLength`) is rejected with `E_INVALIDARG` before any Metal object
+/// is created.
 pub fn create_argument_buffer(
     device: &metal::DeviceRef,
     layout: &ArgumentBufferLayout,
-) -> AppResult<MetalArgumentBuffer> {
+) -> ArgumentBufferResult<MetalArgumentBuffer> {
     let total_size = layout.compute_size().max(layout.total_size);
     if total_size == 0 {
-        return Err(AppError::new(
-            ReasonCode::RcCliInvalid,
+        return Err(ArgumentBufferError::invalid(
             "argument buffer layout has zero size",
         ));
+    }
+    if layout.entries.is_empty() {
+        // An entry-less layout would build an empty descriptor array, which
+        // Metal rejects with `count must be greater than zero` (process abort).
+        return Err(ArgumentBufferError::invalid(
+            "argument buffer layout has no entries",
+        ));
+    }
+
+    // Validate every entry and capture the encoder's argument record before
+    // any Metal call. Footprints are the index ranges Metal will assign.
+    let mut encoder_args = Vec::with_capacity(layout.entries.len());
+    let mut footprints: Vec<(u64, u64)> = Vec::with_capacity(layout.entries.len());
+    let mut total_slots: u64 = 0;
+    for entry in &layout.entries {
+        let (slots, kind) = match &entry.resource_type {
+            ArgumentResourceType::InlineData(size) => {
+                if *size == 0 {
+                    return Err(ArgumentBufferError::invalid(format!(
+                        "inline data entry at binding {} has zero size",
+                        entry.binding
+                    )));
+                }
+                (u64::from(*size), EncoderArgumentKind::Constant)
+            }
+            ArgumentResourceType::Buffer | ArgumentResourceType::NestedArgumentBuffer(_) => (
+                u64::from(entry.array_length.max(1)),
+                EncoderArgumentKind::Buffer,
+            ),
+            ArgumentResourceType::Texture => (
+                u64::from(entry.array_length.max(1)),
+                EncoderArgumentKind::Texture,
+            ),
+            ArgumentResourceType::Sampler => (
+                u64::from(entry.array_length.max(1)),
+                EncoderArgumentKind::Sampler,
+            ),
+        };
+        let start = u64::from(entry.binding);
+        let end = start + slots;
+        if end > u64::from(u32::MAX) + 1 {
+            return Err(ArgumentBufferError::invalid(format!(
+                "binding range at {} overflows the 32-bit index space",
+                entry.binding
+            )));
+        }
+        total_slots = total_slots.saturating_add(slots);
+        footprints.push((start, end));
+        encoder_args.push(EncoderArgument {
+            start: entry.binding,
+            slots: slots as u32,
+            kind,
+        });
+    }
+    let slot_limit = u64::from(argument_buffer_tier_limit(2));
+    if total_slots > slot_limit {
+        // Unbounded array lengths make newArgumentEncoderWithArguments:
+        // hang or exhaust memory (probed: arrayLength = u32::MAX never
+        // returns); the tier-2 limit is Metal's documented entry ceiling.
+        return Err(ArgumentBufferError::invalid(format!(
+            "argument buffer layout needs {total_slots} encoder slots, above the tier-2 limit of {slot_limit}"
+        )));
+    }
+    footprints.sort_unstable();
+    for pair in footprints.windows(2) {
+        if pair[1].0 < pair[0].1 {
+            return Err(ArgumentBufferError::invalid(format!(
+                "argument buffer layout has overlapping binding ranges at index {}",
+                pair[1].0
+            )));
+        }
     }
 
     // Build Metal argument descriptors for each entry
@@ -10107,18 +10302,33 @@ pub fn create_argument_buffer(
         .map(|entry| {
             let desc = metal::ArgumentDescriptor::new();
             desc.set_index(entry.binding as u64);
-            desc.set_array_length(entry.array_length as u64);
+            let (data_type, array_length) = match &entry.resource_type {
+                ArgumentResourceType::Buffer => {
+                    (metal::MTLDataType::Pointer, u64::from(entry.array_length))
+                }
+                ArgumentResourceType::Texture => {
+                    (metal::MTLDataType::Texture, u64::from(entry.array_length))
+                }
+                ArgumentResourceType::Sampler => {
+                    (metal::MTLDataType::Sampler, u64::from(entry.array_length))
+                }
+                // Inline constant data is encoded as a byte array: MTLDataType::Struct
+                // has no expressible struct metadata on MTLArgumentDescriptor and
+                // newArgumentEncoderWithArguments: aborts the process on it, while a
+                // UChar array is a real constant argument of exactly the declared size.
+                ArgumentResourceType::InlineData(size) => {
+                    (metal::MTLDataType::UChar, u64::from(*size))
+                }
+                ArgumentResourceType::NestedArgumentBuffer(_) => {
+                    (metal::MTLDataType::Pointer, u64::from(entry.array_length))
+                }
+            };
+            desc.set_array_length(array_length);
+            desc.set_data_type(data_type);
             desc.set_access(match entry.access {
                 ArgumentAccess::ReadOnly => metal::MTLArgumentAccess::ReadOnly,
                 ArgumentAccess::ReadWrite => metal::MTLArgumentAccess::ReadWrite,
                 ArgumentAccess::WriteOnly => metal::MTLArgumentAccess::WriteOnly,
-            });
-            desc.set_data_type(match &entry.resource_type {
-                ArgumentResourceType::Buffer => metal::MTLDataType::Pointer,
-                ArgumentResourceType::Texture => metal::MTLDataType::Texture,
-                ArgumentResourceType::Sampler => metal::MTLDataType::Sampler,
-                ArgumentResourceType::InlineData(_) => metal::MTLDataType::Struct, // coverage: unreachable — MTLArgumentEncoder rejects Struct-typed argument descriptors without struct metadata before returning
-                ArgumentResourceType::NestedArgumentBuffer(_) => metal::MTLDataType::Pointer,
             });
             desc
         })
@@ -10130,6 +10340,16 @@ pub fn create_argument_buffer(
     let buffer_size = total_size
         .max(encoded_size)
         .max(layout.descriptor.size_bytes as usize);
+
+    // new_buffer panics (host abort) when the length exceeds maxBufferLength
+    // or is zero; zero is impossible here (total_size > 0) but a guest-declared
+    // total_size of usize::MAX is not.
+    let max_buffer_length = u64::from(device.max_buffer_length());
+    if buffer_size as u64 > max_buffer_length {
+        return Err(ArgumentBufferError::invalid(format!(
+            "argument buffer size {buffer_size} exceeds the Metal buffer limit"
+        )));
+    }
 
     let buffer = device.new_buffer(
         buffer_size as u64,
@@ -10144,6 +10364,7 @@ pub fn create_argument_buffer(
         buffer,
         encoder,
         layout: layout.clone(),
+        encoder_args,
     })
 }
 
@@ -10151,12 +10372,42 @@ pub fn create_argument_buffer(
 ///
 /// The buffer's GPU address is written at the offset determined by the
 /// argument encoder for the specified binding index.
+///
+/// Returns `E_INVALIDARG` when the binding is outside the layout's index
+/// footprint, is not a buffer entry, or the offset is not inside the bound
+/// buffer; returns `DXGI_ERROR_INVALID_CALL` when the encoder was not built
+/// with a buffer argument at that binding. No Metal accessor runs on error.
 pub fn set_buffer_in_argument_buffer(
     arg_buffer: &mut MetalArgumentBuffer,
     binding: u32,
     buffer: &MetalBuffer,
     offset: u64,
-) -> AppResult<()> {
+) -> ArgumentBufferResult<()> {
+    let entry = layout_entry_at(&arg_buffer.layout, binding).ok_or_else(|| {
+        ArgumentBufferError::invalid(format!(
+            "binding {binding} not found in argument buffer layout"
+        ))
+    })?;
+    if !matches!(entry.resource_type, ArgumentResourceType::Buffer) {
+        return Err(ArgumentBufferError::invalid(format!(
+            "binding {binding} is not a buffer entry"
+        )));
+    }
+    encoder_arg_at(&arg_buffer.encoder_args, binding)
+        .filter(|arg| matches!(arg.kind, EncoderArgumentKind::Buffer))
+        .ok_or_else(|| {
+            ArgumentBufferError::invalid_call(format!(
+                "argument encoder has no buffer argument at binding {binding}"
+            ))
+        })?;
+    // Metal's validation asserts `offset should be smaller than the buffer
+    // length`, so the encoded byte offset must land inside the bound buffer.
+    let buffer_length = buffer.buffer.length();
+    if offset >= buffer_length {
+        return Err(ArgumentBufferError::invalid(format!(
+            "buffer binding offset {offset} exceeds buffer size {buffer_length}"
+        )));
+    }
     arg_buffer
         .encoder
         .set_buffer(binding as u64, &buffer.buffer, offset);
@@ -10167,11 +10418,32 @@ pub fn set_buffer_in_argument_buffer(
 ///
 /// The texture's GPU handle is written at the offset determined by the
 /// argument encoder for the specified binding index.
+///
+/// Returns `E_INVALIDARG` when the binding is missing from the layout or is
+/// not a texture entry, and `DXGI_ERROR_INVALID_CALL` when the encoder holds
+/// no texture argument at that binding.
 pub fn set_texture_in_argument_buffer(
     arg_buffer: &mut MetalArgumentBuffer,
     binding: u32,
     texture: &MetalTexture,
-) -> AppResult<()> {
+) -> ArgumentBufferResult<()> {
+    let entry = layout_entry_at(&arg_buffer.layout, binding).ok_or_else(|| {
+        ArgumentBufferError::invalid(format!(
+            "binding {binding} not found in argument buffer layout"
+        ))
+    })?;
+    if !matches!(entry.resource_type, ArgumentResourceType::Texture) {
+        return Err(ArgumentBufferError::invalid(format!(
+            "binding {binding} is not a texture entry"
+        )));
+    }
+    encoder_arg_at(&arg_buffer.encoder_args, binding)
+        .filter(|arg| matches!(arg.kind, EncoderArgumentKind::Texture))
+        .ok_or_else(|| {
+            ArgumentBufferError::invalid_call(format!(
+                "argument encoder has no texture argument at binding {binding}"
+            ))
+        })?;
     arg_buffer
         .encoder
         .set_texture(binding as u64, &texture.texture);
@@ -10182,11 +10454,39 @@ pub fn set_texture_in_argument_buffer(
 ///
 /// The sampler's GPU handle is written at the offset determined by the
 /// argument encoder for the specified binding index.
+///
+/// Returns `E_INVALIDARG` when the binding is missing from the layout, is not
+/// a sampler entry, or the sampler was created without
+/// `supportArgumentBuffers` (Metal aborts the host process when such a sampler
+/// reaches `setSamplerState:atIndex:`); returns `DXGI_ERROR_INVALID_CALL` when
+/// the encoder holds no sampler argument at that binding.
 pub fn set_sampler_in_argument_buffer(
     arg_buffer: &mut MetalArgumentBuffer,
     binding: u32,
     sampler: &MetalSampler,
-) -> AppResult<()> {
+) -> ArgumentBufferResult<()> {
+    let entry = layout_entry_at(&arg_buffer.layout, binding).ok_or_else(|| {
+        ArgumentBufferError::invalid(format!(
+            "binding {binding} not found in argument buffer layout"
+        ))
+    })?;
+    if !matches!(entry.resource_type, ArgumentResourceType::Sampler) {
+        return Err(ArgumentBufferError::invalid(format!(
+            "binding {binding} is not a sampler entry"
+        )));
+    }
+    encoder_arg_at(&arg_buffer.encoder_args, binding)
+        .filter(|arg| matches!(arg.kind, EncoderArgumentKind::Sampler))
+        .ok_or_else(|| {
+            ArgumentBufferError::invalid_call(format!(
+                "argument encoder has no sampler argument at binding {binding}"
+            ))
+        })?;
+    if !sampler.supports_argument_buffers {
+        return Err(ArgumentBufferError::invalid(format!(
+            "sampler at binding {binding} does not support argument buffers"
+        )));
+    }
     arg_buffer
         .encoder
         .set_sampler_state(binding as u64, &sampler.sampler);
@@ -10201,13 +10501,16 @@ pub fn set_sampler_in_argument_buffer(
 /// offsets can diverge from Metal's layout — Metal aligns textures/samplers
 /// to 8 bytes while a naive walk aligns every entry to 16 — which would make
 /// the GPU read stale or garbage inline constants. The data size must not
-/// exceed the declared inline data size for the entry.
-#[rustfmt::skip]
+/// exceed the declared inline data size for the entry, and the encoder must
+/// actually expose a constant argument at the binding: `constantDataAtIndex:`
+/// aborts the host process otherwise (Metal validation and paravirtualized
+/// Metal assert), so that mismatch is rejected with
+/// `DXGI_ERROR_INVALID_CALL` before the Objective-C call.
 pub fn set_inline_data(
     arg_buffer: &mut MetalArgumentBuffer,
     binding: u32,
     data: &[u8],
-) -> AppResult<()> {
+) -> ArgumentBufferResult<()> {
     // Find the entry to validate data size
     let entry = arg_buffer
         .layout
@@ -10215,46 +10518,74 @@ pub fn set_inline_data(
         .iter()
         .find(|e| e.binding == binding)
         .ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("binding {binding} not found in argument buffer layout"),
-            )
+            ArgumentBufferError::invalid(format!(
+                "binding {binding} not found in argument buffer layout"
+            ))
         })?;
 
     let max_size = match &entry.resource_type {
         ArgumentResourceType::InlineData(size) => *size as usize,
         _ => {
-            return Err(AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("binding {binding} is not an inline data entry"),
-            ));
+            return Err(ArgumentBufferError::invalid(format!(
+                "binding {binding} is not an inline data entry"
+            )));
         }
     };
 
+    if data.is_empty() {
+        return Err(ArgumentBufferError::invalid(format!(
+            "inline data for binding {binding} is zero-length"
+        )));
+    }
+
     if data.len() > max_size {
-        return Err(AppError::new(
-            ReasonCode::RcCliInvalid,
-            format!(
-                "inline data size {} exceeds declared size {} for binding {binding}",
-                data.len(),
-                max_size
-            ),
-        ));
+        return Err(ArgumentBufferError::invalid(format!(
+            "inline data size {} exceeds declared size {} for binding {binding}",
+            data.len(),
+            max_size
+        )));
+    }
+
+    // Encoder reflection: the recorded encoder must expose a constant argument
+    // starting exactly at this binding. This is the guard that makes the Metal
+    // call a total function — `constantDataAtIndex:` aborts the host process
+    // (validation layer and paravirtualized Metal both assert) whenever the
+    // encoder's argument at that index is a buffer/texture/sampler or does not
+    // exist, which is exactly what a layout/encoder mismatch produces.
+    let constant_bytes = match encoder_arg_at(&arg_buffer.encoder_args, binding)
+        .filter(|arg| arg.start == binding)
+    {
+        Some(EncoderArgument {
+            kind: EncoderArgumentKind::Constant,
+            slots,
+            ..
+        }) => *slots,
+        _ => {
+            return Err(ArgumentBufferError::invalid_call(format!(
+                "argument encoder has no constant argument at binding {binding}"
+            )));
+        }
+    };
+    if data.len() > constant_bytes as usize {
+        return Err(ArgumentBufferError::invalid(format!(
+            "inline data size {} exceeds the {constant_bytes}-byte encoder constant at binding {binding}",
+            data.len()
+        )));
     }
 
     // Ask the argument encoder for the exact offset of this binding's inline
     // data; this is the only layout Metal's GPU-side reads honour.
     let dst = arg_buffer.encoder.constant_data(binding as u64);
     if dst.is_null() {
-        return Err(AppError::new( // coverage: unreachable — MTLArgumentEncoder.constantDataAtIndex returns a non-null pointer for every index the encoder exposes
-            ReasonCode::RcCliInvalid, // coverage: unreachable — constantDataAtIndex cannot return null after the layout validated the binding
-            format!("argument encoder returned null constant data for binding {binding}"), // coverage: unreachable — constantDataAtIndex cannot return null
-        )); // coverage: unreachable — constantDataAtIndex cannot return null
+        return Err(ArgumentBufferError::invalid_call(
+            // coverage: unreachable — MTLArgumentEncoder.constantDataAtIndex returns a non-null pointer for every recorded Constant argument
+            format!("argument encoder returned null constant data for binding {binding}"), // coverage: unreachable — constantDataAtIndex cannot return null after the encoder record validated a Constant argument
+        ));
     }
 
     // SAFETY: `constant_data` returns a pointer valid for the argument's
-    // declared inline data size (validated above), and the backing buffer
-    // storage is alive for as long as `arg_buffer`.
+    // declared inline data size (validated against the encoder record above),
+    // and the backing buffer storage is alive for as long as `arg_buffer`.
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len());
     }
@@ -10266,33 +10597,40 @@ pub fn set_inline_data(
 ///
 /// The nested buffer's GPU address is written at the offset for the parent
 /// binding, enabling hierarchical resource binding.
+///
+/// Returns `E_INVALIDARG` when the binding is missing from the parent layout
+/// or is not a nested entry, and `DXGI_ERROR_INVALID_CALL` when the parent
+/// encoder holds no buffer argument at that binding.
 pub fn set_nested_argument_buffer(
     parent: &mut MetalArgumentBuffer,
     binding: u32,
     nested: &MetalArgumentBuffer,
-) -> AppResult<()> {
+) -> ArgumentBufferResult<()> {
     // Verify the entry exists and is a nested argument buffer type
-    let entry = parent
-        .layout
-        .entries
-        .iter()
-        .find(|e| e.binding == binding)
-        .ok_or_else(|| {
-            AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("binding {binding} not found in parent argument buffer layout"),
-            )
-        })?;
+    let entry = layout_entry_at(&parent.layout, binding).ok_or_else(|| {
+        ArgumentBufferError::invalid(format!(
+            "binding {binding} not found in parent argument buffer layout"
+        ))
+    })?;
 
     match &entry.resource_type {
         ArgumentResourceType::NestedArgumentBuffer(_) => {}
         _ => {
-            return Err(AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("binding {binding} is not a nested argument buffer entry"),
-            ));
+            return Err(ArgumentBufferError::invalid(format!(
+                "binding {binding} is not a nested argument buffer entry"
+            )));
         }
     }
+
+    // Nested argument buffers are encoded as buffer pointers: the parent
+    // encoder must expose a buffer argument at this binding.
+    encoder_arg_at(&parent.encoder_args, binding)
+        .filter(|arg| matches!(arg.kind, EncoderArgumentKind::Buffer))
+        .ok_or_else(|| {
+            ArgumentBufferError::invalid_call(format!(
+                "argument encoder has no buffer argument at binding {binding}"
+            ))
+        })?;
 
     // Use the encoder to set the nested buffer as a buffer resource
     parent.encoder.set_buffer(binding as u64, &nested.buffer, 0);
@@ -23171,7 +23509,7 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
         let error = create_argument_buffer(device.metal_device(), &empty)
             .err()
             .expect("zero-sized argument buffer layout must be rejected");
-        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(error.hresult, E_INVALIDARG);
         assert_eq!(error.message, "argument buffer layout has zero size");
 
         let mut argument_buffer =
@@ -23207,55 +23545,39 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
         set_texture_in_argument_buffer(&mut argument_buffer, 1, &metal_texture)
             .expect("set texture");
         let sampler_desc = metal::SamplerDescriptor::new();
+        sampler_desc.set_support_argument_buffers(true);
         let raw_sampler = device.metal_device().new_sampler(&sampler_desc);
         let metal_sampler = MetalSampler {
             handle: alloc_gpu_id(),
             sampler: raw_sampler,
+            supports_argument_buffers: true,
         };
         set_sampler_in_argument_buffer(&mut argument_buffer, 2, &metal_sampler)
             .expect("set sampler");
 
-        // Inline data must use the encoder's exact offset. Build the encoder
-        // from a buffer argument at the same binding so `constant_data`
-        // returns a real in-buffer pointer without asking Metal to construct
-        // an unsupported Struct-typed argument descriptor.
-        let inline_desc = metal::ArgumentDescriptor::new();
-        inline_desc.set_index(3);
-        inline_desc.set_array_length(1);
-        inline_desc.set_access(metal::MTLArgumentAccess::ReadWrite);
-        inline_desc.set_data_type(metal::MTLDataType::Pointer);
-        let buffer_desc = metal::ArgumentDescriptor::new();
-        buffer_desc.set_index(0);
-        buffer_desc.set_array_length(1);
-        buffer_desc.set_access(metal::MTLArgumentAccess::ReadOnly);
-        buffer_desc.set_data_type(metal::MTLDataType::Pointer);
-        let descriptors: Vec<&metal::ArgumentDescriptorRef> = vec![&buffer_desc, &inline_desc];
-        let array = metal::Array::from_slice(&descriptors);
-        let encoder = device.metal_device().new_argument_encoder(array);
-        let buffer = device.create_buffer(512, metal::MTLResourceOptions::StorageModeShared);
-        encoder.set_argument_buffer(&buffer, 0);
-        let mut inline_buffer = MetalArgumentBuffer {
-            handle: alloc_gpu_id(),
-            buffer,
-            encoder,
-            layout: inline_size.clone(),
-        };
+        // Inline data uses the encoder's own constant-data offset. The encoder
+        // is built by create_argument_buffer, whose record for the InlineData
+        // entry is a real UChar-array constant, so constant_data is legal here
+        // (a Pointer-typed argument at this binding is rejected before Metal —
+        // see argument_buffer_encoder_without_constant_rejects_inline_data).
+        let mut inline_buffer =
+            create_argument_buffer(device.metal_device(), &inline_size).expect("inline buffer");
 
         set_inline_data(&mut inline_buffer, 3, &[7u8; 20]).expect("inline data at limit");
         let error = set_inline_data(&mut inline_buffer, 3, &[7u8; 21])
             .expect_err("oversized inline data must be rejected");
-        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(error.hresult, E_INVALIDARG);
         assert_eq!(
             error.message,
             "inline data size 21 exceeds declared size 20 for binding 3"
         );
         let error = set_inline_data(&mut inline_buffer, 0, &[0u8; 4])
             .expect_err("non-inline binding must be rejected");
-        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(error.hresult, E_INVALIDARG);
         assert_eq!(error.message, "binding 0 is not an inline data entry");
         let error = set_inline_data(&mut inline_buffer, 9, &[])
             .expect_err("unknown binding must be rejected");
-        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(error.hresult, E_INVALIDARG);
         assert_eq!(
             error.message,
             "binding 9 not found in argument buffer layout"
@@ -23267,17 +23589,682 @@ fragment float4 green_fill() { return float4(0.0, 1.0, 0.0, 1.0); }
             .expect("set nested argument buffer");
         let error = set_nested_argument_buffer(&mut argument_buffer, 0, &nested)
             .expect_err("non-nested binding must be rejected");
-        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(error.hresult, E_INVALIDARG);
         assert_eq!(
             error.message,
             "binding 0 is not a nested argument buffer entry"
         );
         let error = set_nested_argument_buffer(&mut argument_buffer, 9, &nested)
             .expect_err("unknown nested binding must be rejected");
-        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(error.hresult, E_INVALIDARG);
         assert_eq!(
             error.message,
             "binding 9 not found in parent argument buffer layout"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Argument-buffer totality: every malformed guest state becomes an
+    // exact HRESULT and never reaches a Metal accessor that asserts.
+    // ------------------------------------------------------------------
+
+    /// The P0 layout/encoder mismatch: the layout claims inline data at
+    /// binding 3 while the encoder holds a Pointer (buffer) argument there.
+    /// `constantDataAtIndex:` aborts the host process for exactly this state
+    /// (observed: `AppleParavirtArgumentEncoder ... Failed to find constant
+    /// argument (3)`; also reproduced with `MTL_DEBUG_LAYER=1`: "Trying to
+    /// set a Constant at index 3 but the argument buffer has a Buffer").
+    #[test]
+    fn argument_buffer_encoder_without_constant_rejects_inline_data() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let layout = ArgumentBufferLayout {
+            descriptor: ArgumentBufferDescriptor {
+                buffer_index: 0,
+                size_bytes: 64,
+                usage: ArgumentBufferUsage::Graphics,
+                access: ArgumentBufferAccess::ReadOnly,
+            },
+            entries: vec![
+                ArgumentBufferEntry {
+                    binding: 0,
+                    resource_type: ArgumentResourceType::Buffer,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 3,
+                    resource_type: ArgumentResourceType::InlineData(20),
+                    access: ArgumentAccess::ReadWrite,
+                    array_length: 1,
+                },
+            ],
+            total_size: 0,
+        };
+        // Hand-built encoder whose index 3 is a buffer pointer — the mismatched
+        // descriptor that made constantDataAtIndex: kill the host.
+        let buffer_desc = metal::ArgumentDescriptor::new();
+        buffer_desc.set_index(0);
+        buffer_desc.set_array_length(1);
+        buffer_desc.set_access(metal::MTLArgumentAccess::ReadOnly);
+        buffer_desc.set_data_type(metal::MTLDataType::Pointer);
+        let inline_desc = metal::ArgumentDescriptor::new();
+        inline_desc.set_index(3);
+        inline_desc.set_array_length(1);
+        inline_desc.set_access(metal::MTLArgumentAccess::ReadWrite);
+        inline_desc.set_data_type(metal::MTLDataType::Pointer);
+        let descriptors: Vec<&metal::ArgumentDescriptorRef> = vec![&buffer_desc, &inline_desc];
+        let array = metal::Array::from_slice(&descriptors);
+        let encoder = device.metal_device().new_argument_encoder(array);
+        let buffer = device.create_buffer(512, metal::MTLResourceOptions::StorageModeShared);
+        encoder.set_argument_buffer(&buffer, 0);
+        let mut argument_buffer = MetalArgumentBuffer {
+            handle: alloc_gpu_id(),
+            buffer,
+            encoder,
+            layout,
+            encoder_args: vec![
+                EncoderArgument {
+                    start: 0,
+                    slots: 1,
+                    kind: EncoderArgumentKind::Buffer,
+                },
+                EncoderArgument {
+                    start: 3,
+                    slots: 1,
+                    kind: EncoderArgumentKind::Buffer,
+                },
+            ],
+        };
+
+        let error = set_inline_data(&mut argument_buffer, 3, &[7u8; 20])
+            .expect_err("encoder without a constant argument at the binding must be rejected");
+        assert_eq!(error.hresult, DXGI_ERROR_INVALID_CALL);
+        assert_eq!(
+            error.message,
+            "argument encoder has no constant argument at binding 3"
+        );
+    }
+
+    /// Out-of-range indices, wrong argument classes, a resource bound where a
+    /// constant is required, and offsets outside the bound buffer all fail
+    /// with `E_INVALIDARG` before any Metal accessor runs.
+    #[test]
+    fn argument_buffer_setters_reject_out_of_range_and_wrong_argument_type() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let nested_layout = ArgumentBufferLayout {
+            descriptor: ArgumentBufferDescriptor {
+                buffer_index: 1,
+                size_bytes: 32,
+                usage: ArgumentBufferUsage::Graphics,
+                access: ArgumentBufferAccess::ReadWrite,
+            },
+            entries: vec![
+                ArgumentBufferEntry {
+                    binding: 0,
+                    resource_type: ArgumentResourceType::Buffer,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 1,
+                    resource_type: ArgumentResourceType::Texture,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 2,
+                },
+            ],
+            total_size: 0,
+        };
+        let layout = ArgumentBufferLayout {
+            descriptor: ArgumentBufferDescriptor {
+                buffer_index: 0,
+                size_bytes: 256,
+                usage: ArgumentBufferUsage::Graphics,
+                access: ArgumentBufferAccess::ReadWrite,
+            },
+            entries: vec![
+                ArgumentBufferEntry {
+                    binding: 0,
+                    resource_type: ArgumentResourceType::Buffer,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 1,
+                    resource_type: ArgumentResourceType::Texture,
+                    access: ArgumentAccess::ReadWrite,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 2,
+                    resource_type: ArgumentResourceType::Sampler,
+                    access: ArgumentAccess::WriteOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 4,
+                    resource_type: ArgumentResourceType::NestedArgumentBuffer(Box::new(
+                        nested_layout.clone(),
+                    )),
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+            ],
+            total_size: 0,
+        };
+        let inline_layout = ArgumentBufferLayout {
+            descriptor: ArgumentBufferDescriptor {
+                buffer_index: 0,
+                size_bytes: 64,
+                usage: ArgumentBufferUsage::Graphics,
+                access: ArgumentBufferAccess::ReadOnly,
+            },
+            entries: vec![
+                ArgumentBufferEntry {
+                    binding: 0,
+                    resource_type: ArgumentResourceType::Buffer,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 3,
+                    resource_type: ArgumentResourceType::InlineData(20),
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+            ],
+            total_size: 0,
+        };
+        let mut argument_buffer =
+            create_argument_buffer(device.metal_device(), &layout).expect("argument buffer");
+        let mut nested_buffer =
+            create_argument_buffer(device.metal_device(), &nested_layout).expect("nested buffer");
+        let inline_buffer =
+            create_argument_buffer(device.metal_device(), &inline_layout).expect("inline buffer");
+
+        let raw_buffer = device.create_buffer(64, metal::MTLResourceOptions::StorageModeShared);
+        let metal_buffer = MetalBuffer {
+            handle: alloc_gpu_id(),
+            buffer: raw_buffer,
+            size: 64,
+        };
+        let raw_texture = device.create_texture(
+            2,
+            2,
+            metal::MTLPixelFormat::RGBA8Unorm,
+            metal::MTLTextureUsage::ShaderRead,
+            metal::MTLStorageMode::Private,
+        );
+        let metal_texture = MetalTexture {
+            handle: alloc_gpu_id(),
+            texture: raw_texture,
+            width: 2,
+            height: 2,
+            format: PixelFormat::RGBA8Unorm,
+        };
+        let sampler_desc = metal::SamplerDescriptor::new();
+        sampler_desc.set_support_argument_buffers(true);
+        let raw_sampler = device.metal_device().new_sampler(&sampler_desc);
+        let metal_sampler = MetalSampler {
+            handle: alloc_gpu_id(),
+            sampler: raw_sampler,
+            supports_argument_buffers: true,
+        };
+
+        // Out-of-range index (outside every entry's footprint).
+        let error = set_buffer_in_argument_buffer(&mut argument_buffer, 9, &metal_buffer, 0)
+            .expect_err("binding beyond the layout must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "binding 9 not found in argument buffer layout"
+        );
+
+        // Array bounds: the texture array at binding 1 occupies [1, 3).
+        let error = set_texture_in_argument_buffer(&mut nested_buffer, 3, &metal_texture)
+            .expect_err("index past the array's last element must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "binding 3 not found in argument buffer layout"
+        );
+
+        // Wrong argument type: texture/sampler writes at a buffer binding.
+        let error = set_texture_in_argument_buffer(&mut argument_buffer, 0, &metal_texture)
+            .expect_err("texture at a buffer binding must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(error.message, "binding 0 is not a texture entry");
+        let error = set_sampler_in_argument_buffer(&mut argument_buffer, 0, &metal_sampler)
+            .expect_err("sampler at a buffer binding must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(error.message, "binding 0 is not a sampler entry");
+
+        // A resource bound where a constant is required: the binding's layout
+        // entry is inline data, so a buffer write is rejected.
+        let mut inline_argument_buffer = inline_buffer;
+        let error = set_buffer_in_argument_buffer(&mut inline_argument_buffer, 3, &metal_buffer, 0)
+            .expect_err("buffer at an inline data binding must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(error.message, "binding 3 is not a buffer entry");
+
+        // Encoded byte offset: u64::MAX must not reach setBuffer:offset:atIndex:,
+        // and offset == length is outside the buffer too (Metal validation
+        // asserts `offset should be smaller than the buffer length`).
+        let error = set_buffer_in_argument_buffer(&mut argument_buffer, 0, &metal_buffer, u64::MAX)
+            .expect_err("overflowing offset must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "buffer binding offset 18446744073709551615 exceeds buffer size 64"
+        );
+        let error = set_buffer_in_argument_buffer(&mut argument_buffer, 0, &metal_buffer, 64)
+            .expect_err("offset at the buffer end must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "buffer binding offset 64 exceeds buffer size 64"
+        );
+    }
+
+    /// Encoder-record mismatches (the record is what the Objective-C encoder
+    /// actually holds) fail with `DXGI_ERROR_INVALID_CALL` and never reach a
+    /// Metal accessor.
+    #[test]
+    fn argument_buffer_encoder_mismatch_returns_invalid_call() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let nested_layout = ArgumentBufferLayout {
+            descriptor: ArgumentBufferDescriptor {
+                buffer_index: 1,
+                size_bytes: 32,
+                usage: ArgumentBufferUsage::Graphics,
+                access: ArgumentBufferAccess::ReadWrite,
+            },
+            entries: vec![ArgumentBufferEntry {
+                binding: 0,
+                resource_type: ArgumentResourceType::Buffer,
+                access: ArgumentAccess::ReadOnly,
+                array_length: 1,
+            }],
+            total_size: 0,
+        };
+        let layout = ArgumentBufferLayout {
+            descriptor: ArgumentBufferDescriptor {
+                buffer_index: 0,
+                size_bytes: 256,
+                usage: ArgumentBufferUsage::Graphics,
+                access: ArgumentBufferAccess::ReadWrite,
+            },
+            entries: vec![
+                ArgumentBufferEntry {
+                    binding: 0,
+                    resource_type: ArgumentResourceType::Buffer,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 1,
+                    resource_type: ArgumentResourceType::Texture,
+                    access: ArgumentAccess::ReadWrite,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 2,
+                    resource_type: ArgumentResourceType::Sampler,
+                    access: ArgumentAccess::WriteOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 4,
+                    resource_type: ArgumentResourceType::NestedArgumentBuffer(Box::new(
+                        nested_layout.clone(),
+                    )),
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+            ],
+            total_size: 0,
+        };
+        let mut argument_buffer =
+            create_argument_buffer(device.metal_device(), &layout).expect("argument buffer");
+        let nested = create_argument_buffer(device.metal_device(), &nested_layout)
+            .expect("nested argument buffer");
+
+        let raw_buffer = device.create_buffer(64, metal::MTLResourceOptions::StorageModeShared);
+        let metal_buffer = MetalBuffer {
+            handle: alloc_gpu_id(),
+            buffer: raw_buffer,
+            size: 64,
+        };
+        let raw_texture = device.create_texture(
+            2,
+            2,
+            metal::MTLPixelFormat::RGBA8Unorm,
+            metal::MTLTextureUsage::ShaderRead,
+            metal::MTLStorageMode::Private,
+        );
+        let metal_texture = MetalTexture {
+            handle: alloc_gpu_id(),
+            texture: raw_texture,
+            width: 2,
+            height: 2,
+            format: PixelFormat::RGBA8Unorm,
+        };
+        let sampler_desc = metal::SamplerDescriptor::new();
+        sampler_desc.set_support_argument_buffers(true);
+        let raw_sampler = device.metal_device().new_sampler(&sampler_desc);
+        let metal_sampler = MetalSampler {
+            handle: alloc_gpu_id(),
+            sampler: raw_sampler,
+            supports_argument_buffers: true,
+        };
+
+        // The encoder no longer exposes the binding at all.
+        argument_buffer.encoder_args.clear();
+        let error = set_buffer_in_argument_buffer(&mut argument_buffer, 0, &metal_buffer, 0)
+            .expect_err("binding absent from the encoder record must be rejected");
+        assert_eq!(error.hresult, DXGI_ERROR_INVALID_CALL);
+        assert_eq!(
+            error.message,
+            "argument encoder has no buffer argument at binding 0"
+        );
+
+        // The recorded class at the texture binding is a buffer.
+        argument_buffer.encoder_args = vec![EncoderArgument {
+            start: 1,
+            slots: 1,
+            kind: EncoderArgumentKind::Buffer,
+        }];
+        let error = set_texture_in_argument_buffer(&mut argument_buffer, 1, &metal_texture)
+            .expect_err("class mismatch at the texture binding must be rejected");
+        assert_eq!(error.hresult, DXGI_ERROR_INVALID_CALL);
+        assert_eq!(
+            error.message,
+            "argument encoder has no texture argument at binding 1"
+        );
+
+        // The recorded class at the sampler binding is a texture.
+        argument_buffer.encoder_args = vec![EncoderArgument {
+            start: 2,
+            slots: 1,
+            kind: EncoderArgumentKind::Texture,
+        }];
+        let error = set_sampler_in_argument_buffer(&mut argument_buffer, 2, &metal_sampler)
+            .expect_err("class mismatch at the sampler binding must be rejected");
+        assert_eq!(error.hresult, DXGI_ERROR_INVALID_CALL);
+        assert_eq!(
+            error.message,
+            "argument encoder has no sampler argument at binding 2"
+        );
+
+        // The recorded class at the nested binding is a texture.
+        argument_buffer.encoder_args = vec![EncoderArgument {
+            start: 4,
+            slots: 1,
+            kind: EncoderArgumentKind::Texture,
+        }];
+        let error = set_nested_argument_buffer(&mut argument_buffer, 4, &nested)
+            .expect_err("class mismatch at the nested binding must be rejected");
+        assert_eq!(error.hresult, DXGI_ERROR_INVALID_CALL);
+        assert_eq!(
+            error.message,
+            "argument encoder has no buffer argument at binding 4"
+        );
+    }
+
+    /// Zero-length writes and writes past the encoder's constant capacity fail
+    /// with `E_INVALIDARG`; a write exactly at capacity still succeeds.
+    #[test]
+    fn argument_buffer_inline_data_rejects_zero_length_and_excess() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let layout = ArgumentBufferLayout {
+            descriptor: ArgumentBufferDescriptor {
+                buffer_index: 0,
+                size_bytes: 64,
+                usage: ArgumentBufferUsage::Graphics,
+                access: ArgumentBufferAccess::ReadOnly,
+            },
+            entries: vec![
+                ArgumentBufferEntry {
+                    binding: 0,
+                    resource_type: ArgumentResourceType::Buffer,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 3,
+                    resource_type: ArgumentResourceType::InlineData(20),
+                    access: ArgumentAccess::ReadWrite,
+                    array_length: 1,
+                },
+            ],
+            total_size: 0,
+        };
+
+        // Zero-length write against a create-built (constant-capable) buffer.
+        let mut argument_buffer =
+            create_argument_buffer(device.metal_device(), &layout).expect("argument buffer");
+        let error = set_inline_data(&mut argument_buffer, 3, &[])
+            .expect_err("zero-length inline data must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(error.message, "inline data for binding 3 is zero-length");
+
+        // Hand-built encoder whose constant at binding 3 is only 4 bytes
+        // while the layout declares 20: the write must stop at the encoder's
+        // capacity instead of corrupting adjacent encoded arguments.
+        let buffer_desc = metal::ArgumentDescriptor::new();
+        buffer_desc.set_index(0);
+        buffer_desc.set_array_length(1);
+        buffer_desc.set_access(metal::MTLArgumentAccess::ReadOnly);
+        buffer_desc.set_data_type(metal::MTLDataType::Pointer);
+        let inline_desc = metal::ArgumentDescriptor::new();
+        inline_desc.set_index(3);
+        inline_desc.set_array_length(4);
+        inline_desc.set_access(metal::MTLArgumentAccess::ReadWrite);
+        inline_desc.set_data_type(metal::MTLDataType::UChar);
+        let descriptors: Vec<&metal::ArgumentDescriptorRef> = vec![&buffer_desc, &inline_desc];
+        let array = metal::Array::from_slice(&descriptors);
+        let encoder = device.metal_device().new_argument_encoder(array);
+        let buffer = device.create_buffer(512, metal::MTLResourceOptions::StorageModeShared);
+        encoder.set_argument_buffer(&buffer, 0);
+        let mut short_constant = MetalArgumentBuffer {
+            handle: alloc_gpu_id(),
+            buffer,
+            encoder,
+            layout: layout.clone(),
+            encoder_args: vec![
+                EncoderArgument {
+                    start: 0,
+                    slots: 1,
+                    kind: EncoderArgumentKind::Buffer,
+                },
+                EncoderArgument {
+                    start: 3,
+                    slots: 4,
+                    kind: EncoderArgumentKind::Constant,
+                },
+            ],
+        };
+        let error = set_inline_data(&mut short_constant, 3, &[7u8; 20])
+            .expect_err("write past the encoder constant must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "inline data size 20 exceeds the 4-byte encoder constant at binding 3"
+        );
+        set_inline_data(&mut short_constant, 3, &[7u8; 4])
+            .expect("write within the encoder constant capacity must succeed");
+    }
+
+    /// Every malformed layout that would make `new_argument_encoder` or
+    /// `new_buffer` abort/hang the host is rejected with `E_INVALIDARG`
+    /// before any Metal object is created.
+    #[test]
+    fn create_argument_buffer_rejects_malformed_layouts() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let base_descriptor = || ArgumentBufferDescriptor {
+            buffer_index: 0,
+            size_bytes: 64,
+            usage: ArgumentBufferUsage::Graphics,
+            access: ArgumentBufferAccess::ReadOnly,
+        };
+
+        // Empty entry list with a non-zero declared size: Metal aborts
+        // encoder creation with `count must be greater than zero`.
+        let empty_entries = ArgumentBufferLayout {
+            descriptor: base_descriptor(),
+            entries: Vec::new(),
+            total_size: 256,
+        };
+        let error = create_argument_buffer(device.metal_device(), &empty_entries)
+            .err()
+            .expect("entry-less layout must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(error.message, "argument buffer layout has no entries");
+
+        // Zero-length inline constant.
+        let zero_inline = ArgumentBufferLayout {
+            descriptor: base_descriptor(),
+            entries: vec![
+                ArgumentBufferEntry {
+                    binding: 0,
+                    resource_type: ArgumentResourceType::Buffer,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 3,
+                    resource_type: ArgumentResourceType::InlineData(0),
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+            ],
+            total_size: 0,
+        };
+        let error = create_argument_buffer(device.metal_device(), &zero_inline)
+            .err()
+            .expect("zero-sized inline entry must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "inline data entry at binding 3 has zero size"
+        );
+
+        // Binding range whose end leaves the 32-bit index space.
+        let overflow_index = ArgumentBufferLayout {
+            descriptor: base_descriptor(),
+            entries: vec![ArgumentBufferEntry {
+                binding: u32::MAX,
+                resource_type: ArgumentResourceType::Buffer,
+                access: ArgumentAccess::ReadOnly,
+                array_length: 2,
+            }],
+            total_size: 0,
+        };
+        let error = create_argument_buffer(device.metal_device(), &overflow_index)
+            .err()
+            .expect("overflowing binding range must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "binding range at 4294967295 overflows the 32-bit index space"
+        );
+
+        // Array lengths above the tier-2 encoder slot limit hang encoder
+        // creation (probed: arrayLength = u32::MAX never returns).
+        let over_limit = ArgumentBufferLayout {
+            descriptor: base_descriptor(),
+            entries: vec![ArgumentBufferEntry {
+                binding: 0,
+                resource_type: ArgumentResourceType::Texture,
+                access: ArgumentAccess::ReadOnly,
+                array_length: 500_001,
+            }],
+            total_size: 0,
+        };
+        let error = create_argument_buffer(device.metal_device(), &over_limit)
+            .err()
+            .expect("slot count above the tier-2 limit must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "argument buffer layout needs 500001 encoder slots, above the tier-2 limit of 500000"
+        );
+
+        // Duplicate binding ranges.
+        let duplicate = ArgumentBufferLayout {
+            descriptor: base_descriptor(),
+            entries: vec![
+                ArgumentBufferEntry {
+                    binding: 0,
+                    resource_type: ArgumentResourceType::Buffer,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 0,
+                    resource_type: ArgumentResourceType::Sampler,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+            ],
+            total_size: 0,
+        };
+        let error = create_argument_buffer(device.metal_device(), &duplicate)
+            .err()
+            .expect("duplicate binding ranges must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "argument buffer layout has overlapping binding ranges at index 0"
+        );
+
+        // The inline blob occupies encoder indices [3, 23) (one per byte), so
+        // a buffer at index 4 collides with it in Metal's index space.
+        let inline_overlap = ArgumentBufferLayout {
+            descriptor: base_descriptor(),
+            entries: vec![
+                ArgumentBufferEntry {
+                    binding: 3,
+                    resource_type: ArgumentResourceType::InlineData(20),
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+                ArgumentBufferEntry {
+                    binding: 4,
+                    resource_type: ArgumentResourceType::Buffer,
+                    access: ArgumentAccess::ReadOnly,
+                    array_length: 1,
+                },
+            ],
+            total_size: 0,
+        };
+        let error = create_argument_buffer(device.metal_device(), &inline_overlap)
+            .err()
+            .expect("entry overlapping an inline blob must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "argument buffer layout has overlapping binding ranges at index 4"
+        );
+
+        // Guest-declared backing size above maxBufferLength: new_buffer returns
+        // nil and the metal crate panics (host abort).
+        let oversized = ArgumentBufferLayout {
+            descriptor: base_descriptor(),
+            entries: vec![ArgumentBufferEntry {
+                binding: 0,
+                resource_type: ArgumentResourceType::Buffer,
+                access: ArgumentAccess::ReadOnly,
+                array_length: 1,
+            }],
+            total_size: usize::MAX,
+        };
+        let error = create_argument_buffer(device.metal_device(), &oversized)
+            .err()
+            .expect("backing size above maxBufferLength must be rejected");
+        assert_eq!(error.hresult, E_INVALIDARG);
+        assert_eq!(
+            error.message,
+            "argument buffer size 18446744073709551615 exceeds the Metal buffer limit"
         );
     }
 

@@ -395,13 +395,34 @@
   "(indices, vec![0, 2])",
   "( bad.validate().unwrap_err().message, \"argmin/argmax axis 2 is out of range for rank 2\" )"
  ],
+ "argument_buffer_encoder_mismatch_returns_invalid_call": [
+  "(error.hresult, DXGI_ERROR_INVALID_CALL)",
+  "( error.message, \"argument encoder has no buffer argument at binding 0\" )",
+  "( error.message, \"argument encoder has no texture argument at binding 1\" )",
+  "( error.message, \"argument encoder has no sampler argument at binding 2\" )"
+ ],
+ "argument_buffer_encoder_without_constant_rejects_inline_data": [
+  "(error.hresult, DXGI_ERROR_INVALID_CALL)",
+  "( error.message, \"argument encoder has no constant argument at binding 3\" )"
+ ],
+ "argument_buffer_inline_data_rejects_zero_length_and_excess": [
+  "(error.hresult, E_INVALIDARG)",
+  "(error.message, \"inline data for binding 3 is zero-length\")",
+  "( error.message, \"inline data size 20 exceeds the 4-byte encoder constant at binding 3\" )"
+ ],
  "argument_buffer_layout_rejects_missing_mismatched_and_oversized_bindings": [
   "(nested_layout.compute_size(), 256)",
   "(layout.compute_size(), 512)",
   "(inline_size.compute_size(), 256)",
-  "(error.code, ReasonCode::RcCliInvalid)",
+  "(error.hresult, E_INVALIDARG)",
   "(error.message, \"argument buffer layout has zero size\")",
   "(argument_buffer.layout.total_size, 0)"
+ ],
+ "argument_buffer_setters_reject_out_of_range_and_wrong_argument_type": [
+  "(error.hresult, E_INVALIDARG)",
+  "( error.message, \"binding 9 not found in argument buffer layout\" )",
+  "( error.message, \"binding 3 not found in argument buffer layout\" )",
+  "(error.message, \"binding 0 is not a texture entry\")"
  ],
  "arm64_assembler_leaf_encoding_boundary_is_pinned": [
   "(&code[0..4], &0xd2800020u32.to_le_bytes())",
@@ -1871,6 +1892,12 @@
   "(runtime.last_error, ERROR_SHARING_VIOLATION)",
   "(result, 1)"
  ],
+ "create_argument_buffer_rejects_malformed_layouts": [
+  "(error.hresult, E_INVALIDARG)",
+  "(error.message, \"argument buffer layout has no entries\")",
+  "( error.message, \"inline data entry at binding 3 has zero size\" )",
+  "( error.message, \"binding range at 4294967295 overflows the 32-bit index space\" )"
+ ],
  "create_directory_missing_parent_returns_path_not_found": [
   "( result.expect_err(\"missing parent must fail\").code, ReasonCode::RcFsPathInvalid, \"CreateDirectoryW with a missing parent must be ERROR_PATH_NOT_FOUND\" )"
  ],
@@ -2299,6 +2326,10 @@
   "( runtime .backend() .resource_bytes(target) .expect(\"target bytes\"), &[0u8; 64][..] )",
   "(runtime.native_target_dimensions(target), Some((4, 4)))"
  ],
+ "d3d12_execute_indirect_empty_argument_buffer_boundary_is_noop": [
+  "( runtime .execute_indirect_gpu(list, dispatch_sig, 0, &[], 0, None, None) .expect(\"empty argument buffer with zero count must be a no-op\"), 0 )",
+  "( runtime .execute_indirect_gpu(list, dispatch_sig, 0, &[], 0, Some(0), None) .expect(\"explicit zero count with an empty argument buffer must be a no-op\"), 0 )"
+ ],
  "d3d12_execute_indirect_gpu_rejects_bad_ranges_and_limits_count_on_gpu": [
   "(runtime.last_indirect_results(), Vec::new())",
   "(runtime.last_indirect_effective(), 0)",
@@ -2427,9 +2458,41 @@
   "(results[0].accepted, 1)",
   "(results[1].hit_kind, 0)"
  ],
+ "d3d12_ray_sbt_selects_multiple_closest_and_miss_exports": [
+  "(hits[0].payload_word(1), Some(0))",
+  "(hits[1].payload_word(1), Some(1))",
+  "(hits[0].payload_word(0), Some(111))",
+  "(hits[1].payload_word(0), Some(222))",
+  "(misses[0].payload_word(0), Some(333))",
+  "(misses[1].payload_word(0), Some(444))"
+ ],
  "d3d12_ray_stage_artifacts_reject_bad_bitcode_with_exact_error": [
   "(error.code, ReasonCode::RcDxilInvalid)",
   "(error.message, \"unsupported LLVM instruction fence\")"
+ ],
+ "d3d12_ray_stage_artifacts_translate_every_export_and_reject_unknown_rename": [
+  "(pso.ray_stages.len(), 3)",
+  "(pso.ray_stages[\"public_a\"].stage, \"closesthit\")",
+  "(pso.ray_stages[\"public_a\"].entry, \"public_a\")",
+  "(pso.ray_stages[\"public_b\"].entry, \"public_b\")",
+  "( pso.ray_stages[\"public_a\"].source.contains(\"void chs_one(\"), true ); assert_eq!( pso.ray_stages[\"public_b\"].source.contains(\"void chs_two(\"), true ); assert_ne!( pso.ray_stages[\"public_a\"].function_index, pso.ray_stages[\"public_b\"].function_index ); assert_eq!(pso.ray_stages.contains_key(\"chs_one\"), false); assert_eq!(pso.ray_stages.contains_key(\"chs_two\"), false); let missing = D3d12StateObjectDesc { object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, subobjects: vec![ D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary { bytecode: make_ray_dxil(\"raygeneration\"), exports: vec![state_objects::D3d12ExportDesc { name: \"raygen\".into(), export_to_rename: None, flags: 0, }], }), D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary { bytecode: container, exports: vec![state_objects::D3d12ExportDesc { name: \"missing\".into(), export_to_rename: Some(\"absent\".into()), flags: 0, }], }), D3d12StateSubobject::RaytracingPipelineConfig { max_trace_recursion_depth: 1, }, ], }; let bad_handle = runtime .create_state_object(missing.clone()) .expect(\"bad rename RTSO\"); let error = runtime .set_pipeline_state1_state_object(list, bad_handle, missing) .expect_err(\"an unknown ExportToRename must fail instead of selecting another export\"); assert_eq!(error.code, ReasonCode::RcDxilInvalid); assert_eq!(error.message, \"LLVM IR has no definition for @absent\"); }",
+  "( pso.ray_stages[\"public_b\"].source.contains(\"void chs_two(\"), true ); assert_ne!( pso.ray_stages[\"public_a\"].function_index, pso.ray_stages[\"public_b\"].function_index ); assert_eq!(pso.ray_stages.contains_key(\"chs_one\"), false); assert_eq!(pso.ray_stages.contains_key(\"chs_two\"), false); let missing = D3d12StateObjectDesc { object_type: STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, subobjects: vec![ D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary { bytecode: make_ray_dxil(\"raygeneration\"), exports: vec![state_objects::D3d12ExportDesc { name: \"raygen\".into(), export_to_rename: None, flags: 0, }], }), D3d12StateSubobject::DxilLibrary(state_objects::D3d12DxilLibrary { bytecode: container, exports: vec![state_objects::D3d12ExportDesc { name: \"missing\".into(), export_to_rename: Some(\"absent\".into()), flags: 0, }], }), D3d12StateSubobject::RaytracingPipelineConfig { max_trace_recursion_depth: 1, }, ], }; let bad_handle = runtime .create_state_object(missing.clone()) .expect(\"bad rename RTSO\"); let error = runtime .set_pipeline_state1_state_object(list, bad_handle, missing) .expect_err(\"an unknown ExportToRename must fail instead of selecting another export\"); assert_eq!(error.code, ReasonCode::RcDxilInvalid); assert_eq!(error.message, \"LLVM IR has no definition for @absent\"); }"
+ ],
+ "d3d12_ray_state_object_compiles_each_stage_from_its_own_bitcode": [
+  "(pso.ray_stages.len(), stages.len() + 1)",
+  "(pso.ray_stages[\"chs_bare\"].stage, \"closesthit\",)",
+  "(artifact.stage, kind)",
+  "(artifact.entry, entry)",
+  "( artifact.source.contains(function), true, \"{kind} missing {function}\" )",
+  "( pso.ray_stages[\"raygen\"].source.contains(\"query.intersect\"), true )"
+ ],
+ "d3d12_ray_state_object_rejects_missing_raygen_export_and_uses_later_raygen_library": [
+  "(pso.ray_entry.as_deref(), Some(\"entry\"))",
+  "(source.contains(\"kernel void entry\"), true)",
+  "(source.contains(\"query.intersect\"), true)",
+  "(source.contains(\"msl_closest_hit\"), true)",
+  "(pso.ray_stages.contains_key(\"chs\"), true)",
+  "(pso.ray_stages.contains_key(\"entry\"), true)"
  ],
  "d3d12_set_pipeline_state1_rejects_collection_state_object": [
   "(error.code, ReasonCode::RcD3dInvalidState)",
@@ -6328,8 +6391,8 @@
   "(JitExecMechanism::Unavailable.to_string(), \"unavailable\")"
  ],
  "jit_exec_probe_matrix_macos_aarch64": [
-  "( matrix.map_jit_wx_write_protect, JitExecProbeOutcome::Executed(42), \"MAP_JIT RWX + pthread_jit_write_protect_np must execute the ARM64 stub: {}\", matrix.map_jit_wx_write_protect )",
   "( matrix.selected, JitExecMechanism::MapJitWx, \"the JIT must prefer the W^X MAP_JIT mechanism when it executes\" )",
+  "( matrix.selected, expected, \"a MAP_JIT refusal must select exactly the mechanism that ran\" )",
   "( matrix.map_jit_wx_write_protect, JitExecProbeOutcome::Executed(42), \"selected MAP_JIT but its probe did not execute\" )",
   "( matrix.mprotect_rx, JitExecProbeOutcome::Executed(42), \"selected mprotect RX but its probe did not execute\" )",
   "(value, 42, \"{name} executed a stub that must return 42\")",

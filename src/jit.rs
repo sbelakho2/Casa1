@@ -107,6 +107,21 @@ fn test_seam_fails(
     })
 }
 
+/// Serialize tests that execute compiled code or drive the process-global JIT
+/// flags.
+///
+/// `JIT_SAFEPOINT_REQUESTED`, `JIT_THUNK_DIRECT_CALLS` and the fast-thunk map
+/// are process-global, exactly as they are in production.  Cargo runs unit
+/// tests in parallel on threads of one process, so a test that raises the
+/// safepoint flag (or counts global thunk calls) would otherwise corrupt an
+/// unrelated test that happens to be executing native code.  Production keeps
+/// the globals; the tests take this lock instead.
+#[cfg(test)]
+pub(crate) fn jit_test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod coverage_adversarial_tests;
 #[cfg(test)]

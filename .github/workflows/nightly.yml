@@ -52,6 +52,16 @@ jobs:
           # clippy-all-features job uses).
 
           pkg-config --modversion libavcodec
+          # ffmpeg-sys-next's FFI is generated from these headers, so the
+          # installed major IS the ABI pin. FFmpeg 7.1 => libav* major 61;
+          # refuse to run the all-features suite against any other major.
+          for lib in libavcodec libavformat; do
+            major="$(pkg-config --modversion "$lib" | cut -d. -f1)"
+            if [ "$major" != "61" ]; then
+              echo "::error::$lib major $major != 61; expected the pinned FFmpeg 7.1 ABI"
+              exit 1
+            fi
+          done
       - name: Test with all features (cargo-invoking meta tests skipped)
         run: |
           set -euo pipefail
@@ -115,6 +125,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check with websocket feature
         run: cargo check --all-targets --features websocket
+
+  check-ffmpeg:
+    name: Check FFmpeg ${{ matrix.ffmpeg }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Crate minor tracks FFmpeg minor; 7.1 is the only supported ABI.
+          # Introduce a new FFmpeg major by adding a row here AND bumping the
+          # pinned ffmpeg-next line in Cargo.toml.
+          - ffmpeg: "7.1"
+            formula: "ffmpeg@7"
+            pkg_config_major: "61"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FFmpeg ${{ matrix.ffmpeg }} development libraries
+        run: |
+          set -euo pipefail
+          brew install ${{ matrix.formula }}
+          echo "PKG_CONFIG_PATH=$(brew --prefix ${{ matrix.formula }})/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "FFMPEG_DIR=$(brew --prefix ${{ matrix.formula }})" >> "$GITHUB_ENV"
+          rm -rf target/debug/build/ffmpeg-sys-next-* target/debug/build/ffmpeg-next-*
+          cargo clean -p ffmpeg-sys-next -p ffmpeg-next || true
+      - name: Verify FFmpeg ABI major
+        run: |
+          set -euo pipefail
+          for lib in libavcodec libavformat; do
+            major="$(pkg-config --modversion "$lib" | cut -d. -f1)"
+            if [ "$major" != "${{ matrix.pkg_config_major }}" ]; then
+              echo "::error::$lib major $major != ${{ matrix.pkg_config_major }}; FFmpeg ${{ matrix.ffmpeg }} ABI pin is not satisfied"
+              exit 1
+            fi
+          done
+      - name: Check FFmpeg-backed library
+        run: cargo check --lib --features ffmpeg
 
   nightly-sanitizer:
     name: Nightly Sanitizer

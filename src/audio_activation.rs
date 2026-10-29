@@ -4859,6 +4859,10 @@ mod tests {
             !snapshot.capture_input_active,
             "loopback never opens the mic"
         );
+        assert!(
+            !snapshot.system_loopback_held,
+            "an Unavailable host capability pins the render-history fallback"
+        );
 
         // A render client released 80 real frames into the device's history.
         let mut rendered = Vec::new();
@@ -4889,8 +4893,12 @@ mod tests {
             "the capture client reads the render stream's frames back"
         );
         capture_release_buffer(pid, service, 80, 0).expect("release loopback packet");
-        assert_eq!(capture_next_packet_size(pid, service), Ok(0));
+        // While running, the capture clock paces silent packets once the
+        // render history is drained, so a zero here is only deterministic
+        // after Stop freezes the clock (the silent-pacing contract itself is
+        // pinned by the system-loopback silence test).
         stop(pid, object);
+        assert_eq!(capture_next_packet_size(pid, service), Ok(0));
         reset(pid, object);
         release_audio_object(pid, object);
         release_audio_object(pid, service);

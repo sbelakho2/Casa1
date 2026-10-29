@@ -495,6 +495,7 @@ fn jit_constant_fold_pins_every_fold_and_noop_edge() {
 
 #[test]
 fn jit_runtime_tier_promotion_replaces_stale_block() {
+    let _serial = jit_test_serial();
     let mut runtime = capable_runtime();
     let ir = vec![
         IrInstruction::MovImm {
@@ -572,6 +573,7 @@ fn jit_get_or_compile_rejects_uncompilable_block() {
 
 #[test]
 fn jit_hash_mismatch_recompiles_stale_cached_block() {
+    let _serial = jit_test_serial();
     let mut runtime = capable_runtime();
     let address = 0x00C3_0000u64;
     runtime
@@ -842,6 +844,7 @@ fn jit_thunk_registration_rejects_unknown_indices_and_pins_guest_addrs() {
 
 #[test]
 fn jit_direct_thunk_unregistered_call_fallback_does_not_count() {
+    let _serial = jit_test_serial();
     use std::collections::HashSet;
     let mut runtime = capable_runtime();
     let guest = 0x00C7_5000u64;
@@ -938,6 +941,7 @@ fn jit_self_test_report_default_rejects_fabricated_activity() {
 
 #[test]
 fn jit_self_test_pins_exact_counters_without_fallback() {
+    let _serial = jit_test_serial();
     let report = run_jit_self_test_child().expect("self-test must complete");
     assert_eq!(report.active, true);
     assert_eq!(report.safepoint_observed, true);
@@ -952,6 +956,7 @@ fn jit_self_test_pins_exact_counters_without_fallback() {
 
 #[test]
 fn jit_self_test_pending_safepoint_rejects_first_execution() {
+    let _serial = jit_test_serial();
     JIT_SAFEPOINT_REQUESTED.store(true, Ordering::Relaxed);
     let error = run_jit_self_test_child().unwrap_err();
     JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Relaxed);
@@ -964,6 +969,7 @@ fn jit_self_test_pending_safepoint_rejects_first_execution() {
 
 #[test]
 fn jit_self_test_unwritable_repatch_page_rejects_repatch() {
+    let _serial = jit_test_serial();
     // The first make_writable call installs the initial block; the second
     // is the self-test's deliberate re-patch of the code page.
     JIT_TEST_WRITE_CALLS.with(|calls| calls.set(0));
@@ -979,6 +985,7 @@ fn jit_self_test_unwritable_repatch_page_rejects_repatch() {
 
 #[test]
 fn jit_self_test_unextendable_repatch_page_rejects_repatch() {
+    let _serial = jit_test_serial();
     JIT_TEST_FINALIZE_CALLS.with(|calls| calls.set(0));
     JIT_TEST_DENY_FINALIZE_AT.with(|at| at.set(2));
     let error = run_jit_self_test_child().unwrap_err();
@@ -992,6 +999,7 @@ fn jit_self_test_unextendable_repatch_page_rejects_repatch() {
 
 #[test]
 fn jit_self_test_unavailable_thunk_zone_rejects_registration() {
+    let _serial = jit_test_serial();
     JIT_TEST_DENY_THUNK_ZONE.with(|deny| deny.set(true));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1003,6 +1011,7 @@ fn jit_self_test_unavailable_thunk_zone_rejects_registration() {
 
 #[test]
 fn jit_self_test_missed_smc_invalidation_rejects_stale_execution() {
+    let _serial = jit_test_serial();
     JIT_TEST_SMC_FAULT.with(|fault| fault.set(1));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1024,6 +1033,7 @@ fn self_test_with_safepoint_at(call: usize) -> AppError {
 
 #[test]
 fn jit_self_test_safepoint_interrupts_reject_later_steps() {
+    let _serial = jit_test_serial();
     let error = self_test_with_safepoint_at(3);
     assert_eq!(
         error.message,
@@ -1043,6 +1053,7 @@ fn jit_self_test_safepoint_interrupts_reject_later_steps() {
 
 #[test]
 fn jit_self_test_already_linked_chain_rejects_missing_publication() {
+    let _serial = jit_test_serial();
     JIT_TEST_PREPUBLISH_CHAIN.with(|prepublish| prepublish.set(true));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1051,6 +1062,7 @@ fn jit_self_test_already_linked_chain_rejects_missing_publication() {
 
 #[test]
 fn jit_self_test_uncounted_eviction_rejects_missing_invalidation() {
+    let _serial = jit_test_serial();
     JIT_TEST_SMC_FAULT.with(|fault| fault.set(2));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1062,6 +1074,7 @@ fn jit_self_test_uncounted_eviction_rejects_missing_invalidation() {
 
 #[test]
 fn jit_self_test_lost_fault_bar_rejects_native_compilation() {
+    let _serial = jit_test_serial();
     JIT_TEST_IGNORE_FAULTED_BLOCKS.with(|ignore| ignore.set(true));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1073,6 +1086,7 @@ fn jit_self_test_lost_fault_bar_rejects_native_compilation() {
 
 #[test]
 fn jit_self_test_wrong_original_rejects_guest_result() {
+    let _serial = jit_test_serial();
     JIT_TEST_SELF_TEST_WRONG_ORIGINAL.with(|wrong| wrong.set(true));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1084,6 +1098,7 @@ fn jit_self_test_wrong_original_rejects_guest_result() {
 
 #[test]
 fn jit_self_test_ignored_safepoint_rejects_missing_exit() {
+    let _serial = jit_test_serial();
     JIT_TEST_IGNORE_SAFEPOINT_AT.with(|at| at.set(2));
     let error = run_jit_self_test_child().unwrap_err();
     JIT_TEST_IGNORE_SAFEPOINT_AT.with(|at| at.set(0));
@@ -1096,6 +1111,7 @@ fn jit_self_test_ignored_safepoint_rejects_missing_exit() {
 
 #[test]
 fn jit_self_test_unapplied_repatch_rejects_stale_value() {
+    let _serial = jit_test_serial();
     JIT_TEST_SKIP_REPATCH.with(|skip| skip.set(true));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1116,6 +1132,7 @@ fn assert_self_test_allocation_failure(fail_at: usize, expected: &str) {
 
 #[test]
 fn jit_self_test_allocation_failures_reject_each_later_step() {
+    let _serial = jit_test_serial();
     assert_self_test_allocation_failure(
         2,
         "JIT self-test: chain source compile failed: JIT: failed to allocate executable memory",
@@ -1149,6 +1166,7 @@ fn jit_self_test_allocation_failures_reject_each_later_step() {
 
 #[test]
 fn jit_self_test_chain_failure_rejects_chain_step() {
+    let _serial = jit_test_serial();
     JIT_TEST_FORCE_CHAIN_ERROR.with(|force| force.set(true));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1160,6 +1178,7 @@ fn jit_self_test_chain_failure_rejects_chain_step() {
 
 #[test]
 fn jit_self_test_lost_thunk_resolution_rejects_direct_call() {
+    let _serial = jit_test_serial();
     JIT_TEST_THUNK_MAP_MISS.with(|miss| miss.set(true));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1171,6 +1190,7 @@ fn jit_self_test_lost_thunk_resolution_rejects_direct_call() {
 
 #[test]
 fn jit_self_test_wrong_thunk_result_rejects_execution() {
+    let _serial = jit_test_serial();
     JIT_TEST_SELF_TEST_THUNK_BAD.with(|bad| bad.set(true));
     let error = run_jit_self_test_child().unwrap_err();
     assert_eq!(error.code, ReasonCode::RcJitCompilationError);
@@ -1182,6 +1202,7 @@ fn jit_self_test_wrong_thunk_result_rejects_execution() {
 
 #[test]
 fn jit_self_test_exec_resolution_failures_reject_fabricated_success() {
+    let _serial = jit_test_serial();
     JIT_TEST_SELF_TEST_EXE_MODE.with(|mode| mode.set(1));
     let report = run_jit_self_test();
     assert_eq!(report.active, false);
@@ -1217,6 +1238,7 @@ fn jit_self_test_exec_resolution_failures_reject_fabricated_success() {
 
 #[test]
 fn jit_self_test_missing_child_flag_reports_inactive() {
+    let _serial = jit_test_serial();
     // In the lib test binary `--jit-self-test-child` is not a real child
     // mode: the parent must report inactive with the child's diagnostics
     // instead of trusting a non-existent report.
@@ -1412,6 +1434,7 @@ fn guest_slice_memory_false_sharing_race_merges_and_publishes() {
 
 #[test]
 fn jit_compare_jump_stale_flag_race_is_exact_for_slice_loops() {
+    let _serial = jit_test_serial();
     JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
     let mut runtime = JitRuntime::new(GuestArch::X86);
     let mut memory = MemoryImage::default();
@@ -1673,6 +1696,7 @@ fn guest_slice_memory_above_four_gib_is_direct_and_window_end_faults_exactly() {
 
 #[test]
 fn jit_loop_with_heap_above_four_gib_executes_without_fault_or_overflow() {
+    let _serial = jit_test_serial();
     let mut runtime = capable_runtime();
     let heap = 0x2_0000_0000_u64;
     let site = 0x2_0000_1000_u64;
@@ -1769,6 +1793,7 @@ fn jit_loop_with_heap_above_four_gib_executes_without_fault_or_overflow() {
 
 #[test]
 fn jit_memory_helpers_above_four_gib_and_high_frame_fallback_are_exact() {
+    let _serial = jit_test_serial();
     let mut runtime = capable_runtime();
     let flat_address = 0x2_0000_0000_u64;
     let upper_flat_address = 0x10_0000_0000_u64;
@@ -1910,6 +1935,7 @@ fn sigbus_partial_page_tail_mapping_fallback_is_exact() {
 
 #[test]
 fn execute_slice_block_stale_null_entry_falls_back_to_safepoint() {
+    let _serial = jit_test_serial();
     let mut runtime = capable_runtime();
     let block = runtime
         .get_or_compile_slice_block(&[IrInstruction::Nop], 0x7000, GuestArch::X64)
@@ -2203,6 +2229,7 @@ fn return_predictor_misprediction_edge_boundary_is_exact() {
 
 #[test]
 fn worker_recursion_uses_native_call_ret_chain_and_exact_predictor_counters() {
+    let _serial = jit_test_serial();
     let arch = GuestArch::X64;
     let stack = 0x11_000_u64;
     let mut memory = worker_memory(stack);
@@ -2283,6 +2310,7 @@ fn worker_recursion_uses_native_call_ret_chain_and_exact_predictor_counters() {
 
 #[test]
 fn worker_mispredicted_return_follows_the_real_guest_address() {
+    let _serial = jit_test_serial();
     let arch = GuestArch::X64;
     let stack = 0x12_000_u64;
     let top = stack + 0x800;
@@ -2348,6 +2376,7 @@ fn worker_mispredicted_return_follows_the_real_guest_address() {
 
 #[test]
 fn worker_indirect_calls_use_monomorphic_polymorphic_and_megamorphic_caches() {
+    let _serial = jit_test_serial();
     let arch = GuestArch::X64;
     let stack = 0x13_000_u64;
     let memory = worker_memory(stack);
@@ -2423,6 +2452,7 @@ fn worker_indirect_calls_use_monomorphic_polymorphic_and_megamorphic_caches() {
 
 #[test]
 fn worker_chained_code_safepoint_and_smc_stop_before_the_next_block() {
+    let _serial = jit_test_serial();
     let arch = GuestArch::X64;
     let stack = 0x14_000_u64;
     let mut memory = worker_memory(stack);
@@ -2563,6 +2593,7 @@ fn loop_blocks(site: u64, exit: u64) -> Vec<(u64, Vec<IrInstruction>)> {
 
 #[test]
 fn jit_worker_linked_loop_and_call_return_match_unlinked_exactly() {
+    let _serial = jit_test_serial();
     JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
     let mut runtime = worker_runtime(GuestArch::X64);
     let memory = worker_memory(0x7000);
@@ -2651,6 +2682,7 @@ fn jit_worker_linked_loop_and_call_return_match_unlinked_exactly() {
 
 #[test]
 fn jit_worker_safepoint_stop_is_observed_within_the_link_budget() {
+    let _serial = jit_test_serial();
     JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
     let mut runtime = worker_runtime(GuestArch::X64);
     let memory = worker_memory(0x7000);
@@ -2699,6 +2731,7 @@ fn jit_worker_safepoint_stop_is_observed_within_the_link_budget() {
 
 #[test]
 fn jit_worker_smc_write_invalidates_native_links_exactly() {
+    let _serial = jit_test_serial();
     JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
     let mut runtime = worker_runtime(GuestArch::X64);
     let mut memory = MemoryImage::default();
@@ -2768,6 +2801,7 @@ fn jit_worker_smc_write_invalidates_native_links_exactly() {
 
 #[test]
 fn jit_worker_host_call_barrier_pushes_return_exactly_once() {
+    let _serial = jit_test_serial();
     JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
     let mut runtime = worker_runtime(GuestArch::X64);
     let memory = worker_memory(0x7000);
@@ -2798,6 +2832,7 @@ fn jit_worker_host_call_barrier_pushes_return_exactly_once() {
 
 #[test]
 fn jit_worker_conditional_flags_equivalence_all_conditions_is_exact() {
+    let _serial = jit_test_serial();
     JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
     let mut runtime = worker_runtime(GuestArch::X64);
     let memory = worker_memory(0x7000);
@@ -2874,6 +2909,7 @@ fn jit_worker_conditional_flags_equivalence_all_conditions_is_exact() {
 
 #[test]
 fn jit_worker_lazy_flags_materialize_before_native_jcc_exactly() {
+    let _serial = jit_test_serial();
     JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
     let mut runtime = worker_runtime(GuestArch::X64);
     let memory = worker_memory(0x7000);
@@ -2963,6 +2999,7 @@ fn run_aot_probe(runtime: &mut JitRuntime, memory: &MemoryImage) -> (u64, u64) {
 
 #[test]
 fn jit_worker_aot_cache_round_trip_across_process_boundaries_loads_exact_code() {
+    let _serial = jit_test_serial();
     if let Ok(directory) = std::env::var("CASA1_AOT_CHILD_DIR") {
         let mut runtime = JitRuntime::new(GuestArch::X64);
         runtime.set_aot_cache_dir(Some(std::path::PathBuf::from(directory)));
@@ -3028,6 +3065,7 @@ fn jit_worker_aot_corrupt_and_wrong_version_cache_are_rejected_with_counters() {
 
 #[test]
 fn jit_worker_aot_relocations_rebind_link_slots_exactly() {
+    let _serial = jit_test_serial();
     let directory = tempfile::tempdir().expect("tempdir");
     let mut writer = JitRuntime::new(GuestArch::X64);
     writer.set_aot_cache_dir(Some(directory.path().to_path_buf()));
@@ -3125,6 +3163,7 @@ fn jit_worker_aot_relocations_rebind_link_slots_exactly() {
 
 #[test]
 fn jit_worker_concurrent_in_flight_linked_blocks_are_exact() {
+    let _serial = jit_test_serial();
     JIT_SAFEPOINT_REQUESTED.store(false, Ordering::Release);
     let mut runtime = worker_runtime(GuestArch::X64);
     let memory = worker_memory(0x7000);

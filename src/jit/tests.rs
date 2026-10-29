@@ -47,17 +47,31 @@ fn jit_exec_probe_matrix_macos_aarch64() {
         "mmap RW -> mprotect RX must execute or fail with a real ENOENT: {}",
         matrix.mprotect_rx
     );
-    assert_eq!(
-        matrix.map_jit_wx_write_protect,
-        JitExecProbeOutcome::Executed(42),
-        "MAP_JIT RWX + pthread_jit_write_protect_np must execute the ARM64 stub: {}",
-        matrix.map_jit_wx_write_protect
-    );
-    assert_eq!(
-        matrix.selected,
-        JitExecMechanism::MapJitWx,
-        "the JIT must prefer the W^X MAP_JIT mechanism when it executes"
-    );
+    match matrix.map_jit_wx_write_protect {
+        JitExecProbeOutcome::Executed(42) => {
+            assert_eq!(
+                matrix.selected,
+                JitExecMechanism::MapJitWx,
+                "the JIT must prefer the W^X MAP_JIT mechanism when it executes"
+            );
+        }
+        // A hardened-runtime process without
+        // `com.apple.security.cs.allow-jit` is refused by the kernel at mmap
+        // time with EPERM.  That is the only supported outage: pin the exact
+        // refusal and require the selection to match what actually ran.
+        JitExecProbeOutcome::MmapFailed(libc::EPERM) => {
+            let expected = if matrix.mprotect_rx == JitExecProbeOutcome::Executed(42) {
+                JitExecMechanism::MprotectRx
+            } else {
+                JitExecMechanism::Unavailable
+            };
+            assert_eq!(
+                matrix.selected, expected,
+                "a MAP_JIT refusal must select exactly the mechanism that ran"
+            );
+        }
+        other => panic!("MAP_JIT W^X must execute or be refused with EPERM; got {other}"),
+    }
     // Regression guard: the pre-fix allocation (MAP_JIT without PROT_EXEC)
     // must never silently start "working" as if it were executable.
     assert!(
@@ -119,6 +133,26 @@ fn jit_capability_selection_rejects_inconsistent_real_matrix() {
         matrix.selected != JitExecMechanism::Unavailable,
         jit_execution_available()
     );
+    if matrix.selected == JitExecMechanism::Unavailable {
+        // Hosts that deny every mechanism (for example a hardened-runtime
+        // process without com.apple.security.cs.allow-jit) are a supported
+        // outcome, but no probe may claim it executed the stub.
+        for (name, outcome) in [
+            ("mprotect_rx", matrix.mprotect_rx),
+            ("map_jit_wx_write_protect", matrix.map_jit_wx_write_protect),
+            ("map_jit_rw_write_protect", matrix.map_jit_rw_write_protect),
+            (
+                "map_jit_wx_no_write_protect",
+                matrix.map_jit_wx_no_write_protect,
+            ),
+        ] {
+            assert!(
+                !matches!(outcome, JitExecProbeOutcome::Executed(_)),
+                "unavailable capability reported an executing {name}: {outcome}"
+            );
+        }
+        return;
+    }
     verify_capability_selection(matrix);
 }
 
@@ -180,6 +214,7 @@ fn jit_unavailable_capability_returns_null_allocation() {
 
 #[test]
 fn jit_execute_with_jit_falls_back_when_block_not_compiled() {
+    let _serial = jit_test_serial();
     let config = crate::cpu::CpuEngineConfig::from_profile(GuestArch::X64, "test", "test", None)
         .expect("cpu config");
     let engine = crate::cpu::CpuExecutionEngine::new(config);
