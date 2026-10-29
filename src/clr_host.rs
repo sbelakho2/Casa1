@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::clr_meta;
+use crate::mono_host;
 
 /// `COR_E_CLRNOTAVAILABLE` — the documented activation failure when the
 /// requested legacy .NET Framework CLR is not installed.
@@ -68,27 +69,80 @@ pub(crate) fn activation_family(version: Option<&str>) -> ActivationFamily {
 
 /// The seam a platform with a real legacy .NET Framework CLR implements.
 ///
-/// There is no fake provider: the only provider in this host is the honest
-/// absence implementation, which reports no version and fails hosting with
-/// [`ClrHostError::FrameworkUnavailable`].  A future platform provider plugs
-/// in by returning its implementation from [`framework_runtime_provider`];
-/// the activation dispatch already consumes the trait.
+/// The real implementation is the host Mono installation (the same strategy
+/// Wine Mono uses); [`AbsentFrameworkRuntimeProvider`] answers honestly when
+/// no Mono runtime is installed.
 pub(crate) trait IFrameworkRuntimeProvider: Send + Sync {
     /// Whether a legacy Framework CLR is installed and usable.
     fn is_available(&self) -> bool;
     /// The installed Framework version string, when available.
     fn version(&self) -> Option<String>;
-    /// Host a managed assembly on the Framework CLR, returning its exit code.
-    ///
-    /// No caller in this build can reach a provider (there is none), so this
-    /// contract is exercised directly by the tests that pin provider absence;
-    /// a future provider uses it from the Framework execution path.
-    #[allow(dead_code)]
+    /// The installed Framework version that satisfies a guest request.
+    fn version_for(&self, _requested: Option<&str>) -> Option<String> {
+        self.version()
+    }
+    /// The real directory that implements a guest Framework request.
+    fn directory_for(&self, _requested: Option<&str>) -> Option<PathBuf> {
+        None
+    }
+    /// Host a managed assembly's entry point, returning its exit code.
+    fn host_assembly(
+        &self,
+        _assembly_path: &Path,
+        _arguments: &[String],
+    ) -> Result<i32, ClrHostError> {
+        Err(ClrHostError::FrameworkUnavailable)
+    }
+    /// Run `static int Method(string)` (the `ExecuteInDefaultAppDomain`
+    /// contract) and return the managed result.
+    fn execute_in_default_app_domain(
+        &self,
+        _assembly_path: &Path,
+        _type_name: &str,
+        _method_name: &str,
+        _argument: Option<&str>,
+    ) -> Result<i32, ClrHostError> {
+        Err(ClrHostError::FrameworkUnavailable)
+    }
+}
+
+/// The real host Mono runtime, when one is installed.
+struct MonoFrameworkRuntimeProvider;
+
+impl IFrameworkRuntimeProvider for MonoFrameworkRuntimeProvider {
+    fn is_available(&self) -> bool {
+        mono_host::is_available()
+    }
+
+    fn version(&self) -> Option<String> {
+        mono_host::version_for(None)
+    }
+
+    fn version_for(&self, requested: Option<&str>) -> Option<String> {
+        mono_host::version_for(requested)
+    }
+
+    fn directory_for(&self, requested: Option<&str>) -> Option<PathBuf> {
+        mono_host::directory_for(requested)
+    }
+
     fn host_assembly(
         &self,
         assembly_path: &Path,
         arguments: &[String],
-    ) -> Result<i32, ClrHostError>;
+    ) -> Result<i32, ClrHostError> {
+        mono_host::host_assembly(assembly_path, arguments)
+    }
+
+    fn execute_in_default_app_domain(
+        &self,
+        assembly_path: &Path,
+        type_name: &str,
+        method_name: &str,
+        argument: Option<&str>,
+    ) -> Result<i32, ClrHostError> {
+        mono_host::execute_in_default_app_domain(assembly_path, type_name, method_name, argument)
+    }
 }
 
 /// The honest absence implementation: this host has no .NET Framework CLR.
@@ -102,21 +156,45 @@ impl IFrameworkRuntimeProvider for AbsentFrameworkRuntimeProvider {
     fn version(&self) -> Option<String> {
         None
     }
+}
 
-    fn host_assembly(
-        &self,
-        _assembly_path: &Path,
-        _arguments: &[String],
-    ) -> Result<i32, ClrHostError> {
-        Err(ClrHostError::FrameworkUnavailable)
+static MONO_FRAMEWORK_RUNTIME: MonoFrameworkRuntimeProvider = MonoFrameworkRuntimeProvider;
+static ABSENT_FRAMEWORK_RUNTIME: AbsentFrameworkRuntimeProvider = AbsentFrameworkRuntimeProvider;
+
+fn select_framework_provider(available: bool) -> &'static dyn IFrameworkRuntimeProvider {
+    if available {
+        &MONO_FRAMEWORK_RUNTIME
+    } else {
+        &ABSENT_FRAMEWORK_RUNTIME
     }
 }
 
-static ABSENT_FRAMEWORK_RUNTIME: AbsentFrameworkRuntimeProvider = AbsentFrameworkRuntimeProvider;
-
 /// The provider the activation dispatch consults for Framework requests.
 pub(crate) fn framework_runtime_provider() -> &'static dyn IFrameworkRuntimeProvider {
-    &ABSENT_FRAMEWORK_RUNTIME
+    select_framework_provider(mono_host::is_available())
+}
+
+/// Host a Framework assembly through the selected provider.
+pub(crate) fn execute_framework_assembly(
+    assembly_path: &Path,
+    arguments: &[String],
+) -> Result<i32, ClrHostError> {
+    framework_runtime_provider().host_assembly(assembly_path, arguments)
+}
+
+/// Run a Framework `ExecuteInDefaultAppDomain` method through the provider.
+pub(crate) fn execute_framework_in_default_app_domain(
+    assembly_path: &Path,
+    type_name: &str,
+    method_name: &str,
+    argument: Option<&str>,
+) -> Result<i32, ClrHostError> {
+    framework_runtime_provider().execute_in_default_app_domain(
+        assembly_path,
+        type_name,
+        method_name,
+        argument,
+    )
 }
 
 /// Select the real installed CoreCLR runtime named by a guest request.
@@ -130,16 +208,58 @@ fn select_requested_runtime(requested: Option<&str>) -> Option<clr_meta::ClrRunt
     clr_meta::select_runtime(&parsed, &installed).cloned()
 }
 
-/// The `GetRequestedRuntimeVersion` contract: the real installed CoreCLR
-/// version string for a CoreCLR request, or `None` when the request names the
-/// absent Framework CLR, is malformed, or matches no installed runtime.
+/// The `GetRequestedRuntimeVersion` contract: the real installed runtime
+/// version string for the request, or `None` when the request is malformed or
+/// no installed runtime matches it.
+///
+/// Framework requests report the Mono installation's own version when one is
+/// present; absence stays `None` (the activation dispatch turns that into the
+/// exact `COR_E_CLRNOTAVAILABLE`).
 pub(crate) fn requested_runtime_version(requested: Option<&str>) -> Option<String> {
-    select_requested_runtime(requested).map(|runtime| runtime.version_string())
+    requested_runtime_version_with(framework_runtime_provider(), requested)
+}
+
+fn requested_runtime_version_with(
+    provider: &dyn IFrameworkRuntimeProvider,
+    requested: Option<&str>,
+) -> Option<String> {
+    match activation_family(requested) {
+        ActivationFamily::CoreClr(_) => {
+            select_requested_runtime(requested).map(|runtime| runtime.version_string())
+        }
+        ActivationFamily::Framework => {
+            if provider.is_available() {
+                provider.version_for(requested)
+            } else {
+                None
+            }
+        }
+        ActivationFamily::Unsupported => None,
+    }
 }
 
 /// The directory half of `GetRequestedRuntimeInfo` for the same selection.
 pub(crate) fn requested_runtime_directory(requested: Option<&str>) -> Option<PathBuf> {
-    select_requested_runtime(requested).map(|runtime| runtime.directory)
+    requested_runtime_directory_with(framework_runtime_provider(), requested)
+}
+
+fn requested_runtime_directory_with(
+    provider: &dyn IFrameworkRuntimeProvider,
+    requested: Option<&str>,
+) -> Option<PathBuf> {
+    match activation_family(requested) {
+        ActivationFamily::CoreClr(_) => {
+            select_requested_runtime(requested).map(|runtime| runtime.directory)
+        }
+        ActivationFamily::Framework => {
+            if provider.is_available() {
+                provider.directory_for(requested)
+            } else {
+                None
+            }
+        }
+        ActivationFamily::Unsupported => None,
+    }
 }
 
 /// A failed managed execution, with the real cause preserved.
@@ -167,6 +287,22 @@ pub(crate) enum ClrHostError {
     NotManaged(PathBuf),
     /// The managed assembly has no entry point (it is a library).
     NoEntryPoint(PathBuf),
+    /// `libmono` could not be loaded.
+    MonoLibraryLoad(String),
+    /// A required Mono embedding entry point is absent from the library.
+    MonoMissingEntryPoint(&'static str),
+    /// `mono_jit_init_version` returned no root domain.
+    MonoInitialize,
+    /// Mono could not open the managed assembly.
+    MonoAssembly(PathBuf),
+    /// Mono resolved the assembly but not the requested managed type.
+    MonoTypeNotFound(String),
+    /// Mono resolved the type but not the requested method.
+    MonoMethodNotFound(String),
+    /// Mono could not marshal or return a value from the managed method.
+    MonoInvoke(&'static str),
+    /// The managed method threw; the message comes from Mono.
+    MonoException(String),
 }
 
 impl std::fmt::Display for ClrHostError {
@@ -191,6 +327,16 @@ impl std::fmt::Display for ClrHostError {
             Self::NoEntryPoint(path) => {
                 write!(f, "managed assembly has no entry point: {}", path.display())
             }
+            Self::MonoLibraryLoad(error) => write!(f, "failed to load libmono: {error}"),
+            Self::MonoMissingEntryPoint(name) => write!(f, "libmono is missing {name}"),
+            Self::MonoInitialize => write!(f, "mono_jit_init_version failed"),
+            Self::MonoAssembly(path) => {
+                write!(f, "mono: cannot open assembly: {}", path.display())
+            }
+            Self::MonoTypeNotFound(name) => write!(f, "mono: type not found: {name}"),
+            Self::MonoMethodNotFound(name) => write!(f, "mono: method not found: {name}"),
+            Self::MonoInvoke(what) => write!(f, "mono: {what}"),
+            Self::MonoException(message) => write!(f, "mono: managed exception: {message}"),
         }
     }
 }
@@ -621,6 +767,35 @@ mod tests {
                 ClrHostError::NoEntryPoint(PathBuf::from("/x.dll")),
                 "managed assembly has no entry point: /x.dll",
             ),
+            (
+                ClrHostError::MonoLibraryLoad("bad".to_string()),
+                "failed to load libmono: bad",
+            ),
+            (
+                ClrHostError::MonoMissingEntryPoint("mono_jit_exec"),
+                "libmono is missing mono_jit_exec",
+            ),
+            (ClrHostError::MonoInitialize, "mono_jit_init_version failed"),
+            (
+                ClrHostError::MonoAssembly(PathBuf::from("/x.dll")),
+                "mono: cannot open assembly: /x.dll",
+            ),
+            (
+                ClrHostError::MonoTypeNotFound("N.T".to_string()),
+                "mono: type not found: N.T",
+            ),
+            (
+                ClrHostError::MonoMethodNotFound("N.T::M".to_string()),
+                "mono: method not found: N.T::M",
+            ),
+            (
+                ClrHostError::MonoInvoke("failed to marshal the argument"),
+                "mono: failed to marshal the argument",
+            ),
+            (
+                ClrHostError::MonoException("boom".to_string()),
+                "mono: managed exception: boom",
+            ),
         ];
         for (error, expected) in cases {
             assert_eq!(error.to_string(), expected);
@@ -741,6 +916,44 @@ mod tests {
     }
 
     #[test]
+    fn absent_framework_provider_reports_exact_absence_without_mono() {
+        let provider = select_framework_provider(false);
+        assert_eq!(provider.is_available(), false);
+        assert_eq!(provider.version(), None);
+        assert_eq!(provider.version_for(Some("v4.0")), None);
+        assert_eq!(provider.directory_for(Some("v4.0")), None);
+        let missing = Path::new("/casa1/does/not/exist/Framework.exe");
+        assert_eq!(
+            provider.host_assembly(missing, &["argument".to_string()]),
+            Err(ClrHostError::FrameworkUnavailable)
+        );
+        assert_eq!(
+            provider.execute_in_default_app_domain(missing, "Type", "Method", None),
+            Err(ClrHostError::FrameworkUnavailable)
+        );
+        assert_eq!(requested_runtime_version_with(provider, None), None);
+        assert_eq!(
+            requested_runtime_directory_with(provider, Some("v4.0.30319")),
+            None
+        );
+        assert_eq!(
+            requested_runtime_version_with(provider, Some("garbage")),
+            None
+        );
+        assert_eq!(
+            requested_runtime_directory_with(provider, Some("garbage")),
+            None
+        );
+
+        // The Mono provider is selected exactly when a real installation is
+        // available; both static implementations are the same trait object.
+        assert_eq!(
+            select_framework_provider(true).is_available(),
+            crate::mono_host::is_available()
+        );
+    }
+
+    #[test]
     fn framework_provider_seam_and_activation_families_are_exact() {
         // Versionless is the Framework "latest" request, never CoreCLR.
         assert_eq!(activation_family(None), ActivationFamily::Framework);
@@ -779,22 +992,64 @@ mod tests {
             );
         }
 
-        // The provider seam has no fake implementation: absence is reported
-        // exactly and hosting fails with the documented Framework error.
+        // The provider is the real host Mono installation when present and the
+        // honest absence implementation otherwise; there is never a fake.
         let provider = framework_runtime_provider();
-        assert!(!provider.is_available());
-        assert_eq!(provider.version(), None);
-        assert_eq!(
-            provider.host_assembly(
-                Path::new("/casa1/does/not/exist/Framework.exe"),
-                &["argument".to_string()],
-            ),
-            Err(ClrHostError::FrameworkUnavailable)
-        );
+        let mono_available = crate::mono_host::is_available();
+        assert_eq!(provider.is_available(), mono_available);
+        let missing = Path::new("/casa1/does/not/exist/Framework.exe");
+        let arguments = ["argument".to_string()];
+        if mono_available {
+            assert_eq!(provider.version(), crate::mono_host::version_for(None));
+            assert!(provider.version().is_some());
+            assert_eq!(
+                provider.version_for(Some("v2.0")),
+                crate::mono_host::version_for(Some("v2.0"))
+            );
+            assert_eq!(
+                provider.version_for(Some("v4.0")),
+                crate::mono_host::version_for(Some("v4.0"))
+            );
+            assert_eq!(
+                provider.directory_for(Some("v4.0")),
+                crate::mono_host::directory_for(Some("v4.0"))
+            );
+            assert_eq!(
+                provider.host_assembly(missing, &arguments),
+                Err(ClrHostError::AssemblyNotFound(missing.to_path_buf()))
+            );
+            assert_eq!(
+                provider.execute_in_default_app_domain(missing, "Type", "Method", None),
+                Err(ClrHostError::AssemblyNotFound(missing.to_path_buf()))
+            );
+        } else {
+            assert_eq!(provider.version(), None);
+            assert_eq!(provider.version_for(Some("v4.0")), None);
+            assert_eq!(provider.directory_for(Some("v4.0")), None);
+            assert_eq!(
+                provider.host_assembly(missing, &arguments),
+                Err(ClrHostError::FrameworkUnavailable)
+            );
+            assert_eq!(
+                provider.execute_in_default_app_domain(missing, "Type", "Method", None),
+                Err(ClrHostError::FrameworkUnavailable)
+            );
+        }
 
         // Framework and malformed requests never select an installed CoreCLR.
-        assert_eq!(requested_runtime_version(None), None);
-        assert_eq!(requested_runtime_directory(Some("v4.0.30319")), None);
+        if mono_available {
+            assert_eq!(
+                requested_runtime_version(None),
+                crate::mono_host::version_for(None)
+            );
+            assert_eq!(
+                requested_runtime_directory(Some("v4.0.30319")),
+                crate::mono_host::directory_for(Some("v4.0.30319"))
+            );
+        } else {
+            assert_eq!(requested_runtime_version(None), None);
+            assert_eq!(requested_runtime_directory(Some("v4.0.30319")), None);
+        }
         assert_eq!(requested_runtime_version(Some("garbage")), None);
 
         let installed = clr_meta::installed_runtimes();

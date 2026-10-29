@@ -201,6 +201,7 @@ pub mod metal_backend;
 pub mod metal_fx;
 pub mod metal_renderer;
 pub mod midi;
+mod mono_host;
 pub mod network;
 pub mod ntdll;
 pub mod oracle_suites;

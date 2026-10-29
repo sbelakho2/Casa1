@@ -1,6 +1,7 @@
 //! Process lifecycle, image loading, and top-level execution entry points.
 
 use super::*;
+use crate::jit::{AotPrecompileReport, profile_directory, profile_file_path};
 
 pub fn synthetic_pid(dtm: bool) -> u32 {
     if dtm {
@@ -8,6 +9,98 @@ pub fn synthetic_pid(dtm: bool) -> u32 {
     } else {
         std::process::id().saturating_add(10_000)
     }
+}
+
+/// Build the persistent AOT cache for `program` without entering the guest.
+///
+/// This is the install/update entry point behind `casa1-runner
+/// --precompile-only`: it maps the image, loads and validates any existing
+/// profile, walks the union of statically reachable blocks and persisted
+/// targets, compiles (or loads) every block into the image-keyed cache, and
+/// returns a machine-readable report.  No guest instruction executes.
+pub fn precompile_only_image(
+    program: &Path,
+    cache_root: &Path,
+    dtm: bool,
+) -> AppResult<AotPrecompileReport> {
+    let bytes = fs::read(program).map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcIo,
+            format!("failed to read {}", program.display()),
+            &error,
+        )
+    })?;
+    let image = pe::parse_from_file(program)?;
+    let arch = match image.machine {
+        0x8664 => crate::cpu::GuestArch::X64,
+        0x014c => crate::cpu::GuestArch::X86,
+        other => {
+            return Err(AppError::new(
+                ReasonCode::RcUnimplInsn,
+                format!("precompile-only does not support PE machine 0x{other:04x}"),
+            ));
+        }
+    };
+    let image_hash = util::sha256_bytes(&bytes);
+    let mapped = pe::map_image(&bytes, &image, &image_hash, dtm)?;
+    let mut memory = MemoryImage::default();
+    memory.map_bytes(mapped.selected_base, &mapped.memory);
+    let entry = mapped.selected_base + u64::from(image.address_of_entry_point);
+    let end = mapped.selected_base + u64::from(image.size_of_image);
+
+    let mut jit = crate::jit::JitRuntime::new(arch);
+    jit.configure_aot_pipeline(cache_root, &image_hash)?;
+    if jit.aot_profile_key().is_none() {
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            "persistent AOT cache is disabled by CASA1_AOT_CACHE_DIR=off",
+        ));
+    }
+    if let Err(error) = jit.load_aot_profile() {
+        // Install/update must fail loudly rather than build on a stale or
+        // corrupted profile.
+        return Err(AppError::new(
+            ReasonCode::RcJitCompilationError,
+            error.to_string(),
+        ));
+    }
+    let seeds = jit.aot_profile_seeds();
+    let report = crate::precompile::precompile_blocks_with_seeds(
+        &memory,
+        arch,
+        entry,
+        end,
+        20_000,
+        &seeds,
+        |ir, address| {
+            jit.record_profile_block_targets(address, ir);
+            jit.get_or_compile_slice_block(ir, address, arch)
+                .map(|_| ())
+        },
+    )?;
+    jit.note_aot_blocks_precompiled(report.blocks as u64);
+    // Seed the profile with this pass's statically known call edges so the
+    // next launch's union walk already covers them.
+    jit.persist_aot_profile(&[])
+        .map_err(|error| AppError::new(ReasonCode::RcJitCompilationError, error.to_string()))?;
+    let key = jit.aot_profile_key().ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcJitCompilationError,
+            "AOT pipeline key missing",
+        )
+    })?;
+    let summary = jit.aot_run_summary();
+    Ok(AotPrecompileReport {
+        image_hash,
+        cache_dir: profile_directory(cache_root, &key).display().to_string(),
+        profile_path: profile_file_path(cache_root, &key).display().to_string(),
+        persisted_targets_loaded: summary.persisted_targets_loaded,
+        seeded_compiled: report.seeded_compiled as u64,
+        blocks_precompiled: report.blocks as u64,
+        aot_hits: summary.aot_hits,
+        aot_misses: summary.aot_misses,
+        aot_rejected: summary.aot_rejected,
+    })
 }
 
 pub fn is_pe_image(path: &Path) -> AppResult<bool> {
@@ -282,6 +375,106 @@ impl PeHostRuntime {
                 state,
                 label,
             )?;
+        }
+    }
+}
+
+/// Hot-block threshold persisted into the profile.
+pub(crate) const AOT_PROFILE_HOT_BLOCK_THRESHOLD: u32 = 2;
+
+impl PeHostRuntime {
+    /// Bind the JIT's persistent store to this image's cache identity.
+    pub(crate) fn configure_aot_pipeline_for_image(
+        &mut self,
+        cache_root: &Path,
+        image_hash: &str,
+    ) -> AppResult<()> {
+        if let Some(jit) = self.jit_runtime.as_mut() {
+            jit.configure_aot_pipeline(cache_root, image_hash)?;
+        }
+        Ok(())
+    }
+
+    /// Precompile the union of the PE-reachable walk, persisted profile
+    /// targets and the blocks the AOT cache will serve before guest entry.
+    pub(crate) fn precompile_image_with_profile(
+        &mut self,
+        memory: &MemoryImage,
+        entry: u64,
+    ) -> AppResult<Option<crate::precompile::PrecompileReport>> {
+        if !self.aot_precompile || self.mapped_image_size == 0 {
+            return Ok(None);
+        }
+        let image_end = self
+            .mapped_image_base
+            .saturating_add(self.mapped_image_size);
+        let arch = self.guest_arch;
+        let Some(jit) = self.jit_runtime.as_mut() else {
+            return Ok(None);
+        };
+        match jit.load_aot_profile() {
+            Ok(loaded) => {
+                if loaded != 0 {
+                    crate::live::live_trace(&format!(
+                        "[aot] loaded {loaded} persisted profile targets"
+                    ));
+                }
+            }
+            Err(error) => {
+                crate::live::live_trace(&format!("[aot] persisted profile rejected: {error}"));
+            }
+        }
+        let seeds = jit.aot_profile_seeds();
+        // Cold starts use the existing whole-image walk unchanged; profile
+        // seeds (and any cached targets only reachable through them) extend
+        // that walk through the union entry point.
+        let report = if seeds.is_empty() {
+            self.precompile_image(memory, entry)?
+        } else {
+            let Some(jit) = self.jit_runtime.as_mut() else {
+                return Ok(None);
+            };
+            Some(crate::precompile::precompile_blocks_with_seeds(
+                memory,
+                arch,
+                entry,
+                image_end,
+                20_000,
+                &seeds,
+                |ir, address| {
+                    jit.get_or_compile_slice_block(ir, address, arch)
+                        .map(|_| ())
+                },
+            )?)
+        };
+        if let Some(jit) = self.jit_runtime.as_mut()
+            && let Some(report) = report.as_ref()
+        {
+            jit.note_aot_blocks_precompiled(report.blocks as u64);
+        }
+        Ok(report)
+    }
+
+    /// Persist profile-discovered targets after a run.
+    pub(crate) fn persist_aot_profile(&mut self) {
+        let hot_blocks: Vec<(u64, u64)> = self
+            .tiered_compiler
+            .execution_counts
+            .iter()
+            .filter(|(_, count)| **count >= AOT_PROFILE_HOT_BLOCK_THRESHOLD)
+            .map(|(address, count)| (*address, u64::from(*count)))
+            .collect();
+        let Some(jit) = self.jit_runtime.as_mut() else {
+            return;
+        };
+        match jit.persist_aot_profile(&hot_blocks) {
+            Ok(0) => {}
+            Ok(count) => {
+                crate::live::live_trace(&format!("[aot] persisted {count} profile targets"))
+            }
+            Err(error) => {
+                crate::live::live_trace(&format!("[aot] failed to persist profile: {error}"))
+            }
         }
     }
 }
@@ -755,6 +948,10 @@ pub fn execute_with_options(
     let resolver = ApiSetResolver::new();
     let resolved_imports = resolve_imports_for_runtime(&image, &resolver);
     let image_hash = util::sha256_bytes(&bytes);
+    // Bind the persistent AOT/profile store before any block is translated:
+    // the cache key is (image hash, translator version, CPU profile) and lives
+    // under the game environment's cache directory.
+    runtime.configure_aot_pipeline_for_image(&ge.root.join("cache"), &image_hash)?;
     let mapped = pe::map_image(&bytes, &image, &image_hash, dtm)?;
     let mut memory = MemoryImage::default();
     // Attach the canonical VM: every guest access is now validated by the
@@ -1080,7 +1277,7 @@ pub fn execute_with_options(
         mapped.selected_base,
     )?;
     state.rip = mapped.selected_base + image.address_of_entry_point as u64;
-    match runtime.precompile_image(&memory, state.rip) {
+    match runtime.precompile_image_with_profile(&memory, state.rip) {
         Ok(Some(report)) => crate::live::live_trace(&format!(
             "[aot] precompiled {}/{} reachable blocks (skipped {}, out-of-range {})",
             report.compiled, report.blocks, report.skipped, report.out_of_range
@@ -2694,6 +2891,17 @@ pub fn execute_with_options(
                     return Err(wrapped);
                 }
             };
+
+            // Persistent profile: fold this execution's call targets (direct
+            // and resolved-indirect) into the pre-entry profile.  The method
+            // is a no-op unless the install/update pipeline is configured.
+            if let Some(jit) = runtime.jit_runtime.as_mut() {
+                jit.record_profile_execution(
+                    block_start_rip,
+                    &cached_block.translated.ir,
+                    state.rip,
+                );
+            }
 
             // --- Adaptive tiered compilation ---
             // Hot blocks (>= 50 dispatches) are compiled to MAP_JIT native
@@ -4702,11 +4910,17 @@ pub(crate) fn finalize_execution(
     termination: ExecutionTermination,
     termination_detail: Option<String>,
 ) -> AppResult<PeExecutionResult> {
+    let elapsed = start_time.elapsed();
     eprintln!(
         "CASA1_LOOP_EXIT: iter={} exit_code={} elapsed_ms={}",
         block_count,
         exit_code,
-        start_time.elapsed().as_millis()
+        elapsed.as_millis()
+    );
+    crate::perf::write_dispatch_stats_if_requested(
+        &runtime.process_shared,
+        steps,
+        elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
     );
 
     let perf = vec![PerfMetric {
@@ -4735,18 +4949,26 @@ pub(crate) fn finalize_execution(
     )];
     trace_events.extend(std::mem::take(&mut runtime.trace_events));
 
+    // Persist profile-discovered targets after the run so the next launch can
+    // seed its pre-entry walk with the addresses this run actually reached.
+    runtime.persist_aot_profile();
+    let aot_summary = runtime
+        .jit_runtime
+        .as_ref()
+        .map(|jit| jit.aot_run_summary());
     let (jit_blocks_compiled, jit_blocks_executed) = match &runtime.jit_runtime {
         Some(jit) => (jit.blocks_compiled, jit.blocks_executed),
         None => (0, 0),
     };
     let (jit_native_lowered, jit_helper_fallback) = crate::jit::jit_lowering_telemetry();
-    let jit_telemetry = JitTelemetry::from_mode(
+    let mut jit_telemetry = JitTelemetry::from_mode(
         &runtime.jit_mode,
         jit_blocks_compiled,
         jit_blocks_executed,
         jit_native_lowered,
         jit_helper_fallback,
     );
+    jit_telemetry.aot = aot_summary;
 
     Ok(PeExecutionResult {
         synthetic_pid: synthetic_pid(dtm),

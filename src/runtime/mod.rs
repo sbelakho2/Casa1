@@ -1687,6 +1687,11 @@ pub struct JitTelemetry {
     /// of native lowering.
     #[serde(default)]
     pub helper_fallback: u64,
+    /// Install/update AOT pipeline counters: persisted profile targets
+    /// loaded, blocks precompiled before entry, AOT hits/misses/rejections,
+    /// and profile targets written after the run.
+    #[serde(default)]
+    pub aot: Option<crate::jit::AotRunSummary>,
 }
 
 impl Default for JitTelemetry {
@@ -1699,6 +1704,7 @@ impl Default for JitTelemetry {
             fallback_reason: None,
             native_lowered: 0,
             helper_fallback: 0,
+            aot: None,
         }
     }
 }
@@ -1730,6 +1736,7 @@ impl JitTelemetry {
             fallback_reason,
             native_lowered,
             helper_fallback,
+            aot: None,
         }
     }
 }

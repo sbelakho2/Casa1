@@ -213,10 +213,10 @@ impl AotRelocKind {
 
 /// Persistent-cache format version.  Bumped whenever the emitted-code ABI
 /// (chain-state offsets, exit codes, relocation layout) changes.
-pub const AOT_FORMAT_VERSION: u32 = 1;
+pub const AOT_FORMAT_VERSION: u32 = 2;
 /// Cache key component: bump when code generation changes without changing the
 /// IR hash (e.g. an emitter fix).  A stale file is rejected, never executed.
-pub const AOT_TRANSLATOR_VERSION: u32 = 5;
+pub const AOT_TRANSLATOR_VERSION: u32 = 6;
 
 /// Optimization-profile key component for worker-slice Tier0 blocks.
 pub(super) const AOT_SLICE_OPT_PROFILE: u32 = 1;
@@ -240,6 +240,9 @@ pub(super) struct AotRecord {
     pub(super) translator: u32,
     pub(super) machine: u64,
     pub(super) cpu_profile: u64,
+    /// Image content hash this record was produced from.  Validated when the
+    /// runtime is bound to an image; a record from another image is rejected.
+    pub(super) image_hash: String,
     pub(super) optimization_profile: u32,
     pub(super) guest_address: u64,
     pub(super) code_hash: u64,
@@ -275,6 +278,8 @@ impl AotRecord {
         out.extend_from_slice(&self.translator.to_le_bytes());
         out.extend_from_slice(&self.machine.to_le_bytes());
         out.extend_from_slice(&self.cpu_profile.to_le_bytes());
+        out.extend_from_slice(&(self.image_hash.len() as u16).to_le_bytes());
+        out.extend_from_slice(self.image_hash.as_bytes());
         out.extend_from_slice(&self.optimization_profile.to_le_bytes());
         out.extend_from_slice(&self.guest_address.to_le_bytes());
         out.extend_from_slice(&self.code_hash.to_le_bytes());
@@ -295,7 +300,7 @@ impl AotRecord {
     }
 
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
-        if bytes.len() < 8 + 4 * 10 + 1 + 1 + 4 + 8 {
+        if bytes.len() < 8 + 4 * 10 + 1 + 2 + 1 + 4 + 8 {
             return Err("truncated record header");
         }
         if &bytes[..8] != Self::MAGIC {
@@ -333,10 +338,33 @@ impl AotRecord {
             *cursor += 8;
             Ok(value)
         };
+        let read_u16 = |cursor: &mut usize| -> Result<u16, &'static str> {
+            let value = u16::from_le_bytes(
+                bytes
+                    .get(*cursor..*cursor + 2)
+                    .ok_or("truncated u16")?
+                    .try_into()
+                    .map_err(|_| "truncated u16")?,
+            );
+            *cursor += 2;
+            Ok(value)
+        };
         let format = read_u32(&mut cursor)?;
         let translator = read_u32(&mut cursor)?;
         let machine = read_u64(&mut cursor)?;
         let cpu_profile = read_u64(&mut cursor)?;
+        let image_hash_len = read_u16(&mut cursor)? as usize;
+        let image_hash_end = cursor
+            .checked_add(image_hash_len)
+            .ok_or("image hash overflow")?;
+        let image_hash = std::str::from_utf8(
+            bytes
+                .get(cursor..image_hash_end)
+                .ok_or("truncated image hash")?,
+        )
+        .map_err(|_| "invalid image hash encoding")?
+        .to_string();
+        cursor = image_hash_end;
         let optimization_profile = read_u32(&mut cursor)?;
         let guest_address = read_u64(&mut cursor)?;
         let code_hash = read_u64(&mut cursor)?;
@@ -375,6 +403,7 @@ impl AotRecord {
             translator,
             machine,
             cpu_profile,
+            image_hash,
             optimization_profile,
             guest_address,
             code_hash,

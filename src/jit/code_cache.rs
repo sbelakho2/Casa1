@@ -2329,6 +2329,23 @@ pub struct JitRuntime {
     /// Directory used to persist/reload translated worker blocks.  `None`
     /// disables the cache (useful for deterministic tests).
     pub(crate) aot_cache_dir: Option<std::path::PathBuf>,
+    /// Image content hash this runtime's cache is bound to.  Set by the
+    /// install/update pipeline; `None` keeps the legacy test/direct-dir mode.
+    pub(crate) aot_image_hash: Option<String>,
+    /// Exact on-disk profile path for the configured pipeline key.
+    pub(crate) aot_profile_path: Option<std::path::PathBuf>,
+    /// Profile targets loaded before entry plus those observed this run.
+    pub(crate) aot_profile: ProfileTargets,
+    /// Number of distinct profile addresses loaded from disk.
+    pub(crate) aot_persisted_targets_loaded: u64,
+    /// Blocks discovered by the pre-entry walk/precompile pass.
+    pub(crate) aot_blocks_precompiled: u64,
+    /// Number of profile targets written after the run.
+    pub(crate) aot_profile_targets_persisted: u64,
+    /// Exact profile rejection reason when a stored file was discarded.
+    pub(crate) aot_profile_error: Option<String>,
+    /// Blocks whose direct-call targets were already folded into the profile.
+    pub(crate) aot_profile_seen_blocks: BTreeSet<u64>,
     /// Guest addresses permanently barred from native compilation after a
     /// fault-equivalent event; the interpreter handles them for the rest of
     /// the run.
@@ -2397,6 +2414,14 @@ impl JitRuntime {
             aot_misses: 0,
             aot_rejected: 0,
             aot_cache_dir,
+            aot_image_hash: None,
+            aot_profile_path: None,
+            aot_profile: ProfileTargets::default(),
+            aot_persisted_targets_loaded: 0,
+            aot_blocks_precompiled: 0,
+            aot_profile_targets_persisted: 0,
+            aot_profile_error: None,
+            aot_profile_seen_blocks: BTreeSet::new(),
             faulted_blocks: BTreeSet::new(),
             block_chains: BTreeMap::new(),
             fast_thunk_table: FastThunkTable::new(),
@@ -2416,6 +2441,186 @@ impl JitRuntime {
     /// `(hits, misses, rejected)` for the persistent AOT cache.
     pub fn aot_metrics(&self) -> (u64, u64, u64) {
         (self.aot_hits, self.aot_misses, self.aot_rejected)
+    }
+
+    /// Bind this runtime to the install/update pipeline store:
+    /// `cache_root/aot/<image-hash>-t<translator>-c<cpu>/`.
+    ///
+    /// Every later block lookup and every profile write is keyed by the image
+    /// hash, translator version and CPU profile.  A record produced for a
+    /// different key is rejected before its code is installed.
+    pub fn configure_aot_pipeline(
+        &mut self,
+        cache_root: &std::path::Path,
+        image_hash: &str,
+    ) -> AppResult<()> {
+        // Preserve the existing kill switch: CASA1_AOT_CACHE_DIR=off disables
+        // every persistent translation/profile write, even from the pipeline.
+        if std::env::var("CASA1_AOT_CACHE_DIR").is_ok_and(|value| value.eq_ignore_ascii_case("off"))
+        {
+            self.aot_cache_dir = None;
+            self.aot_profile_path = None;
+            self.aot_image_hash = None;
+            return Ok(());
+        }
+        let key = ProfileKey::new(image_hash, AOT_TRANSLATOR_VERSION, aot_target_cpu_profile());
+        let directory = profile_directory(cache_root, &key);
+        let profile_path = profile_file_path(cache_root, &key);
+        self.aot_cache_dir = Some(directory);
+        self.aot_profile_path = Some(profile_path);
+        self.aot_image_hash = Some(image_hash.to_string());
+        // Re-binding to a key replaces any in-memory targets from another
+        // image; they must never leak into this image's cache.
+        self.aot_profile = ProfileTargets::default();
+        self.aot_profile_seen_blocks.clear();
+        self.aot_persisted_targets_loaded = 0;
+        self.aot_blocks_precompiled = 0;
+        self.aot_profile_targets_persisted = 0;
+        self.aot_profile_error = None;
+        Ok(())
+    }
+
+    /// The exact pipeline key, when configured.
+    pub fn aot_profile_key(&self) -> Option<ProfileKey> {
+        self.aot_image_hash.as_ref().map(|image_hash| {
+            ProfileKey::new(
+                image_hash.clone(),
+                AOT_TRANSLATOR_VERSION,
+                aot_target_cpu_profile(),
+            )
+        })
+    }
+
+    /// Load and validate the persisted profile before entry.
+    ///
+    /// Returns the number of distinct target addresses loaded.  A missing file
+    /// is a cold start (0).  Any integrity/key failure is returned verbatim so
+    /// the caller can report it; stale targets are never installed.
+    pub fn load_aot_profile(&mut self) -> Result<u64, ProfileError> {
+        let Some(path) = self.aot_profile_path.clone() else {
+            return Ok(0);
+        };
+        let Some(key) = self.aot_profile_key() else {
+            return Ok(0);
+        };
+        match load_profile_file(&path, &key) {
+            Ok(Some(loaded)) => {
+                let count = loaded.address_count();
+                self.aot_profile.merge(&loaded);
+                self.aot_persisted_targets_loaded = count;
+                Ok(count)
+            }
+            Ok(None) => Ok(0),
+            Err(error) => {
+                self.aot_profile_error = Some(error.to_string());
+                self.aot_rejected += 1;
+                Err(error)
+            }
+        }
+    }
+
+    /// Union of persisted profile addresses to seed the pre-entry walk with.
+    pub fn aot_profile_seeds(&self) -> Vec<u64> {
+        self.aot_profile.seed_addresses()
+    }
+
+    /// Read-only view used by diagnostics and adversarial tests.
+    pub fn aot_profile_targets(&self) -> &ProfileTargets {
+        &self.aot_profile
+    }
+
+    /// Fold one executed block into the in-memory profile.
+    ///
+    /// Direct call targets and function entries are extracted once per block.
+    /// The resolved target of an indirect call is the guest RIP observed after
+    /// the block executed, so it is recorded on every execution.
+    pub fn record_profile_execution(
+        &mut self,
+        block_address: u64,
+        ir: &[IrInstruction],
+        exit_rip: u64,
+    ) {
+        if self.aot_profile_path.is_none() {
+            return;
+        }
+        if matches!(
+            ir.last(),
+            Some(IrInstruction::CallRegister { .. } | IrInstruction::CallMemory { .. })
+        ) {
+            self.aot_profile
+                .record(ProfileTargetKind::IndirectCall, exit_rip, 1);
+        }
+        self.record_profile_block_targets(block_address, ir);
+    }
+
+    /// Fold a block's statically known call edges into the profile.  Used by
+    /// the execution path and by install-time precompile-only discovery.
+    pub fn record_profile_block_targets(&mut self, block_address: u64, ir: &[IrInstruction]) {
+        if self.aot_profile_path.is_none() {
+            return;
+        }
+        if !self.aot_profile_seen_blocks.insert(block_address) {
+            return;
+        }
+        for instruction in ir {
+            if let IrInstruction::Call { target, .. } = instruction {
+                self.aot_profile
+                    .record(ProfileTargetKind::DirectCall, *target, 1);
+                self.aot_profile
+                    .record(ProfileTargetKind::FunctionEntry, *target, 1);
+            }
+        }
+    }
+
+    /// Record how many blocks the pre-entry pass compiled.
+    pub fn note_aot_blocks_precompiled(&mut self, blocks: u64) {
+        self.aot_blocks_precompiled = blocks;
+    }
+
+    /// Persist the accumulated profile plus this run's hot blocks.
+    ///
+    /// Returns the number of distinct targets written.  When no pipeline is
+    /// configured this is a no-op.
+    pub fn persist_aot_profile(&mut self, hot_blocks: &[(u64, u64)]) -> Result<u64, ProfileError> {
+        for (address, hits) in hot_blocks {
+            self.aot_profile
+                .record(ProfileTargetKind::HotBlock, *address, *hits);
+        }
+        let Some(path) = self.aot_profile_path.clone() else {
+            return Ok(0);
+        };
+        let Some(key) = self.aot_profile_key() else {
+            return Ok(0);
+        };
+        let count = self.aot_profile.address_count();
+        match store_profile_file(&path, &key, &self.aot_profile) {
+            Ok(()) => {
+                self.aot_profile_targets_persisted = count;
+                Ok(count)
+            }
+            Err(error) => {
+                self.aot_profile_error = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// Counters reported with the run and by precompile-only mode.
+    pub fn aot_run_summary(&self) -> AotRunSummary {
+        AotRunSummary {
+            persisted_targets_loaded: self.aot_persisted_targets_loaded,
+            blocks_precompiled: self.aot_blocks_precompiled,
+            aot_hits: self.aot_hits,
+            aot_misses: self.aot_misses,
+            aot_rejected: self.aot_rejected,
+            profile_targets_persisted: self.aot_profile_targets_persisted,
+            profile_error: self.aot_profile_error.clone(),
+        }
+    }
+
+    /// Drop profile targets in `[start, end)` after code invalidation.
+    pub fn clear_aot_profile_range(&mut self, start: u64, end: u64) {
+        self.aot_profile.clear_range(start, end);
     }
 
     /// Get or compile a JIT block for the given guest address.
@@ -2816,6 +3021,17 @@ impl JitRuntime {
                 format!("malformed AOT cache record: {reason}"),
             )
         })?;
+        if let Some(expected_image_hash) = self.aot_image_hash.as_deref()
+            && record.image_hash != expected_image_hash
+        {
+            return Err(AppError::new(
+                ReasonCode::RcJitCompilationError,
+                format!(
+                    "AOT cache record image hash mismatch: found {}, expected {expected_image_hash}",
+                    record.image_hash
+                ),
+            ));
+        }
         if record.optimization_profile != AOT_SLICE_OPT_PROFILE
             || record.guest_address != guest_address
             || record.code_hash != source_hash
@@ -2867,6 +3083,7 @@ impl JitRuntime {
             translator: AOT_TRANSLATOR_VERSION,
             machine: AotRecord::machine_tag(),
             cpu_profile: aot_target_cpu_profile(),
+            image_hash: self.aot_image_hash.clone().unwrap_or_default(),
             optimization_profile: AOT_SLICE_OPT_PROFILE,
             guest_address: block.guest_address,
             code_hash: source_hash,
@@ -2890,6 +3107,19 @@ impl JitRuntime {
     }
 
     pub(crate) fn clear_slice_blocks(&mut self) {
+        let cleared_ranges: Vec<(u64, u64)> = self
+            .slice_block_cache
+            .values()
+            .map(|block| {
+                (
+                    block.guest_address,
+                    block.guest_address.saturating_add(block_guest_span(block)),
+                )
+            })
+            .collect();
+        for (start, end) in cleared_ranges {
+            self.clear_aot_profile_range(start, end);
+        }
         for block in self.slice_block_cache.values() {
             block.link_target.store(0, Ordering::Release);
             block.taken_link.store(0, Ordering::Release);
@@ -2994,6 +3224,8 @@ impl JitRuntime {
         // Overflow means the bounded dirty ring wrapped: some written page is
         // unknown, so conservative whole-cache invalidation is required.
         let affected: Vec<u64> = if overflow {
+            self.aot_profile = ProfileTargets::default();
+            self.aot_profile_seen_blocks.clear();
             let all: Vec<u64> = self.block_cache.keys().copied().collect();
             for address in &all {
                 self.invalidate_block(*address);
@@ -3035,7 +3267,13 @@ impl JitRuntime {
     /// The caller is responsible for syncing the updated unwind table to the
     /// SEH subsystem via [`JitUnwindTable::register_with_seh`].
     pub fn invalidate_block(&mut self, guest_address: u64) {
+        // Self-modifying code invalidates the profile targets that pointed at
+        // this block (and every address inside its guest span): a later run
+        // must never seed a stale address.
+        self.clear_aot_profile_range(guest_address, guest_address.saturating_add(1));
         if let Some(block) = self.slice_block_cache.remove(&guest_address) {
+            let end = block.guest_address.saturating_add(block_guest_span(&block));
+            self.clear_aot_profile_range(block.guest_address, end);
             block.link_target.store(0, Ordering::Release);
             block.taken_link.store(0, Ordering::Release);
             block.fallthrough_link.store(0, Ordering::Release);
@@ -3044,6 +3282,8 @@ impl JitRuntime {
             self.slice_epoch = self.slice_epoch.wrapping_add(1);
         }
         if let Some(block) = self.block_cache.remove(&guest_address) {
+            let end = block.guest_address.saturating_add(block_guest_span(&block));
+            self.clear_aot_profile_range(block.guest_address, end);
             // Remove from the access-order queue so stale entries don't
             // accumulate and cause incorrect evictions.
             self.block_access_order.retain(|&a| a != guest_address);
@@ -3213,9 +3453,18 @@ impl JitRuntime {
         &mut self,
         dirty_pages: &std::collections::BTreeSet<u64>,
     ) -> Vec<u64> {
-        if dirty_pages.is_empty()
-            || (self.block_cache.is_empty() && self.slice_block_cache.is_empty())
-        {
+        if dirty_pages.is_empty() {
+            return Vec::new();
+        }
+        // A code write invalidates every profile target on the written pages,
+        // even when no compiled block is currently cached for them: a later
+        // launch must not seed translation from stale code.
+        for page in dirty_pages {
+            self.clear_aot_profile_range(*page, page.saturating_add(0x1000));
+            self.aot_profile_seen_blocks
+                .retain(|address| *address < *page || *address >= page.saturating_add(0x1000));
+        }
+        if self.block_cache.is_empty() && self.slice_block_cache.is_empty() {
             return Vec::new();
         }
 

@@ -2,7 +2,7 @@ use super::support::*;
 use super::*;
 
 #[test]
-fn evidence_mscoree_clr_absent_semantics() {
+fn evidence_mscoree_clr_activation_semantics() {
     with_big_stack(|| {
         let (mut runtime, _tmp) = test_runtime("evidence-mscoree");
         let mut memory = MemoryImage::default();
@@ -44,6 +44,8 @@ fn evidence_mscoree_clr_absent_semantics() {
             "metadata host object returned"
         );
 
+        // Null rclsid/riid is E_POINTER regardless of which runtime is
+        // installed: argument validation precedes runtime selection.
         assert_eq!(
             dispatch_x86_thunk(
                 &mut runtime,
@@ -51,9 +53,52 @@ fn evidence_mscoree_clr_absent_semantics() {
                 bind,
                 &[0, 0, 0, 0, 0, out as u32]
             ),
-            0x8013_1013
+            0x8000_4003
         );
         assert_eq!(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0);
+
+        // A v4 Framework request binds the real Mono-backed host when Mono is
+        // installed; CLSID_CLRRuntimeHost {90F1A06E-...} and
+        // IID_ICLRRuntimeHost {D5F0A32B-...}.
+        let host_clsid = 0x41_030_u64;
+        let host_iid = 0x41_040_u64;
+        memory.map_bytes(
+            host_clsid,
+            &[
+                0x6E, 0xA0, 0xF1, 0x90, 0x12, 0x77, 0x62, 0x47, 0x86, 0xB5, 0x7A, 0x5E, 0xBA, 0x6B,
+                0x65, 0xE6,
+            ],
+        );
+        memory.map_bytes(
+            host_iid,
+            &[
+                0x2B, 0xA3, 0xF0, 0xD5, 0x4D, 0x2E, 0x4B, 0x4E, 0x9B, 0x5C, 0x2D, 0x8B, 0x0B, 0x3B,
+                0x6F, 0x5F,
+            ],
+        );
+        let version = runtime
+            .alloc_utf16_string(&mut memory, "v4.0.30319")
+            .expect("framework version");
+        let mono_bind = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            bind,
+            &[
+                version as u32,
+                0,
+                0,
+                host_clsid as u32,
+                host_iid as u32,
+                out as u32,
+            ],
+        );
+        let host = read_guest_pointer(&memory, out, GuestArch::X86).unwrap();
+        // Mono may be absent on a non-provisioned host: absence is the exact
+        // documented failure, presence must be a real host object.
+        assert!(
+            (mono_bind == 0 && host != 0) || mono_bind == 0x8013_1013,
+            "unexpected Framework bind result {mono_bind:#x}"
+        );
 
         // The host has a real CoreCLR, so the directory query succeeds with
         // the installed runtime path (the old no-CLR expectation was stale).
@@ -88,28 +133,29 @@ fn evidence_mscoree_clr_absent_semantics() {
             "unexpected CoreCLR directory {path}"
         );
 
-        // A versionless request names the absent Framework CLR, so the
-        // requested-runtime contract keeps the documented absence error.
-        assert_eq!(
-            dispatch_x86_thunk(
-                &mut runtime,
-                &mut memory,
-                requested,
-                &[
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    buffer as u32,
-                    260,
-                    length_out as u32,
-                    0,
-                    0,
-                    0
-                ]
-            ),
-            0x8013_1013
+        // A versionless request binds the installed Framework runtime when
+        // one is present (Mono), otherwise it keeps the documented absence.
+        let requested_hr = dispatch_x86_thunk(
+            &mut runtime,
+            &mut memory,
+            requested,
+            &[
+                0,
+                0,
+                0,
+                0,
+                0,
+                buffer as u32,
+                260,
+                length_out as u32,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert!(
+            requested_hr == 0 || requested_hr == 0x8013_1013,
+            "unexpected requested-runtime result {requested_hr:#x}"
         );
         assert_eq!(
             dispatch_x86_thunk(&mut runtime, &mut memory, shim, &[0, 0, 0, 0]),

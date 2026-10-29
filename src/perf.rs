@@ -13,6 +13,613 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ===========================================================================
+// Owner-barrier / API-dispatch KPI ingestion
+// ===========================================================================
+
+/// Environment variable naming the JSON document written by the runner at
+/// exit.  The perf harness never reads runtime memory directly; it only
+/// consumes this stable on-disk contract.
+pub const DISPATCH_STATS_ENV: &str = "CASA1_DISPATCH_STATS";
+
+/// Schema version of the dispatch-stats document.
+pub const DISPATCH_STATS_SCHEMA: u64 = 1;
+
+/// Why an owner-barrier KPI cannot be reported.  Every variant carries the
+/// exact, user-visible reason; no ratio is ever synthesized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchStatsUnavailable {
+    /// The runner was not asked to write the document.
+    NotRequested,
+    /// The configured document does not exist.
+    Absent(PathBuf),
+    /// The document exists but could not be read.
+    Unreadable { path: PathBuf, detail: String },
+    /// The document is not valid JSON or is not a JSON object.
+    Malformed { path: PathBuf, detail: String },
+    /// The document declares a schema this harness does not understand.
+    UnsupportedSchema { path: PathBuf, schema: u64 },
+    /// A required field is absent or has the wrong JSON type.
+    MissingField { path: PathBuf, field: &'static str },
+    /// A field is present but semantically invalid.
+    InvalidField {
+        path: PathBuf,
+        field: &'static str,
+        detail: String,
+    },
+    /// The document is valid but recorded no host-thunk dispatches.
+    ZeroDispatches { path: PathBuf },
+}
+
+impl DispatchStatsUnavailable {
+    /// Exact human-readable reason used in both the KPI document and the gate
+    /// report.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::NotRequested => format!(
+                "{DISPATCH_STATS_ENV} is not set; owner-barrier dispatch statistics are unavailable"
+            ),
+            Self::Absent(path) => {
+                format!("dispatch statistics file {} does not exist", path.display())
+            }
+            Self::Unreadable { path, detail } => format!(
+                "dispatch statistics file {} is unreadable: {detail}",
+                path.display()
+            ),
+            Self::Malformed { path, detail } => format!(
+                "dispatch statistics file {} is malformed: {detail}",
+                path.display()
+            ),
+            Self::UnsupportedSchema { path, schema } => format!(
+                "dispatch statistics file {} uses unsupported schema {schema} (expected {DISPATCH_STATS_SCHEMA})",
+                path.display()
+            ),
+            Self::MissingField { path, field } => format!(
+                "dispatch statistics file {} is partial: required field `{field}` is missing or not an unsigned integer",
+                path.display()
+            ),
+            Self::InvalidField {
+                path,
+                field,
+                detail,
+            } => format!(
+                "dispatch statistics file {} has invalid `{field}`: {detail}",
+                path.display()
+            ),
+            Self::ZeroDispatches { path } => format!(
+                "dispatch statistics file {} recorded zero host-thunk dispatches; owner-barrier ratio is undefined",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// One category's dispatch accounting from the runtime snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchCategoryStats {
+    pub dispatched: u64,
+    pub fallbacks: u64,
+}
+
+/// Parsed owner-barrier statistics document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchStats {
+    pub parallel_dispatched: u64,
+    pub barrier_calls: u64,
+    pub stateless_dispatched: u64,
+    pub read_mostly_dispatched: u64,
+    pub owner_only_barriers: u64,
+    pub fallback_barriers: u64,
+    pub categories: BTreeMap<String, DispatchCategoryStats>,
+    pub barrier_reasons: BTreeMap<String, u64>,
+    pub guest_instructions: Option<u64>,
+    pub wall_ns: Option<u64>,
+}
+
+impl DispatchStats {
+    pub fn total_dispatches(&self) -> u64 {
+        self.parallel_dispatched.saturating_add(self.barrier_calls)
+    }
+
+    /// Fraction of host-thunk dispatches that crossed the owner barrier.
+    pub fn owner_barrier_ratio(&self) -> Option<f64> {
+        let total = self.total_dispatches();
+        (total > 0).then(|| self.barrier_calls as f64 / total as f64)
+    }
+
+    /// Fraction of host-thunk dispatches serviced on a worker.
+    pub fn parallel_dispatch_ratio(&self) -> Option<f64> {
+        let total = self.total_dispatches();
+        (total > 0).then(|| self.parallel_dispatched as f64 / total as f64)
+    }
+
+    /// Wall time spent per 1000 retired guest instructions.
+    pub fn time_per_1000_guest_instructions_ns(&self) -> Option<f64> {
+        match (self.wall_ns, self.guest_instructions) {
+            (Some(wall_ns), Some(instructions)) if wall_ns > 0 && instructions > 0 => {
+                Some(wall_ns as f64 * 1_000.0 / instructions as f64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Stable JSON representation, shared by the runner writer and the
+    /// harness reader.
+    pub fn to_json(&self) -> serde_json::Value {
+        let categories = self
+            .categories
+            .iter()
+            .map(|(name, stats)| {
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "dispatched": stats.dispatched,
+                        "fallbacks": stats.fallbacks,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        serde_json::json!({
+            "schema": DISPATCH_STATS_SCHEMA,
+            "source": "casa1-api-dispatch",
+            "parallel_dispatched": self.parallel_dispatched,
+            "barrier_calls": self.barrier_calls,
+            "stateless_dispatched": self.stateless_dispatched,
+            "read_mostly_dispatched": self.read_mostly_dispatched,
+            "owner_only_barriers": self.owner_only_barriers,
+            "fallback_barriers": self.fallback_barriers,
+            "owner_barrier_ratio": self.owner_barrier_ratio(),
+            "parallel_dispatch_ratio": self.parallel_dispatch_ratio(),
+            "categories": categories,
+            "barrier_reasons": self.barrier_reasons,
+            "guest_instructions": self.guest_instructions,
+            "wall_ns": self.wall_ns,
+            "time_per_1000_guest_instructions_ns": self
+                .time_per_1000_guest_instructions_ns(),
+        })
+    }
+
+    fn from_runtime_snapshot(
+        snapshot: &crate::runtime::ApiDispatchSnapshot,
+        guest_instructions: u64,
+        wall_ns: u64,
+    ) -> Self {
+        let mut categories = BTreeMap::new();
+        for (category, dispatched, fallbacks) in &snapshot.categories {
+            categories.insert(
+                category.as_str().to_string(),
+                DispatchCategoryStats {
+                    dispatched: *dispatched,
+                    fallbacks: *fallbacks,
+                },
+            );
+        }
+        let mut barrier_reasons = BTreeMap::new();
+        for (reason, count) in &snapshot.fallbacks {
+            barrier_reasons.insert(reason.as_str().to_string(), *count);
+        }
+        Self {
+            parallel_dispatched: snapshot.totals.parallel_dispatched,
+            barrier_calls: snapshot.totals.barrier_calls,
+            stateless_dispatched: snapshot.totals.stateless_dispatched,
+            read_mostly_dispatched: snapshot.totals.read_mostly_dispatched,
+            owner_only_barriers: snapshot.totals.owner_only_barriers,
+            fallback_barriers: snapshot.totals.fallback_barriers,
+            categories,
+            barrier_reasons,
+            guest_instructions: (guest_instructions > 0).then_some(guest_instructions),
+            wall_ns: (wall_ns > 0).then_some(wall_ns),
+        }
+    }
+}
+
+/// Result of reading the dispatch-stats contract: either a parsed document or
+/// the exact reason it is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchStatsReport {
+    pub stats: Option<DispatchStats>,
+    pub unavailable: Option<DispatchStatsUnavailable>,
+}
+
+impl DispatchStatsReport {
+    /// Read [`DISPATCH_STATS_ENV`].  An unset variable is an explicit
+    /// not-requested result, not a fabricated zero.
+    pub fn from_env() -> Self {
+        match std::env::var_os(DISPATCH_STATS_ENV) {
+            Some(path) if !path.is_empty() => Self::from_path(Path::new(&path)),
+            _ => Self {
+                stats: None,
+                unavailable: Some(DispatchStatsUnavailable::NotRequested),
+            },
+        }
+    }
+
+    /// Read and validate a dispatch-stats document.
+    pub fn from_path(path: &Path) -> Self {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self {
+                    stats: None,
+                    unavailable: Some(DispatchStatsUnavailable::Absent(path.to_path_buf())),
+                };
+            }
+            Err(error) => {
+                return Self {
+                    stats: None,
+                    unavailable: Some(DispatchStatsUnavailable::Unreadable {
+                        path: path.to_path_buf(),
+                        detail: error.to_string(),
+                    }),
+                };
+            }
+        };
+        match Self::from_json(path, &text) {
+            Ok(stats) => Self {
+                stats: Some(stats),
+                unavailable: None,
+            },
+            Err(reason) => Self {
+                stats: None,
+                unavailable: Some(reason),
+            },
+        }
+    }
+
+    fn from_json(path: &Path, text: &str) -> Result<DispatchStats, DispatchStatsUnavailable> {
+        let document: serde_json::Value =
+            serde_json::from_str(text).map_err(|error| DispatchStatsUnavailable::Malformed {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        let object = document
+            .as_object()
+            .ok_or_else(|| DispatchStatsUnavailable::Malformed {
+                path: path.to_path_buf(),
+                detail: "top-level JSON value is not an object".to_string(),
+            })?;
+        let schema = object
+            .get("schema")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(DispatchStatsUnavailable::MissingField {
+                path: path.to_path_buf(),
+                field: "schema",
+            })?;
+        if schema != DISPATCH_STATS_SCHEMA {
+            return Err(DispatchStatsUnavailable::UnsupportedSchema {
+                path: path.to_path_buf(),
+                schema,
+            });
+        }
+        let parallel_dispatched = required_u64(object, path, "parallel_dispatched")?;
+        let barrier_calls = required_u64(object, path, "barrier_calls")?;
+        let stateless_dispatched = optional_u64(object, path, "stateless_dispatched")?;
+        let read_mostly_dispatched = optional_u64(object, path, "read_mostly_dispatched")?;
+        let owner_only_barriers = optional_u64(object, path, "owner_only_barriers")?;
+        let fallback_barriers = optional_u64(object, path, "fallback_barriers")?;
+
+        let mut categories = BTreeMap::new();
+        if let Some(value) = object.get("categories") {
+            let map = value
+                .as_object()
+                .ok_or_else(|| DispatchStatsUnavailable::InvalidField {
+                    path: path.to_path_buf(),
+                    field: "categories",
+                    detail: "expected an object keyed by category".to_string(),
+                })?;
+            for (name, category) in map {
+                let category =
+                    category
+                        .as_object()
+                        .ok_or_else(|| DispatchStatsUnavailable::InvalidField {
+                            path: path.to_path_buf(),
+                            field: "categories",
+                            detail: format!("category `{name}` is not an object"),
+                        })?;
+                categories.insert(
+                    name.clone(),
+                    DispatchCategoryStats {
+                        dispatched: required_u64(category, path, "dispatched")?,
+                        fallbacks: required_u64(category, path, "fallbacks")?,
+                    },
+                );
+            }
+        }
+        let mut barrier_reasons = BTreeMap::new();
+        if let Some(value) = object.get("barrier_reasons") {
+            let map = value
+                .as_object()
+                .ok_or_else(|| DispatchStatsUnavailable::InvalidField {
+                    path: path.to_path_buf(),
+                    field: "barrier_reasons",
+                    detail: "expected an object keyed by fallback reason".to_string(),
+                })?;
+            for (name, count) in map {
+                let count =
+                    count
+                        .as_u64()
+                        .ok_or_else(|| DispatchStatsUnavailable::InvalidField {
+                            path: path.to_path_buf(),
+                            field: "barrier_reasons",
+                            detail: format!("reason `{name}` is not an unsigned integer"),
+                        })?;
+                barrier_reasons.insert(name.clone(), count);
+            }
+        }
+        let guest_instructions = optional_optional_u64(object, path, "guest_instructions")?;
+        let wall_ns = optional_optional_u64(object, path, "wall_ns")?;
+        let stats = DispatchStats {
+            parallel_dispatched,
+            barrier_calls,
+            stateless_dispatched,
+            read_mostly_dispatched,
+            owner_only_barriers,
+            fallback_barriers,
+            categories,
+            barrier_reasons,
+            guest_instructions,
+            wall_ns,
+        };
+        if stats.total_dispatches() == 0 {
+            return Err(DispatchStatsUnavailable::ZeroDispatches {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(stats)
+    }
+
+    /// KPI entries for the benchmark document.  An unavailable document
+    /// produces `available: false` entries with the exact reason.
+    pub fn to_json_metrics(&self) -> BTreeMap<String, serde_json::Value> {
+        let mut metrics = BTreeMap::new();
+        let source = "runner CASA1_DISPATCH_STATS ApiDispatchSnapshot";
+        let unavailable_reason = self.unavailable.as_ref().map(|reason| reason.reason());
+        for (key, value, unit) in [
+            (
+                "owner_barrier_ratio",
+                self.stats
+                    .as_ref()
+                    .and_then(DispatchStats::owner_barrier_ratio),
+                "owner-barrier dispatches/(parallel+barrier)",
+            ),
+            (
+                "time_per_1000_guest_instructions_ns",
+                self.stats
+                    .as_ref()
+                    .and_then(DispatchStats::time_per_1000_guest_instructions_ns),
+                "ns/1000 guest instructions",
+            ),
+        ] {
+            match value {
+                Some(value) if value.is_finite() => {
+                    metrics.insert(
+                        key.to_string(),
+                        serde_json::json!({
+                            "available": true,
+                            "value": value,
+                            "unit": unit,
+                            "direction": "lower",
+                            "source": source,
+                        }),
+                    );
+                }
+                _ => {
+                    let reason = match (&self.stats, key) {
+                        (Some(stats), "owner_barrier_ratio")
+                            if stats.total_dispatches() == 0 =>
+                        {
+                            "dispatch statistics recorded zero host-thunk dispatches; owner-barrier ratio is undefined".to_string()
+                        }
+                        (Some(stats), "time_per_1000_guest_instructions_ns")
+                            if stats.guest_instructions.unwrap_or(0) == 0
+                                || stats.wall_ns.unwrap_or(0) == 0 =>
+                        {
+                            "dispatch statistics did not record both wall time and guest instructions; time per 1000 guest instructions is unavailable".to_string()
+                        }
+                        _ => unavailable_reason
+                            .clone()
+                            .unwrap_or_else(|| "dispatch statistic is unavailable".to_string()),
+                    };
+                    metrics.insert(
+                        key.to_string(),
+                        serde_json::json!({
+                            "available": false,
+                            "reason": reason,
+                            "source": source,
+                        }),
+                    );
+                }
+            }
+        }
+        metrics
+    }
+
+    /// Stable JSON block for the KPI/perf report.  Unavailable reports carry
+    /// the exact reason instead of a zero ratio.
+    pub fn to_json(&self) -> serde_json::Value {
+        match &self.stats {
+            Some(stats) => {
+                let mut value = stats.to_json();
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("available".to_string(), serde_json::Value::Bool(true));
+                }
+                value
+            }
+            None => serde_json::json!({
+                "schema": DISPATCH_STATS_SCHEMA,
+                "available": false,
+                "reason": self
+                    .unavailable
+                    .as_ref()
+                    .map(DispatchStatsUnavailable::reason)
+                    .unwrap_or_else(|| "dispatch statistics are unavailable".to_string()),
+                "owner_barrier_ratio": serde_json::Value::Null,
+                "barrier_reasons": {},
+                "time_per_1000_guest_instructions_ns": serde_json::Value::Null,
+            }),
+        }
+    }
+
+    /// Human-readable lines for the perf harness output.
+    pub fn human_lines(&self) -> Vec<String> {
+        let Some(stats) = &self.stats else {
+            return vec![format!(
+                "unavailable: {}",
+                self.unavailable
+                    .as_ref()
+                    .map(DispatchStatsUnavailable::reason)
+                    .unwrap_or_else(|| "dispatch statistics are unavailable".to_string())
+            )];
+        };
+        let ratio = stats.owner_barrier_ratio().map_or_else(
+            || "unavailable (zero dispatches)".to_string(),
+            |ratio| format!("{ratio:.6}"),
+        );
+        let time = stats.time_per_1000_guest_instructions_ns().map_or_else(
+            || "unavailable (no guest-instruction sample)".to_string(),
+            |value| format!("{value:.3} ns"),
+        );
+        let reasons = stats
+            .barrier_reasons
+            .iter()
+            .map(|(reason, count)| format!("{reason}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        vec![
+            format!(
+                "parallel={} barrier={} owner_barrier_ratio={ratio}",
+                stats.parallel_dispatched, stats.barrier_calls
+            ),
+            format!("barrier_reasons=[{reasons}]"),
+            format!("time_per_1000_guest_instructions={time}"),
+        ]
+    }
+}
+
+fn required_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+    field: &'static str,
+) -> Result<u64, DispatchStatsUnavailable> {
+    object.get(field).and_then(serde_json::Value::as_u64).ok_or(
+        DispatchStatsUnavailable::MissingField {
+            path: path.to_path_buf(),
+            field,
+        },
+    )
+}
+
+fn optional_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+    field: &'static str,
+) -> Result<u64, DispatchStatsUnavailable> {
+    match object.get(field) {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| DispatchStatsUnavailable::InvalidField {
+                path: path.to_path_buf(),
+                field,
+                detail: "expected an unsigned integer".to_string(),
+            }),
+    }
+}
+
+fn optional_optional_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+    field: &'static str,
+) -> Result<Option<u64>, DispatchStatsUnavailable> {
+    match object.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            value
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| DispatchStatsUnavailable::InvalidField {
+                    path: path.to_path_buf(),
+                    field,
+                    detail: "expected an unsigned integer or null".to_string(),
+                })
+        }
+    }
+}
+
+/// Runner-side writer: when [`DISPATCH_STATS_ENV`] names a file, serialize the
+/// runtime's own dispatch snapshot at exit.  This function never invents
+/// counters; a zero-dispatch run writes a real zero document and the harness
+/// reports the ratio as undefined.
+pub(crate) fn write_dispatch_stats_if_requested(
+    shared: &crate::runtime::ProcessShared,
+    guest_instructions: u64,
+    wall_ns: u64,
+) {
+    let Some(path) = std::env::var_os(DISPATCH_STATS_ENV) else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let snapshot = shared.api_dispatch_snapshot();
+    let stats = DispatchStats::from_runtime_snapshot(&snapshot, guest_instructions, wall_ns);
+    if let Ok(text) = serde_json::to_string_pretty(&stats.to_json()) {
+        let _ = std::fs::write(PathBuf::from(path), text);
+    }
+}
+
+/// Why a native-relative ratio cannot be computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeRatioUnavailable {
+    Casa1Unavailable,
+    NativeUnavailable,
+    Casa1ZeroTime,
+    NativeZeroTime,
+}
+
+impl NativeRatioUnavailable {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Casa1Unavailable => {
+                "Casa1 guest workload is unavailable; native-relative ratio refused"
+            }
+            Self::NativeUnavailable => {
+                "native reference workload is unavailable; native-relative ratio refused"
+            }
+            Self::Casa1ZeroTime => {
+                "Casa1 guest workload measured zero wall time; native-relative ratio refused"
+            }
+            Self::NativeZeroTime => {
+                "native reference measured zero wall time; native-relative ratio refused"
+            }
+        }
+    }
+}
+
+/// `casa1_time / native_time` for the native-relative lane.  Both sides must
+/// be available and non-zero; otherwise the ratio is refused with an exact
+/// reason instead of dividing by zero or substituting a placeholder.
+pub fn native_relative_ratio(
+    casa1_available: bool,
+    casa1_wall_ns: u64,
+    native_available: bool,
+    native_wall_ns: u64,
+) -> Result<f64, NativeRatioUnavailable> {
+    if !casa1_available {
+        return Err(NativeRatioUnavailable::Casa1Unavailable);
+    }
+    if !native_available {
+        return Err(NativeRatioUnavailable::NativeUnavailable);
+    }
+    if casa1_wall_ns == 0 {
+        return Err(NativeRatioUnavailable::Casa1ZeroTime);
+    }
+    if native_wall_ns == 0 {
+        return Err(NativeRatioUnavailable::NativeZeroTime);
+    }
+    Ok(casa1_wall_ns as f64 / native_wall_ns as f64)
+}
+
+// ===========================================================================
 // Block Chaining
 // ===========================================================================
 
@@ -1756,7 +2363,7 @@ impl Drop for MmappedFile {
 /// Why a real timestamp-backed metric cannot be reported. Every variant has an
 /// exact, user-visible reason; a metric is never replaced by a CPU-side
 /// bookkeeping estimate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum TimingUnavailable {
     /// No Metal device exists on this host.
     NoMetalDevice,
@@ -1766,6 +2373,9 @@ pub enum TimingUnavailable {
     UnsupportedGpuTimestamp,
     /// `CAMetalLayer.nextDrawable` returned no drawable (headless present).
     NoDrawable,
+    /// No macOS window-server display session exists, so a windowed
+    /// `CAMetalLayer` cannot present.
+    NoDisplaySession,
     /// The drawable reported `presentedTime == 0` (not displayed).
     MissingPresentTimestamp,
     /// No input-event timestamp was correlated with the measured frame.
@@ -1795,6 +2405,10 @@ impl TimingUnavailable {
             TimingUnavailable::NoDrawable => {
                 "CAMetalLayer.nextDrawable returned no drawable (headless presentation); \
                  drawable presentedTime is unavailable"
+            }
+            TimingUnavailable::NoDisplaySession => {
+                "no macOS window-server display session is available; a windowed CAMetalLayer \
+                 cannot present and presentedTime is unavailable"
             }
             TimingUnavailable::MissingPresentTimestamp => {
                 "CAMetalLayer drawable reported presentedTime=0; no display presentation occurred"
@@ -1836,7 +2450,7 @@ pub fn percentile_ns(sorted: &[u64], fraction: f64) -> Option<u64> {
 }
 
 /// Exact order-statistic summary for one latency distribution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PercentileStats {
     pub sample_count: usize,
     pub p50_ns: u64,
@@ -2081,7 +2695,7 @@ pub fn process_cpu_time_ns() -> u64 {
 }
 
 /// Aggregated real-sample metrics for GPU/present measurement.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct GpuPresentSummary {
     pub sample_count: usize,
     pub gpu_sample_count: usize,
@@ -2555,11 +3169,72 @@ pub fn measure_gpu_present_into(
     recorder: &mut GpuPresentRecorder,
     frames: usize,
 ) -> Result<(), String> {
+    measure_gpu_present_with_mode(recorder, frames, false)
+}
+
+/// Windowed present mode: create a real `NSWindow`, attach a real
+/// `CAMetalLayer` to its content view, and correlate the drawable's
+/// `presentedTime` with the input/CPU-submit timestamps.  When the host has no
+/// window-server display session the recorder carries the exact
+/// [`TimingUnavailable::NoDisplaySession`] reason; no timestamp is synthesized.
+#[cfg(target_os = "macos")]
+pub fn measure_gpu_present_windowed_into(
+    recorder: &mut GpuPresentRecorder,
+    frames: usize,
+) -> Result<(), String> {
+    measure_gpu_present_with_mode(recorder, frames, true)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn pump_app_events_for(milliseconds: u64) {
+    use objc::{class, msg_send, sel, sel_impl};
+    let app: *mut objc::runtime::Object =
+        unsafe { msg_send![class!(NSApplication), sharedApplication] };
+    if app.is_null() {
+        return;
+    }
+    let mode_name = std::ffi::CString::new("NSDefaultRunLoopMode").expect("mode name");
+    let mode: *mut objc::runtime::Object =
+        unsafe { msg_send![class!(NSString), stringWithUTF8String: mode_name.as_ptr()] };
+    let deadline: *mut objc::runtime::Object = unsafe {
+        msg_send![
+            class!(NSDate),
+            dateWithTimeIntervalSinceNow: (milliseconds as f64) / 1000.0
+        ]
+    };
+    // NSAnyEventMask is all bits set; dequeue one event per call until the
+    // deadline, then return so the measurement loop can continue.
+    loop {
+        let event: *mut objc::runtime::Object = unsafe {
+            msg_send![
+                app,
+                nextEventMatchingMask: u64::MAX
+                untilDate: deadline
+                inMode: mode
+                dequeue: true
+            ]
+        };
+        if event.is_null() {
+            break;
+        }
+        unsafe {
+            let _: () = msg_send![app, sendEvent: event];
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn measure_gpu_present_with_mode(
+    recorder: &mut GpuPresentRecorder,
+    frames: usize,
+    windowed: bool,
+) -> Result<(), String> {
     use crate::metal_backend::{
         DrawableTimingProbe, GpuTimestampReading, GpuTimingProbe, MetalGpuBackend,
         PresentTimestampReading,
     };
     use core_graphics_types::geometry::CGSize;
+    use metal::foreign_types::ForeignType;
 
     if frames == 0 {
         return Err("GPU present measurement needs at least one frame".to_string());
@@ -2585,11 +3260,120 @@ pub fn measure_gpu_present_into(
     layer.set_device(&device);
     layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
     layer.set_drawable_size(CGSize {
-        width: 64.0,
-        height: 64.0,
+        width: 320.0,
+        height: 240.0,
     });
     layer.set_framebuffer_only(false);
-    layer.set_display_sync_enabled(false);
+    // Presentation timestamps require display-synchronised presentation; a
+    // non-synced (tearing) layer may present without a display timestamp.
+    layer.set_display_sync_enabled(true);
+    // A windowed capture needs a real window-server session.  Window creation
+    // returns null when NSApp/the window server is unavailable (headless CI,
+    // ssh session, or a non-.app process without forced creation).  The exact
+    // reason is recorded and the GPU work still runs, but no present timestamp
+    // is invented.
+    // AppKit window creation must run on the main thread (the explicit
+    // main-queue only advances while the host loop pumps it).  A background
+    // caller gets the exact no-display-session fallback instead of blocking.
+    let on_main_thread = unsafe { libc::pthread_main_np() } != 0;
+    let window = if windowed && on_main_thread {
+        let previous_force = crate::mac_window::force_window_creation();
+        crate::mac_window::set_force_window_creation(true);
+        let created = crate::mac_window::create_nswindow(
+            "Casa1 perf present capture",
+            320,
+            240,
+            320,
+            240,
+            0x00C0_0000, // WS_CAPTION: a titled NSWindow
+            0,
+        );
+        crate::mac_window::set_force_window_creation(previous_force);
+        if created.is_null() {
+            recorder.mark_present_unavailable(TimingUnavailable::NoDisplaySession);
+            std::ptr::null_mut()
+        } else {
+            let attached = crate::mac_window::attach_cametal_layer_to_window(
+                created,
+                layer.as_ptr() as *mut std::ffi::c_void,
+                64,
+                64,
+            );
+            if attached.is_null() {
+                recorder.mark_present_unavailable(TimingUnavailable::NoDisplaySession);
+                crate::mac_window::close_nswindow(created);
+                std::ptr::null_mut()
+            } else {
+                crate::mac_window::show_nswindow(created, true);
+                layer.set_display_sync_enabled(true);
+                created
+            }
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+    if windowed && !on_main_thread {
+        recorder.mark_present_unavailable(TimingUnavailable::NoDisplaySession);
+    }
+    let window_presenting = windowed && !window.is_null();
+    if window_presenting {
+        // Attach the CAMetalLayer to the window's content view and order the
+        // window front. A created-but-detached layer can vend drawables, but
+        // its presentedTime stays zero because nothing is composited.
+        use objc::{class, msg_send, sel, sel_impl};
+        unsafe {
+            let window_obj = window as *mut objc::runtime::Object;
+            let content: *mut objc::runtime::Object = msg_send![window_obj, contentView];
+            if !content.is_null() {
+                // Layer-hosting order: install the custom CAMetalLayer before
+                // asking AppKit to host a layer, otherwise AppKit keeps its
+                // own backing layer and the metal layer is never composited.
+                let _: () = msg_send![content, setLayer: layer.as_ptr()];
+                let _: () = msg_send![content, setWantsLayer: true];
+            }
+            // An ordinary window can be fully occluded by the terminal/IDE, in
+            // which case the drawable is never composited and presentedTime
+            // stays zero. Raise the capture window above normal windows.
+            let _: () = msg_send![window_obj, setLevel: 1000i64];
+            let _: () = msg_send![window_obj, setHidesOnDeactivate: false];
+            let _: () = msg_send![
+                window_obj,
+                makeKeyAndOrderFront: std::ptr::null_mut::<objc::runtime::Object>()
+            ];
+            let _: () = msg_send![window_obj, orderFrontRegardless];
+            let app: *mut objc::runtime::Object =
+                msg_send![class!(NSApplication), sharedApplication];
+            if !app.is_null() {
+                let _: () = msg_send![app, setActivationPolicy: 0i64];
+                let _: () = msg_send![app, finishLaunching];
+                let _: () = msg_send![app, activateIgnoringOtherApps: true];
+                if std::env::var_os("CASA1_PERF_DEBUG_WINDOW").is_some() {
+                    let visible: bool = msg_send![window_obj, isVisible];
+                    let occlusion: i64 = msg_send![window_obj, occlusionState];
+                    let screens: *mut objc::runtime::Object = msg_send![class!(NSScreen), screens];
+                    let screen_count: u64 = msg_send![screens, count];
+                    eprintln!(
+                        "[perf-window] visible={visible} occlusion={occlusion} screens={screen_count}"
+                    );
+                }
+            }
+        }
+    }
+    if window_presenting {
+        unsafe { pump_app_events_for(50) };
+        if std::env::var_os("CASA1_PERF_DEBUG_WINDOW").is_some() {
+            use objc::{msg_send, sel, sel_impl};
+            unsafe {
+                let window_obj = window as *mut objc::runtime::Object;
+                let occlusion: i64 = msg_send![window_obj, occlusionState];
+                let is_visible: bool = msg_send![window_obj, isVisible];
+                let on_active_space: bool = msg_send![window_obj, isOnActiveSpace];
+                eprintln!(
+                    "[perf-window] after pump: visible={is_visible} occlusion={occlusion} active_space={on_active_space}"
+                );
+            }
+        }
+    }
     let clock = MediaClock::capture().ok_or_else(|| {
         TimingUnavailable::UnsupportedGpuTimestamp
             .reason()
@@ -2600,7 +3384,7 @@ pub fn measure_gpu_present_into(
     // submission to the compositor. Present only while a real presentation
     // timestamp is being produced; otherwise keep measuring unthrottled GPU
     // work and report the exact presentation fallback.
-    let mut present_enabled = true;
+    let mut present_enabled = window_presenting || !windowed;
 
     for sequence in 0..frames as u64 {
         let host_cpu_start = process_cpu_time_ns();
@@ -2621,11 +3405,31 @@ pub fn measure_gpu_present_into(
         let drawable = present_enabled.then(|| layer.next_drawable()).flatten();
         let drawable_probe = drawable.map(DrawableTimingProbe::attach);
         if let Some(drawable) = drawable {
+            // Render something into the drawable. Presenting a never-written
+            // texture can be optimized away by the compositor and leaves
+            // presentedTime at zero; a real clear pass makes it a presented
+            // frame.
+            let pass = metal::RenderPassDescriptor::new().to_owned();
+            if let Some(attachment) = pass.color_attachments().object_at(0) {
+                attachment.set_texture(Some(drawable.texture()));
+                attachment.set_load_action(metal::MTLLoadAction::Clear);
+                attachment.set_store_action(metal::MTLStoreAction::Store);
+                attachment.set_clear_color(metal::MTLClearColor::new(0.05, 0.05, 0.08, 1.0));
+            }
+            let encoder = command_buffer.new_render_command_encoder(&pass);
+            encoder.end_encoding();
             command_buffer.present_drawable(drawable);
         }
         command_buffer.commit();
         let submit_end_ns = clock.now_ns();
         command_buffer.wait_until_completed();
+        if window_presenting {
+            // Let AppKit actually deliver the frame to the window server.
+            // Pumping CFRunLoop alone does not dispatch NSApplication events,
+            // so the drawable would never be composited and presentedTime
+            // would stay zero.
+            unsafe { pump_app_events_for(5) };
+        }
         if let Some(probe) = &drawable_probe {
             for _ in 0..2 {
                 if probe.snapshot().is_some() {
@@ -2690,11 +3494,22 @@ pub fn measure_gpu_present_into(
 
         recorder.record(sample);
     }
+    if !window.is_null() {
+        crate::mac_window::close_nswindow(window);
+    }
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn measure_gpu_present_into(
+    _recorder: &mut GpuPresentRecorder,
+    _frames: usize,
+) -> Result<(), String> {
+    Err(TimingUnavailable::NoMetalDevice.reason().to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn measure_gpu_present_windowed_into(
     _recorder: &mut GpuPresentRecorder,
     _frames: usize,
 ) -> Result<(), String> {
@@ -2725,10 +3540,17 @@ pub const GPU_PRESENT_METRIC_KEYS: &[&str] = &[
     "gpu_idle_gap_us",
 ];
 
-/// Convenience wrapper returning a summary from a fresh measurement.
+/// Convenience wrapper returning a summary from a fresh headless measurement.
 pub fn measure_gpu_present(frames: usize) -> Result<GpuPresentSummary, String> {
     let mut recorder = GpuPresentRecorder::new();
     measure_gpu_present_into(&mut recorder, frames)?;
+    Ok(recorder.summary())
+}
+
+/// Convenience wrapper returning a summary from a fresh windowed measurement.
+pub fn measure_gpu_present_windowed(frames: usize) -> Result<GpuPresentSummary, String> {
+    let mut recorder = GpuPresentRecorder::new();
+    measure_gpu_present_windowed_into(&mut recorder, frames)?;
     Ok(recorder.summary())
 }
 
@@ -3274,6 +4096,220 @@ mod tests {
         assert_eq!(summary.shader_compile_stalls, 1);
         assert_eq!(summary.shader_compile_stall_rate, Some(0.5));
         assert_eq!(summary.guest_instructions_per_sec, Some(500_000.0));
+    }
+
+    #[test]
+    fn dispatch_stats_missing_partial_malformed_and_zero_documents_report_exact_reasons() {
+        let directory = std::env::temp_dir().join(format!(
+            "casa1-dispatch-stats-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&directory).expect("create dispatch stats temp dir");
+        let missing = directory.join("absent.json");
+        let report = DispatchStatsReport::from_path(&missing);
+        assert_eq!(report.stats, None);
+        assert_eq!(
+            report.unavailable,
+            Some(DispatchStatsUnavailable::Absent(missing.clone()))
+        );
+        assert_eq!(
+            report
+                .unavailable
+                .as_ref()
+                .map(DispatchStatsUnavailable::reason),
+            Some(format!(
+                "dispatch statistics file {} does not exist",
+                missing.display()
+            ))
+        );
+
+        let partial = directory.join("partial.json");
+        std::fs::write(&partial, r#"{"schema":1,"parallel_dispatched":7}"#)
+            .expect("write partial dispatch stats");
+        let report = DispatchStatsReport::from_path(&partial);
+        assert_eq!(
+            report.unavailable,
+            Some(DispatchStatsUnavailable::MissingField {
+                path: partial.clone(),
+                field: "barrier_calls"
+            })
+        );
+        assert_eq!(
+            report
+                .unavailable
+                .as_ref()
+                .map(DispatchStatsUnavailable::reason),
+            Some(format!(
+                "dispatch statistics file {} is partial: required field `barrier_calls` is missing or not an unsigned integer",
+                partial.display()
+            ))
+        );
+
+        let malformed = directory.join("malformed.json");
+        std::fs::write(&malformed, "!").expect("write malformed dispatch stats");
+        let report = DispatchStatsReport::from_path(&malformed);
+        assert_eq!(
+            report
+                .unavailable
+                .as_ref()
+                .map(DispatchStatsUnavailable::reason),
+            Some(format!(
+                "dispatch statistics file {} is malformed: expected value at line 1 column 1",
+                malformed.display()
+            ))
+        );
+
+        let zero = directory.join("zero.json");
+        std::fs::write(
+            &zero,
+            r#"{"schema":1,"parallel_dispatched":0,"barrier_calls":0}"#,
+        )
+        .expect("write zero dispatch stats");
+        let report = DispatchStatsReport::from_path(&zero);
+        assert_eq!(
+            report.unavailable,
+            Some(DispatchStatsUnavailable::ZeroDispatches { path: zero.clone() })
+        );
+        let metrics = report.to_json_metrics();
+        assert_eq!(
+            metrics["owner_barrier_ratio"]["available"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            metrics["owner_barrier_ratio"]["reason"],
+            serde_json::Value::String(format!(
+                "dispatch statistics file {} recorded zero host-thunk dispatches; owner-barrier ratio is undefined",
+                zero.display()
+            ))
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn dispatch_stats_ratio_boundary_math_is_exact() {
+        let directory = std::env::temp_dir().join(format!(
+            "casa1-dispatch-ratio-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&directory).expect("create dispatch ratio temp dir");
+        let path = directory.join("stats.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "schema": 1,
+                "parallel_dispatched": 3,
+                "barrier_calls": 1,
+                "stateless_dispatched": 2,
+                "read_mostly_dispatched": 1,
+                "owner_only_barriers": 1,
+                "fallback_barriers": 0,
+                "categories": {"kernel32": {"dispatched": 3, "fallbacks": 1}},
+                "barrier_reasons": {"owner-only": 1},
+                "guest_instructions": 500,
+                "wall_ns": 1000000
+            }"#,
+        )
+        .expect("write dispatch ratio stats");
+        let report = DispatchStatsReport::from_path(&path);
+        let stats = report.stats.as_ref().expect("stats available");
+        assert_eq!(stats.total_dispatches(), 4);
+        assert_eq!(stats.owner_barrier_ratio(), Some(0.25));
+        assert_eq!(stats.parallel_dispatch_ratio(), Some(0.75));
+        assert_eq!(
+            stats.time_per_1000_guest_instructions_ns(),
+            Some(2_000_000.0)
+        );
+        let metrics = report.to_json_metrics();
+        assert_eq!(metrics["owner_barrier_ratio"]["value"], 0.25);
+        assert_eq!(
+            metrics["time_per_1000_guest_instructions_ns"]["value"],
+            2_000_000.0
+        );
+        assert_eq!(report.human_lines()[1], "barrier_reasons=[owner-only:1]");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn dispatch_stats_zero_snapshot_writer_never_fabricates_a_ratio() {
+        let shared = crate::runtime::ProcessShared::default();
+        let snapshot = shared.api_dispatch_snapshot();
+        let stats = DispatchStats::from_runtime_snapshot(&snapshot, 1_000, 5_000);
+        assert_eq!(stats.parallel_dispatched, 0);
+        assert_eq!(stats.barrier_calls, 0);
+        assert_eq!(stats.owner_barrier_ratio(), None);
+        assert_eq!(stats.time_per_1000_guest_instructions_ns(), Some(5_000.0));
+        let document = stats.to_json();
+        assert_eq!(document["owner_barrier_ratio"], serde_json::Value::Null);
+        let text = serde_json::to_string(&document).expect("serialize dispatch stats");
+        assert_eq!(
+            DispatchStatsReport::from_json(Path::new("snapshot.json"), &text),
+            Err(DispatchStatsUnavailable::ZeroDispatches {
+                path: PathBuf::from("snapshot.json")
+            })
+        );
+    }
+
+    #[test]
+    fn native_relative_ratio_refuses_zero_and_missing_sides() {
+        assert_eq!(
+            native_relative_ratio(false, 100, true, 10),
+            Err(NativeRatioUnavailable::Casa1Unavailable)
+        );
+        assert_eq!(
+            native_relative_ratio(true, 100, false, 10),
+            Err(NativeRatioUnavailable::NativeUnavailable)
+        );
+        assert_eq!(
+            native_relative_ratio(true, 0, true, 10),
+            Err(NativeRatioUnavailable::Casa1ZeroTime)
+        );
+        assert_eq!(
+            native_relative_ratio(true, 100, true, 0),
+            Err(NativeRatioUnavailable::NativeZeroTime)
+        );
+        assert_eq!(native_relative_ratio(true, 100, true, 10), Ok(10.0));
+        assert_eq!(
+            NativeRatioUnavailable::NativeZeroTime.reason(),
+            "native reference measured zero wall time; native-relative ratio refused"
+        );
+    }
+
+    #[test]
+    fn windowed_present_missing_display_session_reports_exact_reason() {
+        let mut recorder = GpuPresentRecorder::new();
+        recorder.mark_present_unavailable(TimingUnavailable::NoDisplaySession);
+        let summary = recorder.summary();
+        assert_eq!(
+            summary.present_unavailable,
+            Some(TimingUnavailable::NoDisplaySession)
+        );
+        assert_eq!(
+            summary.to_json_metrics()["input_to_present_p50_us"]["reason"],
+            serde_json::Value::String(TimingUnavailable::NoDisplaySession.reason().to_string())
+        );
+        assert_eq!(
+            TimingUnavailable::NoDisplaySession.reason(),
+            "no macOS window-server display session is available; a windowed CAMetalLayer cannot present and presentedTime is unavailable"
+        );
+    }
+
+    #[test]
+    fn percentile_math_handles_invalid_fractions_and_duplicate_boundaries() {
+        assert_eq!(percentile_ns(&[5, 5, 5], f64::NEG_INFINITY), Some(5));
+        assert_eq!(percentile_ns(&[5, 5, 5], f64::INFINITY), Some(5));
+        assert_eq!(percentile_ns(&[1, 2, 3, 4], 1.0), Some(4));
+        assert_eq!(percentile_ns(&[1, 2, 3, 4], 0.75), Some(3));
+        assert_eq!(low_fps(&[1_000_000], f64::NAN), Some(1000.0));
+        assert_eq!(low_fps(&[1_000_000, 2_000_000], 0.0), Some(500.0));
+        assert_eq!(
+            low_fps(&[1_000_000, 2_000_000], 2.0),
+            Some(666.6666666666666)
+        );
+        assert_eq!(low_fps(&[0, 0], f64::NAN), None);
     }
 
     #[cfg(target_os = "macos")]

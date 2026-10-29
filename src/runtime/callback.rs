@@ -421,6 +421,14 @@ impl PeHostRuntime {
                 continue;
             }
 
+            if let Some(jit) = self.jit_runtime.as_mut() {
+                jit.record_profile_execution(
+                    cached_block.start_rip,
+                    &cached_block.translated.ir,
+                    state.rip,
+                );
+            }
+
             // --- Adaptive tiered compilation ---
             if let Some(jit) = self.jit_runtime.as_mut() {
                 let block_start = cached_block.start_rip;

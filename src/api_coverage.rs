@@ -7478,32 +7478,32 @@ pub static COVERAGE_EVIDENCE: &[ApiCoverageEvidence] = &[
     conformance(
         "mscoree.dll",
         "CLRCreateInstance",
-        "casa1-conformance:evidence_mscoree_clr_absent_semantics",
+        "casa1-conformance:evidence_mscoree_clr_activation_semantics",
     ),
     conformance(
         "mscoree.dll",
         "CorBindToRuntime",
-        "casa1-conformance:evidence_mscoree_clr_absent_semantics",
+        "casa1-conformance:evidence_mscoree_clr_activation_semantics",
     ),
     conformance(
         "mscoree.dll",
         "CorBindToRuntimeEx",
-        "casa1-conformance:evidence_mscoree_clr_absent_semantics",
+        "casa1-conformance:evidence_mscoree_clr_activation_semantics",
     ),
     conformance(
         "mscoree.dll",
         "GetCORSystemDirectory",
-        "casa1-conformance:evidence_mscoree_clr_absent_semantics",
+        "casa1-conformance:evidence_mscoree_clr_activation_semantics",
     ),
     conformance(
         "mscoree.dll",
         "GetRequestedRuntimeInfo",
-        "casa1-conformance:evidence_mscoree_clr_absent_semantics",
+        "casa1-conformance:evidence_mscoree_clr_activation_semantics",
     ),
     conformance(
         "mscoree.dll",
         "LoadLibraryShim",
-        "casa1-conformance:evidence_mscoree_clr_absent_semantics",
+        "casa1-conformance:evidence_mscoree_clr_activation_semantics",
     ),
     conformance(
         "quartz.dll",

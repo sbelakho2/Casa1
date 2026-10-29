@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, LazyLock, Mutex};
 
 mod aot;
+mod aot_profile;
 mod arm64_emitter;
 mod code_cache;
 mod frontend;
@@ -30,6 +31,7 @@ mod safepoints;
 mod unwind;
 
 pub use aot::*;
+pub use aot_profile::*;
 pub use arm64_emitter::*;
 pub use code_cache::*;
 pub use frontend::*;
@@ -122,6 +124,8 @@ pub(crate) fn jit_test_serial() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(test)]
+mod aot_pipeline_tests;
 #[cfg(test)]
 mod coverage_adversarial_tests;
 #[cfg(test)]

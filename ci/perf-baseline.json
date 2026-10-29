@@ -702,6 +702,12 @@
       },
       "unit": "fraction of blocks"
     },
+    "kpi/owner_barrier_ratio": {
+      "available": false,
+      "kind": "kpi",
+      "reason": "CASA1_DISPATCH_STATS was not supplied; owner-barrier dispatch statistics are unavailable",
+      "source": "runner CASA1_DISPATCH_STATS ApiDispatchSnapshot"
+    },
     "kpi/persistent_aot_hit_rate": {
       "available": true,
       "baseline": {
@@ -805,6 +811,12 @@
         "rel": 0.0
       },
       "unit": "generic fallbacks/lookup"
+    },
+    "kpi/time_per_1000_guest_instructions_ns": {
+      "available": false,
+      "kind": "kpi",
+      "reason": "CASA1_DISPATCH_STATS was not supplied; dispatch wall time and guest-instruction counts are unavailable",
+      "source": "runner CASA1_DISPATCH_STATS ApiDispatchSnapshot"
     },
     "kpi/tier2_compile_hit_rate": {
       "available": true,

@@ -79,6 +79,8 @@ def run_case(
     kpi_metrics: dict[str, dict],
     thresholds: dict | None = None,
     report: bool = False,
+    dispatch: dict | None = None,
+    native_report: dict | str | None = None,
 ) -> tuple[int, str, dict | None]:
     with tempfile.TemporaryDirectory(prefix=f"casa1-perf-{name}-") as directory:
         root = Path(directory)
@@ -90,9 +92,10 @@ def run_case(
         baseline_path = root / "baseline.json"
         baseline_path.write_text(json.dumps(baseline(baseline_entries)), encoding="utf-8")
         kpi_path = root / "kpi.json"
-        kpi_path.write_text(
-            json.dumps({"schema": 1, "metrics": kpi_metrics}), encoding="utf-8"
-        )
+        kpi_document: dict = {"schema": 1, "metrics": kpi_metrics}
+        if dispatch is not None:
+            kpi_document["dispatch"] = dispatch
+        kpi_path.write_text(json.dumps(kpi_document), encoding="utf-8")
         command = [
             sys.executable,
             str(GATE),
@@ -105,7 +108,15 @@ def run_case(
             "--filter",
             FILTER,
             "--no-run",
+            "--native-report",
+            str(root / "native.json"),
         ]
+        if native_report is not None:
+            native_path = root / "native.json"
+            if isinstance(native_report, str):
+                native_path.write_text(native_report, encoding="utf-8")
+            else:
+                native_path.write_text(json.dumps(native_report), encoding="utf-8")
         if thresholds is not None:
             threshold_path = root / "thresholds.json"
             threshold_path.write_text(json.dumps(thresholds), encoding="utf-8")
@@ -262,7 +273,132 @@ def main() -> int:
     assert report["entries"][0]["status"] == "PASS", report
     check("report-json", code, "report.json result=pass")
 
-    print("SELFTEST PASS cases=11")
+    metric = "kpi/synthetic_metric"
+    code, output, _ = run_case(
+        "kpi-required-unavailable",
+        {metric: kpi_entry(0.10)},
+        {},
+        {"synthetic_metric": {"available": False, "reason": "no sample on this host"}},
+    )
+    assert code == 3, (code, output)
+    assert (
+        f"UNAVAILABLE {metric}: baseline requires this KPI but the run reported it unavailable: "
+        "no sample on this host" in output
+    ), output
+    assert "RESULT FAIL regressions=0 missing=1 mismatches=0" in output, output
+    check("kpi-required-unavailable", code, f"UNAVAILABLE {metric}")
+
+    dispatch = {
+        "schema": 1,
+        "available": True,
+        "parallel_dispatched": 3,
+        "barrier_calls": 1,
+        "owner_barrier_ratio": 0.25,
+        "barrier_reasons": {"owner-only": 1},
+        "time_per_1000_guest_instructions_ns": 2000.0,
+    }
+    code, output, report = run_case(
+        "dispatch-available",
+        {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
+        {benchmark: estimates(1000.0, 980.0, 1020.0)},
+        {},
+        dispatch=dispatch,
+        report=True,
+    )
+    assert code == 0, (code, output)
+    assert (
+        "DISPATCH owner_barrier_ratio=0.250000 parallel=3 barrier=1 "
+        "barrier_reasons=[owner-only:1] time_per_1000_guest_instructions=2000.000 ns"
+        in output
+    ), output
+    assert report["dispatch"]["owner_barrier_ratio"] == 0.25, report
+    check("dispatch-available", code, "DISPATCH owner_barrier_ratio=0.250000")
+
+    code, output, report = run_case(
+        "dispatch-absent",
+        {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
+        {benchmark: estimates(1000.0, 980.0, 1020.0)},
+        {},
+        report=True,
+    )
+    assert code == 0, (code, output)
+    assert "DISPATCH unavailable:" in output, output
+    assert report["dispatch"]["available"] is False, report
+    check("dispatch-absent", code, "DISPATCH unavailable")
+
+    native_workload = {
+        "casa1": {"available": True, "wall_ns": 100, "cpu_ns": 50, "allocations": 2},
+        "native": {"available": True, "wall_ns": 10, "cpu_ns": 5, "allocations": 1},
+    }
+    code, output, report = run_case(
+        "native-ratio",
+        {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
+        {benchmark: estimates(1000.0, 980.0, 1020.0)},
+        {},
+        native_report={"schema": 1, "workloads": {"integer_loop": native_workload}},
+        report=True,
+    )
+    assert code == 0, (code, output)
+    assert "NATIVE_RATIO integer_loop: ratio=10.000000" in output, output
+    assert report["native_relative"][0]["status"] == "RATIO", report
+    assert report["native_relative"][0]["ratio"] == 10.0, report
+    check("native-ratio", code, "NATIVE_RATIO integer_loop: ratio=10.000000")
+
+    zero_native = {
+        "casa1": {"available": True, "wall_ns": 100, "cpu_ns": 50, "allocations": 2},
+        "native": {"available": True, "wall_ns": 0, "cpu_ns": 0, "allocations": 0},
+    }
+    code, output, report = run_case(
+        "native-zero-time",
+        {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
+        {benchmark: estimates(1000.0, 980.0, 1020.0)},
+        {},
+        native_report={"schema": 1, "workloads": {"integer_loop": zero_native}},
+        report=True,
+    )
+    assert code == 0, (code, output)
+    assert (
+        "NATIVE_UNAVAILABLE integer_loop: native reference measured zero wall time; ratio refused"
+        in output
+    ), output
+    assert "ratio" not in report["native_relative"][0], report
+    check("native-zero-time", code, "NATIVE_UNAVAILABLE integer_loop: native reference measured zero wall time")
+
+    missing_guest = {
+        "casa1": {"available": False, "reason": "JIT execution capability is unavailable on this host"},
+        "native": {"available": True, "wall_ns": 10, "cpu_ns": 5, "allocations": 1},
+    }
+    code, output, report = run_case(
+        "native-missing-guest",
+        {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
+        {benchmark: estimates(1000.0, 980.0, 1020.0)},
+        {},
+        native_report={"schema": 1, "workloads": {"integer_loop": missing_guest}},
+        report=True,
+    )
+    assert code == 0, (code, output)
+    assert (
+        "NATIVE_UNAVAILABLE integer_loop: Casa1 guest workload is unavailable: "
+        "JIT execution capability is unavailable on this host; ratio refused" in output
+    ), output
+    assert "ratio" not in report["native_relative"][0], report
+    check("native-missing-guest", code, "NATIVE_UNAVAILABLE integer_loop: Casa1 guest workload is unavailable")
+
+    code, output, report = run_case(
+        "native-malformed",
+        {benchmark: timing_entry(1000.0, 950.0, 1050.0)},
+        {benchmark: estimates(1000.0, 980.0, 1020.0)},
+        {},
+        native_report="{",
+        report=True,
+    )
+    assert code == 0, (code, output)
+    assert "NATIVE_UNAVAILABLE: native reference report" in output, output
+    assert "is malformed:" in output, output
+    assert report["native_relative"][0]["status"] == "UNAVAILABLE", report
+    check("native-malformed", code, "NATIVE_UNAVAILABLE: native reference report")
+
+    print("SELFTEST PASS cases=18")
     for name, code, text in CASES:
         print(f"SELFTEST {name} exit={code} message={text}")
     return 0

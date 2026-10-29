@@ -32,6 +32,7 @@ SCHEMA = 1
 DEFAULT_FILTER = "gate/kpi"
 DEFAULT_BASELINE = Path(__file__).resolve().parent / "perf-baseline.json"
 DEFAULT_NATIVE = Path(__file__).resolve().parent / "perf-native-baseline.json"
+DEFAULT_NATIVE_REPORT = Path("target") / "casa1-perf-native.json"
 DEFAULT_CRITERION_DIR = Path("target") / "criterion"
 EPSILON = 1e-9
 
@@ -44,6 +45,8 @@ EXIT_RUN_FAILED = 5
 # Machine-readable report entries accumulated by ``evaluate`` and written by
 # ``--report-json``. Each entry records the exact status and diagnostic.
 REPORT_ENTRIES: list[dict[str, Any]] = []
+DISPATCH_REPORT: dict[str, Any] = {}
+NATIVE_RELATIVE_ENTRIES: list[dict[str, Any]] = []
 
 
 def report_entry(entry_id: str, status: str, detail: str, **extra: Any) -> None:
@@ -146,6 +149,8 @@ KPI_GATES: dict[str, dict[str, Any]] = {
         "abs": 1000000.0,
         "direction": "higher",
     },
+    "owner_barrier_ratio": {"rel": 0.10, "abs": 0.0},
+    "time_per_1000_guest_instructions_ns": {"rel": 0.15, "abs": 0.0},
     "residency_churn_per_1000_frames": {"rel": 0.20, "abs": 1.0},
     "gpu_heap_faults_per_1000_frames": {"rel": 0.20, "abs": 1.0},
 }
@@ -231,6 +236,216 @@ def native_baseline(path: Path) -> dict[str, Any]:
         return {"available": False, "reason": f"unreadable native baseline: {error}"}
     document.setdefault("available", True)
     return document
+
+
+def dispatch_report(path: Path) -> dict[str, Any]:
+    """Return the runner's owner-barrier dispatch block from the KPI document."""
+    if not path.exists():
+        return {
+            "available": False,
+            "reason": (
+                f"KPI document {path} is absent; run with CASA1_DISPATCH_STATS set "
+                "to capture owner-barrier statistics"
+            ),
+        }
+    try:
+        document = read_json(path)
+    except (OSError, json.JSONDecodeError) as error:
+        return {
+            "available": False,
+            "reason": f"KPI document {path} is unreadable: {error}",
+        }
+    dispatch = document.get("dispatch")
+    if not isinstance(dispatch, dict):
+        return {
+            "available": False,
+            "reason": (
+                f"KPI document {path} has no dispatch section; set "
+                "CASA1_DISPATCH_STATS to a dispatch statistics file"
+            ),
+        }
+    if not isinstance(dispatch.get("available"), bool):
+        return {
+            "available": False,
+            "reason": "dispatch section is malformed: `available` must be a boolean",
+        }
+    return dispatch
+
+
+def print_dispatch(dispatch: dict[str, Any]) -> None:
+    if not dispatch.get("available"):
+        print(f"DISPATCH unavailable: {dispatch.get('reason', 'dispatch statistics are unavailable')}")
+        return
+    ratio = dispatch.get("owner_barrier_ratio")
+    time_per_1000 = dispatch.get("time_per_1000_guest_instructions_ns")
+    reasons = dispatch.get("barrier_reasons") or {}
+    reason_text = ",".join(f"{name}:{count}" for name, count in sorted(reasons.items())) or "none"
+    ratio_text = f"{float(ratio):.6f}" if isinstance(ratio, (int, float)) else "unavailable"
+    time_text = (
+        f"{float(time_per_1000):.3f} ns"
+        if isinstance(time_per_1000, (int, float))
+        else "unavailable"
+    )
+    print(
+        f"DISPATCH owner_barrier_ratio={ratio_text} "
+        f"parallel={dispatch.get('parallel_dispatched')} "
+        f"barrier={dispatch.get('barrier_calls')} barrier_reasons=[{reason_text}] "
+        f"time_per_1000_guest_instructions={time_text}"
+    )
+
+
+def _side(side: Any) -> tuple[bool, int, str]:
+    if not isinstance(side, dict):
+        return False, 0, "side is missing from the native reference report"
+    if not isinstance(side.get("available"), bool):
+        return False, 0, "side is malformed: `available` must be a boolean"
+    if not side["available"]:
+        reason = side.get("reason")
+        return (
+            False,
+            0,
+            reason if isinstance(reason, str) else "side is unavailable without a reason",
+        )
+    wall_ns = side.get("wall_ns")
+    if not isinstance(wall_ns, int) or isinstance(wall_ns, bool) or wall_ns < 0:
+        return False, 0, "side is malformed: `wall_ns` must be a non-negative integer"
+    return True, wall_ns, ""
+
+
+def _cpu_ns(side: Any) -> int | None:
+    if not isinstance(side, dict) or not side.get("available"):
+        return None
+    value = side.get("cpu_ns")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
+
+
+def native_relative_entries(path: Path) -> list[dict[str, Any]]:
+    """Compute per-workload ``casa1_time / native_time`` without fabricating sides."""
+    if not path.exists():
+        return [
+            {
+                "status": "UNAVAILABLE",
+                "reason": (
+                    f"native reference report {path} is absent; run "
+                    "`cargo run --bin perf_native` (or pass --native-report)"
+                ),
+            }
+        ]
+    try:
+        document = read_json(path)
+    except (OSError, json.JSONDecodeError) as error:
+        return [
+            {
+                "status": "UNAVAILABLE",
+                "reason": f"native reference report {path} is malformed: {error}",
+            }
+        ]
+    workloads = document.get("workloads")
+    if not isinstance(workloads, dict) or not workloads:
+        return [
+            {
+                "status": "UNAVAILABLE",
+                "reason": f"native reference report {path} has no workloads object",
+            }
+        ]
+    entries: list[dict[str, Any]] = []
+    for workload in sorted(workloads):
+        measured = workloads[workload]
+        if not isinstance(measured, dict):
+            entries.append(
+                {
+                    "workload": workload,
+                    "status": "UNAVAILABLE",
+                    "reason": "workload entry is not an object; ratio refused",
+                }
+            )
+            continue
+        casa1_ok, casa1_wall, casa1_reason = _side(measured.get("casa1"))
+        native_ok, native_wall, native_reason = _side(measured.get("native"))
+        if not casa1_ok:
+            entries.append(
+                {
+                    "workload": workload,
+                    "status": "UNAVAILABLE",
+                    "reason": f"Casa1 guest workload is unavailable: {casa1_reason}; ratio refused",
+                    "casa1": measured.get("casa1"),
+                    "native": measured.get("native"),
+                }
+            )
+            continue
+        if not native_ok:
+            entries.append(
+                {
+                    "workload": workload,
+                    "status": "UNAVAILABLE",
+                    "reason": f"native reference workload is unavailable: {native_reason}; ratio refused",
+                    "casa1": measured.get("casa1"),
+                    "native": measured.get("native"),
+                }
+            )
+            continue
+        if casa1_wall == 0:
+            entries.append(
+                {
+                    "workload": workload,
+                    "status": "UNAVAILABLE",
+                    "reason": "Casa1 guest workload measured zero wall time; ratio refused",
+                    "casa1": measured.get("casa1"),
+                    "native": measured.get("native"),
+                }
+            )
+            continue
+        if native_wall == 0:
+            entries.append(
+                {
+                    "workload": workload,
+                    "status": "UNAVAILABLE",
+                    "reason": "native reference measured zero wall time; ratio refused",
+                    "casa1": measured.get("casa1"),
+                    "native": measured.get("native"),
+                }
+            )
+            continue
+        casa1_cpu = _cpu_ns(measured.get("casa1"))
+        native_cpu = _cpu_ns(measured.get("native"))
+        ratio_cpu = None
+        if casa1_cpu is not None and native_cpu is not None and casa1_cpu > 0 and native_cpu > 0:
+            ratio_cpu = casa1_cpu / native_cpu
+        entries.append(
+            {
+                "workload": workload,
+                "status": "RATIO",
+                "ratio": casa1_wall / native_wall,
+                "ratio_cpu": ratio_cpu,
+                "casa1_wall_ns": casa1_wall,
+                "native_wall_ns": native_wall,
+                "casa1_cpu_ns": casa1_cpu,
+                "native_cpu_ns": native_cpu,
+                "casa1_allocations": (measured.get("casa1") or {}).get("allocations"),
+                "native_allocations": (measured.get("native") or {}).get("allocations"),
+            }
+        )
+    return entries
+
+
+def print_native_relative(entries: list[dict[str, Any]]) -> None:
+    for entry in entries:
+        if entry.get("status") == "RATIO":
+            cpu = entry.get("ratio_cpu")
+            cpu_text = f"{float(cpu):.6f}" if isinstance(cpu, (int, float)) else "unavailable"
+            print(
+                f"NATIVE_RATIO {entry['workload']}: ratio={float(entry['ratio']):.6f} "
+                f"casa1_wall_ns={entry['casa1_wall_ns']} native_wall_ns={entry['native_wall_ns']} "
+                f"casa1_cpu_ns={entry['casa1_cpu_ns']} native_cpu_ns={entry['native_cpu_ns']} "
+                f"casa1_allocations={entry['casa1_allocations']} "
+                f"native_allocations={entry['native_allocations']} ratio_cpu={cpu_text}"
+            )
+        else:
+            workload = entry.get("workload")
+            prefix = f"NATIVE_UNAVAILABLE {workload}" if workload else "NATIVE_UNAVAILABLE"
+            print(f"{prefix}: {entry.get('reason', 'ratio unavailable')}")
 
 
 def parse_metric_lines(text: str) -> dict[str, dict[str, Any]]:
@@ -531,8 +746,19 @@ def evaluate(
             observed = kpis[metric]
             if not observed.get("available"):
                 reason = observed.get("reason", "metric reported unavailable")
-                print(f"UNAVAILABLE {entry_id}: {reason}")
-                report_entry(entry_id, "UNAVAILABLE", reason, kind="kpi")
+                detail = (
+                    "baseline requires this KPI but the run reported it unavailable: "
+                    f"{reason}"
+                )
+                print(f"UNAVAILABLE {entry_id}: {detail}")
+                report_entry(
+                    entry_id,
+                    "UNAVAILABLE",
+                    detail,
+                    kind="kpi",
+                    baseline_available=True,
+                )
+                missing += 1
                 continue
             value = float(observed["value"])
             status, detail = compare(
@@ -647,6 +873,7 @@ def apply_thresholds_to_baseline(baseline: dict[str, Any], document: dict[str, A
 
 
 def write_report(path: Path, exit_code: int, baseline_path: Path) -> None:
+    global DISPATCH_REPORT, NATIVE_RELATIVE_ENTRIES
     status = {
         EXIT_PASS: "pass",
         EXIT_REGRESSION: "regression",
@@ -664,6 +891,8 @@ def write_report(path: Path, exit_code: int, baseline_path: Path) -> None:
             "baseline": str(baseline_path),
             "result": status,
             "exit_code": exit_code,
+            "dispatch": DISPATCH_REPORT,
+            "native_relative": NATIVE_RELATIVE_ENTRIES,
             "entries": REPORT_ENTRIES,
         },
     )
@@ -693,6 +922,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--no-run", action="store_true", help="never invoke cargo bench")
     parser.add_argument(
+        "--native-report",
+        type=Path,
+        default=DEFAULT_NATIVE_REPORT,
+        help=(
+            "native-relative report written by `cargo run --bin perf_native` "
+            f"(default: {DEFAULT_NATIVE_REPORT})"
+        ),
+    )
+    parser.add_argument(
         "--runs",
         type=int,
         default=3,
@@ -714,6 +952,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    global DISPATCH_REPORT, NATIVE_RELATIVE_ENTRIES
     args = parse_args(argv)
     threshold_document = (
         apply_threshold_overrides(args.thresholds)
@@ -769,6 +1008,11 @@ def main(argv: list[str]) -> int:
             finally:
                 run_kpi_path.unlink(missing_ok=True)
         estimates = fastest
+
+    DISPATCH_REPORT = dispatch_report(kpi_path)
+    NATIVE_RELATIVE_ENTRIES = native_relative_entries(args.native_report)
+    print_dispatch(DISPATCH_REPORT)
+    print_native_relative(NATIVE_RELATIVE_ENTRIES)
 
     if args.update:
         if not estimates and not kpis:

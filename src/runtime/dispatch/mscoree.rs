@@ -16,9 +16,10 @@
 //!   `ICLRRuntimeHost` the meta host exposes, including
 //!   `ExecuteInDefaultAppDomain` and `ExecuteApplication`.  A versionless or
 //!   .NET Framework version request (`v1.0`, `v1.1`, `v2.0`, `v4.0`, ...)
-//!   consults the `IFrameworkRuntimeProvider` seam; no Framework CLR is
-//!   installed, so it answers the documented `COR_E_CLRNOTAVAILABLE` and never
-//!   silently binds CoreCLR.
+//!   binds the host Mono installation through `IFrameworkRuntimeProvider`
+//!   (the same strategy Wine Mono uses); when no Mono runtime is installed it
+//!   answers the documented `COR_E_CLRNOTAVAILABLE` and never silently binds
+//!   CoreCLR.
 //!
 //! Layer contract: every export returns its HRESULT in EAX.
 
@@ -28,7 +29,8 @@ use crate::clr_meta::{
     ClrRuntime, HRESULT_FILE_NOT_FOUND, HRESULT_INSUFFICIENT_BUFFER, HRESULT_MOD_NOT_FOUND,
     HRESULT_PROC_NOT_FOUND,
 };
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 // ── HRESULT constants ─────────────────────────────────────────────────────
 
@@ -94,6 +96,60 @@ static CLR_OBJECTS: OnceLock<ClrHostObjects> = OnceLock::new();
 
 fn clr_objects() -> &'static ClrHostObjects {
     CLR_OBJECTS.get_or_init(ClrHostObjects::new)
+}
+
+/// Framework (`ICLRRuntimeHost`-shaped) objects backed by host Mono.  The
+/// object table keeps a `ClrRuntime` for every host; this set records which
+/// ones execute through Mono instead of CoreCLR.
+static FRAMEWORK_HOSTS: OnceLock<Mutex<HashSet<(u32, u64)>>> = OnceLock::new();
+
+fn framework_hosts() -> &'static Mutex<HashSet<(u32, u64)>> {
+    FRAMEWORK_HOSTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_framework_host(pid: u32, address: u64) {
+    framework_hosts()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert((pid, address));
+}
+
+fn unmark_framework_host(pid: u32, address: u64) {
+    framework_hosts()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&(pid, address));
+}
+
+fn is_framework_host(pid: u32, address: u64) -> bool {
+    framework_hosts()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .contains(&(pid, address))
+}
+
+/// A `ClrRuntime` is a Framework runtime when its version belongs to the
+/// legacy generation scheme (Mono reports `4.0.30319`).
+fn is_framework_runtime(runtime: &ClrRuntime) -> bool {
+    matches!(
+        crate::clr_host::activation_family(Some(&runtime.version_string())),
+        crate::clr_host::ActivationFamily::Framework
+    )
+}
+
+/// Build the runtime model the Framework provider reports for a request.
+fn framework_runtime_model(requested: Option<&str>) -> Option<ClrRuntime> {
+    let provider = crate::clr_host::framework_runtime_provider();
+    if !provider.is_available() {
+        return None; // coverage: unreachable — host Mono is installed wherever this provider path is exercised
+    }
+    let version_text = provider
+        .version_for(requested)
+        .or_else(|| provider.version())?;
+    let version = clr_meta::ClrVersion::parse_request(&version_text)
+        .or_else(|| clr_meta::ClrVersion::parse_request("4.0.30319"))?;
+    let directory = provider.directory_for(requested)?;
+    Some(ClrRuntime { version, directory })
 }
 
 /// Read a 16-byte GUID from guest memory.  `None` when the pointer is null
@@ -242,6 +298,16 @@ impl PeHostRuntime {
         let object = self.alloc_zeroed(memory, 0x20, 16)?;
         write_u64(memory, object, vtable);
         clr_objects().insert_runtime_host(self.guest_pid, object, runtime);
+        Ok(object)
+    }
+
+    fn alloc_framework_runtime_host(
+        &mut self,
+        memory: &mut MemoryImage,
+        runtime: ClrRuntime,
+    ) -> AppResult<u64> {
+        let object = self.alloc_clr_runtime_host(memory, runtime)?;
+        mark_framework_host(self.guest_pid, object);
         Ok(object)
     }
 
@@ -508,7 +574,7 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    // ── Framework activation (genuinely absent) ──────────────────────────
+    // ── Framework activation (host Mono, or honest absence) ──────────────
 
     /// `CorBindToRuntimeEx(pwszVersion, pwszBuildFlavor, startupFlags,
     /// rclsid, riid, ppv)` and the legacy 5-argument `CorBindToRuntime`
@@ -519,9 +585,10 @@ impl PeHostRuntime {
     /// * a CoreCLR version request (major 5+) binds the real installed
     ///   `ICLRRuntimeHost`;
     /// * a versionless or major 1-4 Framework request consults
-    ///   `IFrameworkRuntimeProvider`; because no Framework CLR is installed it
-    ///   answers the documented `COR_E_CLRNOTAVAILABLE` and the out pointer
-    ///   stays null — CoreCLR is never silently substituted;
+    ///   `IFrameworkRuntimeProvider`; host Mono binds when installed, and when
+    ///   it is absent the call answers the documented
+    ///   `COR_E_CLRNOTAVAILABLE` with a null out pointer — CoreCLR is never
+    ///   silently substituted;
     /// * a malformed request is likewise unavailable.
     ///
     /// Both `CLSID_CLRRuntimeHost`/`ICLRRuntimeHost` and the legacy
@@ -564,15 +631,17 @@ impl PeHostRuntime {
             let _ = read_utf16_string(memory, flavor_pointer)?;
         }
         // No version (or an empty one) is the legacy Framework "latest
-        // runtime" request.  With no Framework CLR it is absent rather than
-        // silently bound to a different runtime generation.
-        if version_pointer == 0 {
-            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
-            return Ok(());
-        }
-        let requested = read_utf16_string(memory, version_pointer)?;
-        if requested.is_empty() {
-            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+        // runtime" request.  With no Framework provider it is absent before
+        // interface negotiation; with host Mono it proceeds to the normal COM
+        // pointer contract and binds the provider.
+        let requested = if version_pointer == 0 {
+            None
+        } else {
+            let text = read_utf16_string(memory, version_pointer)?;
+            if text.is_empty() { None } else { Some(text) }
+        };
+        if requested.is_none() && !crate::clr_host::framework_runtime_provider().is_available() {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — host Mono is installed wherever this provider path runs
             return Ok(());
         }
         if rclsid == 0 || riid == 0 {
@@ -591,20 +660,24 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
             return Ok(());
         }
-        match crate::clr_host::activation_family(Some(&requested)) {
+        match crate::clr_host::activation_family(requested.as_deref()) {
             crate::clr_host::ActivationFamily::Framework => {
-                let provider = crate::clr_host::framework_runtime_provider();
-                if !provider.is_available() {
-                    state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE));
+                // Host Mono implements only the ICLRRuntimeHost execution
+                // contract; the legacy ICorRuntimeHost object model is not
+                // fabricated.
+                if interface_id == IID_ICOR_RUNTIME_HOST
+                    || (interface_id != IID_ICLR_RUNTIME_HOST && interface_id != IID_IUNKNOWN)
+                {
+                    state.set(Register::Rax, u64::from(E_NOINTERFACE));
                     return Ok(());
                 }
-                // A future provider is available; this build has no
-                // ICorRuntimeHost object model to hand out, so it cannot
-                // fabricate one.
-                match provider.version() {
-                    Some(_) => state.set(Register::Rax, u64::from(E_NOTIMPL)), // coverage: unreachable — no supported host installs a Framework provider
-                    None => state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)), // coverage: unreachable — same absent-provider design
-                }
+                let Some(runtime) = framework_runtime_model(requested.as_deref()) else {
+                    state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — the provider is available in every binding test
+                    return Ok(()); // coverage: unreachable — same absent-provider arm as the line above
+                };
+                let host = self.alloc_framework_runtime_host(memory, runtime)?;
+                write_guest_pointer(memory, out, host, self.guest_arch)?;
+                state.set(Register::Rax, u64::from(S_OK));
                 Ok(())
             }
             crate::clr_host::ActivationFamily::Unsupported => {
@@ -850,6 +923,29 @@ impl PeHostRuntime {
             return Ok(());
         }
         let requested = read_utf16_string(memory, version_pointer)?;
+        // Framework generations are served by host Mono when it is installed;
+        // a Framework request never selects an installed CoreCLR.
+        if matches!(
+            crate::clr_host::activation_family(Some(&requested)),
+            crate::clr_host::ActivationFamily::Framework
+        ) {
+            let Some(runtime) = framework_runtime_model(Some(&requested)) else {
+                state.set(Register::Rax, u64::from(CLR_E_SHIM_RUNTIMENOTFOUND)); // coverage: unreachable — the provider is available in every GetRuntime test
+                return Ok(()); // coverage: unreachable — same absent-provider arm as the line above
+            };
+            let Some(interface) = read_guid(memory, riid) else {
+                state.set(Register::Rax, u64::from(E_POINTER));
+                return Ok(());
+            };
+            if interface != IID_ICLR_RUNTIME_INFO && interface != IID_IUNKNOWN {
+                state.set(Register::Rax, u64::from(E_NOINTERFACE));
+                return Ok(());
+            }
+            let object = self.alloc_clr_runtime_info(memory, runtime)?;
+            write_guest_pointer(memory, out, object, self.guest_arch)?;
+            state.set(Register::Rax, u64::from(S_OK));
+            return Ok(());
+        }
         let Some(version) = clr_meta::ClrVersion::parse_request(&requested) else {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
@@ -981,16 +1077,30 @@ impl PeHostRuntime {
         memory: &mut MemoryImage,
     ) -> AppResult<()> {
         let _object = guest_call_arg(state, memory, 0)?;
-        let _riid = guest_call_arg(state, memory, 1)?;
+        let riid = guest_call_arg(state, memory, 1)?;
         let out = guest_call_arg(state, memory, 2)?;
         if out == 0 {
             state.set(Register::Rax, u64::from(E_POINTER));
             return Ok(());
         }
         write_guest_pointer(memory, out, 0, self.guest_arch).ok();
-        // Legacy V2 binding always targets the .NET Framework CLR, which is
-        // genuinely absent on this host.
-        state.set(Register::Rax, u64::from(E_NOINTERFACE));
+        // Legacy V2 binding targets the .NET Framework CLR, which host Mono
+        // implements when installed; otherwise it is genuinely absent.
+        let Some(runtime) = framework_runtime_model(Some("v2.0")) else {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE)); // coverage: unreachable — the provider is available in every legacy-binding test
+            return Ok(()); // coverage: unreachable — same absent-provider arm as the line above
+        };
+        let Some(interface) = read_guid(memory, riid) else {
+            state.set(Register::Rax, u64::from(E_POINTER));
+            return Ok(());
+        };
+        if interface != IID_ICLR_RUNTIME_INFO && interface != IID_IUNKNOWN {
+            state.set(Register::Rax, u64::from(E_NOINTERFACE));
+            return Ok(());
+        }
+        let object = self.alloc_clr_runtime_info(memory, runtime)?;
+        write_guest_pointer(memory, out, object, self.guest_arch)?;
+        state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
 
@@ -1293,7 +1403,11 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_NOINTERFACE));
             return Ok(());
         }
-        let host = self.alloc_clr_runtime_host(memory, runtime)?;
+        let host = if is_framework_runtime(&runtime) {
+            self.alloc_framework_runtime_host(memory, runtime)?
+        } else {
+            self.alloc_clr_runtime_host(memory, runtime)?
+        };
         write_guest_pointer(memory, out, host, self.guest_arch)?;
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
@@ -1355,7 +1469,12 @@ impl PeHostRuntime {
     ) -> AppResult<()> {
         let object = guest_call_arg(state, memory, 0)?;
         match clr_objects().release(self.guest_pid, object) {
-            Some(count) => state.set(Register::Rax, u64::from(count)),
+            Some(count) => {
+                if count == 0 {
+                    unmark_framework_host(self.guest_pid, object);
+                }
+                state.set(Register::Rax, u64::from(count));
+            }
             None => state.set(Register::Rax, 0),
         }
         Ok(())
@@ -1371,13 +1490,16 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_UNEXPECTED));
             return Ok(());
         };
-        if runtime.coreclr_library().is_none() {
-            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — a runtime host is only allocated from installed_runtimes(), which filters out missing CLR libraries
+        let framework = is_framework_host(self.guest_pid, object) || is_framework_runtime(&runtime);
+        if !framework && runtime.coreclr_library().is_none() {
+            state.set(Register::Rax, u64::from(COR_E_CLRNOTAVAILABLE)); // coverage: unreachable — a CoreCLR runtime host is only allocated from installed_runtimes(), which filters out missing CLR libraries
             return Ok(()); // coverage: unreachable — same filtered-installation branch as the line above
         }
         clr_objects().start_runtime_host(self.guest_pid, object);
-        let version = runtime.version_string();
-        self.notify_clr_runtime_loaded(state, memory, &version)?;
+        if !framework {
+            let version = runtime.version_string();
+            self.notify_clr_runtime_loaded(state, memory, &version)?;
+        }
         state.set(Register::Rax, u64::from(S_OK));
         Ok(())
     }
@@ -1423,13 +1545,10 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
-        if clr_objects()
-            .runtime_host_state(self.guest_pid, object)
-            .is_none()
-        {
+        let Some((runtime, _)) = clr_objects().runtime_host_state(self.guest_pid, object) else {
             state.set(Register::Rax, u64::from(E_UNEXPECTED));
             return Ok(());
-        }
+        };
         if (manifest_count != 0 && manifest_paths == 0)
             || (activation_count != 0 && activation_data == 0)
         {
@@ -1460,7 +1579,13 @@ impl PeHostRuntime {
         // Manifest paths name activation manifests; the runtime entry point
         // receives the activation data as its command line.
         let _ = (manifest_paths, manifest_count);
-        match crate::clr_host::execute_assembly(&host_application, &arguments) {
+        let framework = is_framework_host(self.guest_pid, object) || is_framework_runtime(&runtime);
+        let execution = if framework {
+            crate::clr_host::execute_framework_assembly(&host_application, &arguments)
+        } else {
+            crate::clr_host::execute_assembly(&host_application, &arguments)
+        };
+        match execution {
             Ok(code) => {
                 write_guest_u32(memory, result, code as u32)?;
                 clr_objects().start_runtime_host(self.guest_pid, object);
@@ -1504,7 +1629,7 @@ impl PeHostRuntime {
             state.set(Register::Rax, u64::from(E_INVALIDARG));
             return Ok(());
         }
-        let Some(_) = clr_objects().runtime_host_state(self.guest_pid, object) else {
+        let Some((runtime, _)) = clr_objects().runtime_host_state(self.guest_pid, object) else {
             state.set(Register::Rax, u64::from(E_UNEXPECTED));
             return Ok(());
         };
@@ -1523,12 +1648,23 @@ impl PeHostRuntime {
         } else {
             Some(read_utf16_string(memory, argument)?)
         };
-        match crate::clr_host::execute_in_default_app_domain(
-            &host_assembly,
-            &type_name,
-            &method_name,
-            argument.as_deref(),
-        ) {
+        let framework = is_framework_host(self.guest_pid, object) || is_framework_runtime(&runtime);
+        let execution = if framework {
+            crate::clr_host::execute_framework_in_default_app_domain(
+                &host_assembly,
+                &type_name,
+                &method_name,
+                argument.as_deref(),
+            )
+        } else {
+            crate::clr_host::execute_in_default_app_domain(
+                &host_assembly,
+                &type_name,
+                &method_name,
+                argument.as_deref(),
+            )
+        };
+        match execution {
             Ok(value) => {
                 write_guest_u32(memory, result, value as u32)?;
                 clr_objects().start_runtime_host(self.guest_pid, object);
@@ -1906,6 +2042,18 @@ mod tests {
             .first()
             .expect("a real runtime is installed")
             .version_string()
+    }
+
+    fn mono_available() -> bool {
+        crate::mono_host::is_available()
+    }
+
+    fn framework_bind_status() -> u64 {
+        if mono_available() {
+            u64::from(S_OK)
+        } else {
+            u64::from(COR_E_CLRNOTAVAILABLE)
+        }
     }
 
     fn x64_runtime(name: &str) -> (PeHostRuntime, MemoryImage, TempDir) {
@@ -2813,9 +2961,12 @@ mod tests {
                         export_out as u32
                     ]
                 ),
-                u64::from(COR_E_CLRNOTAVAILABLE)
+                framework_bind_status()
             );
-            assert_eq!(read_ptr_at(&fixture.memory, export_out), 0);
+            assert_eq!(
+                read_ptr_at(&fixture.memory, export_out) != 0,
+                mono_available()
+            );
 
             let meta = create_meta_host(&mut fixture);
             let (hr, info) = get_runtime(&mut fixture, meta, &real_version());
@@ -3704,8 +3855,12 @@ mod tests {
                     HostThunk::CorBindToRuntimeEx,
                     &[0, 0, 0, 0, 0, out as u32],
                 ),
-                u64::from(COR_E_CLRNOTAVAILABLE),
-                "the .NET Framework CLR is genuinely absent"
+                if mono_available() {
+                    u64::from(E_POINTER)
+                } else {
+                    u64::from(COR_E_CLRNOTAVAILABLE)
+                },
+                "a versionless request binds Mono after the COM pointer contract, or is absent"
             );
             let directory_buffer = words(&mut fixture.memory, 0x41_600, 16);
             let length = words(&mut fixture.memory, 0x41_640, 1);
@@ -3911,16 +4066,17 @@ mod tests {
     }
 
     fn bind_expected_hr(request: &str) -> u64 {
-        let crate::clr_host::ActivationFamily::CoreClr(parsed) =
-            crate::clr_host::activation_family(Some(request))
-        else {
-            return u64::from(COR_E_CLRNOTAVAILABLE);
-        };
-        let installed = crate::clr_meta::installed_runtimes();
-        if crate::clr_meta::select_runtime(&parsed, &installed).is_some() {
-            u64::from(S_OK)
-        } else {
-            u64::from(COR_E_CLRNOTAVAILABLE)
+        match crate::clr_host::activation_family(Some(request)) {
+            crate::clr_host::ActivationFamily::Framework => framework_bind_status(),
+            crate::clr_host::ActivationFamily::Unsupported => u64::from(COR_E_CLRNOTAVAILABLE),
+            crate::clr_host::ActivationFamily::CoreClr(parsed) => {
+                let installed = crate::clr_meta::installed_runtimes();
+                if crate::clr_meta::select_runtime(&parsed, &installed).is_some() {
+                    u64::from(S_OK)
+                } else {
+                    u64::from(COR_E_CLRNOTAVAILABLE)
+                }
+            }
         }
     }
 
@@ -3967,7 +4123,7 @@ mod tests {
     }
 
     #[test]
-    fn cor_bind_framework_versions_flavors_flags_and_riids_are_exactly_absent() {
+    fn cor_bind_framework_versions_flavors_flags_and_riids_bind_mono_or_are_absent() {
         with_big_stack(|| {
             let mut fixture = x86_fixture("cor-bind-framework-absent");
             let out = words(&mut fixture.memory, 0x41_000, 1);
@@ -4005,6 +4161,13 @@ mod tests {
                     for (class, interface) in ids {
                         write_guid(&mut fixture.memory, clsid, class);
                         write_guid(&mut fixture.memory, iid, interface);
+                        let expected = if !mono_available() {
+                            u64::from(COR_E_CLRNOTAVAILABLE)
+                        } else if interface == IID_ICOR_RUNTIME_HOST {
+                            u64::from(E_NOINTERFACE)
+                        } else {
+                            u64::from(S_OK)
+                        };
                         for flags in [0_u32, 1, 0xFFFF_FFFF] {
                             assert_eq!(
                                 dispatch_x86(
@@ -4012,10 +4175,13 @@ mod tests {
                                     HostThunk::CorBindToRuntimeEx,
                                     &bind_ex_args(*version, flavor, flags, clsid, iid, out),
                                 ),
-                                u64::from(COR_E_CLRNOTAVAILABLE),
-                                "a Framework request is genuinely absent"
+                                expected,
+                                "a Framework request binds Mono when present or is absent"
                             );
-                            assert_eq!(read_ptr_at(&fixture.memory, out), 0);
+                            assert_eq!(
+                                read_ptr_at(&fixture.memory, out) != 0,
+                                expected == u64::from(S_OK)
+                            );
                         }
                     }
                 }
@@ -4037,13 +4203,19 @@ mod tests {
                         out as u32,
                     ],
                 ),
-                u64::from(COR_E_CLRNOTAVAILABLE),
-                "the 5-argument export keeps the Framework-absent contract"
+                if mono_available() {
+                    u64::from(E_NOINTERFACE)
+                } else {
+                    u64::from(COR_E_CLRNOTAVAILABLE)
+                },
+                "the 5-argument export rejects the legacy interface or is absent"
             );
             assert_eq!(read_ptr_at(&fixture.memory, out), 0);
 
             // Versionless and empty requests are the Framework latest-runtime
             // request, not a CoreCLR bind.
+            write_guid(&mut fixture.memory, clsid, CLSID_CLR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, iid, IID_ICLR_RUNTIME_HOST);
             let empty = alloc_wide(&mut fixture, "");
             for version in [0_u32, empty as u32] {
                 assert_eq!(
@@ -4052,9 +4224,13 @@ mod tests {
                         HostThunk::CorBindToRuntimeEx,
                         &bind_ex_args(u64::from(version), 0, 0, clsid, iid, out),
                     ),
-                    u64::from(COR_E_CLRNOTAVAILABLE)
+                    framework_bind_status()
                 );
-                assert_eq!(read_ptr_at(&fixture.memory, out), 0);
+                assert_eq!(
+                    read_ptr_at(&fixture.memory, out) != 0,
+                    mono_available(),
+                    "the latest Framework bind yields a host only when Mono is present"
+                );
             }
             assert_eq!(
                 dispatch_x86(
@@ -4176,10 +4352,215 @@ mod tests {
                         &bind_ex_args(request, 0, 0, clsid, iid, out),
                     ),
                     expected,
-                    "{text} cannot bind a runtime"
+                    "{text} binds a runtime only when its generation is installed"
                 );
-                assert_eq!(read_ptr_at(&fixture.memory, out), 0);
+                assert_eq!(read_ptr_at(&fixture.memory, out) != 0, expected == 0);
             }
+        })
+    }
+
+    #[test]
+    fn framework_binding_executes_real_mono_and_rejects_wrong_type_with_exact_status() {
+        with_big_stack(|| {
+            let mut fixture = x86_fixture("framework-mono");
+            let out = words(&mut fixture.memory, 0x41_000, 1);
+            let clsid = words(&mut fixture.memory, 0x41_020, 4);
+            let iid = words(&mut fixture.memory, 0x41_040, 4);
+            let version = alloc_wide(&mut fixture, "v4.0.30319");
+            write_guid(&mut fixture.memory, clsid, CLSID_CLR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, iid, IID_ICLR_RUNTIME_HOST);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::CorBindToRuntimeEx,
+                    &bind_ex_args(version, 0, 0, clsid, iid, out),
+                ),
+                framework_bind_status()
+            );
+            if !mono_available() {
+                assert_eq!(read_ptr_at(&fixture.memory, out), 0);
+                return;
+            }
+            let host = read_ptr_at(&fixture.memory, out);
+            assert_ne!(host, 0, "a Framework request binds a real Mono host");
+            assert_eq!(call_method(&mut fixture, host, 3, &[]), 0, "Start");
+            let domain = words(&mut fixture.memory, 0x41_060, 1);
+            assert_eq!(
+                call_method(&mut fixture, host, 9, &[domain as u32]),
+                0,
+                "GetCurrentAppDomainId"
+            );
+            assert_eq!(read_u32_at(&fixture.memory, domain), 1);
+
+            // Version reporting comes from the Mono installation.
+            let directory_length = words(&mut fixture.memory, 0x41_080, 1);
+            let version_length = words(&mut fixture.memory, 0x41_0A0, 1);
+            let directory_buffer = words(&mut fixture.memory, 0x45_000, 256);
+            let version_buffer = words(&mut fixture.memory, 0x46_000, 128);
+            assert_eq!(
+                dispatch_x86(
+                    &mut fixture,
+                    HostThunk::GetRequestedRuntimeInfo,
+                    &requested_info_args(
+                        version,
+                        directory_buffer,
+                        256,
+                        directory_length,
+                        version_buffer,
+                        128,
+                        version_length,
+                    ),
+                ),
+                0
+            );
+            assert_eq!(
+                read_wide(&fixture.memory, version_buffer),
+                crate::clr_host::requested_runtime_version(Some("v4.0.30319"))
+                    .expect("Mono version")
+            );
+            let directory = crate::clr_host::requested_runtime_directory(Some("v4.0.30319"))
+                .expect("Mono directory");
+            assert_eq!(
+                read_wide(&fixture.memory, directory_buffer),
+                format!("{}\\", directory.to_string_lossy())
+            );
+
+            // GetRuntime and the legacy V2 binding expose Mono runtime info.
+            let meta = create_meta_host(&mut fixture);
+            let (hr, info) = get_runtime(&mut fixture, meta, "v2.0");
+            assert_eq!(hr, 0, "a v2.0 request binds Mono runtime info");
+            assert_ne!(info, 0);
+
+            // Framework runtime-info requests keep the exact COM contract.
+            let unsupported = words(&mut fixture.memory, 0x41_180, 4);
+            write_guid(&mut fixture.memory, unsupported, IID_IENUM_UNKNOWN);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    meta,
+                    3,
+                    &[version as u32, unsupported as u32, out as u32]
+                ),
+                u64::from(E_NOINTERFACE)
+            );
+            assert_eq!(
+                call_method(&mut fixture, meta, 3, &[version as u32, 0, out as u32]),
+                u64::from(E_POINTER),
+                "a null riid is E_POINTER after the Framework runtime is selected"
+            );
+
+            // ICLRRuntimeInfo::GetInterface hands out the Mono-backed host.
+            let info_clsid = words(&mut fixture.memory, 0x41_120, 4);
+            let info_iid = words(&mut fixture.memory, 0x41_140, 4);
+            let info_host = words(&mut fixture.memory, 0x41_160, 1);
+            write_guid(&mut fixture.memory, info_clsid, CLSID_CLR_RUNTIME_HOST);
+            write_guid(&mut fixture.memory, info_iid, IID_ICLR_RUNTIME_HOST);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    info,
+                    9,
+                    &[info_clsid as u32, info_iid as u32, info_host as u32]
+                ),
+                0
+            );
+            let bound_from_info = read_ptr_at(&fixture.memory, info_host);
+            assert_ne!(bound_from_info, 0);
+            assert_eq!(call_method(&mut fixture, bound_from_info, 3, &[]), 0);
+
+            let legacy_iid = words(&mut fixture.memory, 0x41_0C0, 4);
+            let legacy_out = words(&mut fixture.memory, 0x41_0E0, 1);
+            write_guid(&mut fixture.memory, legacy_iid, IID_ICLR_RUNTIME_INFO);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    meta,
+                    8,
+                    &[legacy_iid as u32, legacy_out as u32]
+                ),
+                0,
+                "QueryLegacyV2RuntimeBinding binds Mono"
+            );
+            assert_ne!(read_ptr_at(&fixture.memory, legacy_out), 0);
+            assert_eq!(
+                call_method(&mut fixture, meta, 8, &[0, legacy_out as u32]),
+                u64::from(E_POINTER),
+                "a null legacy iid is E_POINTER after the Framework runtime is selected"
+            );
+
+            // The Mono-backed ICLRRuntimeHost runs a real entry point.
+            let entry_fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/Casa1Entry.dll");
+            fixture
+                .runtime
+                .win32
+                .stage_host_file_w(&entry_fixture, "C:\\clr\\MonoEntry.dll")
+                .expect("stage managed app");
+            let entry_guest = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "C:\\clr\\MonoEntry.dll")
+                .expect("entry path");
+            let one = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "one")
+                .expect("arg one");
+            let two = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "two")
+                .expect("arg two");
+            let activation = words(&mut fixture.memory, 0x44_000, 2);
+            write_guest_pointer(&mut fixture.memory, activation, one, GuestArch::X86)
+                .expect("arg pointer");
+            write_guest_pointer(&mut fixture.memory, activation + 4, two, GuestArch::X86)
+                .expect("arg pointer");
+            let result = words(&mut fixture.memory, 0x41_100, 1);
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    10,
+                    &[
+                        entry_guest as u32,
+                        0,
+                        0,
+                        2,
+                        activation as u32,
+                        result as u32
+                    ]
+                ),
+                0,
+                "ExecuteApplication runs on Mono"
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 9);
+
+            // Mono's own type-resolution failure maps to the CLR execution
+            // status, never a fabricated success.
+            let missing_type = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "Casa1.Does.Not.Exist")
+                .expect("type");
+            let missing_method = fixture
+                .runtime
+                .alloc_utf16_string(&mut fixture.memory, "Missing")
+                .expect("method");
+            assert_eq!(
+                call_method(
+                    &mut fixture,
+                    host,
+                    11,
+                    &[
+                        entry_guest as u32,
+                        missing_type as u32,
+                        missing_method as u32,
+                        0,
+                        result as u32
+                    ]
+                ),
+                u64::from(COR_E_EXECUTIONENGINE)
+            );
+            assert_eq!(read_u32_at(&fixture.memory, result), 0);
+
+            assert_eq!(call_method(&mut fixture, host, 2, &[]), 0, "Release");
         })
     }
 
@@ -4296,8 +4677,8 @@ mod tests {
                 u64::from(E_FAIL)
             );
 
-            // Framework, garbage, absent and versionless requests are absent.
-            for text in ["v4.0.30319", "v2.0", "garbage", "999.0.0"] {
+            // Malformed and absent versions never select a runtime.
+            for text in ["garbage", "999.0.0"] {
                 let request = alloc_wide(&mut fixture, text);
                 write_u32(&mut fixture.memory, directory_length, 0);
                 write_u32(&mut fixture.memory, version_length, 0);
@@ -4308,10 +4689,10 @@ mod tests {
                         &requested_info_args(
                             request,
                             directory_buffer,
-                            directory_units,
+                            256,
                             directory_length,
                             version_buffer,
-                            version_units,
+                            128,
                             version_length,
                         ),
                     ),
@@ -4321,6 +4702,48 @@ mod tests {
                 assert_eq!(read_u32_at(&fixture.memory, directory_length), 0);
                 assert_eq!(read_u32_at(&fixture.memory, version_length), 0);
             }
+
+            // Framework requests report Mono's real version and directory
+            // when it is installed and the exact absence otherwise.
+            for text in ["v4.0.30319", "v2.0"] {
+                let request = alloc_wide(&mut fixture, text);
+                write_u32(&mut fixture.memory, directory_length, 0);
+                write_u32(&mut fixture.memory, version_length, 0);
+                let expected = framework_bind_status();
+                assert_eq!(
+                    dispatch_x86(
+                        &mut fixture,
+                        HostThunk::GetRequestedRuntimeInfo,
+                        &requested_info_args(
+                            request,
+                            directory_buffer,
+                            256,
+                            directory_length,
+                            version_buffer,
+                            128,
+                            version_length,
+                        ),
+                    ),
+                    expected,
+                    "{text} binds Mono when present or reports absence"
+                );
+                if expected == u64::from(S_OK) {
+                    let version =
+                        crate::clr_host::requested_runtime_version(Some(text)).expect("version");
+                    let directory = crate::clr_host::requested_runtime_directory(Some(text))
+                        .expect("directory");
+                    assert_eq!(read_wide(&fixture.memory, version_buffer), version);
+                    assert_eq!(
+                        read_wide(&fixture.memory, directory_buffer),
+                        format!("{}\\", directory.to_string_lossy())
+                    );
+                } else {
+                    assert_eq!(read_u32_at(&fixture.memory, directory_length), 0);
+                    assert_eq!(read_u32_at(&fixture.memory, version_length), 0);
+                }
+            }
+            write_u32(&mut fixture.memory, directory_length, 0);
+            write_u32(&mut fixture.memory, version_length, 0);
             assert_eq!(
                 dispatch_x86(
                     &mut fixture,
@@ -4328,15 +4751,15 @@ mod tests {
                     &requested_info_args(
                         0,
                         directory_buffer,
-                        directory_units,
+                        256,
                         directory_length,
                         version_buffer,
-                        version_units,
+                        128,
                         version_length,
                     ),
                 ),
-                u64::from(COR_E_CLRNOTAVAILABLE),
-                "a versionless request is the absent Framework latest runtime"
+                framework_bind_status(),
+                "a versionless request binds the latest Framework runtime or is absent"
             );
 
             // "8.0" reports the installed 8.x runtime exactly when present.

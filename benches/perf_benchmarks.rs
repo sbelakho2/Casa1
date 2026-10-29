@@ -2873,10 +2873,17 @@ fn gate_frame_metrics() -> Result<GateFrameMetrics, String> {
 }
 
 fn gate_gpu_present_metrics() -> Result<BTreeMap<String, serde_json::Value>, String> {
-    use casa1::perf::{GpuPresentRecorder, measure_gpu_present_into};
+    use casa1::perf::{
+        GpuPresentRecorder, measure_gpu_present_into, measure_gpu_present_windowed_into,
+    };
 
+    let windowed = std::env::var("CASA1_PERF_WINDOWED").as_deref() == Ok("1");
     let mut recorder = GpuPresentRecorder::new();
-    measure_gpu_present_into(&mut recorder, 256)?;
+    if windowed {
+        measure_gpu_present_windowed_into(&mut recorder, 256)?;
+    } else {
+        measure_gpu_present_into(&mut recorder, 256)?;
+    }
     let mut metrics = recorder.summary().to_json_metrics();
     metrics.remove("shader_compile_stall_rate_measured");
     metrics.remove("guest_instructions_per_sec");
@@ -3074,6 +3081,13 @@ fn bench_gate_kpis(c: &mut Criterion) {
     use std::collections::BTreeMap;
 
     let mut metrics: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let dispatch = casa1::perf::DispatchStatsReport::from_env();
+    for (key, value) in dispatch.to_json_metrics() {
+        metrics.insert(key, value);
+    }
+    for line in dispatch.human_lines() {
+        eprintln!("CASA1_DISPATCH {line}");
+    }
     match gate_gpu_present_metrics() {
         Ok(gpu_metrics) => {
             for (key, value) in gpu_metrics {
@@ -3564,6 +3578,7 @@ fn bench_gate_kpis(c: &mut Criterion) {
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
         },
+        "dispatch": dispatch.to_json(),
         "metrics": metrics,
     });
     let text = serde_json::to_string(&document).unwrap_or_else(|_| "{}".to_string());

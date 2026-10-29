@@ -40,6 +40,10 @@ pub struct PrecompileReport {
     pub skipped: usize,
     /// Successors outside the module range that were not followed.
     pub out_of_range: usize,
+    /// Profile/persisted seed addresses supplied for the union walk.
+    pub seeded: usize,
+    /// Seed addresses that were compiled (or loaded from the AOT cache).
+    pub seeded_compiled: usize,
 }
 
 const MAX_BLOCK_BYTES: u64 = 4096;
@@ -196,6 +200,29 @@ pub fn precompile_blocks<F>(
     start: u64,
     end: u64,
     max_blocks: usize,
+    compile: F,
+) -> AppResult<PrecompileReport>
+where
+    F: FnMut(&[IrInstruction], u64) -> AppResult<()>,
+{
+    precompile_blocks_with_seeds(memory, arch, start, end, max_blocks, &[], compile)
+}
+
+/// Discover the control-flow-reachable blocks starting at `start` **and** at
+/// every address in `seeds` (persisted profile targets and known cache
+/// misses), handing each distinct block to `compile`.
+///
+/// This is the union install/update pipeline: the static walk supplies
+/// directly-reachable code, while profile seeds supply blocks reached only
+/// through indirect calls or other runtime-only edges.  Addresses are visited
+/// once regardless of how many sources discover them.
+pub fn precompile_blocks_with_seeds<F>(
+    memory: &MemoryImage,
+    arch: GuestArch,
+    start: u64,
+    end: u64,
+    max_blocks: usize,
+    seeds: &[u64],
     mut compile: F,
 ) -> AppResult<PrecompileReport>
 where
@@ -203,9 +230,15 @@ where
 {
     let config = CpuEngineConfig::from_profile(arch, "win11-23h2", "macOS", None)?;
     let mut engine = CpuExecutionEngine::new(config);
+    let seed_set: BTreeSet<u64> = seeds.iter().copied().collect();
     let mut pending = vec![start];
+    // LIFO: start is popped first, then profile seeds in ascending order.
+    pending.extend(seed_set.iter().rev().copied());
     let mut visited = BTreeSet::new();
-    let mut report = PrecompileReport::default();
+    let mut report = PrecompileReport {
+        seeded: seed_set.len(),
+        ..PrecompileReport::default()
+    };
     while let Some(address) = pending.pop() {
         if address < start || address >= end {
             report.out_of_range += 1;
@@ -231,7 +264,12 @@ where
             }
         }
         match compile(&translated.ir, address) {
-            Ok(()) => report.compiled += 1,
+            Ok(()) => {
+                report.compiled += 1;
+                if seed_set.contains(&address) {
+                    report.seeded_compiled += 1;
+                }
+            }
             Err(_) => report.skipped += 1,
         }
     }

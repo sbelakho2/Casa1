@@ -1,4 +1,12 @@
 {
+ "absent_framework_provider_reports_exact_absence_without_mono": [
+  "(provider.is_available(), false)",
+  "(provider.version(), None)",
+  "(provider.version_for(Some(\"v4.0\")), None)",
+  "(provider.directory_for(Some(\"v4.0\")), None)",
+  "( provider.host_assembly(missing, &[\"argument\".to_string()]), Err(ClrHostError::FrameworkUnavailable) )",
+  "( provider.execute_in_default_app_domain(missing, \"Type\", \"Method\", None), Err(ClrHostError::FrameworkUnavailable) )"
+ ],
  "absent_managed_type_reports_the_real_clr_resolution_failure": [
   "(status, 0)",
   "(processors, 0)"
@@ -1701,6 +1709,9 @@
   "(store.materialised_page_count(), PAGES)",
   "(store.materialisation_count(), PAGES)"
  ],
+ "concurrent_profile_readers_never_observe_a_partial_record": [
+  "(loaded.address_count() > 0, true)"
+ ],
  "concurrent_signal_wait_races_wake_each_waiter_exactly_once": [
   "( subsystem.d3dkmt_signal_synchronization_object(sync, 1), Ok(()) )",
   "(waiter.join().expect(\"waiter thread\"), Ok(()))",
@@ -1864,11 +1875,13 @@
   "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(version, 0, 0, clsid, iid, out), ), u64::from(E_NOINTERFACE) )",
   "(read_ptr_at(&fixture.memory, out), 0)"
  ],
- "cor_bind_framework_versions_flavors_flags_and_riids_are_exactly_absent": [
-  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(*version, flavor, flags, clsid, iid, out), ), u64::from(COR_E_CLRNOTAVAILABLE), \"a Framework request is genuinely absent\" )",
+ "cor_bind_framework_versions_flavors_flags_and_riids_bind_mono_or_are_absent": [
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(*version, flavor, flags, clsid, iid, out), ), expected, \"a Framework request binds Mono when present or is absent\" )",
+  "( read_ptr_at(&fixture.memory, out) != 0, expected == u64::from(S_OK) )",
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntime, &[ versions[3] as u32, flavors[0] as u32, clsid as u32, iid as u32, out as u32, ], ), if mono_available() { u64::from(E_NOINTERFACE) } else { u64::from(COR_E_CLRNOTAVAILABLE) }, \"the 5-argument export rejects the legacy interface or is absent\" )",
   "(read_ptr_at(&fixture.memory, out), 0)",
-  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntime, &[ versions[3] as u32, flavors[0] as u32, clsid as u32, iid as u32, out as u32, ], ), u64::from(COR_E_CLRNOTAVAILABLE), \"the 5-argument export keeps the Framework-absent contract\" )",
-  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(u64::from(version), 0, 0, clsid, iid, out), ), u64::from(COR_E_CLRNOTAVAILABLE) )"
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(u64::from(version), 0, 0, clsid, iid, out), ), framework_bind_status() )",
+  "( read_ptr_at(&fixture.memory, out) != 0, mono_available(), \"the latest Framework bind yields a host only when Mono is present\" )"
  ],
  "corpus_classifies_missing_import_crash_timeout_library_and_invalid_title_exactly": [
   "(report.discovered_title_count, 7)",
@@ -3538,6 +3551,30 @@
   "(ticket.irql, 5)",
   "(manager.isr_invocations(), 1)"
  ],
+ "dispatch_stats_missing_partial_malformed_and_zero_documents_report_exact_reasons": [
+  "(report.stats, None)",
+  "( report.unavailable, Some(DispatchStatsUnavailable::Absent(missing.clone())) )",
+  "( report .unavailable .as_ref() .map(DispatchStatsUnavailable::reason), Some(format!( \"dispatch statistics file {} does not exist\", missing.display() )) )",
+  "( report.unavailable, Some(DispatchStatsUnavailable::MissingField { path: partial.clone(), field: \"barrier_calls\" }) )",
+  "( report .unavailable .as_ref() .map(DispatchStatsUnavailable::reason), Some(format!( \"dispatch statistics file {} is partial: required field `barrier_calls` is missing or not an unsigned integer\", partial.display() )) )",
+  "( report .unavailable .as_ref() .map(DispatchStatsUnavailable::reason), Some(format!( \"dispatch statistics file {} is malformed: expected value at line 1 column 1\", malformed.display() )) )"
+ ],
+ "dispatch_stats_ratio_boundary_math_is_exact": [
+  "(stats.total_dispatches(), 4)",
+  "(stats.owner_barrier_ratio(), Some(0.25))",
+  "(stats.parallel_dispatch_ratio(), Some(0.75))",
+  "( stats.time_per_1000_guest_instructions_ns(), Some(2_000_000.0) )",
+  "(metrics[\"owner_barrier_ratio\"][\"value\"], 0.25)",
+  "( metrics[\"time_per_1000_guest_instructions_ns\"][\"value\"], 2_000_000.0 )"
+ ],
+ "dispatch_stats_zero_snapshot_writer_never_fabricates_a_ratio": [
+  "(stats.parallel_dispatched, 0)",
+  "(stats.barrier_calls, 0)",
+  "(stats.owner_barrier_ratio(), None)",
+  "(stats.time_per_1000_guest_instructions_ns(), Some(5_000.0))",
+  "(document[\"owner_barrier_ratio\"], serde_json::Value::Null)",
+  "( DispatchStatsReport::from_json(Path::new(\"snapshot.json\"), &text), Err(DispatchStatsUnavailable::ZeroDispatches { path: PathBuf::from(\"snapshot.json\") }) )"
+ ],
  "dispatcher_events_auto_reset_and_report_exact_timeout": [
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::KeInitializeEvent, &[event, u64::from(SYNCHRONIZATION_EVENT), 0], ), STATUS_SUCCESS )",
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::KeReadStateEvent, &[event], ), 0 )",
@@ -4676,6 +4713,14 @@
   "( dispatch_x86_thunk( &mut runtime, &mut memory, prepare, &[wave_in, header as u32, 32] ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, add_buffer, &[wave_in, header as u32, 32] ), 0 )"
  ],
+ "evidence_mscoree_clr_activation_semantics": [
+  "(hr, 0, \"real CLR metadata host\")",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, bind, &[0, 0, 0, 0, 0, out as u32] ), 0x8000_4003 )",
+  "(read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0)",
+  "( dispatch_x86_thunk( &mut runtime, &mut memory, directory, &[buffer as u32, 260, length_out as u32] ), 0, \"GetCORSystemDirectory reports the installed CoreCLR\" )",
+  "( dispatch_x86_thunk(&mut runtime, &mut memory, shim, &[0, 0, 0, 0]), 0x8000_4005 )",
+  "( read_guest_pointer(&memory, out, GuestArch::X86).unwrap(), 0, \"metadata host object returned\" )"
+ ],
  "evidence_net_sys_iphlpapi_tables_from_guest_config": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, get_adapters_info, &[0, len_slot as u32] ), ERROR_BUFFER_OVERFLOW as u64 )",
   "(read_u32(&memory, len_slot).expect(\"required\"), 688 * 2)",
@@ -5041,13 +5086,21 @@
   "(*semaphore.slots.lock().unwrap(), 1)",
   "(*empty.slots.lock().unwrap(), 1)"
  ],
+ "framework_binding_executes_real_mono_and_rejects_wrong_type_with_exact_status": [
+  "( dispatch_x86( &mut fixture, HostThunk::CorBindToRuntimeEx, &bind_ex_args(version, 0, 0, clsid, iid, out), ), framework_bind_status() )",
+  "(read_ptr_at(&fixture.memory, out), 0)",
+  "(call_method(&mut fixture, host, 3, &[]), 0, \"Start\")",
+  "( call_method(&mut fixture, host, 9, &[domain as u32]), 0, \"GetCurrentAppDomainId\" )",
+  "(read_u32_at(&fixture.memory, domain), 1)",
+  "( dispatch_x86( &mut fixture, HostThunk::GetRequestedRuntimeInfo, &requested_info_args( version, directory_buffer, 256, directory_length, version_buffer, 128, version_length, ), ), 0 )"
+ ],
  "framework_provider_seam_and_activation_families_are_exact": [
   "(activation_family(None), ActivationFamily::Framework)",
   "(activation_family(Some(\"\")), ActivationFamily::Framework)",
   "( activation_family(Some(version)), ActivationFamily::Framework, \"{version} is a Framework version\" )",
   "( activation_family(Some(version)), ActivationFamily::Unsupported, \"{version} is not a runtime version\" )",
-  "(provider.version(), None)",
-  "( provider.host_assembly( Path::new(\"/casa1/does/not/exist/Framework.exe\"), &[\"argument\".to_string()], ), Err(ClrHostError::FrameworkUnavailable) )"
+  "(provider.is_available(), mono_available)",
+  "(provider.version(), crate::mono_host::version_for(None))"
  ],
  "free_releases_or_decommits": [
   "(range, 0x1000)",
@@ -8037,6 +8090,14 @@
   "(rc(&run(&mut tpm, &trailing)), TPM_RC_SIZE)",
   "(rc(&run(&mut tpm, &trailing)), TPM_RC_AUTHSIZE)"
  ],
+ "malformed_profile_bad_magic_format_kind_and_trailing_bytes_are_rejected_exactly": [
+  "( ProfileTargets::decode(&bad_magic, &key), Err(ProfileError::BadMagic) )",
+  "( ProfileTargets::decode(&bad_format, &key), Err(ProfileError::UnsupportedFormat { found: AOT_PROFILE_FORMAT_VERSION + 1, expected: AOT_PROFILE_FORMAT_VERSION, }) )",
+  "( ProfileTargets::decode(&bad_kind, &key), Err(ProfileError::UnknownTargetKind(9)) )",
+  "( ProfileTargets::decode(&trailing, &key), Err(ProfileError::TrailingBytes) )",
+  "( ProfileTargets::default().encode(&ProfileKey::new(\"bad/hash\", 1, 2)), Err(ProfileError::InvalidImageHash(\"bad/hash\".to_string())) )",
+  "( sanitized .parent() .and_then(|path| path.file_name()) .and_then(|name| name.to_str()), Some(expected.as_str()) )"
+ ],
  "malformed_version_strings_are_rejected_without_guessing": [
   "( ClrVersion::parse_request(malformed), None, \"malformed version {malformed:?} must be rejected\" )",
   "(ClrVersion::parse_directory_name(\"v8.0.31\"), None)",
@@ -8806,6 +8867,74 @@
   "(user32.monitor_from_window(Some(0xdead_beef), 0x2), 1)",
   "(user32.monitor_from_window(None, 0), 0)"
  ],
+ "mono_api_load_rejects_missing_library_and_paths_with_nul": [
+  "( matches!(error, ClrHostError::MonoLibraryLoad(_)), true, \"the dynamic-loader error is preserved: {error:?}\" )",
+  "( c_path(Path::new(\"bad\\0path\")), Err(ClrHostError::InvalidArgument(\"path\")) )",
+  "( matches!( MonoRuntime::initialize(&installation, latest_version()), Err(ClrHostError::MonoLibraryLoad(_)) ), true, \"initialization reports the loader failure before touching a domain\" )"
+ ],
+ "mono_default_app_domain_rejects_wrong_type_method_and_bad_marshaling": [
+  "( execute_in_default_app_domain(missing, \"Type\", \"Method\", None), Err(ClrHostError::AssemblyNotFound(missing.to_path_buf())) )",
+  "( execute_in_default_app_domain(&fixture, \"\", \"Method\", None), Err(ClrHostError::InvalidArgument(\"type name\")) )",
+  "( execute_in_default_app_domain(&fixture, \"Type\", \"\", None), Err(ClrHostError::InvalidArgument(\"method name\")) )",
+  "( execute_in_default_app_domain(&fixture, \"Type\\0Name\", \"Method\", None), Err(ClrHostError::InvalidArgument(\"type name\")) )",
+  "( execute_in_default_app_domain(&fixture, \"Type\", \"Bad\\0Method\", None), Err(ClrHostError::InvalidArgument(\"method name\")) )",
+  "( execute_in_default_app_domain(&fixture, \"Casa1.Entry\", \"Method\", None), Err(ClrHostError::FrameworkUnavailable) )"
+ ],
+ "mono_discovery_accepts_real_layouts_and_rejects_relative_roots": [
+  "( discovered.library, version .canonicalize() .expect(\"canonical version\") .join(\"lib\") .join(\"libmono-2.0.dylib\") )",
+  "(discovered.lib_dir, canonical_lib)",
+  "( discovered.root, canonical_lib.parent().expect(\"standalone prefix\") )",
+  "( discover_from(None, None, &[PathBuf::from(\"relative/mono\")]), None, \"a relative root that does not exist is rejected\" )"
+ ],
+ "mono_discovery_precedence_rejects_unrelated_roots_and_binds_real_layouts": [
+  "( discover_from(Some(override_root.clone()), Some(path.clone()), &roots) .expect(\"override wins\") .root, override_root .canonicalize() .expect(\"canonical override root\") )",
+  "( discover_from(None, Some(path), &roots) .expect(\"PATH wins over listed roots\") .root, path_root.canonicalize().expect(\"canonical path root\") )",
+  "( discover_from(None, None, &roots).expect(\"listed root\").root, listed_root.canonicalize().expect(\"canonical listed root\") )",
+  "( discover_from(None, None, &[temp.path().join(\"unrelated\")]), None, \"a directory without a Mono library is rejected\" )"
+ ],
+ "mono_discovery_rejects_missing_root_and_missing_library_exactly": [
+  "(discover_from(Some(missing.clone()), None, &[]), None)",
+  "(discover_from(None, Some(path), &[]), None)",
+  "( discover_from(None, None, &[root.clone()]), None, \"a prefix without an embedding library is not a Mono installation\" )",
+  "( discovered.root, good.canonicalize().expect(\"canonical root\") )",
+  "( discovered.library, discovered.lib_dir.join(\"libmonosgen-2.0.dylib\") )"
+ ],
+ "mono_double_initialization_and_shutdown_are_idempotent": [
+  "( discover_from(Some(PathBuf::from(\"/casa1/no/mono\")), None, &[]), None, \"an invalid override reports honest absence\" )",
+  "( first.domain, second.domain, \"mono_jit_init_version runs exactly once per process\" )",
+  "(initialized_version(), Some(latest_version()))",
+  "( initialized_domain(), Some(first.domain as usize), \"the root domain is retained\" )"
+ ],
+ "mono_framework_only_method_marshals_arguments_and_propagates_exit_codes": [
+  "( version_for(Some(\"v4.0\")), None, \"absence reports no Framework version\" )",
+  "( version_for(Some(\"v4.0\")), Some(\"v4.0.30319\".to_string()), \"the version comes from Mono's own mscorlib metadata\" )",
+  "( version_for(Some(\"v2.0\")), Some(\"v4.0.30319\".to_string()), \"a v2.0 request reports the profile Mono actually falls back to\" )",
+  "( execute_in_default_app_domain(&assembly, \"Casa1FrameworkProbe\", \"Echo\", Some(\"abcd\")), Ok(7), \"Mono marshals the string argument and returns the managed int\" )",
+  "( execute_in_default_app_domain(&assembly, \"Casa1FrameworkProbe\", \"Echo\", Some(\"\")), Ok(3), \"the empty string marshals as an empty managed string\" )",
+  "( execute_in_default_app_domain(&assembly, \"Casa1FrameworkProbe\", \"Echo\", Some(\"a\\0b\")), Err(ClrHostError::InvalidArgument(\"argument\")), \"an interior NUL cannot be marshaled\" )"
+ ],
+ "mono_framework_version_mapping_rejects_malformed_requests_and_selects_profiles": [
+  "(clr_version_for(Some(\"garbage\")), None)",
+  "(clr_version_for(Some(\"v8.0\")), Some(FRAMEWORK_LATEST))",
+  "(clr_version_for(Some(\"v2.0.50727\")), Some(FRAMEWORK_V2))",
+  "(clr_version_for(Some(\"v3.5\")), Some(FRAMEWORK_V2))",
+  "(clr_version_for(Some(\"v1.1.4322\")), Some(FRAMEWORK_V1))",
+  "(clr_version_for(Some(\"v4.0.30319\")), Some(FRAMEWORK_LATEST))"
+ ],
+ "mono_host_rejects_missing_assembly_and_runs_the_real_entry_point": [
+  "( host_assembly(missing, &[]), Err(ClrHostError::AssemblyNotFound(missing.to_path_buf())) )",
+  "( host_assembly(&fixture, &args), Err(ClrHostError::FrameworkUnavailable) )",
+  "( host_assembly(&fixture, &args), Ok(9), \"Casa1Entry returns args.Length + 7 through Mono\" )",
+  "( host_assembly(&fixture, &[\"bad\\0arg\".to_string()]), Err(ClrHostError::InvalidArgument(\"activation data\")) )",
+  "( host_assembly(Path::new(\"/casa1/no/such.dll\"), &[]), Err(ClrHostError::AssemblyNotFound(PathBuf::from( \"/casa1/no/such.dll\" ))) )"
+ ],
+ "mono_metadata_reader_rejects_malformed_headers_and_maps_pe32_plus": [
+  "(metadata_version_from_file(&not_pe), None)",
+  "(metadata_version_from_file(&bad_signature_path), None)",
+  "( metadata_version_from_file(&fixture_path), Some(\"v4.0.30319\".to_string()), \"the PE32+ metadata root maps without reading imports\" )",
+  "( u16::from_le_bytes(fixture[optional..optional + 2].try_into().expect(\"magic\")), 0x20b )",
+  "(metadata_version_from_file(&path), None, \"{name}\")"
+ ],
  "monotonic_clock_cross_thread_tsc_incoherence_is_rejected": [
   "( clock.query_performance_frequency(), clock.frequency_hz() as i64 )",
   "(qpc >= 0, true)",
@@ -9077,6 +9206,14 @@
   "(native_export_available(runtime, \"\"), false)",
   "( native_export_available(&empty, \"coreclr_initialize\"), false, \"a directory without a real CLR library exports nothing\" )",
   "( native_export_available( &valid_runtime(&hostfxr_dir, \"1.0.0\"), \"hostfxr_initialize_for_runtime_config\" ), false )"
+ ],
+ "native_relative_ratio_refuses_zero_and_missing_sides": [
+  "( native_relative_ratio(false, 100, true, 10), Err(NativeRatioUnavailable::Casa1Unavailable) )",
+  "( native_relative_ratio(true, 100, false, 10), Err(NativeRatioUnavailable::NativeUnavailable) )",
+  "( native_relative_ratio(true, 0, true, 10), Err(NativeRatioUnavailable::Casa1ZeroTime) )",
+  "( native_relative_ratio(true, 100, true, 0), Err(NativeRatioUnavailable::NativeZeroTime) )",
+  "(native_relative_ratio(true, 100, true, 10), Ok(10.0))",
+  "( NativeRatioUnavailable::NativeZeroTime.reason(), \"native reference measured zero wall time; native-relative ratio refused\" )"
  ],
  "neg_flags_zero_result": [
   "(state.get(Register::Rax), 0)"
@@ -9924,6 +10061,11 @@
  "partial_page_boundary_probes_never_report_unmapped_bytes_or_absent_pages": [
   "(memory.canonical_store().materialisation_count(), 1)"
  ],
+ "partial_profile_write_keeps_previous_record_and_never_leaves_temporary": [
+  "(fs::read(&path).expect(\"read after failure\"), before)",
+  "( leftovers, 0, \"a failed atomic write must leave no temp file\" )",
+  "(error, ProfileError::Io(_))"
+ ],
  "partially_mapped_page_is_not_materialised": [
   "(detached.pages_materialised, 0)",
   "(detached.bytes_copied, 0)",
@@ -10049,6 +10191,14 @@
   "(recycled_pipe, pipe, \"closed pipe value is recycled FIFO\")",
   "(err.code, ReasonCode::RcWin32InvalidHandle)",
   "( win32 .wait_for_single_object(event, 0, false, None) .expect(\"wait\"), WaitStatus::Timeout, \"original event must not be signaled by the stale completion\" )"
+ ],
+ "percentile_math_handles_invalid_fractions_and_duplicate_boundaries": [
+  "(percentile_ns(&[5, 5, 5], f64::NEG_INFINITY), Some(5))",
+  "(percentile_ns(&[5, 5, 5], f64::INFINITY), Some(5))",
+  "(percentile_ns(&[1, 2, 3, 4], 1.0), Some(4))",
+  "(percentile_ns(&[1, 2, 3, 4], 0.75), Some(3))",
+  "(low_fps(&[1_000_000], f64::NAN), Some(1000.0))",
+  "(low_fps(&[1_000_000, 2_000_000], 0.0), Some(500.0))"
  ],
  "percentile_ns_rejects_empty_and_pins_single_outlier_boundaries": [
   "(percentile_ns(&[], 0.50), None)",
@@ -10463,6 +10613,14 @@
   "( manager.set_power(device, PowerState::D0), Err(STATUS_DEVICE_NOT_READY) )",
   "( manager.set_power(device, PowerState::D1), Err(STATUS_INVALID_DEVICE_STATE) )",
   "( manager.set_power(device, PowerState::D0), Err(STATUS_INVALID_DEVICE_STATE) )"
+ ],
+ "precompile_only_builds_exact_cache_without_guest_entry_and_warm_run_avoids_fallback": [
+  "(cold.image_hash.len(), 64)",
+  "(cold.blocks_precompiled, 3)",
+  "(cold.aot_hits, 0)",
+  "(cold.aot_misses, 3)",
+  "(cold.aot_rejected, 0)",
+  "(Path::new(&cold.profile_path).is_file(), true)"
  ],
  "predefined_palettes_carry_real_color_tables_and_flags": [
   "( dispatch_x86( &mut fixture, HostThunk::WicFactoryCreatePalette, &[factory as u32, PALETTE_OUT as u32] ), 0 )",
@@ -10929,6 +11087,11 @@
   "( slot.fs_base, session.runtime.teb_base, \"the slot must keep the guest TEB/TLS base\" )",
   "( slot.metrics.blocks_executed, round, \"metrics must accumulate on the persistent slot\" )",
   "(slot.has_wait, false)"
+ ],
+ "profile_round_trip_and_corrupt_copy_rejected_with_exact_checksum_error": [
+  "(loaded, targets)",
+  "(loaded.address_count(), 4)",
+  "(error, ProfileError::ChecksumMismatch { .. })"
  ],
  "profiles_are_internally_consistent": [
   "(desktop.windows_version, WindowsVersion::Win11)",
@@ -11571,6 +11734,14 @@
   "( call_slot( &mut fixture, rot, 6, &[rot as u32, unknown as u32, OUT as u32] ), MK_E_UNAVAILABLE )",
   "( call_slot(&mut fixture, rot, 6, &[rot as u32, unknown as u32, 0]), E_POINTER )"
  ],
+ "runtime_profile_persistence_round_trips_targets_and_rejects_wrong_key": [
+  "(writer.persist_aot_profile(&[(0x1000, 9)]), Ok(3))",
+  "(reader.load_aot_profile(), Ok(3))",
+  "(targets.get(ProfileTargetKind::HotBlock, 0x1000), Some(9))",
+  "(targets.get(ProfileTargetKind::DirectCall, 0x1010), Some(1))",
+  "( targets.get(ProfileTargetKind::FunctionEntry, 0x1010), Some(1) )",
+  "( targets.get(ProfileTargetKind::IndirectCall, 0x2020), Some(1) )"
+ ],
  "runtime_root_precedence_rejects_missing_duplicate_and_relative_roots": [
   "( roots.first(), Some(&first.canonicalize().expect(\"canonical\")) )",
   "( roots.contains(&home.join(\".dotnet\")), false, \"a home directory without .dotnet is not a CLR root\" )",
@@ -12094,6 +12265,13 @@
   "(empty.len(), 0)",
   "(cleared, false)"
  ],
+ "smc_invalidation_clears_profile_targets_and_never_reseeds_stale_code": [
+  "( runtime .aot_profile_targets() .get(ProfileTargetKind::DirectCall, 0x1010), Some(1) )",
+  "( runtime .aot_profile_targets() .get(ProfileTargetKind::FunctionEntry, 0x1010), Some(1) )",
+  "( runtime .aot_profile_targets() .get(ProfileTargetKind::DirectCall, 0x1010), None )",
+  "( runtime .aot_profile_targets() .get(ProfileTargetKind::FunctionEntry, 0x1010), None )",
+  "(runtime.aot_profile_targets().contains(0x1000), false)"
+ ],
  "smc_watch_full_table_rejects_absent_page": [
   "(state.watched_count.load(Ordering::Acquire), SMC_WATCH_SLOTS)",
   "(state.watch_overflow.load(Ordering::Acquire), false)",
@@ -12190,6 +12368,11 @@
   "(drive, \"C\", \"CON.txt should default to C drive\")",
   "(drive2, \"C\", \"NUL.dat should default to C drive\")",
   "(drive3, \"C\", \"LPT1.000 should default to C drive\")"
+ ],
+ "stale_profile_wrong_image_translator_and_cpu_are_rejected_with_exact_reasons": [
+  "( load_profile_file(&path, &wrong_image), Err(ProfileError::ImageHashMismatch { found: \"image-stale\".to_string(), expected: \"image-other\".to_string(), }) )",
+  "( load_profile_file(&path, &wrong_translator), Err(ProfileError::TranslatorMismatch { found: AOT_TRANSLATOR_VERSION, expected: AOT_TRANSLATOR_VERSION + 1, }) )",
+  "( load_profile_file(&path, &wrong_cpu), Err(ProfileError::CpuProfileMismatch { found: aot_target_cpu_profile(), expected: aot_target_cpu_profile() ^ 0x5a5a, }) )"
  ],
  "start_stop_and_remove_state_machine_rejects_invalid_transitions": [
   "( manager.remove_device(root), Err(STATUS_INVALID_DEVICE_STATE) )",
@@ -14639,6 +14822,9 @@
  "truncate_existing_requires_write_access": [
   "( result.expect_err(\"read-only access must fail\").code, ReasonCode::RcHelperPermissionDenied, \"TRUNCATE_EXISTING without write access must be ERROR_ACCESS_DENIED\" )"
  ],
+ "truncated_profile_record_is_rejected_with_exact_truncated_error": [
+  "( ProfileTargets::decode(&bytes, &key), Err(ProfileError::Truncated(\"records\")) )"
+ ],
  "try_vec_and_box_are_fallible": [
   "(*try_box(String::from(\"hello\")).unwrap(), \"hello\")"
  ],
@@ -15609,6 +15795,11 @@
  ],
  "win_verify_trust_rejects_non_file_union_choice": [
   "(result, 0x800B_0003)"
+ ],
+ "windowed_present_missing_display_session_reports_exact_reason": [
+  "( summary.present_unavailable, Some(TimingUnavailable::NoDisplaySession) )",
+  "( summary.to_json_metrics()[\"input_to_present_p50_us\"][\"reason\"], serde_json::Value::String(TimingUnavailable::NoDisplaySession.reason().to_string()) )",
+  "( TimingUnavailable::NoDisplaySession.reason(), \"no macOS window-server display session is available; a windowed CAMetalLayer cannot present and presentedTime is unavailable\" )"
  ],
  "windows_kernel_shim_irp_queue": [
   "(shim.irp_queue.len(), 2)",

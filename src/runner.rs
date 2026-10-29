@@ -180,6 +180,21 @@ struct RunnerCli {
     /// `--jit-self-test`).  Prints the JSON report on success.
     #[arg(long, hide = true)]
     jit_self_test_child: bool,
+    /// Build the persistent AOT cache for a PE image without entering the
+    /// guest.  Use with `--job <job.json>`, or with `--program <exe>` plus a
+    /// cache location (`--cache-root <dir>` or `--ge-root <dir>`).  Prints a
+    /// machine-readable summary and exits non-zero on any integrity failure.
+    #[arg(long)]
+    precompile_only: bool,
+    /// PE image to precompile when `--precompile-only` is used without a job.
+    #[arg(long)]
+    program: Option<PathBuf>,
+    /// Cache directory root (the store lives under `<cache-root>/aot/`).
+    #[arg(long)]
+    cache_root: Option<PathBuf>,
+    /// Game environment root; the cache root is `<ge-root>/cache`.
+    #[arg(long)]
+    ge_root: Option<PathBuf>,
 }
 
 pub fn runner_main<I, S>(args: I) -> i32
@@ -848,6 +863,54 @@ pub fn replay_trace(trace_path: &Path, ge: &GameEnvironment) -> AppResult<Canoni
     Ok(actual)
 }
 
+/// Resolve the inputs of `--precompile-only`.
+///
+/// A job carries the program, deterministic mode and the game-environment
+/// root, so the install-time cache lands in exactly the same store a later
+/// launch uses.  Without a job, `--program` plus `--cache-root`/`--ge-root`
+/// is enough; no guest entry is ever performed.
+fn load_precompile_only_request(cli: &RunnerCli) -> AppResult<(PathBuf, PathBuf, bool)> {
+    if let Some(job_path) = cli.job.as_ref() {
+        let contents = fs::read_to_string(job_path).map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcRunnerProtocolInvalid,
+                format!("failed to read {}", job_path.display()),
+                &error,
+            )
+        })?;
+        let job = serde_json::from_str::<RunnerJob>(&contents).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcRunnerProtocolInvalid,
+                format!("failed to parse {}", job_path.display()),
+            )
+            .with_hint(error.to_string())
+        })?;
+        return Ok((job.program, job.ge_root.join("cache"), job.dtm));
+    }
+    let program = cli.program.clone().ok_or_else(|| {
+        AppError::new(
+            ReasonCode::RcRunnerProtocolInvalid,
+            "--precompile-only needs --job or --program",
+        )
+        .with_hint(
+            "usage: casa1-runner --precompile-only --program <exe> \
+             (--cache-root <dir> | --ge-root <dir>)",
+        )
+    })?;
+    let cache_root = match (cli.cache_root.clone(), cli.ge_root.clone()) {
+        (Some(cache_root), _) => cache_root,
+        (None, Some(ge_root)) => ge_root.join("cache"),
+        (None, None) => {
+            return Err(AppError::new(
+                ReasonCode::RcRunnerProtocolInvalid,
+                "--precompile-only needs a cache location",
+            )
+            .with_hint("pass --cache-root <dir> or --ge-root <dir>"));
+        }
+    };
+    Ok((program, cache_root, false))
+}
+
 fn runner_main_impl<I, S>(args: I) -> AppResult<String>
 where
     I: IntoIterator<Item = S>,
@@ -860,12 +923,21 @@ where
     if cli.jit_self_test_child {
         return util::stable_json(&crate::jit::run_jit_self_test_child()?);
     }
+    if cli.precompile_only {
+        let (program, cache_root, dtm) = load_precompile_only_request(&cli)?;
+        let report = crate::pe_runtime::precompile_only_image(&program, &cache_root, dtm)?;
+        return util::stable_json(&report);
+    }
     let job_path = cli.job.ok_or_else(|| {
         AppError::new(
             ReasonCode::RcRunnerProtocolInvalid,
             "no --job provided (or --jit-self-test)",
         )
-        .with_hint("usage: casa1-runner --job <job.json> | casa1-runner --jit-self-test")
+        .with_hint(
+            "usage: casa1-runner --job <job.json> | casa1-runner --jit-self-test | \
+             casa1-runner --precompile-only (--job <job.json> | --program <exe> \
+             [--cache-root <dir>|--ge-root <dir>])",
+        )
     })?;
     let contents = fs::read_to_string(&job_path).map_err(|error| {
         AppError::from_io(
