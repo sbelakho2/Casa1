@@ -21192,6 +21192,23 @@ impl PeHostRuntime {
                     .is_ok_and(|object_type| object_type == crate::win32::ObjectType::Pipe);
 
                 if handle == STD_OUTPUT_HANDLE || handle == STD_ERROR_HANDLE {
+                    if handle == STD_ERROR_HANDLE
+                        && std::env::var_os("CASA1_ERR_TRACE").is_some()
+                    {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static WF: AtomicU32 = AtomicU32::new(0);
+                        if WF.fetch_add(1, Ordering::Relaxed) < 96 {
+                            let next = memory
+                                .read_bytes(buffer_ptr + length as u64, 32)
+                                .unwrap_or_default();
+                            eprintln!(
+                                "[writefile-err] buf={buffer_ptr:#x} len={length} mapped={} next_mapped={} next={:?}",
+                                memory.is_range_mapped(buffer_ptr, length),
+                                memory.is_range_mapped(buffer_ptr + length as u64, 32),
+                                String::from_utf8_lossy(&next)
+                            );
+                        }
+                    }
                     let bytes = read_window(memory, buffer_ptr, length)?;
                     let text = String::from_utf8_lossy(&bytes);
                     if handle == STD_ERROR_HANDLE {
@@ -38689,10 +38706,22 @@ impl PeHostRuntime {
                             u64::from(slot).wrapping_sub(self.mapped_image_base)
                         )
                     };
+                    let file_rva = 0x3511a0u64;
+                    let file_addr = self.mapped_image_base.wrapping_add(file_rva);
+                    let mut file_literal = Vec::new();
+                    if let Ok(bytes) = memory.read_bytes(file_addr, 128) {
+                        file_literal = bytes;
+                    }
+                    let file_nul = file_literal.iter().position(|byte| *byte == 0);
+                    let file_mapped = memory.is_range_mapped(file_addr, 128);
                     eprintln!(
-                        "[cxxthrow] code={code:#x} params={:x?} object={object:#x} type={type_name:?} what={what_text:?} what_ptr={what_ptr:#x} what_err={what_error:?} vtable={vtable:#x} slots=[{}] strings={strings:?} stderr={guest_stderr:?}",
+                        "[cxxthrow] code={code:#x} params={:x?} object={object:#x} type={type_name:?} what={what_text:?} what_ptr={what_ptr:#x} what_err={what_error:?} vtable={vtable:#x} slots=[{}] file_addr={file_addr:#x} file_mapped={file_mapped} file_nul={file_nul:?} file_literal={:?} strings={strings:?} stderr={guest_stderr:?}",
                         raise_parameters,
-                        slots.iter().map(|slot| slot_rva(*slot)).collect::<Vec<_>>().join(", ")
+                        slots.iter().map(|slot| slot_rva(*slot)).collect::<Vec<_>>().join(", "),
+                        String::from_utf8_lossy(&file_literal)
+                            .chars()
+                            .take(120)
+                            .collect::<String>()
                     );
                     self.push_trace(
                         "process",

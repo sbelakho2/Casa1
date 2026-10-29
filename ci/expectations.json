@@ -11270,6 +11270,11 @@
  "read_body_with_huge_count_does_not_panic": [
   "(body, br#\"{\"ok\":true}\"#)"
  ],
+ "read_bytes_unmapped_boundary_is_error_not_partial": [
+  "( memory .read_bytes(page, 0x1000) .expect(\"fully mapped page\") .len(), 0x1000 )",
+  "(text.len(), 0x10)",
+  "(text[0x0f], 0)"
+ ],
  "read_file_denied_on_write_only_handle": [
   "(runtime.last_error, 0)",
   "(result, 0, \"ReadFile must fail on a write-only handle\")",

@@ -909,6 +909,13 @@ impl PeHostRuntime {
                     } else {
                         read_c_string_limit(memory, ptr, max)?
                     };
+                    if std::env::var_os("CASA1_ERR_TRACE").is_some() {
+                        eprintln!(
+                            "[fmt-s] ptr={ptr:#x} len={} text={:?}",
+                            rendered.len(),
+                            String::from_utf8_lossy(&rendered[..rendered.len().min(120)])
+                        );
+                    }
                     if precision >= 0 {
                         rendered.truncate(precision as usize);
                     }
@@ -1048,6 +1055,13 @@ impl PeHostRuntime {
                 }
                 index += 1;
             }
+        }
+        if std::env::var_os("CASA1_ERR_TRACE").is_some() {
+            eprintln!(
+                "[fmt-out] len={} text={:?}",
+                out.len(),
+                String::from_utf8_lossy(&out[..out.len().min(300)])
+            );
         }
         Ok(out)
     }
@@ -1683,7 +1697,25 @@ impl PeHostRuntime {
         if buffer == 0 || total == 0 {
             return Ok(0);
         }
-        let bytes = memory.read_bytes(buffer, total)?;
+        if self.crt_iob_index(stream) == Some(2) && std::env::var_os("CASA1_ERR_TRACE").is_some() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static FW: AtomicU32 = AtomicU32::new(0);
+            if FW.fetch_add(1, Ordering::Relaxed) < 96 {
+                eprintln!(
+                    "[fwrite] buffer={buffer:#x} size={size} count={count} total={total} mapped={}",
+                    memory.is_range_mapped(buffer, total)
+                );
+            }
+        }
+        let bytes = match memory.read_bytes(buffer, total) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if self.crt_iob_index(stream) == Some(2) {
+                    eprintln!("[fwrite-err] buffer={buffer:#x} total={total} error={error}");
+                }
+                return Err(error);
+            }
+        };
         if let Some(index) = self.crt_iob_index(stream) {
             let text = String::from_utf8_lossy(&bytes);
             if index == 2 {

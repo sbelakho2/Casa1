@@ -4558,3 +4558,41 @@ fn x86_flag_audit_boundary_jit_matches_interpreter() {
         "JIT/interpreter flag divergences: {divergences:#?}"
     );
 }
+
+/// Pins the mapping invariant behind the protobuf-banner investigation:
+/// a read whose range crosses into an unmapped page must fail exactly, never
+/// return a truncated success.  This is the property that rules out a
+/// "page-tail partial read" explanation for the 50-byte banner cut.
+#[test]
+fn read_bytes_unmapped_boundary_is_error_not_partial() {
+    let mut memory = MemoryImage::default();
+    let page = 0x4000_0000u64;
+    memory.map_bytes(page, &vec![b'A'; 0x1000]);
+
+    assert_eq!(
+        memory
+            .read_bytes(page, 0x1000)
+            .expect("fully mapped page")
+            .len(),
+        0x1000
+    );
+    assert!(
+        memory.read_bytes(page, 0x1001).is_err(),
+        "a read one byte past the mapped page must be an exact error"
+    );
+    assert!(
+        memory.read_bytes(page + 0xff0, 0x11).is_err(),
+        "a read crossing the page boundary must error, not truncate"
+    );
+
+    // A string that terminates exactly at the last mapped byte is readable in
+    // full; the same read one byte longer is not.
+    let mut last = vec![b'B'; 0x1000];
+    last[0xfff] = 0;
+    memory.map_bytes(page, &last);
+    let text = memory
+        .read_bytes(page + 0xff0, 0x10)
+        .expect("string ends inside the page");
+    assert_eq!(text.len(), 0x10);
+    assert_eq!(text[0x0f], 0);
+}
