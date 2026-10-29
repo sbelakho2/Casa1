@@ -38541,21 +38541,59 @@ impl PeHostRuntime {
                     {
                         dump = bytes.to_vec();
                     }
-                    let mut strings = Vec::new();
-                    let mut start = None;
-                    for (index, byte) in dump.iter().enumerate() {
-                        if byte.is_ascii_graphic() || *byte == b' ' {
-                            start.get_or_insert(index);
-                        } else if let Some(begin) = start.take() {
-                            if index - begin >= 4 {
-                                strings.push(String::from_utf8_lossy(&dump[begin..index]).into_owned());
+                    let mut strings: Vec<String> = Vec::new();
+                    let mut collect = |bytes: &[u8]| {
+                        let mut begin = None;
+                        for (index, byte) in bytes.iter().enumerate() {
+                            if byte.is_ascii_graphic() || *byte == b' ' {
+                                begin.get_or_insert(index);
+                            } else if let Some(from) = begin.take() {
+                                if index - from >= 6 {
+                                    let text =
+                                        String::from_utf8_lossy(&bytes[from..index]).into_owned();
+                                    if !strings.contains(&text) {
+                                        strings.push(text);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(from) = begin {
+                            if bytes.len() - from >= 6 {
+                                let text =
+                                    String::from_utf8_lossy(&bytes[from..]).into_owned();
+                                if !strings.contains(&text) {
+                                    strings.push(text);
+                                }
+                            }
+                        }
+                    };
+                    collect(&dump);
+                    // The FatalException object stores its message behind a
+                    // std::string pointer; follow every pointer-like dword in
+                    // the object's first 32 bytes and collect printable runs.
+                    if object != 0 {
+                        for index in 0..8u64 {
+                            if let Ok(word) = read_guest_u32(memory, u64::from(object) + index * 4) {
+                                if word >= 0x1_0000
+                                    && let Ok(bytes) = memory.read_bytes(u64::from(word), 512)
+                                {
+                                    collect(&bytes);
+                                }
                             }
                         }
                     }
-                    if let Some(begin) = start {
-                        if dump.len() - begin >= 4 {
-                            strings.push(String::from_utf8_lossy(&dump[begin..]).into_owned());
+                    // The GOOGLE_LOG buffer is a local on the throwing
+                    // thread's stack; scan around the exception object for
+                    // the completed banner/message.
+                    if object != 0 {
+                        let start = u64::from(object).saturating_sub(0x800);
+                        if let Ok(bytes) = memory.read_bytes(start, 0x1000) {
+                            collect(&bytes);
                         }
+                    }
+                    let mut guest_stderr = self.stderr.clone();
+                    if guest_stderr.len() > 4096 {
+                        guest_stderr.truncate(4096);
                     }
                     // Decode the MSVC ThrowInfo -> CatchableTypeArray ->
                     // CatchableType -> TypeDescriptor chain to name the
@@ -38595,9 +38633,66 @@ impl PeHostRuntime {
                             }
                         }
                     }
+                    // Resolve the exception vtable and call slot 1 with
+                    // ECX = object (MSVC `std::exception::what`).  The probe
+                    // runs on a cloned state and a scratch stack so the
+                    // original exception dispatch is unaffected.
+                    let vtable = if object != 0 {
+                        read_guest_u32(memory, u64::from(object)).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let mut slots = [0u32; 4];
+                    if vtable != 0 {
+                        for (index, slot) in slots.iter_mut().enumerate() {
+                            *slot = read_guest_u32(memory, u64::from(vtable) + index as u64 * 4)
+                                .unwrap_or(0);
+                        }
+                    }
+                    let mut what_text = String::new();
+                    let mut what_ptr = 0u64;
+                    let mut what_error = String::new();
+                    if slots[1] != 0 {
+                        let saved = state.clone();
+                        let mut probe = state.clone();
+                        probe.set(Register::Rsp, 0x700f_0ff0);
+                        probe.set(Register::Rcx, u64::from(object));
+                        probe.rip = u64::from(slots[1]);
+                        let _ = memory.map_bytes(0x700f_0000, &[0u8; 0x1000]);
+                        match self.execute_guest_callback(
+                            &mut probe,
+                            memory,
+                            u64::from(slots[1]),
+                            &[],
+                            "protobuf_what",
+                        ) {
+                            Ok(value) => {
+                                what_ptr = u64::from(value as u32);
+                                if what_ptr >= 0x1_0000
+                                    && let Ok(bytes) = memory.read_bytes(what_ptr, 4096)
+                                {
+                                    let end = bytes
+                                        .iter()
+                                        .position(|byte| *byte == 0)
+                                        .unwrap_or(bytes.len());
+                                    what_text =
+                                        String::from_utf8_lossy(&bytes[..end]).into_owned();
+                                }
+                            }
+                            Err(error) => what_error = error.to_string(),
+                        }
+                        *state = saved;
+                    }
+                    let slot_rva = |slot: u32| {
+                        format!(
+                            "{slot:#x} (main_rva {:#x})",
+                            u64::from(slot).wrapping_sub(self.mapped_image_base)
+                        )
+                    };
                     eprintln!(
-                        "[cxxthrow] code={code:#x} params={:x?} object={object:#x} type={type_name:?} strings={strings:?}",
-                        raise_parameters
+                        "[cxxthrow] code={code:#x} params={:x?} object={object:#x} type={type_name:?} what={what_text:?} what_ptr={what_ptr:#x} what_err={what_error:?} vtable={vtable:#x} slots=[{}] strings={strings:?} stderr={guest_stderr:?}",
+                        raise_parameters,
+                        slots.iter().map(|slot| slot_rva(*slot)).collect::<Vec<_>>().join(", ")
                     );
                     self.push_trace(
                         "process",
@@ -38616,6 +38711,15 @@ impl PeHostRuntime {
                             ),
                             ("strings".to_string(), json!(strings)),
                             ("type_name".to_string(), json!(type_name)),
+                            ("guest_stderr".to_string(), json!(guest_stderr)),
+                            ("what".to_string(), json!(what_text)),
+                            ("what_ptr".to_string(), json!(format!("{what_ptr:#x}"))),
+                            ("what_error".to_string(), json!(what_error)),
+                            ("vtable".to_string(), json!(format!("{vtable:#x}"))),
+                            (
+                                "vtable_slots".to_string(),
+                                json!(slots.to_vec()),
+                            ),
                         ]),
                         json!(null),
                     );
