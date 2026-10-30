@@ -36,49 +36,57 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least privilege: workflows only read repository contents; jobs that need
+# more (cross-run artifacts) add it at the job level.
+permissions:
+  contents: read
+
 jobs:
   steam-e2e:
     name: Steam E2E Acceptance (S0-S13)
     runs-on: [self-hosted, macos, arm64]
     steps:
       # Exact SHA: evidence must tie to the precise commit being released.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
 
       - name: Build release binaries
         run: cargo build --release --bins
 
-      - name: Sign binaries (Developer ID when available, else ad-hoc)
+      - name: Sign binaries (Developer ID, fail closed)
         shell: bash
         run: |
           set -euo pipefail
           # Signed JIT: casa1-runner needs the allow-jit entitlement in its
-          # embedded signature for MAP_JIT guest execution. Sign it with the
-          # Developer ID identity held by this self-hosted runner when one
-          # exists; record the signing mode for the evidence.
+          # embedded signature for MAP_JIT guest execution. Ad-hoc signing is
+          # rejected here: this workflow produces release evidence, and the
+          # signed JIT self-test is only meaningful for a notarized Developer
+          # ID build.
           IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
             | awk '/Developer ID Application/ {print $2; exit}')"
-          if [[ -n "$IDENTITY" ]]; then
-            for b in casa1 macwin casa1-helper casa1-test-guest casa1-oracle; do
-              /usr/bin/codesign --force --sign "$IDENTITY" --options runtime "target/release/$b"
-            done
-            /usr/bin/codesign --force --sign "$IDENTITY" --options runtime \
-              --entitlements ci/entitlements/casa1-runner.plist \
-              target/release/casa1-runner
-            echo "SIGNING_MODE=developer-id" >> "$GITHUB_ENV"
-          else
-            for b in casa1 macwin casa1-helper casa1-test-guest casa1-oracle; do
-              /usr/bin/codesign --force --sign - "target/release/$b"
-            done
-            /usr/bin/codesign --force --sign - \
-              --entitlements ci/entitlements/casa1-runner.plist \
-              target/release/casa1-runner
-            echo "SIGNING_MODE=ad-hoc" >> "$GITHUB_ENV"
+          if [[ -z "$IDENTITY" ]]; then
+            echo "::error::No 'Developer ID Application' identity found in the runner keychain."
+            echo "::error::Steam E2E evidence requires a notarizable Developer ID build; ad-hoc signing is not accepted."
+            security find-identity -v -p codesigning || true
+            exit 1
           fi
-          echo "Signed with: ${IDENTITY:-ad-hoc}"
+          for b in casa1 macwin casa1-helper casa1-test-guest casa1-oracle; do
+            /usr/bin/codesign --force --sign "$IDENTITY" --options runtime "target/release/$b"
+          done
+          /usr/bin/codesign --force --sign "$IDENTITY" --options runtime \
+            --entitlements ci/entitlements/casa1-runner.plist \
+            target/release/casa1-runner
+          echo "SIGNING_MODE=developer-id" >> "$GITHUB_ENV"
+          echo "Signed with: $IDENTITY"
+
+      - name: Notarize and staple (Developer ID)
+        if: env.SIGNING_MODE == 'developer-id'
+        env:
+          NOTARYTOOL_PROFILE: ${{ vars.CASA1_NOTARYTOOL_PROFILE || 'casa1-notary' }}
+        run: ./ci/notarize_release.sh
 
       # Smoke the signed artifacts on the same machine that will E2E them:
       # fail-closed release smoke (JIT self-test, packaged-runner PE
@@ -273,7 +281,7 @@ jobs:
 
       - name: Upload evidence (steam-e2e-<sha>)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: steam-e2e-${{ github.sha }}
           path: e2e-evidence/

@@ -24,17 +24,22 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least privilege: workflows only read repository contents; jobs that need
+# more (cross-run artifacts) add it at the job level.
+permissions:
+  contents: read
+
 jobs:
   generate-corpus:
     name: Generate Exhaustive Corpus
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Generate the exhaustive differential vector corpus
         run: cargo run -p casa1 --bin casa1-oracle -- vectors --exhaustive --out windows_oracle_vectors_exhaustive.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-oracle-vectors-exhaustive
           path: windows_oracle_vectors_exhaustive.json
@@ -45,10 +50,10 @@ jobs:
     needs: generate-corpus
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: windows-oracle-vectors-exhaustive
       - name: Build the Windows reference executable
@@ -82,7 +87,7 @@ jobs:
           Write-Host "OK: $exe embeds the application manifest with the Windows 10 supportedOS GUID"
       - name: Run the reference executable on the exhaustive corpus
         run: .\windows_reference\target\release\casa1-windows-reference.exe windows_oracle_vectors_exhaustive.json windows_oracle_reference_results_exhaustive.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-oracle-reference-results-exhaustive
           path: |
@@ -95,10 +100,10 @@ jobs:
     needs: reference-capture
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: windows-oracle-reference-results-exhaustive
       - name: Compare Casa1 runtime results against the Windows reference results

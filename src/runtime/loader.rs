@@ -647,16 +647,37 @@ impl PeHostRuntime {
                 eprintln!("[pe_runtime] warning: loading unsigned DLL {normalized}");
             }
             crate::security::AuthenticodeVerdict::Invalid(ref reason) => {
+                if parsed.subsystem == IMAGE_SUBSYSTEM_NATIVE {
+                    eprintln!(
+                        "[pe_runtime] rejecting driver {normalized} with invalid Authenticode signature: {reason}"
+                    );
+                    return (0, ERROR_MOD_NOT_FOUND);
+                }
+                // H4: a failed Authenticode check must not block a non-driver
+                // user-mode DLL.  Windows only enforces signatures for
+                // drivers / protected processes; log and keep loading.
                 eprintln!(
-                    "[pe_runtime] rejecting PE {normalized} with invalid Authenticode signature: {reason}"
+                    "[pe_runtime] warning: {normalized} has an invalid Authenticode signature ({reason}); loading anyway"
                 );
-                return (0, ERROR_MOD_NOT_FOUND);
             }
         }
 
-        // Allocate a module handle in guest space
-        let handle = align_up_u64(self.next_data_address, 0x1000);
-        self.next_data_address = handle + 0x1000;
+        // E1: map a REAL image (sections, relocations) at its preferred base
+        // BEFORE any DllMain is queued.  The old code handed the guest a
+        // heap handle and jumped to handle + AddressOfEntryPoint, i.e. ran the
+        // entry point out of uninitialised heap.  A mapping failure is a bad
+        // image and LoadLibrary must return NULL with ERROR_BAD_EXE_FORMAT.
+        let selected_base = parsed.image_base;
+        let mapped = match crate::pe::map_image_at(&pe_bytes, &parsed, selected_base) {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                eprintln!(
+                    "[pe_runtime] failed to map PE image {normalized} at {selected_base:#x}: {error}"
+                );
+                return (0, crate::error::ERROR_BAD_EXE_FORMAT);
+            }
+        };
+        let handle = mapped.selected_base;
 
         // Try to load a native shim (macOS dylib equivalent)
         let native_library = Self::load_native_shim(&normalized);
@@ -750,6 +771,45 @@ impl PeHostRuntime {
             None
         };
 
+        // Resolve the image's IAT entries now that every provider's export
+        // thunks exist.  They are written into the mapped image immediately
+        // before DllMain runs (see `materialize_real_dll_image`).
+        let mut import_thunks: Vec<(u32, u64)> = Vec::new();
+        for descriptor in parsed.imports.iter().chain(parsed.delay_imports.iter()) {
+            let provider = normalize_module_name(&descriptor.dll_name);
+            let provider_is_self = provider == normalized;
+            let provider_handle = if provider_is_self {
+                0
+            } else {
+                self.lookup_module_handle(&provider)
+                    .or_else(|| {
+                        if export_tables().contains_key(&provider) {
+                            Some(self.get_or_create_module_handle(&provider))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0)
+            };
+            for thunk in &descriptor.imports {
+                let address = if provider_is_self {
+                    match &thunk.symbol {
+                        pe::ImportSymbol::ByName { name, .. } => {
+                            export_thunks.get(name).copied().unwrap_or(0)
+                        }
+                        pe::ImportSymbol::ByOrdinal { .. } => 0,
+                    }
+                } else if provider_handle != 0 {
+                    self.resolve_proc_address(provider_handle, thunk.symbol.clone())
+                } else {
+                    0
+                };
+                if address != 0 {
+                    import_thunks.push((thunk.iat_rva, address));
+                }
+            }
+        }
+
         let state = RealDllState {
             path: host_path.to_path_buf(),
             dll_name: normalized.clone(),
@@ -759,6 +819,10 @@ impl PeHostRuntime {
             refcount: 1,
             handle,
             native_library,
+            mapped_image: Some(mapped),
+            materialized: false,
+            import_thunks,
+            pointer_bytes: parsed.pointer_bytes(),
         };
 
         // Queue DllMain(DLL_PROCESS_ATTACH) for execution after the host thunk
@@ -829,11 +893,76 @@ impl PeHostRuntime {
         (handle, 0)
     }
 
-    /// Call a loaded DLL's entry point (DllMain) with the given reason code.
-    ///
-    /// `entry_point_rva` is the RVA from the PE header.
-    /// `reason` is one of `DLL_PROCESS_ATTACH`, `DLL_THREAD_ATTACH`,
-    /// `DLL_THREAD_DETACH`, or `DLL_PROCESS_DETACH`.
+    /// Copy a mapped real-DLL image into guest memory (once) and patch its
+    /// IAT entries.  Called from the DllMain drain, before TLS callbacks and
+    /// the entry point run.
+    pub(crate) fn materialize_real_dll_image(
+        &mut self,
+        image_base: u64,
+        memory: &mut MemoryImage,
+    ) -> AppResult<()> {
+        let Some(state) = self
+            .loaded_real_dlls
+            .values()
+            .find(|state| state.handle == image_base)
+        else {
+            return Ok(());
+        };
+        if state.materialized {
+            return Ok(());
+        }
+        let Some(mapped) = state.mapped_image.clone() else {
+            return Ok(());
+        };
+        let import_thunks = state.import_thunks.clone();
+        let pointer_bytes = state.pointer_bytes;
+        let mut bytes = mapped.memory;
+        for (iat_rva, address) in import_thunks {
+            let offset = iat_rva as usize;
+            if offset + pointer_bytes > bytes.len() {
+                continue;
+            }
+            if pointer_bytes == 8 {
+                bytes[offset..offset + 8].copy_from_slice(&address.to_le_bytes());
+            } else {
+                bytes[offset..offset + 4].copy_from_slice(&(address as u32).to_le_bytes());
+            }
+        }
+        let size = bytes.len() as u64;
+        memory.map_bytes(mapped.selected_base, &bytes);
+        self.win32.address_space_mut().register(
+            mapped.selected_base,
+            size,
+            crate::vm::VmRegionKind::Image,
+        );
+        self.win32.address_space_mut().commit(
+            mapped.selected_base,
+            size,
+            crate::vm::VmProtection::READ_WRITE_EXECUTE,
+            false,
+        );
+        for section in &mapped.sections {
+            let protection = crate::vm::VmProtection {
+                read: section.protection.read,
+                write: section.protection.write,
+                execute: section.protection.execute,
+            };
+            self.win32.address_space_mut().protect(
+                mapped.selected_base + u64::from(section.virtual_address),
+                u64::from(section.mapped_size),
+                protection,
+            );
+        }
+        if let Some(state) = self
+            .loaded_real_dlls
+            .values_mut()
+            .find(|state| state.handle == image_base)
+        {
+            state.materialized = true;
+        }
+        Ok(())
+    }
+
     /// Execute all queued DllMain calls after the current host thunk returns.
     ///
     /// DllMain calls are queued by [`load_real_dll`] when a real PE DLL with a
@@ -856,6 +985,11 @@ impl PeHostRuntime {
         while let Some((image_base, entry_point_rva, reason)) =
             self.pending_dll_main_calls.pop_front()
         {
+            // The mapped image must be in guest memory before the first TLS
+            // callback or DllMain executes.  Mapping itself (sections +
+            // relocations) already happened synchronously in `load_real_dll`;
+            // this copies those bytes in and patches the IAT.
+            self.materialize_real_dll_image(image_base, memory)?;
             // Modules marked by DisableThreadLibraryCalls never receive
             // DLL_THREAD_ATTACH / DLL_THREAD_DETACH notifications (the
             // loader-lock flag semantics of the Win32 API).
@@ -870,10 +1004,6 @@ impl PeHostRuntime {
             }
 
             let entry_point = image_base + entry_point_rva as u64;
-            eprintln!(
-                "[pe_runtime] DllMain({:#x}, {}, NULL) at {:#x}",
-                image_base, reason, entry_point
-            );
             self.execute_guest_callback(
                 state,
                 memory,
@@ -890,6 +1020,12 @@ impl PeHostRuntime {
         Ok(())
     }
 
+    /// Call a loaded DLL's entry point (DllMain) with the given reason code.
+    ///
+    /// `entry_point_rva` is the RVA from the PE header.  `reason` is one of
+    /// `DLL_PROCESS_ATTACH`, `DLL_THREAD_ATTACH`, `DLL_THREAD_DETACH`, or
+    /// `DLL_PROCESS_DETACH`.
+    ///
     /// Legacy stub — kept for any leftover callers.  Delegates to the queue-based
     /// mechanism via [`drain_pending_dll_main_calls`] (which is a no-op when the
     /// queue is empty).
@@ -1007,9 +1143,15 @@ impl PeHostRuntime {
         self.current_process_module_handles()
             .into_iter()
             .find(|handle| {
-                *handle != self.mapped_image_base
-                    && address >= *handle
-                    && address < *handle + 0x1000
+                if *handle == self.mapped_image_base || address < *handle {
+                    return false;
+                }
+                let size = self
+                    .dll_info_table
+                    .get(handle)
+                    .map(|info| info.image_size.max(0x1000))
+                    .unwrap_or(0x1000);
+                address < handle.saturating_add(size)
             })
     }
 
@@ -1177,6 +1319,7 @@ impl PeHostRuntime {
         handle: u64,
         reason: u32,
     ) -> AppResult<()> {
+        self.materialize_real_dll_image(handle, memory)?;
         let callbacks = self
             .dll_info_table
             .get(&handle)
@@ -1551,6 +1694,637 @@ impl PeHostRuntime {
 mod tests {
     use super::*;
     use crate::ge::GeArch;
+
+    const PROBE_IMAGE_BASE: u32 = 0x1000_0000;
+    const IAT_SELF_BY_NAME: u32 = 0x2080;
+    const IAT_SELF_BY_ORDINAL: u32 = 0x2084;
+    const IAT_PROVIDER: u32 = 0x2098;
+    const IAT_KERNEL32: u32 = 0x20A8;
+    const IAT_MISSING: u32 = 0x20B8;
+    const IMAGE_SUBSYSTEM_NATIVE: u16 = 1;
+    const IMAGE_SUBSYSTEM_WINDOWS_CUI: u16 = 3;
+
+    fn probe_runtime(name: &str) -> (PeHostRuntime, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), name, GeArch::X86, "win11-23h2")
+            .expect("game environment");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        runtime.guest_arch = GuestArch::X86;
+        runtime.next_thunk_address = thunk_base_for_arch(GuestArch::X86);
+        runtime.next_data_address = data_base_for_arch(GuestArch::X86);
+        runtime.next_heap_address = heap_base_for_arch(GuestArch::X86);
+        runtime
+            .win32
+            .reset_address_space(private_pages_base_for_arch(GuestArch::X86));
+        runtime.x86_heap_region = 0;
+        (runtime, temp_dir)
+    }
+
+    fn write_probe(temp_dir: &tempfile::TempDir, file_name: &str, image: &[u8]) -> PathBuf {
+        let path = temp_dir.path().join(file_name);
+        fs::write(&path, image).expect("write probe image");
+        path
+    }
+
+    /// Minimal PE32 (two sections, one named export) with optional knobs for
+    /// the loader error paths: unaligned `image_base` (map failure), native
+    /// subsystem + garbage Authenticode table (driver rejection), and a
+    /// four-descriptor import table exercising every IAT-resolution branch of
+    /// `load_real_dll`: self by-name, self by-ordinal, a loaded real provider,
+    /// the synthesizable `kernel32.dll` provider, and a missing module.
+    fn build_probe_pe(
+        dll_name: &str,
+        image_base: u32,
+        subsystem: u16,
+        garbage_cert: bool,
+        with_imports: bool,
+    ) -> Vec<u8> {
+        let mut pe = vec![0u8; 0x600];
+        // DOS header with e_lfanew == 0x80.
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3C..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        // NT headers: COFF (i386, two sections, 0xE0-byte optional header).
+        let nt = 0x80usize;
+        pe[nt..nt + 4].copy_from_slice(b"PE\0\0");
+        pe[nt + 4..nt + 6].copy_from_slice(&0x014C_u16.to_le_bytes());
+        pe[nt + 6..nt + 8].copy_from_slice(&2_u16.to_le_bytes());
+        pe[nt + 20..nt + 22].copy_from_slice(&0x00E0_u16.to_le_bytes());
+        pe[nt + 22..nt + 24].copy_from_slice(&0x2102_u16.to_le_bytes());
+        // Optional header (PE32).
+        let opt = nt + 24;
+        pe[opt..opt + 2].copy_from_slice(&0x010B_u16.to_le_bytes());
+        pe[opt + 16..opt + 20].copy_from_slice(&0_u32.to_le_bytes()); // no entry point: no DllMain
+        pe[opt + 20..opt + 24].copy_from_slice(&0x1000_u32.to_le_bytes());
+        pe[opt + 24..opt + 28].copy_from_slice(&0x1000_u32.to_le_bytes());
+        pe[opt + 28..opt + 32].copy_from_slice(&image_base.to_le_bytes());
+        pe[opt + 32..opt + 36].copy_from_slice(&0x1000_u32.to_le_bytes()); // SectionAlignment
+        pe[opt + 36..opt + 40].copy_from_slice(&0x200_u32.to_le_bytes()); // FileAlignment
+        pe[opt + 48..opt + 50].copy_from_slice(&4_u16.to_le_bytes()); // MajorSubsystemVersion
+        pe[opt + 56..opt + 60].copy_from_slice(&0x3000_u32.to_le_bytes()); // SizeOfImage
+        pe[opt + 60..opt + 64].copy_from_slice(&0x200_u32.to_le_bytes()); // SizeOfHeaders
+        pe[opt + 68..opt + 70].copy_from_slice(&subsystem.to_le_bytes());
+        pe[opt + 92..opt + 96].copy_from_slice(&16_u32.to_le_bytes()); // NumberOfRvaAndSizes
+        // Data directories: [0] export (RVA 0x1000, size 0x40), [1] import.
+        pe[opt + 96..opt + 100].copy_from_slice(&0x1000_u32.to_le_bytes());
+        pe[opt + 100..opt + 104].copy_from_slice(&0x40_u32.to_le_bytes());
+        if with_imports {
+            pe[opt + 104..opt + 108].copy_from_slice(&0x2000_u32.to_le_bytes());
+            pe[opt + 108..opt + 112].copy_from_slice(&0x80_u32.to_le_bytes());
+        }
+        if garbage_cert {
+            // IMAGE_DIRECTORY_ENTRY_SECURITY carries a FILE offset, not an RVA.
+            let security = opt + 96 + 4 * 8;
+            pe[security..security + 4].copy_from_slice(&0x600_u32.to_le_bytes());
+            pe[security + 4..security + 8].copy_from_slice(&0x20_u32.to_le_bytes());
+        }
+        // Section table: .edata (VA 0x1000, file 0x200), .idata (VA 0x2000, file 0x400).
+        let section = opt + 0xE0;
+        pe[section..section + 8].copy_from_slice(b".edata\0\0");
+        pe[section + 8..section + 12].copy_from_slice(&0x200_u32.to_le_bytes());
+        pe[section + 12..section + 16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        pe[section + 16..section + 20].copy_from_slice(&0x200_u32.to_le_bytes());
+        pe[section + 20..section + 24].copy_from_slice(&0x200_u32.to_le_bytes());
+        pe[section + 36..section + 40].copy_from_slice(&0x4000_0040_u32.to_le_bytes());
+        let idata_header = section + 40;
+        pe[idata_header..idata_header + 8].copy_from_slice(b".idata\0\0");
+        pe[idata_header + 8..idata_header + 12].copy_from_slice(&0x200_u32.to_le_bytes());
+        pe[idata_header + 12..idata_header + 16].copy_from_slice(&0x2000_u32.to_le_bytes());
+        pe[idata_header + 16..idata_header + 20].copy_from_slice(&0x200_u32.to_le_bytes());
+        pe[idata_header + 20..idata_header + 24].copy_from_slice(&0x400_u32.to_le_bytes());
+        pe[idata_header + 36..idata_header + 40].copy_from_slice(&0xC000_0040_u32.to_le_bytes());
+
+        // RVA → file offset for the two single-section images.
+        let edata = |rva: u32| -> usize { 0x200 + (rva - 0x1000) as usize };
+        let idata = |rva: u32| -> usize { 0x400 + (rva - 0x2000) as usize };
+        let put_u32 = |pe: &mut Vec<u8>, at: usize, value: u32| {
+            pe[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        let put_name = |pe: &mut Vec<u8>, at: usize, value: &str| {
+            pe[at..at + value.len()].copy_from_slice(value.as_bytes());
+        };
+
+        // Export directory at RVA 0x1000: one named function.
+        put_u32(&mut pe, edata(0x1000) + 12, 0x1080); // Name
+        put_u32(&mut pe, edata(0x1000) + 16, 1); // Base
+        put_u32(&mut pe, edata(0x1000) + 20, 1); // NumberOfFunctions
+        put_u32(&mut pe, edata(0x1000) + 24, 1); // NumberOfNames
+        put_u32(&mut pe, edata(0x1000) + 28, 0x1040); // AddressOfFunctions
+        put_u32(&mut pe, edata(0x1000) + 32, 0x1044); // AddressOfNames
+        put_u32(&mut pe, edata(0x1000) + 36, 0x1048); // AddressOfNameOrdinals
+        put_u32(&mut pe, edata(0x1040), 0x1050); // function RVA (outside the directory)
+        put_u32(&mut pe, edata(0x1044), 0x1060); // name RVA
+        put_u32(&mut pe, edata(0x1048), 0); // ordinal index
+        put_name(&mut pe, edata(0x1060), "ProbeExport\0");
+        put_name(&mut pe, edata(0x1080), &format!("{dll_name}\0"));
+
+        if with_imports {
+            // Four descriptors + null terminator at RVA 0x2000.
+            let mut descriptor = |index: u32, oft: u32, name_rva: u32, ft: u32| {
+                let at = idata(0x2000 + index * 20);
+                put_u32(&mut pe, at, oft);
+                put_u32(&mut pe, at + 12, name_rva);
+                put_u32(&mut pe, at + 16, ft);
+            };
+            descriptor(0, 0x2070, 0x2150, 0x2080); // self
+            descriptor(1, 0x2090, 0x2170, 0x2098); // loaded real provider
+            descriptor(2, 0x20A0, 0x2190, 0x20A8); // synthesizable kernel32
+            descriptor(3, 0x20B0, 0x21B0, 0x20B8); // missing module
+            // INT/IAT arrays (PE32: 4-byte entries, zero-terminated).
+            for (iat, hint_name) in [
+                (0x2070_u32, 0x20C0_u32),
+                (0x2080, 0x20C0),
+                (0x2090, 0x20D0),
+                (0x2098, 0x20D0),
+                (0x20A0, 0x20E0),
+                (0x20A8, 0x20E0),
+                (0x20B0, 0x20F0),
+                (0x20B8, 0x20F0),
+            ] {
+                put_u32(&mut pe, idata(iat), hint_name);
+            }
+            // Self ordinal import second entry (iat slot 0x2084).
+            put_u32(&mut pe, idata(0x2074), 0x8000_0001);
+            put_u32(&mut pe, idata(0x2084), 0x8000_0001);
+            // Hint/name entries.
+            for (at, symbol) in [
+                (0x20C0_u32, "ProbeExport\0"),
+                (0x20D0, "ProbeExport\0"),
+                (0x20E0, "CreateFileW\0"),
+                (0x20F0, "NoSuchExport\0"),
+            ] {
+                put_name(&mut pe, idata(at + 2), symbol);
+            }
+            // Imported module names.
+            put_name(&mut pe, idata(0x2150), "casa1_import_probe.dll\0");
+            put_name(&mut pe, idata(0x2170), "casa1_provider.dll\0");
+            put_name(&mut pe, idata(0x2190), "KERNEL32.dll\0");
+            put_name(&mut pe, idata(0x21B0), "definitely_missing_module.dll\0");
+        }
+
+        if garbage_cert {
+            // WIN_CERTIFICATE at file offset 0x600: well-formed header,
+            // garbage PKCS#7 payload → AuthenticodeVerdict::Invalid.
+            pe.extend_from_slice(&0x20_u32.to_le_bytes()); // dwLength
+            pe.extend_from_slice(&0x0200_u16.to_le_bytes()); // wRevision
+            pe.extend_from_slice(&0x0002_u16.to_le_bytes()); // WIN_CERT_TYPE_PKCS_SIGNED_DATA
+            pe.extend_from_slice(&[0xFF; 0x18]);
+        }
+        pe
+    }
+
+    #[test]
+    fn load_real_dll_rejects_driver_image_with_invalid_authenticode_signature() {
+        let (mut runtime, temp_dir) = probe_runtime("loader-driver-reject");
+        let image = build_probe_pe(
+            "casa1_driver_probe.sys",
+            PROBE_IMAGE_BASE,
+            IMAGE_SUBSYSTEM_NATIVE,
+            true,
+            false,
+        );
+        let path = write_probe(&temp_dir, "casa1_driver_probe.sys", &image);
+        let (handle, status) = runtime.load_real_dll("casa1_driver_probe.sys", &path);
+        assert_eq!(handle, 0, "an invalidly signed driver must not load");
+        assert_eq!(status, ERROR_MOD_NOT_FOUND);
+        assert!(
+            !runtime
+                .loaded_real_dlls
+                .contains_key("casa1_driver_probe.sys"),
+            "the rejected driver must not be registered"
+        );
+
+        // H4: the SAME invalid signature on a non-driver (user-mode) image
+        // must not block the load — Windows only enforces Authenticode for
+        // drivers / protected processes, so the image loads with a warning.
+        let user_image = build_probe_pe(
+            "casa1_invalid_sig_user.dll",
+            0x0E00_0000,
+            IMAGE_SUBSYSTEM_WINDOWS_CUI,
+            true,
+            false,
+        );
+        let user_path = write_probe(&temp_dir, "casa1_invalid_sig_user.dll", &user_image);
+        let (user_handle, user_status) =
+            runtime.load_real_dll("casa1_invalid_sig_user.dll", &user_path);
+        assert_eq!(
+            user_status, 0,
+            "an invalid signature must not block a user DLL"
+        );
+        assert_eq!(user_handle, 0x0E00_0000);
+        assert!(
+            runtime
+                .loaded_real_dlls
+                .contains_key("casa1_invalid_sig_user.dll")
+        );
+    }
+
+    #[test]
+    fn load_real_dll_rejects_unaligned_image_base_with_bad_exe_format() {
+        let (mut runtime, temp_dir) = probe_runtime("loader-unaligned-map");
+        // Parses cleanly; only `map_image_at` rejects the image base that is
+        // not aligned to SectionAlignment.
+        let image = build_probe_pe(
+            "casa1_unaligned_probe.dll",
+            PROBE_IMAGE_BASE + 1,
+            IMAGE_SUBSYSTEM_WINDOWS_CUI,
+            false,
+            false,
+        );
+        let path = write_probe(&temp_dir, "casa1_unaligned_probe.dll", &image);
+        let (handle, status) = runtime.load_real_dll("casa1_unaligned_probe.dll", &path);
+        assert_eq!(handle, 0, "the unaligned image must not map");
+        assert_eq!(status, crate::error::ERROR_BAD_EXE_FORMAT);
+        assert!(runtime.loaded_real_dlls.is_empty());
+    }
+
+    #[test]
+    fn load_real_dll_import_edge_missing_provider_and_ordinal_thunks_resolve_exactly() {
+        let (mut runtime, temp_dir) = probe_runtime("loader-import-edges");
+
+        // The provider maps at its own distinct preferred base so its state
+        // can never shadow the probe's handle in `materialize_real_dll_image`.
+        let provider_image = build_probe_pe(
+            "casa1_provider.dll",
+            0x0F00_0000,
+            IMAGE_SUBSYSTEM_WINDOWS_CUI,
+            false,
+            false,
+        );
+        let provider_path = write_probe(&temp_dir, "casa1_provider.dll", &provider_image);
+        let (provider_handle, provider_status) =
+            runtime.load_real_dll("casa1_provider.dll", &provider_path);
+        assert_eq!(provider_status, 0);
+        assert_ne!(provider_handle, 0);
+        let provider_thunk = runtime
+            .loaded_real_dlls
+            .get("casa1_provider.dll")
+            .expect("provider state")
+            .exports
+            .get("ProbeExport")
+            .copied()
+            .expect("provider ProbeExport thunk");
+        assert_ne!(provider_thunk, 0);
+
+        let probe_image = build_probe_pe(
+            "casa1_import_probe.dll",
+            PROBE_IMAGE_BASE,
+            IMAGE_SUBSYSTEM_WINDOWS_CUI,
+            false,
+            true,
+        );
+        let probe_path = write_probe(&temp_dir, "casa1_import_probe.dll", &probe_image);
+        let (handle, status) = runtime.load_real_dll("casa1_import_probe.dll", &probe_path);
+        assert_eq!(status, 0, "the import probe must load");
+        assert_eq!(handle, u64::from(PROBE_IMAGE_BASE));
+
+        let state = runtime
+            .loaded_real_dlls
+            .get("casa1_import_probe.dll")
+            .expect("probe state");
+        assert_eq!(state.pointer_bytes, 4);
+        let self_thunk = state
+            .exports
+            .get("ProbeExport")
+            .copied()
+            .expect("self export thunk");
+        assert_ne!(self_thunk, 0);
+        assert_eq!(
+            state.import_thunks.len(),
+            3,
+            "self by-name + loaded provider + synthesizable kernel32"
+        );
+        assert_eq!(state.import_thunks[0], (IAT_SELF_BY_NAME, self_thunk));
+        assert_eq!(state.import_thunks[1], (IAT_PROVIDER, provider_thunk));
+        assert_eq!(state.import_thunks[2].0, IAT_KERNEL32);
+        let kernel32_thunk = state.import_thunks[2].1;
+        assert_ne!(
+            kernel32_thunk, 0,
+            "kernel32!CreateFileW must synthesize a host thunk"
+        );
+        assert!(
+            !state
+                .import_thunks
+                .iter()
+                .any(|(iat_rva, _)| *iat_rva == IAT_SELF_BY_ORDINAL),
+            "ordinal-only self import must stay unresolved"
+        );
+        assert!(
+            !state
+                .import_thunks
+                .iter()
+                .any(|(iat_rva, _)| *iat_rva == IAT_MISSING),
+            "import from a missing module must stay unresolved"
+        );
+
+        // An IAT RVA outside the mapped image must be skipped, not panic.
+        runtime
+            .loaded_real_dlls
+            .get_mut("casa1_import_probe.dll")
+            .expect("probe state")
+            .import_thunks
+            .push((0xF000_0000, 0xABCD));
+
+        let mut memory = MemoryImage::default();
+        runtime
+            .materialize_real_dll_image(handle, &mut memory)
+            .expect("materialise probe image");
+        assert_eq!(
+            read_u32(&memory, handle + u64::from(IAT_SELF_BY_NAME)).expect("self IAT slot"),
+            self_thunk as u32
+        );
+        assert_eq!(
+            read_u32(&memory, handle + u64::from(IAT_PROVIDER)).expect("provider IAT slot"),
+            provider_thunk as u32
+        );
+        assert_eq!(
+            read_u32(&memory, handle + u64::from(IAT_KERNEL32)).expect("kernel32 IAT slot"),
+            kernel32_thunk as u32
+        );
+        assert_eq!(
+            read_u32(&memory, handle + u64::from(IAT_MISSING)).expect("missing IAT slot"),
+            0x20F0,
+            "the unresolved slot keeps the raw image value, never a thunk"
+        );
+        assert_eq!(
+            memory.read_u8(handle).expect("mapped header"),
+            b'M',
+            "headers are copied into guest memory before DllMain"
+        );
+        assert!(
+            runtime
+                .loaded_real_dlls
+                .get("casa1_import_probe.dll")
+                .expect("probe state")
+                .materialized
+        );
+        // Second call hits the materialised early-return; an unknown handle
+        // hits the no-state early-return.
+        runtime
+            .materialize_real_dll_image(handle, &mut memory)
+            .expect("already materialised image is a no-op");
+        runtime
+            .materialize_real_dll_image(0xDEAD_0000, &mut memory)
+            .expect("unknown handle is a no-op");
+    }
+
+    #[test]
+    fn materialize_real_dll_image_edge_unmapped_state_and_x64_iat_width() {
+        let (mut runtime, _temp_dir) = probe_runtime("loader-materialize-edges");
+        let mut memory = MemoryImage::default();
+
+        runtime
+            .materialize_real_dll_image(0x1234_0000, &mut memory)
+            .expect("unknown handle is a no-op");
+
+        runtime.loaded_real_dlls.insert(
+            "synthetic_probe.dll".to_string(),
+            RealDllState {
+                path: PathBuf::from("/synthetic/probe.dll"),
+                dll_name: "synthetic_probe.dll".to_string(),
+                exports: HashMap::new(),
+                entry_point: None,
+                image_base: 0x1400_0000,
+                refcount: 1,
+                handle: 0x1400_0000,
+                native_library: None,
+                mapped_image: None,
+                materialized: false,
+                import_thunks: Vec::new(),
+                pointer_bytes: 4,
+            },
+        );
+        runtime
+            .materialize_real_dll_image(0x1400_0000, &mut memory)
+            .expect("state without a mapped image is a no-op");
+
+        // 64-bit image: the IAT patch must span a full 8-byte pointer.
+        let x64_base = 0x0000_0001_8000_0000_u64;
+        runtime.loaded_real_dlls.insert(
+            "x64_probe.dll".to_string(),
+            RealDllState {
+                path: PathBuf::from("/x64/probe.dll"),
+                dll_name: "x64_probe.dll".to_string(),
+                exports: HashMap::new(),
+                entry_point: None,
+                image_base: x64_base,
+                refcount: 1,
+                handle: x64_base,
+                native_library: None,
+                mapped_image: Some(crate::pe::MappedImage {
+                    preferred_base: x64_base,
+                    selected_base: x64_base,
+                    memory: vec![0u8; 0x2000],
+                    sections: vec![crate::pe::SectionMapping {
+                        name: ".text".to_string(),
+                        virtual_address: 0x1000,
+                        mapped_size: 0x1000,
+                        raw_data_size: 0,
+                        protection: crate::pe::MemoryProtection {
+                            read: true,
+                            write: false,
+                            execute: true,
+                        },
+                    }],
+                }),
+                materialized: false,
+                import_thunks: vec![(0x100, 0x1122_3344_5566_7788)],
+                pointer_bytes: 8,
+            },
+        );
+        runtime
+            .materialize_real_dll_image(x64_base, &mut memory)
+            .expect("materialise 64-bit image");
+        assert_eq!(
+            read_u64(&memory, x64_base + 0x100).expect("64-bit IAT slot"),
+            0x1122_3344_5566_7788
+        );
+        assert!(
+            runtime
+                .loaded_real_dlls
+                .get("x64_probe.dll")
+                .expect("x64 state")
+                .materialized
+        );
+        runtime
+            .materialize_real_dll_image(x64_base, &mut memory)
+            .expect("already materialised image is a no-op");
+    }
+
+    #[test]
+    fn dll_main_drain_edge_disabled_thread_module_is_materialized_without_guest_entry() {
+        let (mut runtime, _temp_dir) = probe_runtime("loader-drain-disabled");
+        let mut memory = MemoryImage::default();
+        let mut state = CpuState::new(GuestArch::X86);
+
+        let base = 0x6000_0000_u64;
+        let mut image = vec![0u8; 0x800];
+        image[0] = b'M';
+        image[1] = b'Z';
+        runtime.loaded_real_dlls.insert(
+            "drain_probe.dll".to_string(),
+            RealDllState {
+                path: PathBuf::from("/drain/probe.dll"),
+                dll_name: "drain_probe.dll".to_string(),
+                exports: HashMap::new(),
+                entry_point: Some(0x100),
+                image_base: base,
+                refcount: 1,
+                handle: base,
+                native_library: None,
+                mapped_image: Some(crate::pe::MappedImage {
+                    preferred_base: base,
+                    selected_base: base,
+                    memory: image,
+                    sections: Vec::new(),
+                }),
+                materialized: false,
+                import_thunks: Vec::new(),
+                pointer_bytes: 4,
+            },
+        );
+        runtime.disabled_thread_library_calls.insert(base);
+        runtime
+            .pending_dll_main_calls
+            .push_back((base, 0x100, DLL_THREAD_ATTACH));
+        runtime
+            .drain_pending_dll_main_calls(&mut state, &mut memory)
+            .expect("drain skips the disabled module");
+        assert_eq!(
+            runtime.pending_dll_main_calls.len(),
+            0,
+            "the queued notification is consumed"
+        );
+        assert_eq!(
+            memory.read_u8(base).expect("materialised image"),
+            b'M',
+            "materialise ran before the disabled-thread skip"
+        );
+    }
+
+    #[test]
+    fn execute_tls_callbacks_for_missing_module_is_noop() {
+        let (mut runtime, _temp_dir) = probe_runtime("loader-tls-missing");
+        let mut memory = MemoryImage::default();
+        let mut state = CpuState::new(GuestArch::X86);
+        let before = runtime.dll_info_table.len();
+        let result = runtime.execute_tls_callbacks_for_module(
+            &mut state,
+            &mut memory,
+            0x7777_0000,
+            DLL_PROCESS_ATTACH,
+        );
+        assert_eq!(result.err().map(|error| error.code), None::<ReasonCode>);
+        assert_eq!(
+            runtime.dll_info_table.len(),
+            before,
+            "no module table entry is invented"
+        );
+    }
+
+    #[test]
+    fn execute_tls_callbacks_error_on_faulting_callback_address() {
+        let (mut runtime, _temp_dir) = probe_runtime("loader-tls-fault");
+        let mut memory = MemoryImage::default();
+        let mut state = CpuState::new(GuestArch::X86);
+        state.set(Register::Rsp, 0x50_000);
+        memory.map_bytes(0x50_000, &[0u8; 0x400]);
+        let handle = 0x7788_0000_u64;
+        runtime.dll_info_table.insert(
+            handle,
+            DllInfo {
+                handle,
+                image_size: 0x1000,
+                entry_point_rva: 0,
+                load_count: 1,
+                module_name: "ghost_tls.dll".to_string(),
+                host_path: String::new(),
+                // The zero RVA is skipped before any guest code runs; the
+                // second callback lands in unmapped memory and must surface
+                // the guest fetch fault instead of being swallowed.
+                tls_callbacks: vec![0, 0x100],
+            },
+        );
+        let error = runtime
+            .execute_tls_callbacks_for_module(&mut state, &mut memory, handle, DLL_PROCESS_ATTACH)
+            .expect_err("unmapped TLS callback must fail");
+        assert_eq!(error.code, ReasonCode::RcUnimplInsn);
+        assert_eq!(
+            error.message,
+            "unmapped guest memory at 0x77880100 while executing guest instruction at \
+             0x77880100: <unavailable> | rax=0x0 rbx=0x0 rcx=0x0 rdx=0x0 rsi=0x0 rdi=0x0 \
+             rsp=0x4ffec rbp=0x0"
+        );
+    }
+
+    #[test]
+    fn module_handle_from_address_edge_ranges_missing_info_and_saturation() {
+        let (mut runtime, _temp_dir) = probe_runtime("loader-module-address");
+        runtime.mapped_image_base = 0x4000_0000;
+        runtime.mapped_image_size = 0x1000;
+        runtime
+            .module_handles
+            .insert("probe_a.dll".to_string(), 0x6000_0000);
+        runtime.dll_info_table.insert(
+            0x6000_0000,
+            DllInfo {
+                handle: 0x6000_0000,
+                image_size: 0x2000,
+                entry_point_rva: 0,
+                load_count: 1,
+                module_name: "probe_a.dll".to_string(),
+                host_path: String::new(),
+                tls_callbacks: Vec::new(),
+            },
+        );
+        // Registered without DllInfo: the 0x1000 fallback window applies.
+        runtime
+            .module_handles
+            .insert("probe_b.dll".to_string(), 0x7000_0000);
+        runtime
+            .module_handles
+            .insert("probe_top.dll".to_string(), u64::MAX - 0x100);
+
+        assert_eq!(
+            runtime.module_handle_from_address(0x4000_0800),
+            Some(0x4000_0000),
+            "addresses inside the main image resolve to it"
+        );
+        assert_eq!(
+            runtime.module_handle_from_address(0x6000_1000),
+            Some(0x6000_0000)
+        );
+        assert_eq!(
+            runtime.module_handle_from_address(0x6000_0000),
+            Some(0x6000_0000),
+            "the exact module base is inside the module"
+        );
+        assert_eq!(
+            runtime.module_handle_from_address(0x7000_0F00),
+            Some(0x7000_0000),
+            "missing DllInfo falls back to a 0x1000 window"
+        );
+        assert_eq!(
+            runtime.module_handle_from_address(0x6000_3000),
+            None,
+            "past the module size and below the next handle"
+        );
+        assert_eq!(
+            runtime.module_handle_from_address(0x4000_2000),
+            None,
+            "the main-image handle is skipped before its size is consulted"
+        );
+        assert_eq!(
+            runtime.module_handle_from_address(0x2000_0000),
+            None,
+            "addresses below every handle never resolve"
+        );
+        assert_eq!(
+            runtime.module_handle_from_address(u64::MAX - 0x80),
+            Some(u64::MAX - 0x100),
+            "the topmost handle saturates instead of overflowing"
+        );
+    }
 
     #[test]
     fn synthetic_dll_init_callback_failure_race_fires_exactly_once() {

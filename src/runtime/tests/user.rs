@@ -2306,15 +2306,17 @@ fn evidence_dialogs_profiles_netprov_tsf_vb_surfaces() {
         let create_block: u64 = runtime.alloc_host_thunk(HostThunk::CreateEnvironmentBlock);
         let destroy_block: u64 = runtime.alloc_host_thunk(HostThunk::DestroyEnvironmentBlock);
         let dir_out = 0x41_100_u64;
+        let dir_size_ptr = 0x41_0f0_u64;
+        memory.map_bytes(dir_size_ptr, &512_u32.to_le_bytes());
         let dir_len = dispatch_x86_thunk(
             &mut runtime,
             &mut memory,
             profiles_dir,
-            &[dir_out as u32, 512],
+            &[dir_out as u32, dir_size_ptr as u32],
         );
-        assert!(dir_len > 0);
+        assert_eq!(dir_len, 1, "GetProfilesDirectoryW returns TRUE");
         let path = read_utf16_string(&memory, dir_out).unwrap();
-        assert!(!path.is_empty(), "profiles dir");
+        assert_eq!(path, "C:\\Users");
         let block_out = 0x41_200_u64;
         assert_eq!(
             dispatch_x86_thunk(

@@ -122,11 +122,15 @@ pub(crate) fn write_utf16_buffer(
     if units.len() + 1 > capacity_chars {
         return false;
     }
-    for (index, unit) in units.iter().enumerate() {
-        write_u16(memory, address + index as u64 * 2, *unit);
+    // Validate and write the whole range, terminator included, in one checked
+    // operation: a buffer whose last character (or terminator) spills into an
+    // uncommitted or read-only page fails before any byte is written.
+    let mut bytes = Vec::with_capacity((units.len() + 1) * 2);
+    for unit in &units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    write_u16(memory, address + units.len() as u64 * 2, 0);
-    true
+    bytes.extend_from_slice(&0_u16.to_le_bytes());
+    memory.guest_write_checked(address, &bytes).is_ok()
 }
 
 /// Read a null-terminated ANSI string from guest memory.
@@ -355,28 +359,33 @@ pub(crate) fn read_guest_f32(memory: &MemoryImage, address: u64) -> AppResult<f3
 }
 
 pub(crate) fn write_guest_u32(memory: &mut MemoryImage, address: u64, value: u32) -> AppResult<()> {
-    memory.write_u32(address, value);
-    Ok(())
+    memory
+        .guest_write_checked(address, &value.to_le_bytes())
+        .map_err(crate::host_thunks::guest_write_fault_error)
 }
 
 pub(crate) fn write_guest_u64(memory: &mut MemoryImage, address: u64, value: u64) -> AppResult<()> {
-    memory.write_u64(address, value);
-    Ok(())
+    memory
+        .guest_write_checked(address, &value.to_le_bytes())
+        .map_err(crate::host_thunks::guest_write_fault_error)
 }
 
 pub(crate) fn write_guest_u16(memory: &mut MemoryImage, address: u64, value: u16) -> AppResult<()> {
-    memory.write_u16(address, value);
-    Ok(())
+    memory
+        .guest_write_checked(address, &value.to_le_bytes())
+        .map_err(crate::host_thunks::guest_write_fault_error)
 }
 
 pub(crate) fn write_guest_f64(memory: &mut MemoryImage, address: u64, value: f64) -> AppResult<()> {
-    memory.write_u64(address, value.to_bits());
-    Ok(())
+    memory
+        .guest_write_checked(address, &value.to_bits().to_le_bytes())
+        .map_err(crate::host_thunks::guest_write_fault_error)
 }
 
 pub(crate) fn write_guest_f32(memory: &mut MemoryImage, address: u64, value: f32) -> AppResult<()> {
-    memory.write_u32(address, value.to_bits());
-    Ok(())
+    memory
+        .guest_write_checked(address, &value.to_bits().to_le_bytes())
+        .map_err(crate::host_thunks::guest_write_fault_error)
 }
 
 pub(crate) fn read_guest_u64(memory: &MemoryImage, address: u64) -> AppResult<u64> {
@@ -532,7 +541,7 @@ pub(crate) fn write_utf16_fixed(
     address: u64,
     capacity: usize,
     value: &str,
-) {
+) -> bool {
     let mut bytes = vec![0_u8; capacity * 2];
     for (index, unit) in value
         .encode_utf16()
@@ -542,7 +551,7 @@ pub(crate) fn write_utf16_fixed(
         let offset = index * 2;
         bytes[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
     }
-    memory.map_bytes(address, &bytes);
+    memory.guest_write_checked(address, &bytes).is_ok()
 }
 
 pub(crate) fn write_u32(memory: &mut MemoryImage, address: u64, value: u32) {
@@ -568,4 +577,145 @@ pub(crate) fn read_memory_slice(
     len: usize,
 ) -> AppResult<Vec<u8>> {
     memory.read_bytes(address, len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `write_utf16_buffer` validates the WHOLE range (terminator included)
+    /// before writing: a buffer whose last units spill into an uncommitted
+    /// page must fail without leaving a partial write behind.
+    #[test]
+    fn write_utf16_buffer_uncommitted_tail_fails_without_partial_write() {
+        let mut memory = MemoryImage::default();
+        let page = 0x1000_u64;
+        memory.map_bytes(page, &[0u8; 4096]);
+        // Marker at the end of the committed page.
+        write_u16(&mut memory, page + 4094, 0xBEEF);
+        // 4 chars + terminator = 10 bytes starting at +4090 spills 2 bytes
+        // into the uncommitted next page.
+        assert!(
+            !write_utf16_buffer(&mut memory, page + 4090, 8, "abcd"),
+            "a tail spilling into an uncommitted page must be rejected"
+        );
+        assert_eq!(
+            memory.read_u16(page + 4094).expect("marker"),
+            0xBEEF,
+            "no byte of a rejected write may land in guest memory"
+        );
+        // The in-page prefix of the rejected write must be untouched too.
+        assert_eq!(
+            memory.read_u16(page + 4090).expect("prefix"),
+            0,
+            "the in-page prefix of a rejected write stays zero"
+        );
+        // The same buffer fully inside the page succeeds and NUL-terminates.
+        assert!(
+            write_utf16_buffer(&mut memory, page, 8, "ab"),
+            "an in-page buffer is accepted"
+        );
+        assert_eq!(
+            memory.read_u16(page + 4).expect("terminator"),
+            0,
+            "the UTF-16 terminator follows the payload"
+        );
+        assert_eq!(
+            memory.read_u16(page + 6).expect("untouched"),
+            0,
+            "nothing beyond the terminator is written"
+        );
+    }
+
+    /// The typed checked-write helpers must surface the guest write-fault
+    /// error (RcMemoryAccessViolation) for an unmapped page and succeed on a
+    /// mapped one, without ever materialising the missing page.
+    #[test]
+    fn typed_checked_writes_reject_unmapped_pages_with_exact_fault() {
+        let mut memory = MemoryImage::default();
+        let page = 0x3000_u64;
+        let unmapped = 0x9000_u64;
+        memory.map_bytes(page, &[0u8; 16]);
+        assert!(write_guest_u64(&mut memory, page, 0x1122_3344_5566_7788).is_ok());
+        assert_eq!(
+            memory.read_u64(page).expect("u64"),
+            0x1122_3344_5566_7788,
+            "mapped u64 write lands"
+        );
+        let err = write_guest_u64(&mut memory, unmapped, 1).expect_err("unmapped u64 write");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcMemoryAccessViolation,
+            "u64 write fault is a memory access violation"
+        );
+        let err = write_guest_u16(&mut memory, unmapped, 2).expect_err("unmapped u16 write");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcMemoryAccessViolation,
+            "u16 write fault is a memory access violation"
+        );
+        let err = write_guest_f64(&mut memory, unmapped, 1.5).expect_err("unmapped f64 write");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcMemoryAccessViolation,
+            "f64 write fault is a memory access violation"
+        );
+        let err = write_guest_f32(&mut memory, unmapped, 2.5).expect_err("unmapped f32 write");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcMemoryAccessViolation,
+            "f32 write fault is a memory access violation"
+        );
+        assert!(
+            !memory.page_exists(unmapped),
+            "a checked-write fault must never materialise the page"
+        );
+        assert!(write_guest_u16(&mut memory, page, 0xCAFE).is_ok());
+        assert!(write_guest_f64(&mut memory, page, -3.25).is_ok());
+        assert!(write_guest_f32(&mut memory, page + 8, 0.5).is_ok());
+        assert!(write_guest_u32(&mut memory, page + 12, 0xDEAD_BEEF).is_ok());
+        assert_eq!(
+            memory.read_u32(page + 12).expect("u32"),
+            0xDEAD_BEEF,
+            "mapped u32 write lands"
+        );
+        let err = write_guest_u32(&mut memory, unmapped, 7).expect_err("unmapped u32 write");
+        assert_eq!(
+            err.code,
+            ReasonCode::RcMemoryAccessViolation,
+            "u32 write fault is a memory access violation"
+        );
+        assert_eq!(
+            f64::from_bits(memory.read_u64(page).expect("f64")),
+            -3.25,
+            "mapped f64 write lands"
+        );
+    }
+
+    /// `write_utf16_fixed` truncates to `capacity - 1` units and fails on an
+    /// unmapped destination without writing.
+    #[test]
+    fn write_utf16_fixed_rejects_unmapped_destination() {
+        let mut memory = MemoryImage::default();
+        let page = 0x6000_u64;
+        memory.map_bytes(page, &[0u8; 16]);
+        assert!(
+            write_utf16_fixed(&mut memory, page, 4, "abcdefg"),
+            "fixed write into a mapped buffer succeeds"
+        );
+        assert_eq!(
+            memory.read_u16(page + 6).expect("terminator"),
+            0,
+            "the fixed buffer is NUL-terminated at capacity - 1"
+        );
+        assert_eq!(
+            memory.read_u16(page + 8).expect("padding"),
+            0,
+            "the remainder of the fixed buffer stays zero"
+        );
+        assert!(
+            !write_utf16_fixed(&mut memory, 0x7000, 4, "abc"),
+            "an unmapped destination is rejected"
+        );
+    }
 }

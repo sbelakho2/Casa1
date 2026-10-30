@@ -323,8 +323,9 @@ impl PeHostRuntime {
         } else {
             0
         };
-        match nt::memory::nt_allocate_virtual_memory(
+        match nt::memory::nt_allocate_virtual_memory_with_pages(
             self.win32.address_space_mut(),
+            memory,
             base_in,
             zero_bits,
             size_in,
@@ -332,9 +333,10 @@ impl PeHostRuntime {
             protect,
         ) {
             Ok((base, size)) => {
-                if allocation_type & nt::MEM_COMMIT != 0 {
-                    memory.map_bytes(base, &vec![0_u8; size as usize]);
-                }
+                // Newly committed pages were materialised and zeroed in
+                // place by the memory layer; already-committed pages keep
+                // their contents.
+                let _ = (base, size);
                 if base_address_ptr != 0 {
                     write_guest_pointer(memory, base_address_ptr, base, self.guest_arch)?;
                 }
@@ -489,7 +491,10 @@ impl PeHostRuntime {
         Ok(())
     }
 
-    /// `NtReadVirtualMemory` — checked read; never creates pages.
+    /// `NtReadVirtualMemory` — checked read; never creates pages and never
+    /// allocates a buffer sized by the guest's length field.  The transfer is
+    /// copied one page at a time and stops at the first inaccessible page,
+    /// reporting `STATUS_PARTIAL_COPY` when at least one byte was copied.
     pub(crate) fn dispatch_nt_read_virtual_memory(
         &mut self,
         state: &mut CpuState,
@@ -501,26 +506,28 @@ impl PeHostRuntime {
         let length = guest_call_arg(state, memory, 3)?;
         let bytes_read_ptr = guest_call_arg(state, memory, 4)?;
 
-        let mut bytes = vec![0_u8; length as usize];
-        match nt::memory::nt_read_virtual_memory(memory, base_address, &mut bytes) {
-            Ok(read) => {
-                if read > 0 && buffer != 0 {
-                    memory.map_bytes(buffer, &bytes[..read]);
-                }
-                if bytes_read_ptr != 0 {
-                    write_guest_pointer(memory, bytes_read_ptr, read as u64, self.guest_arch)?;
-                }
-                state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
-            }
-            Err(status) => {
-                state.set(Register::Rax, u64::from(status.raw()));
+        let requested = usize::try_from(length).unwrap_or(usize::MAX);
+        let (status, bytes) =
+            nt::memory::nt_read_virtual_memory_paged(memory, base_address, requested);
+        let copied = bytes.len();
+        let mut status = status;
+        if copied > 0 && buffer != 0 {
+            if let Err(_fault) = write_guest_bytes_checked(memory, buffer, &bytes) {
+                status = nt::STATUS_ACCESS_VIOLATION;
             }
         }
+        if bytes_read_ptr != 0 {
+            write_guest_pointer(memory, bytes_read_ptr, copied as u64, self.guest_arch)?;
+        }
+        state.set(Register::Rax, u64::from(status.raw()));
         self.last_error = 0;
         Ok(())
     }
 
-    /// `NtWriteVirtualMemory` — checked write; never creates pages.
+    /// `NtWriteVirtualMemory` — checked write; the source is read page by page
+    /// into a bounded buffer (never `vec![0; guest_u64]`) and the destination
+    /// is written page by page.  A partial transfer reports
+    /// `STATUS_PARTIAL_COPY` with the number of bytes actually written.
     pub(crate) fn dispatch_nt_write_virtual_memory(
         &mut self,
         state: &mut CpuState,
@@ -532,28 +539,29 @@ impl PeHostRuntime {
         let length = guest_call_arg(state, memory, 3)?;
         let bytes_written_ptr = guest_call_arg(state, memory, 4)?;
 
-        let mut bytes = vec![0_u8; length as usize];
-        if length > 0 && nt::memory::nt_read_virtual_memory(memory, buffer, &mut bytes).is_err() {
-            // An unmapped source buffer is an access violation on the read.
-            state.set(Register::Rax, u64::from(nt::STATUS_ACCESS_VIOLATION.raw()));
-            return Ok(());
+        let requested = usize::try_from(length).unwrap_or(usize::MAX);
+        let (source_status, bytes) =
+            nt::memory::nt_read_virtual_memory_paged(memory, buffer, requested);
+        let (mut status, mut written) = if bytes.is_empty() {
+            (source_status, 0usize)
+        } else {
+            let (dest_status, written) =
+                nt::memory::nt_write_virtual_memory_paged(memory, base_address, &bytes);
+            let status = if !dest_status.is_success() {
+                dest_status
+            } else {
+                source_status
+            };
+            (status, written)
+        };
+        if written == 0 && status.is_success() {
+            written = 0;
         }
-        match nt::memory::nt_write_virtual_memory(memory, base_address, &bytes) {
-            Ok(written) => {
-                if bytes_written_ptr != 0 {
-                    write_guest_pointer(
-                        memory,
-                        bytes_written_ptr,
-                        written as u64,
-                        self.guest_arch,
-                    )?;
-                }
-                state.set(Register::Rax, u64::from(nt::STATUS_SUCCESS.raw()));
-            }
-            Err(status) => {
-                state.set(Register::Rax, u64::from(status.raw()));
-            }
+        let _ = &mut status;
+        if bytes_written_ptr != 0 {
+            write_guest_pointer(memory, bytes_written_ptr, written as u64, self.guest_arch)?;
         }
+        state.set(Register::Rax, u64::from(status.raw()));
         self.last_error = 0;
         Ok(())
     }
@@ -5320,5 +5328,324 @@ impl GuestAnticheatState {
             attestation: crate::anticheat::AttestationRegistry::new(),
             attestation_key: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ge::GeArch;
+    use tempfile::TempDir;
+
+    const STACK: u64 = 0x58_000;
+
+    fn x64_runtime_and_memory(name: &str) -> (PeHostRuntime, MemoryImage, TempDir) {
+        let temp = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp.path(), name, GeArch::X64, "win11-23h2").expect("ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        runtime.guest_arch = GuestArch::X64;
+        (runtime, MemoryImage::default(), temp)
+    }
+
+    /// X64 calling convention: args 0..3 in RCX/RDX/R8/R9, the rest on the
+    /// stack at `Rsp + 0x20 + (i - 4) * 8`.
+    fn x64_state_with_args(memory: &mut MemoryImage, args: &[u64]) -> CpuState {
+        memory.map_bytes(STACK, &[0u8; 0x100]);
+        let mut state = CpuState::new(GuestArch::X64);
+        state.set(Register::Rsp, STACK);
+        for (index, arg) in args.iter().enumerate().take(4) {
+            let reg = match index {
+                0 => Register::Rcx,
+                1 => Register::Rdx,
+                2 => Register::R8,
+                _ => Register::R9,
+            };
+            state.set(reg, *arg);
+        }
+        for (index, arg) in args.iter().enumerate().skip(4) {
+            write_u64(memory, STACK + 0x20 + ((index as u64 - 4) * 8), *arg);
+        }
+        state
+    }
+
+    fn rax_status(state: &CpuState) -> u32 {
+        state.get(Register::Rax) as u32
+    }
+
+    /// `NtAllocateVirtualMemory` bounds: a successful fixed commit writes
+    /// both out-parameters, an invalid size and an overlapping reservation
+    /// surface their exact NTSTATUS in RAX without touching memory.
+    #[test]
+    fn nt_allocate_virtual_memory_dispatch_pins_bounds_and_conflicts() {
+        let (mut runtime, mut memory, _temp) = x64_runtime_and_memory("nt-alloc-dispatch-bounds");
+        let base_ptr: u64 = 0x60_000;
+        let size_ptr: u64 = 0x60_010;
+        memory.map_bytes(base_ptr, &[0u8; 8]);
+        memory.map_bytes(size_ptr, &[0u8; 8]);
+        write_u64(&mut memory, size_ptr, 0x2000);
+        let mut state = x64_state_with_args(
+            &mut memory,
+            &[
+                0,
+                base_ptr,
+                0,
+                size_ptr,
+                u64::from(nt::MEM_COMMIT | nt::MEM_RESERVE),
+                u64::from(nt::PAGE_READWRITE),
+            ],
+        );
+        runtime
+            .dispatch_nt_allocate_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_SUCCESS.raw(),
+            "fixed reserve+commit succeeds"
+        );
+        let base = memory.read_u64(base_ptr).expect("base out");
+        assert_ne!(base, 0, "the committed base is written back");
+        assert_eq!(
+            memory.read_u64(size_ptr).expect("size out"),
+            0x2000,
+            "the aligned size is written back"
+        );
+        // Zero size is rejected before any VM mutation.
+        let mut state = x64_state_with_args(
+            &mut memory,
+            &[
+                0,
+                base_ptr,
+                0,
+                size_ptr,
+                u64::from(nt::MEM_COMMIT),
+                u64::from(nt::PAGE_READWRITE),
+            ],
+        );
+        write_u64(&mut memory, size_ptr, 0);
+        runtime
+            .dispatch_nt_allocate_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_INVALID_PARAMETER.raw(),
+            "a zero region size is STATUS_INVALID_PARAMETER"
+        );
+        // A bare MEM_RESERVE at the already-committed base conflicts.
+        write_u64(&mut memory, base_ptr, base);
+        write_u64(&mut memory, size_ptr, 0x1000);
+        let mut state = x64_state_with_args(
+            &mut memory,
+            &[
+                0,
+                base_ptr,
+                0,
+                size_ptr,
+                u64::from(nt::MEM_RESERVE),
+                u64::from(nt::PAGE_READWRITE),
+            ],
+        );
+        runtime
+            .dispatch_nt_allocate_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_CONFLICTING_ADDRESSES.raw(),
+            "reserving over a live reservation is STATUS_CONFLICTING_ADDRESSES"
+        );
+    }
+
+    /// `NtReadVirtualMemory` bounds: full transfer, an oversized guest
+    /// `u64` length that stops at the first unmapped page with
+    /// `STATUS_PARTIAL_COPY`, an immediate fault (`STATUS_ACCESS_VIOLATION`),
+    /// a null destination buffer, and a destination that faults on write.
+    #[test]
+    fn nt_read_virtual_memory_dispatch_bounds_and_partial_copy_status() {
+        let (mut runtime, mut memory, _temp) = x64_runtime_and_memory("nt-read-dispatch-bounds");
+        let source: u64 = 0x9000;
+        let buffer: u64 = 0xC000;
+        let unmapped_source: u64 = 0xE000;
+        let unmapped_buffer: u64 = 0xF000;
+        let bytes_read_ptr: u64 = 0x60_020;
+        memory.map_bytes(source, &[0x5A; 0x1000]);
+        memory.map_bytes(buffer, &[0u8; 0x1000]);
+        memory.map_bytes(bytes_read_ptr, &[0u8; 8]);
+        // Full transfer.
+        let mut state =
+            x64_state_with_args(&mut memory, &[0, source, buffer, 0x20, bytes_read_ptr]);
+        runtime
+            .dispatch_nt_read_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_SUCCESS.raw(),
+            "an accessible read succeeds"
+        );
+        assert_eq!(
+            memory.read_u64(bytes_read_ptr).expect("bytes read"),
+            0x20,
+            "the byte count is written back"
+        );
+        // Oversized guest length: never pre-allocates; walks page by page
+        // until the unmapped page after the source stops the transfer, and
+        // the destination still accepts the one transferred page.
+        let mut state =
+            x64_state_with_args(&mut memory, &[0, source, buffer, u64::MAX, bytes_read_ptr]);
+        runtime
+            .dispatch_nt_read_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::memory::STATUS_PARTIAL_COPY.raw(),
+            "an oversized read that hits an unmapped page is STATUS_PARTIAL_COPY"
+        );
+        assert_eq!(
+            memory.read_u64(bytes_read_ptr).expect("bytes read"),
+            0x1000,
+            "only the accessible page was transferred"
+        );
+        // Immediate fault: the source page is unmapped.
+        let mut state = x64_state_with_args(
+            &mut memory,
+            &[0, unmapped_source, buffer, 0x10, bytes_read_ptr],
+        );
+        runtime
+            .dispatch_nt_read_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_ACCESS_VIOLATION.raw(),
+            "an unmapped source is STATUS_ACCESS_VIOLATION"
+        );
+        assert_eq!(
+            memory.read_u64(bytes_read_ptr).expect("bytes read"),
+            0,
+            "no bytes are reported on an immediate fault"
+        );
+        // Null destination: the transfer is still reported, nothing written,
+        // and a null BytesWritten out-pointer is skipped entirely.
+        let mut state = x64_state_with_args(&mut memory, &[0, source, 0, 8, 0]);
+        runtime
+            .dispatch_nt_read_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_SUCCESS.raw(),
+            "a null destination does not fail the read itself"
+        );
+        // Destination faults: the reported status downgrades to AV.
+        let mut state = x64_state_with_args(
+            &mut memory,
+            &[0, source, unmapped_buffer, 0x10, bytes_read_ptr],
+        );
+        runtime
+            .dispatch_nt_read_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_ACCESS_VIOLATION.raw(),
+            "an unmapped destination buffer is STATUS_ACCESS_VIOLATION"
+        );
+    }
+
+    /// `NtWriteVirtualMemory` bounds: full transfer, zero length, a source
+    /// that faults midway (`STATUS_PARTIAL_COPY` keeps the source status
+    /// once the destination accepted the readable prefix), an unmapped
+    /// source, and an unmapped destination.
+    #[test]
+    fn nt_write_virtual_memory_dispatch_bounds_and_partial_copy_status() {
+        let (mut runtime, mut memory, _temp) = x64_runtime_and_memory("nt-write-dispatch-bounds");
+        let source: u64 = 0x9000;
+        let dest: u64 = 0xC000;
+        let unmapped_source: u64 = 0xE000;
+        let unmapped_dest: u64 = 0xF000;
+        let bytes_written_ptr: u64 = 0x60_030;
+        memory.map_bytes(source, &[0x3C; 0x1000]);
+        memory.map_bytes(dest, &[0u8; 0x1000]);
+        memory.map_bytes(bytes_written_ptr, &[0u8; 8]);
+        // Full transfer: BaseAddress = destination, Buffer = source.
+        let mut state =
+            x64_state_with_args(&mut memory, &[0, dest, source, 0x20, bytes_written_ptr]);
+        runtime
+            .dispatch_nt_write_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_SUCCESS.raw(),
+            "an accessible write succeeds"
+        );
+        assert_eq!(
+            memory.read_u64(bytes_written_ptr).expect("bytes written"),
+            0x20,
+            "the byte count is written back"
+        );
+        assert_eq!(
+            memory.read_u64(dest).expect("dest"),
+            u64::from_le_bytes([0x3C; 8]),
+            "the payload landed in the destination"
+        );
+        // Zero length: success with nothing transferred.
+        let mut state = x64_state_with_args(&mut memory, &[0, dest, source, 0, bytes_written_ptr]);
+        runtime
+            .dispatch_nt_write_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_SUCCESS.raw(),
+            "a zero-length write succeeds"
+        );
+        assert_eq!(
+            memory.read_u64(bytes_written_ptr).expect("bytes written"),
+            0,
+            "a zero-length write transfers nothing"
+        );
+        // Source fault midway: one accessible page then unmapped; the
+        // destination accepts the readable prefix, so the SOURCE status wins.
+        let mut state =
+            x64_state_with_args(&mut memory, &[0, dest, source, 0x2000, bytes_written_ptr]);
+        runtime
+            .dispatch_nt_write_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::memory::STATUS_PARTIAL_COPY.raw(),
+            "a partially readable source is STATUS_PARTIAL_COPY"
+        );
+        assert_eq!(
+            memory.read_u64(bytes_written_ptr).expect("bytes written"),
+            0x1000,
+            "only the readable prefix is written"
+        );
+        // Unmapped source: nothing read, immediate AV.
+        let mut state = x64_state_with_args(
+            &mut memory,
+            &[0, dest, unmapped_source, 8, bytes_written_ptr],
+        );
+        runtime
+            .dispatch_nt_write_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_ACCESS_VIOLATION.raw(),
+            "an unmapped source is STATUS_ACCESS_VIOLATION"
+        );
+        assert_eq!(
+            memory.read_u64(bytes_written_ptr).expect("bytes written"),
+            0,
+            "no bytes are written on an unmapped source"
+        );
+        // Unmapped destination: the DEST status wins.
+        let mut state = x64_state_with_args(
+            &mut memory,
+            &[0, unmapped_dest, source, 0x10, bytes_written_ptr],
+        );
+        runtime
+            .dispatch_nt_write_virtual_memory(&mut state, &mut memory)
+            .expect("dispatch");
+        assert_eq!(
+            rax_status(&state),
+            nt::STATUS_ACCESS_VIOLATION.raw(),
+            "an unmapped destination is STATUS_ACCESS_VIOLATION"
+        );
     }
 }

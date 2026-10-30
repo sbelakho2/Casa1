@@ -277,6 +277,246 @@ mod scheduler_default_tests {
     }
 }
 
+#[cfg(test)]
+mod trace_environment_tests {
+    use super::trace_environment;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn trace_environment_rejects_host_secrets_and_keeps_only_the_allowlist() {
+        let environment = BTreeMap::from([
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("LANG".to_string(), "en_US.UTF-8".to_string()),
+            ("CASA1_RUN_ID".to_string(), "run".to_string()),
+            ("SECRET_TOKEN".to_string(), "hunter2".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "aws".to_string()),
+        ]);
+        let traced = trace_environment(&environment);
+        assert_eq!(traced.get("PATH"), Some(&"/usr/bin".to_string()));
+        assert_eq!(traced.get("LANG"), Some(&"en_US.UTF-8".to_string()));
+        assert_eq!(traced.get("CASA1_RUN_ID"), Some(&"run".to_string()));
+        assert_eq!(traced.get("SECRET_TOKEN"), None);
+        assert_eq!(traced.get("AWS_SECRET_ACCESS_KEY"), None);
+        assert_eq!(traced.contains_key("__CASA1_HOST_ENV_SHA256"), true);
+        assert_eq!(traced.len(), 4);
+    }
+
+    #[test]
+    fn trace_environment_with_missing_host_variables_never_emits_a_digest() {
+        let environment = BTreeMap::from([
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("CASA1_RUN_ID".to_string(), "run".to_string()),
+        ]);
+        let traced = trace_environment(&environment);
+        assert_eq!(
+            traced.contains_key("__CASA1_HOST_ENV_SHA256"),
+            false,
+            "an allowlist-only map must not grow a digest entry"
+        );
+        assert_eq!(traced.len(), 2);
+        assert_eq!(traced.get("PATH"), Some(&"/usr/bin".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod execute_job_env_trace_tests {
+    use super::*;
+
+    const SECRET: &str = "hunter2-never-in-trace";
+
+    fn unique(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("casa1_{tag}_{}_{nanos}", std::process::id()))
+    }
+
+    fn write_minimal_ge(root: &Path) {
+        fs::create_dir_all(root.join("drive_c")).expect("drive_c");
+        let config = json!({
+            "schema_version": 2,
+            "name": "trace-env",
+            "arch": "x64",
+            "winver": "win11-23h2",
+            "user_name": "casa1",
+            "long_paths_enabled": false,
+            "drive_mappings": [{
+                "drive": "C",
+                "target": "<GE>/drive_c",
+                "read_only": false,
+                "enabled": true,
+                "requires_permission": false
+            }],
+            "override_profiles": [],
+            "fs_state": {"entries": {}}
+        });
+        fs::write(
+            root.join("ge.json"),
+            serde_json::to_vec_pretty(&config).expect("ge json"),
+        )
+        .expect("ge.json");
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).expect("destination");
+        for entry in fs::read_dir(source).expect("source") {
+            let entry = entry.expect("entry");
+            let target = destination.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), &target).expect("copy");
+            }
+        }
+    }
+
+    fn base_job(ge_root: &Path, program: PathBuf, test_id: &str) -> RunnerJob {
+        RunnerJob {
+            ge_name: "trace-env".to_string(),
+            ge_root: ge_root.to_path_buf(),
+            program,
+            args: Vec::new(),
+            cwd: ge_root.to_path_buf(),
+            env: BTreeMap::from([("SECRET_TOKEN".to_string(), SECRET.to_string())]),
+            dtm: true,
+            intent: RunIntent::Run,
+            trace_categories: Vec::new(),
+            test_id: test_id.to_string(),
+            jit_mode: JitMode::Auto,
+            steam_ipc: false,
+            window_width: None,
+            window_height: None,
+            thread_start: None,
+        }
+    }
+
+    fn assert_trace_is_digest_only(outcome: &RunnerOutcome) {
+        let trace = fs::read_to_string(&outcome.trace_path).expect("trace file");
+        assert_eq!(
+            trace.contains(SECRET),
+            false,
+            "raw job environment values must never reach the trace"
+        );
+        assert_eq!(
+            trace.contains("__CASA1_HOST_ENV_SHA256"),
+            true,
+            "the trace must carry the host-environment digest instead"
+        );
+    }
+
+    #[test]
+    fn native_execute_job_trace_records_the_digest_not_the_raw_host_environment() {
+        let root = unique("ge_native");
+        write_minimal_ge(&root);
+        let job = base_job(&root, PathBuf::from("/usr/bin/true"), "native-trace-env");
+        let outcome = execute_job(&job).expect("native job must run");
+        assert_eq!(
+            outcome.canonical_output.exit_code, 0,
+            "/usr/bin/true must exit cleanly"
+        );
+        assert_trace_is_digest_only(&outcome);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pe_execute_job_trace_records_the_digest_not_the_raw_host_environment() {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ges/tetris");
+        let root = unique("ge_pe");
+        copy_tree(&source, &root);
+        let program = root.join("drive_c/users/casa1/AppData/Local/Temp/casa1-tetris-smoke.exe");
+        assert_eq!(program.is_file(), true, "checked-in smoke PE fixture");
+        let job = base_job(&root, program, "pe-trace-env");
+        // The cooperative PE runtime executes the guest on the calling
+        // thread, which needs far more stack than libtest's test threads
+        // provide (the same reason the dispatch fixtures use big stacks).
+        let outcome = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || execute_job(&job).expect("PE job must run"))
+            .expect("spawn big-stack PE thread")
+            .join()
+            .expect("PE job thread must not fail");
+        assert_eq!(
+            outcome.canonical_output.exit_code, 0,
+            "the smoke PE must exit cleanly in DTM mode"
+        );
+        assert_trace_is_digest_only(&outcome);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn steam_zero_touch_execute_job_trace_records_the_digest_not_the_raw_host_environment() {
+        let root = unique("ge_steam");
+        write_minimal_ge(&root);
+        let work = unique("steam_fixtures");
+        fs::create_dir_all(&work).expect("workdir");
+        let payload = work.join("payload");
+        fs::create_dir_all(&payload).expect("payload");
+        fs::write(payload.join("game.exe"), b"fake game payload").expect("game exe");
+        let update_plan = work.join("update_plan.json");
+        fs::write(&update_plan, r#"{"files":{},"fail_after_write":null}"#).expect("update plan");
+        let cert_chain = work.join("cert_chain.json");
+        fs::write(
+            &cert_chain,
+            serde_json::to_vec(&vec![json!({
+                "subject": "CN=api.example.com",
+                "issuer": "CN=Casa1 Test Root",
+                "fingerprint": "deadbeef",
+                "valid_hostnames": ["api.example.com"],
+                "not_after_day": 999_999,
+                "revoked": false,
+                "supported_ciphers": ["TLS_AES_128_GCM_SHA256"]
+            })])
+            .expect("cert chain json"),
+        )
+        .expect("cert chain");
+        let appmanifest = work.join("appmanifest_480.acf");
+        fs::write(
+            &appmanifest,
+            "\"AppState\"\n{\n\t\"appid\"\t\"480\"\n\t\"name\"\t\"Casa1 Test Game\"\n\t\"installdir\"\t\"Casa1TestGame\"\n}\n",
+        )
+        .expect("appmanifest");
+        let installscript = work.join("installscript.vdf");
+        fs::write(
+            &installscript,
+            "\"InstallScript\"\n{\n\t\"Launch\"\n\t{\n\t\t\"Executable\"\t\"game.exe\"\n\t}\n\t\"Redistributables\"\n\t{\n\t}\n}\n",
+        )
+        .expect("installscript");
+        let mut job = base_job(&root, payload.join("game.exe"), "steam-trace-env");
+        job.intent = RunIntent::Install;
+        job.env
+            .insert("CASA1_STEAM_ZERO_TOUCH".to_string(), "1".to_string());
+        job.env.insert(
+            "CASA1_STEAM_UPDATE_PLAN_PATH".to_string(),
+            update_plan.display().to_string(),
+        );
+        job.env.insert(
+            "CASA1_STEAM_CERT_CHAIN_PATH".to_string(),
+            cert_chain.display().to_string(),
+        );
+        job.env.insert(
+            "CASA1_STEAM_APPMANIFEST_PATH".to_string(),
+            appmanifest.display().to_string(),
+        );
+        job.env.insert(
+            "CASA1_STEAM_INSTALLSCRIPT_PATH".to_string(),
+            installscript.display().to_string(),
+        );
+        job.env.insert(
+            "CASA1_STEAM_PAYLOAD_ROOT".to_string(),
+            payload.display().to_string(),
+        );
+        let outcome = execute_job(&job).expect("steam zero-touch job must run");
+        assert_eq!(
+            outcome.canonical_output.test_id, "steam-trace-env",
+            "the zero-touch run must produce its canonical output"
+        );
+        assert_trace_is_digest_only(&outcome);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&work);
+    }
+}
+
 pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
     // Run identity: generated ONCE at job start and carried through the whole
     // run, so every artifact of this run shares one id and two concurrent
@@ -441,7 +681,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             program: job.program.clone(),
             args: job.args.clone(),
             cwd: job.cwd.clone(),
-            env: effective_child_environment.clone(),
+            env: trace_environment(&effective_child_environment),
             dtm: job.dtm,
             intent: job.intent.as_str().to_string(),
         };
@@ -650,7 +890,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
             program: job.program.clone(),
             args: job.args.clone(),
             cwd: job.cwd.clone(),
-            env: effective_child_environment.clone(),
+            env: trace_environment(&effective_child_environment),
             dtm: job.dtm,
             intent: job.intent.as_str().to_string(),
         };
@@ -792,7 +1032,7 @@ pub fn execute_job(job: &RunnerJob) -> AppResult<RunnerOutcome> {
         program: job.program.clone(),
         args: job.args.clone(),
         cwd: job.cwd.clone(),
-        env: spawn_env.clone(),
+        env: trace_environment(&spawn_env),
         dtm: job.dtm,
         intent: job.intent.as_str().to_string(),
     };
@@ -955,6 +1195,37 @@ where
     })?;
     let outcome = execute_job(&job)?;
     util::stable_json(&outcome)
+}
+
+/// Environment recorded in a trace: only the deterministic allowlist
+/// (`PATH`, `LANG`, `CASA1_*`) is serialized verbatim.  Every other variable
+/// is replaced by one SHA-256 digest of the sorted NAME=VALUE set, so traces
+/// stay reproducible without exposing the host environment.
+fn trace_environment(environment: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    use sha2::{Digest, Sha256};
+
+    let mut traced = BTreeMap::new();
+    let mut digested = Vec::new();
+    for (key, value) in environment {
+        if key == "PATH" || key == "LANG" || key.starts_with("CASA1_") {
+            traced.insert(key.clone(), value.clone());
+        } else {
+            digested.push(format!("{key}={value}"));
+        }
+    }
+    if !digested.is_empty() {
+        digested.sort();
+        let mut hasher = Sha256::new();
+        for entry in &digested {
+            hasher.update(entry.as_bytes());
+            hasher.update([0_u8]);
+        }
+        traced.insert(
+            "__CASA1_HOST_ENV_SHA256".to_string(),
+            hex::encode(hasher.finalize()),
+        );
+    }
+    traced
 }
 
 fn child_environment(

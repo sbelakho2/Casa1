@@ -22,6 +22,10 @@ use crate::ntdll::{
 };
 use crate::vm::{VirtualMemory, VmProtection, VmRegionKind, VmState};
 
+/// `STATUS_PARTIAL_COPY` — part of the requested range was transferred before
+/// the first inaccessible page was reached.
+pub const STATUS_PARTIAL_COPY: NtStatus = NtStatus(0x8000_001Bu32 as i32);
+
 /// The x64 `MEMORY_BASIC_INFORMATION` layout (48 bytes):
 ///
 /// ```text
@@ -79,10 +83,60 @@ pub fn nt_allocate_virtual_memory(
     allocation_type: u32,
     protect: u32,
 ) -> Result<(u64, u64), NtStatus> {
+    nt_allocate_virtual_memory_inner(
+        vm,
+        None,
+        requested_base,
+        zero_bits,
+        region_size,
+        allocation_type,
+        protect,
+    )
+}
+
+/// Commit `region_size` bytes at `base` and zero ONLY the pages that were not
+/// already committed.  Existing committed contents are preserved, exactly as
+/// `MEM_COMMIT` requires; a previous `MEM_DECOMMIT` leaves stale raw bytes
+/// behind, so newly committed pages are zeroed in place (never with a
+/// `vec![0; size]` temporary).
+fn commit_zeroing_new_pages(
+    vm: &mut VirtualMemory,
+    memory: &mut Option<&mut MemoryImage>,
+    base: u64,
+    region_size: u64,
+    protection: VmProtection,
+) {
+    let start = base & crate::vm::VM_PAGE_MASK;
+    // Windows computes the committed end as align_up(base + size); using
+    // base + align_up(size) over-commits when base is page-unaligned.
+    let end = align_up(base.saturating_add(region_size.max(1)));
+    let mut page = start;
+    while page < end {
+        let already_committed = vm.query(page).state == VmState::Committed;
+        if !already_committed && let Some(memory) = memory.as_deref_mut() {
+            // Zero in place: the page may still hold raw bytes from a
+            // previous decommit.  This creates/backfills only this page.
+            memory.zero_range(page, crate::vm::VM_PAGE_SIZE as usize);
+        }
+        page = page.saturating_add(crate::vm::VM_PAGE_SIZE);
+    }
+    vm.commit(start, end.saturating_sub(start), protection, false);
+}
+
+fn nt_allocate_virtual_memory_inner(
+    vm: &mut VirtualMemory,
+    mut memory: Option<&mut MemoryImage>,
+    requested_base: u64,
+    zero_bits: u32,
+    region_size: u64,
+    allocation_type: u32,
+    protect: u32,
+) -> Result<(u64, u64), NtStatus> {
     if region_size == 0 || allocation_type & (MEM_COMMIT | MEM_RESERVE) == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     let commits = allocation_type & MEM_COMMIT != 0;
+    let reserves = allocation_type & MEM_RESERVE != 0;
     let aligned = align_up(region_size);
     let protection = protection_from_page_flags(protect);
     // MEM_TOP_DOWN / MEM_WRITE_WATCH are accepted and ignored (the canonical
@@ -96,13 +150,23 @@ pub fn nt_allocate_virtual_memory(
         }
         base
     } else if requested_base != 0 {
-        // MEM_COMMIT at a specific address: interior commit inside an
-        // existing PRIVATE reservation.
+        // MEM_COMMIT at a specific address.  `MEM_RESERVE | MEM_COMMIT` with a
+        // fixed base is a legal single call: reserve the range first when no
+        // reservation covers it, then commit.  A bare MEM_COMMIT must find an
+        // existing private reservation.
         let base = requested_base & crate::vm::VM_PAGE_MASK;
+        if vm.region_size(base).is_none() {
+            if reserves {
+                let reserved = vm.reserve(Some(base), aligned);
+                if reserved == 0 {
+                    return Err(STATUS_CONFLICTING_ADDRESSES);
+                }
+            }
+        }
         if !vm.can_commit(base, aligned) {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        vm.commit(base, aligned, protection, false);
+        commit_zeroing_new_pages(vm, &mut memory, base, region_size, protection);
         base
     } else {
         // Reserve + commit a fresh region through the canonical cursor.
@@ -110,10 +174,33 @@ pub fn nt_allocate_virtual_memory(
         if base == 0 {
             return Err(STATUS_INVALID_PARAMETER);
         }
-        vm.commit(base, aligned, protection, false);
+        commit_zeroing_new_pages(vm, &mut memory, base, region_size, protection);
         base
     };
     Ok((base, aligned))
+}
+
+/// `NtAllocateVirtualMemory` for the dispatch layer: like
+/// [`nt_allocate_virtual_memory`] but also materialises newly committed pages
+/// in the guest page map, zeroing only those pages.
+pub fn nt_allocate_virtual_memory_with_pages(
+    vm: &mut VirtualMemory,
+    memory: &mut MemoryImage,
+    requested_base: u64,
+    zero_bits: u32,
+    region_size: u64,
+    allocation_type: u32,
+    protect: u32,
+) -> Result<(u64, u64), NtStatus> {
+    nt_allocate_virtual_memory_inner(
+        vm,
+        Some(memory),
+        requested_base,
+        zero_bits,
+        region_size,
+        allocation_type,
+        protect,
+    )
 }
 
 /// `NtFreeVirtualMemory` — release (MEM_RELEASE) or decommit (MEM_DECOMMIT)
@@ -143,9 +230,28 @@ pub fn nt_free_virtual_memory(
             return Err(STATUS_INVALID_PARAMETER);
         }
         let start = base & crate::vm::VM_PAGE_MASK;
-        let aligned = align_up(region_size);
-        vm.decommit(start, aligned);
-        Ok((0, aligned))
+        // Windows end is align_up(base + RegionSize), not base + aligned size.
+        let end = align_up(base.saturating_add(region_size));
+        if end <= start {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        // The range must lie inside an existing reservation; decommitting
+        // free or partially-outside addresses fails without side effects.
+        let query = vm.query(start);
+        if query.state == VmState::Free {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let Some(region) = vm.region_size(query.base) else {
+            // `query` only reports a non-free page for a region; if the
+            // reservation lookup disagrees, fail closed.
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let region_end = query.base.saturating_add(region);
+        if end > region_end {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        vm.decommit(start, end.saturating_sub(start));
+        Ok((0, end.saturating_sub(start)))
     } else {
         Err(STATUS_INVALID_PARAMETER)
     }
@@ -249,8 +355,76 @@ pub fn nt_write_virtual_memory(
     Ok(buffer.len())
 }
 
+/// Page-by-page `NtReadVirtualMemory` transfer used by the dispatch layer.
+///
+/// The requested length is never used to pre-allocate a buffer: bytes are
+/// copied one guest page at a time and the transfer stops at the first
+/// inaccessible page.  A transfer that stops after at least one byte
+/// returns [`STATUS_PARTIAL_COPY`]; a fault before the first byte returns
+/// [`STATUS_ACCESS_VIOLATION`].
+pub fn nt_read_virtual_memory_paged(
+    memory: &MemoryImage,
+    address: u64,
+    length: usize,
+) -> (NtStatus, Vec<u8>) {
+    let mut out = Vec::new();
+    let mut chunk = [0_u8; crate::vm::VM_PAGE_SIZE as usize];
+    while out.len() < length {
+        let current = address.wrapping_add(out.len() as u64);
+        let page_offset = (current & (crate::vm::VM_PAGE_SIZE - 1)) as usize;
+        let chunk_len = (crate::vm::VM_PAGE_SIZE as usize - page_offset).min(length - out.len());
+        match memory.guest_read_checked(current, &mut chunk[..chunk_len]) {
+            Ok(()) => out.extend_from_slice(&chunk[..chunk_len]),
+            Err(_) => {
+                let status = if out.is_empty() {
+                    STATUS_ACCESS_VIOLATION
+                } else {
+                    STATUS_PARTIAL_COPY
+                };
+                return (status, out);
+            }
+        }
+    }
+    (STATUS_SUCCESS, out)
+}
+
+/// Page-by-page `NtWriteVirtualMemory` transfer used by the dispatch layer.
+///
+/// `buffer` is only as large as the bytes actually read from the guest
+/// source, so the destination is never asked to accept an unbounded
+/// allocation.  A fault after at least one byte returns
+/// [`STATUS_PARTIAL_COPY`] with the number of bytes written.
+pub fn nt_write_virtual_memory_paged(
+    memory: &mut MemoryImage,
+    address: u64,
+    buffer: &[u8],
+) -> (NtStatus, usize) {
+    let mut written = 0usize;
+    while written < buffer.len() {
+        let current = address.wrapping_add(written as u64);
+        let page_offset = (current & (crate::vm::VM_PAGE_SIZE - 1)) as usize;
+        let chunk_len =
+            (crate::vm::VM_PAGE_SIZE as usize - page_offset).min(buffer.len() - written);
+        match memory.guest_write_checked(current, &buffer[written..written + chunk_len]) {
+            Ok(()) => written += chunk_len,
+            Err(_) => {
+                let status = if written == 0 {
+                    STATUS_ACCESS_VIOLATION
+                } else {
+                    STATUS_PARTIAL_COPY
+                };
+                return (status, written);
+            }
+        }
+    }
+    (STATUS_SUCCESS, written)
+}
+
 fn align_up(value: u64) -> u64 {
-    (value + (crate::vm::VM_PAGE_SIZE - 1)) & crate::vm::VM_PAGE_MASK
+    // Saturating so a request that reaches the top of the address space
+    // yields the last page instead of wrapping (or overflowing a debug
+    // build) — callers then see `end <= start` and fail the call.
+    value.saturating_add(crate::vm::VM_PAGE_SIZE - 1) & crate::vm::VM_PAGE_MASK
 }
 
 /// Guard-page bit kept separate from the protection conversion helpers.
@@ -414,5 +588,226 @@ mod tests {
         assert_eq!(query.region_size, 0x4000);
         assert_eq!(query.protection, VmProtection::READ_WRITE);
         assert!(vm.is_mapped(base));
+    }
+
+    /// MEM_COMMIT semantics: re-committing an already-committed range keeps
+    /// its contents, while a page that was decommitted is zeroed IN PLACE
+    /// (stale raw bytes from before the decommit must never resurface).
+    #[test]
+    fn mem_commit_zeroes_only_new_pages_and_preserves_committed_contents() {
+        let mut vm = test_vm();
+        let mut memory = MemoryImage::default();
+        let (base, size) = nt_allocate_virtual_memory_with_pages(
+            &mut vm,
+            &mut memory,
+            0,
+            0,
+            0x2000,
+            MEM_COMMIT | MEM_RESERVE,
+            crate::ntdll::PAGE_READWRITE,
+        )
+        .expect("initial commit");
+        assert_eq!(size, 0x2000);
+        memory.map_bytes(base, &[0xAA; 8]);
+        memory.map_bytes(base + 0x1000, &[0xBB; 8]);
+        // Re-commit of the full range: already-committed pages are NOT zeroed.
+        let (again, again_size) = nt_allocate_virtual_memory_with_pages(
+            &mut vm,
+            &mut memory,
+            base,
+            0,
+            0x2000,
+            MEM_COMMIT,
+            crate::ntdll::PAGE_READWRITE,
+        )
+        .expect("re-commit");
+        assert_eq!((again, again_size), (base, 0x2000));
+        assert_eq!(
+            memory.read_u64(base).expect("page 0 contents"),
+            u64::from_le_bytes([0xAA; 8]),
+            "MEM_COMMIT preserves already-committed contents"
+        );
+        // Decommit page 0 in the VM only, then leave stale raw bytes behind.
+        nt_free_virtual_memory(&mut vm, base, 0x1000, MEM_DECOMMIT).expect("decommit page 0");
+        memory.map_bytes(base, &[0xCC; 8]);
+        // Re-commit page 0: the stale 0xCC bytes must be zeroed in place.
+        nt_allocate_virtual_memory_with_pages(
+            &mut vm,
+            &mut memory,
+            base,
+            0,
+            0x1000,
+            MEM_COMMIT,
+            crate::ntdll::PAGE_READWRITE,
+        )
+        .expect("re-commit page 0");
+        assert_eq!(
+            memory.read_u64(base).expect("recommitted page 0"),
+            0,
+            "a newly committed page is zeroed in place, not left stale"
+        );
+        assert_eq!(
+            memory.read_u64(base + 0x1000).expect("page 1 contents"),
+            u64::from_le_bytes([0xBB; 8]),
+            "the untouched committed page keeps its contents"
+        );
+    }
+
+    /// A fixed-base `MEM_RESERVE | MEM_COMMIT` reserves the free range first
+    /// and reports `STATUS_CONFLICTING_ADDRESSES` when that range overlaps an
+    /// existing reservation.
+    #[test]
+    fn fixed_base_reserve_and_commit_conflicts_with_overlapping_reservation() {
+        let mut vm = test_vm();
+        // An existing cursor reservation to collide with.
+        let occupied = vm.reserve(None, 0x1000);
+        assert_ne!(occupied, 0);
+        // Overlap: the fixed range [occupied - 0x1000, +0x2000) covers it.
+        assert_eq!(
+            nt_allocate_virtual_memory(
+                &mut vm,
+                occupied - 0x1000,
+                0,
+                0x2000,
+                MEM_COMMIT | MEM_RESERVE,
+                crate::ntdll::PAGE_READWRITE,
+            ),
+            Err(STATUS_CONFLICTING_ADDRESSES),
+            "a fixed reserve+commit overlapping a live reservation conflicts"
+        );
+        // A free fixed base succeeds: reserve first, then commit.
+        let fixed = 0x7FF0_0000_0000_u64;
+        assert_eq!(vm.region_size(fixed), None, "precondition: base is free");
+        let (base, size) = nt_allocate_virtual_memory(
+            &mut vm,
+            fixed,
+            0,
+            0x2000,
+            MEM_COMMIT | MEM_RESERVE,
+            crate::ntdll::PAGE_READWRITE,
+        )
+        .expect("fixed reserve+commit");
+        assert_eq!((base, size), (fixed, 0x2000));
+        assert_eq!(vm.query(fixed).state, VmState::Committed);
+    }
+
+    /// MEM_DECOMMIT validation edges: zero/absent arguments, a range whose
+    /// aligned end wraps off the top of the address space, free pages,
+    /// ranges extending past the reservation, and a committed run whose base
+    /// is not the reservation base (fail closed).
+    #[test]
+    fn decommit_rejects_wrapping_end_free_pages_and_out_of_region_ranges() {
+        let mut vm = test_vm();
+        let (base, _) = nt_allocate_virtual_memory(
+            &mut vm,
+            0,
+            0,
+            0x3000,
+            MEM_COMMIT | MEM_RESERVE,
+            crate::ntdll::PAGE_READWRITE,
+        )
+        .expect("allocate");
+        assert_eq!(
+            nt_free_virtual_memory(&mut vm, base, 0, MEM_DECOMMIT),
+            Err(STATUS_INVALID_PARAMETER),
+            "MEM_DECOMMIT with RegionSize 0 is invalid"
+        );
+        assert_eq!(
+            nt_free_virtual_memory(&mut vm, 0, 0x1000, MEM_DECOMMIT),
+            Err(STATUS_INVALID_PARAMETER),
+            "MEM_DECOMMIT with a null base is invalid"
+        );
+        assert_eq!(
+            nt_free_virtual_memory(&mut vm, u64::MAX - 0x800, 0x1000, MEM_DECOMMIT),
+            Err(STATUS_INVALID_PARAMETER),
+            "a decommit whose aligned end wraps the address space is invalid"
+        );
+        assert_eq!(
+            nt_free_virtual_memory(&mut vm, 0x1000, 0x1000, MEM_DECOMMIT),
+            Err(STATUS_INVALID_PARAMETER),
+            "decommitting free memory is invalid"
+        );
+        assert_eq!(
+            nt_free_virtual_memory(&mut vm, base + 0x2000, 0x2000, MEM_DECOMMIT),
+            Err(STATUS_INVALID_PARAMETER),
+            "a decommit extending past the reservation is invalid"
+        );
+        // Decommit the first page; page 0's absence makes the committed run
+        // of pages 1..3 start mid-reservation, so a further decommit of
+        // page 2 must fail closed instead of corrupting the region.
+        nt_free_virtual_memory(&mut vm, base, 0x1000, MEM_DECOMMIT).expect("decommit page 0");
+        assert_eq!(
+            nt_free_virtual_memory(&mut vm, base + 0x2000, 0x1000, MEM_DECOMMIT),
+            Err(STATUS_INVALID_PARAMETER),
+            "a committed run that does not start at the reservation base fails closed"
+        );
+        assert_eq!(
+            nt_free_virtual_memory(&mut vm, base + 0x10_000, 0, MEM_RELEASE),
+            Err(STATUS_INVALID_PARAMETER),
+            "MEM_RELEASE of a never-reserved base is invalid"
+        );
+        assert_eq!(
+            nt_free_virtual_memory(&mut vm, base, 0x1000, 0),
+            Err(STATUS_INVALID_PARAMETER),
+            "a free type without MEM_RELEASE/MEM_DECOMMIT is invalid"
+        );
+    }
+
+    /// Page-by-page transfers stop at the first inaccessible page: a fault
+    /// before any byte is `STATUS_ACCESS_VIOLATION`, a fault after at least
+    /// one byte is `STATUS_PARTIAL_COPY`, and unaligned starts chunk to the
+    /// page boundary.
+    #[test]
+    fn paged_transfers_stop_at_first_inaccessible_page_with_partial_status() {
+        let mut memory = MemoryImage::default();
+        let page = 0x8000_u64;
+        memory.map_bytes(page, &[0x5A; 0x1000]);
+        // Unaligned start 16 bytes before the page end: first chunk succeeds,
+        // the next page is unmapped → partial copy of exactly 16 bytes.
+        let (status, bytes) = nt_read_virtual_memory_paged(&memory, page + 0xFF0, 0x20);
+        assert_eq!(status, STATUS_PARTIAL_COPY, "mid-transfer fault is partial");
+        assert_eq!(
+            bytes,
+            vec![0x5A; 16],
+            "only the accessible chunk is returned"
+        );
+        // A fault before the first byte is a straight access violation.
+        let (status, bytes) = nt_read_virtual_memory_paged(&memory, 0x9000, 0x10);
+        assert_eq!(status, STATUS_ACCESS_VIOLATION, "immediate fault is AV");
+        assert_eq!(
+            bytes.len(),
+            0,
+            "no bytes are returned on an immediate fault"
+        );
+        // A fully accessible range succeeds.
+        let (status, bytes) = nt_read_virtual_memory_paged(&memory, page + 0x10, 0x20);
+        assert_eq!(status, STATUS_SUCCESS, "accessible read succeeds");
+        assert_eq!(bytes, vec![0x5A; 0x20]);
+        // Zero length never touches memory.
+        let (status, bytes) = nt_read_virtual_memory_paged(&memory, page, 0);
+        assert_eq!(status, STATUS_SUCCESS, "zero-length read succeeds");
+        assert_eq!(bytes.len(), 0);
+        // Writes mirror the read semantics.
+        let (status, written) =
+            nt_write_virtual_memory_paged(&mut memory, page + 0xFF0, &[0x11; 0x20]);
+        assert_eq!(
+            status, STATUS_PARTIAL_COPY,
+            "mid-transfer write fault is partial"
+        );
+        assert_eq!(written, 16, "only the accessible chunk is written");
+        let (status, written) = nt_write_virtual_memory_paged(&mut memory, 0x9000, &[0x22; 8]);
+        assert_eq!(
+            status, STATUS_ACCESS_VIOLATION,
+            "immediate write fault is AV"
+        );
+        assert_eq!(written, 0, "no bytes are written on an immediate fault");
+        let (status, written) = nt_write_virtual_memory_paged(&mut memory, page, &[0x33; 8]);
+        assert_eq!(status, STATUS_SUCCESS, "accessible write succeeds");
+        assert_eq!(written, 8);
+        assert_eq!(
+            memory.read_u8(page).expect("byte"),
+            0x33,
+            "the write landed"
+        );
     }
 }

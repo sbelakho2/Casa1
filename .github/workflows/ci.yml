@@ -19,18 +19,23 @@ env:
   # and manual runner invocations use the production worker pool by default.
   CASA1_COOPERATIVE_SCHEDULER: "1"
 
+# Least privilege: workflows only read repository contents; jobs that need
+# more (cross-run artifacts) add it at the job level.
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: Format
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -38,23 +43,37 @@ jobs:
     name: Check
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Check compilation
         run: cargo check --all-targets
       - name: Check KNOWN-ISSUE markers carry tracking evidence
         run: ./ci/check_known_issues.sh
+      - name: Reject new forbidden call sites (RCX state reads, Command::new, path translation)
+        run: ./ci/check_forbidden_patterns.sh
+
+  audit:
+    name: Dependency Audit (RustSec)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit (only reviewed exceptions in .cargo/audit.toml)
+        run: ./ci/check_audit.sh
 
   clippy:
     name: Clippy (default features)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Run Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings -A future-incompatible
 
@@ -62,11 +81,11 @@ jobs:
     name: Clippy (all features)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install FFmpeg development libraries
         run: |
           brew install ffmpeg@7
@@ -117,9 +136,9 @@ jobs:
             formula: "ffmpeg@7"
             pkg_config_major: "61"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install FFmpeg ${{ matrix.ffmpeg }} development libraries
         run: |
           brew install ${{ matrix.formula }}
@@ -144,14 +163,14 @@ jobs:
     name: Test
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           # The affected-test selector diffs against origin/main; a shallow
           # checkout would make that base unresolvable (and used to silently
           # select no tests).
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Run affected adversarial tests with 100% changed-line coverage
         env:
           CASA1_BASE_REF: origin/main
@@ -162,7 +181,7 @@ jobs:
       # failure instead of silently losing the evidence.
       - name: Upload compiled test/evidence manifest
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: test-manifest-${{ github.sha }}
           path: ci/test-manifest.json
@@ -173,9 +192,9 @@ jobs:
     name: API Completeness and Coverage Regression Gate
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       # The dev gate runs the SAME completeness gate as the release path
       # (Partial never passes; every Implemented API needs
       # Differential/Conformance coverage), then applies the regression
@@ -191,7 +210,7 @@ jobs:
         run: bash ci/check_api_regression.sh api-completeness.json --baseline ci/api-baseline.json
       - name: Upload commit-bound API completeness evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: api-completeness-${{ github.sha }}
           path: |
@@ -204,9 +223,9 @@ jobs:
     name: Integration Tests
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Run non-ignored, non-external integration tests
         env:
           RUST_TEST_THREADS: "1"
@@ -216,9 +235,9 @@ jobs:
     name: Docs
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Build documentation
         run: cargo doc --no-deps
 
@@ -226,9 +245,9 @@ jobs:
     name: Fuzz Build
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
       - name: Build fuzz targets
@@ -240,9 +259,9 @@ jobs:
     runs-on: macos-latest
     needs: [fuzz-build]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
       - name: Run short bounded fuzz smoke runs
@@ -271,9 +290,9 @@ jobs:
     name: Warning Count
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Count compiler warnings
         run: |
           LOG_FILE=$(mktemp)
@@ -291,7 +310,7 @@ jobs:
     name: Release Policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Verify protected-main/release policy
         run: python3 ci/check_release_policy.py --root .
 

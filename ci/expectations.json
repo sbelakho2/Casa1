@@ -267,6 +267,10 @@
   "( manager.cancel_wait(created.handle, STATUS_CANCELLED), Ok(created.id) )",
   "(manager.take_wake_status(created.id), Some(STATUS_CANCELLED))"
  ],
+ "alloc_private_pages_rejects_guest_sizes_above_the_host_allocation_bound": [
+  "(error.code, ReasonCode::RcBufferLimitExceeded)",
+  "( error.message, format!( \"private page allocation of {:#x} bytes exceeds the {:#x}-byte bound\", (1u64 << 30) + 0x1000, 1u64 << 30 ) )"
+ ],
  "allocate_validates_arguments": [
   "( nt_allocate_virtual_memory(&mut vm, 0, 0, 0, MEM_RESERVE, crate::ntdll::PAGE_READWRITE), Err(STATUS_INVALID_PARAMETER) )",
   "( nt_allocate_virtual_memory(&mut vm, 0, 0, 0x1000, 0, crate::ntdll::PAGE_READWRITE), Err(STATUS_INVALID_PARAMETER) )",
@@ -383,6 +387,14 @@
   "( bad(&[ (b\"fcTL\", apng_fctl(0, 1, 1, 0, 0, 1, 10, 0, 0)), (b\"IDAT\", raw.clone()), ]), WINCODEC_ERR_BADIMAGE, \"fcTL without acTL is invalid\" )",
   "( bad(&[ (b\"acTL\", apng_actl(1, 0)), (b\"fcTL\", apng_fctl(1, 1, 1, 0, 0, 1, 10, 0, 0)), (b\"IDAT\", raw.clone()), ]), WINCODEC_ERR_BADIMAGE, \"a sequence gap is rejected\" )",
   "( bad(&[ (b\"acTL\", apng_actl(1, 0)), (b\"fcTL\", apng_fctl(0, 2, 2, 1, 1, 1, 10, 0, 0)), (b\"IDAT\", raw.clone()), ]), WINCODEC_ERR_BADIMAGE, \"a frame rectangle outside the canvas is rejected\" )"
+ ],
+ "app_container_profile_path_uses_the_same_rejecting_size_contract": [
+  "(result, 0)",
+  "(fixture.runtime.last_error, ERROR_INSUFFICIENT_BUFFER)",
+  "(read_u32(&fixture.memory, SIZE).expect(\"required size\"), 9)",
+  "( read_u16(&fixture.memory, BUFFER).expect(\"sentinel\"), 0xAAAA, \"a too-small buffer must not be written\" )",
+  "( dispatch_x86( &mut fixture, HostThunk::GetAppContainerProfilePath, &[0, BUFFER as u32, SIZE as u32], ), 1 )",
+  "(fixture.runtime.last_error, 0)"
  ],
  "apple_m_series_profiles_map_to_expected_metal_families": [
   "(m1.adapter.name, \"Apple M1 Max\")",
@@ -891,6 +903,19 @@
   "(bridge.records(), Vec::new())",
   "(bridge.record(descriptor.id), None)"
  ],
+ "authenticode_code_signing_policy_rejects_wrong_eku": [
+  "( certificate_allows_code_signing(&cert), Ok(false), \"a timestamping-only EKU must not satisfy the code-signing policy\" )",
+  "( certificate_allows_code_signing(&cert), Ok(true), \"id-kp-codeSigning must satisfy the code-signing policy\" )"
+ ],
+ "authenticode_valid_signature_with_malformed_eku_is_rejected": [
+  "( reason.starts_with(\"malformed ExtendedKeyUsage extension\"), true, \"exact failure prefix, got: {reason}\" )"
+ ],
+ "authenticode_valid_signature_with_untrusted_chain_is_rejected": [
+  "( reason.starts_with(\"chain validation failed: \"), true, \"must fail at chain validation (signature verified), got: {reason}\" )"
+ ],
+ "authenticode_valid_signature_with_wrong_eku_is_rejected": [
+  "( reason, \"signer certificate EKU does not include codeSigning (1.3.6.1.5.5.7.3.3)\" )"
+ ],
  "auto_unavailable_host_and_deterministic_modes_fall_back": [
   "( crate::runtime::jit_construction_selected(&JitMode::Auto, false, false), false )",
   "( crate::runtime::jit_construction_selected(&JitMode::Auto, true, true), false )",
@@ -1219,6 +1244,14 @@
   "(ret, 0, \"an empty picker cancels\")",
   "(runtime.last_error, 0)"
  ],
+ "certificate_chain_at_timestamped_date_rejects_untrusted_self_signed": [
+  "( at_timestamp.is_err(), true, \"self-signed chain must fail at the timestamped date: {at_timestamp:?}\" )",
+  "( now.is_err(), true, \"self-signed chain must fail at the current date: {now:?}\" )",
+  "(cert_der[off], 0x04, \"extnValue is an OCTET STRING\")",
+  "(pkcs7.len(), cert_size - 8, \"hash substitution keeps sizes\")",
+  "(tag, 0x04, \"eContent wraps an OCTET STRING\")",
+  "(signature_bytes.len(), 128, \"RSA-1024 signature width\")"
+ ],
  "certificate_from_der_truncated": [
   "(cert.thumbprint.len(), 20)"
  ],
@@ -1240,6 +1273,14 @@
   "(fault.address, 0x1000)",
   "(fault.address, base + 0x2000)",
   "(fault.address, base + 0x1000)"
+ ],
+ "checked_guest_writers_reject_read_only_pages_with_noaccess_error": [
+  "(vm.reserve(Some(base), 0x1000), base)",
+  "(bytes_error.code, ReasonCode::RcMemoryAccessViolation)",
+  "(bytes_error.message, noaccess(4))",
+  "(u16_error.code, ReasonCode::RcMemoryAccessViolation)",
+  "(u16_error.message, noaccess(2))",
+  "(u32_error.code, ReasonCode::RcMemoryAccessViolation)"
  ],
  "checked_le_bytes_4_out_of_bounds": [
   "(err.code, ReasonCode::RcUnimplInsn)"
@@ -1332,6 +1373,10 @@
  "closed_values_are_recycled_with_a_fresh_generation": [
   "(second, first, \"closed values are recycled FIFO\")",
   "( table.handle_generation(second), Some(1), \"reuse gets a fresh generation\" )"
+ ],
+ "closing_one_printer_keeps_another_printers_active_job": [
+  "(ps.active_job_for_printer(second), Some(second_job))",
+  "(ps.active_job_for_printer(first), None)"
  ],
  "clr_create_instance_rejects_unknown_ids_and_nulls_with_zeroed_out": [
   "( dispatch_x86( &mut fixture, HostThunk::ClrCreateInstance, &[clsid as u32, riid as u32, 0], ), u64::from(E_POINTER) )",
@@ -1459,6 +1504,12 @@
  ],
  "code_page_conversion_unsupported_codepage": [
   "(result, None, \"unsupported code page should return None\")"
+ ],
+ "code_signing_policy_boundary_absent_and_malformed_extensions": [
+  "( certificate_allows_code_signing(&parsed), Ok(true), \"a certificate without extensions is code-signing unconstrained\" )",
+  "( certificate_allows_code_signing(&no_eku_cert), Ok(true), \"extensions without an EKU are code-signing unconstrained\" )",
+  "(broken[off], 0x04, \"extnValue is an OCTET STRING\")",
+  "( err.starts_with(\"malformed ExtendedKeyUsage extension\"), true, \"exact failure prefix, got: {err}\" )"
  ],
  "com_abs_item_bind_to_storage_failure_and_compound_stream_edges_are_pinned": [
   "( call_slot( &mut fixture, moniker, 9, &[moniker as u32, 0, 0, IID_PTR as u32, OUT as u32] ), E_NOINTERFACE )",
@@ -1678,6 +1729,9 @@
   "(report.compiled, 5)",
   "(report.blocks, 0)"
  ],
+ "completed_job_retention_is_bounded_and_never_evicts_active_jobs": [
+  "(ps.jobs.len(), MAX_RETAINED_JOBS)"
+ ],
  "completion_port_binds_posts_dequeues_and_closes": [
   "(manager.port_count(), 1)",
   "(port.queue_depth(), 8)",
@@ -1725,6 +1779,9 @@
  ],
  "concurrent_profile_readers_never_observe_a_partial_record": [
   "(loaded.address_count() > 0, true)"
+ ],
+ "concurrent_readers_never_observe_a_partial_file": [
+  "( temp_files(dir.path()).len(), 0, \"atomic writer must not leave temp files\" )"
  ],
  "concurrent_signal_wait_races_wake_each_waiter_exactly_once": [
   "( subsystem.d3dkmt_signal_synchronization_object(sync, 1), Ok(()) )",
@@ -1929,6 +1986,14 @@
   "(status, u64::from(PDH_INVALID_DATA))",
   "(status, 0, \"PDH_CSTATUS_VALID_DATA\")"
  ],
+ "countersignature_edges_pin_exact_signing_times": [
+  "( countersignature_signing_time(&signer), None, \"no unsigned attributes means no countersignature time\" )",
+  "( countersignature_signing_time(&signer), Some(TEST_UNIX_2024_01_01), \"a UTCTime signingTime attribute yields its Unix instant\" )",
+  "( countersignature_signing_time(&signer), Some(TEST_UNIX_2024_01_01), \"a GeneralizedTime signingTime attribute yields its Unix instant\" )",
+  "( countersignature_signing_time(&signer), Some(TEST_UNIX_2024_01_01), \"a bare SPC_TIME_STAMP counter-SignerInfo yields its signed time\" )",
+  "( countersignature_signing_time(&signer), Some(TEST_UNIX_2024_01_01), \"an OCTET STRING-wrapped SPC_TIME_STAMP yields its signed time\" )",
+  "( countersignature_signing_time(&signer), None, \"a non-Time signingTime value yields no countersignature time\" )"
+ ],
  "coverage_for_pe_produces_generic_binary_import_entries": [
   "(report.image_arch, GuestArch::X86)",
   "(report.target, target)",
@@ -1971,6 +2036,14 @@
  ],
  "create_directory_missing_parent_returns_path_not_found": [
   "( result.expect_err(\"missing parent must fail\").code, ReasonCode::RcFsPathInvalid, \"CreateDirectoryW with a missing parent must be ERROR_PATH_NOT_FOUND\" )"
+ ],
+ "create_environment_block_rejects_host_environment_and_destroy_frees_it": [
+  "( dispatch_x86( &mut fixture, HostThunk::CreateEnvironmentBlock, &[OUT as u32, 0, 0], ), 1 )",
+  "( read_utf16_string(&fixture.memory, block).expect(\"first entry\"), \"GUEST_ONLY=1\", \"the block must be the guest environment, never std::env\" )",
+  "( fixture .runtime .win32 .address_space() .region_size(block) .is_some(), true )",
+  "( dispatch_x86( &mut fixture, HostThunk::DestroyEnvironmentBlock, &[block as u32], ), 1 )",
+  "( fixture.runtime.win32.address_space().region_size(block), None, \"DestroyEnvironmentBlock must release the guest allocation\" )",
+  "(fixture.runtime.userenv_blocks.contains_key(&block), false)"
  ],
  "create_file_a_null_path_fails_with_path_not_found": [
   "(handle, u32::MAX as u64)",
@@ -3081,6 +3154,18 @@
  "decode_xma_stereo_output_is_frame_major_interleaved": [
   "(s, 0)"
  ],
+ "decommit_rejects_wrapping_end_free_pages_and_out_of_region_ranges": [
+  "( nt_free_virtual_memory(&mut vm, base, 0, MEM_DECOMMIT), Err(STATUS_INVALID_PARAMETER), \"MEM_DECOMMIT with RegionSize 0 is invalid\" )",
+  "( nt_free_virtual_memory(&mut vm, 0, 0x1000, MEM_DECOMMIT), Err(STATUS_INVALID_PARAMETER), \"MEM_DECOMMIT with a null base is invalid\" )",
+  "( nt_free_virtual_memory(&mut vm, u64::MAX - 0x800, 0x1000, MEM_DECOMMIT), Err(STATUS_INVALID_PARAMETER), \"a decommit whose aligned end wraps the address space is invalid\" )",
+  "( nt_free_virtual_memory(&mut vm, 0x1000, 0x1000, MEM_DECOMMIT), Err(STATUS_INVALID_PARAMETER), \"decommitting free memory is invalid\" )",
+  "( nt_free_virtual_memory(&mut vm, base + 0x2000, 0x2000, MEM_DECOMMIT), Err(STATUS_INVALID_PARAMETER), \"a decommit extending past the reservation is invalid\" )",
+  "( nt_free_virtual_memory(&mut vm, base + 0x2000, 0x1000, MEM_DECOMMIT), Err(STATUS_INVALID_PARAMETER), \"a committed run that does not start at the reservation base fails closed\" )"
+ ],
+ "deep_path_inside_drive_root_is_not_rejected_as_escape": [
+  "( win32 .ge .parse_windows_path(\"C:\\\\deep\\\\a\\\\b\\\\file.txt\", None) .expect(\"parse deep path\") .normalized_path, \"C:\\\\deep\\\\a\\\\b\\\\file.txt\", \"Windows preserves the caller's drive-letter case\" )",
+  "(host, win32.ge.drive_c().join(\"deep/a/b/file.txt\"))"
+ ],
  "default_blend_state": [
   "(blend.src_blend, BlendFactor::One)",
   "(blend.dst_blend, BlendFactor::Zero)"
@@ -3163,6 +3248,11 @@
   "( backend .descriptor_translation_cache .lock() .unwrap_or_else(|poisoned| poisoned.into_inner()) .entries .contains_key(&heap), false )",
   "(error.code, ReasonCode::RcD3dInvalidState)",
   "(error.message, \"unknown descriptor heap\")"
+ ],
+ "destroy_environment_block_of_an_unknown_address_is_invalid_parameter": [
+  "(result, 0, \"an unknown block pointer must fail\")",
+  "(fixture.runtime.last_error, ERROR_INVALID_PARAMETER)",
+  "( fixture.runtime.userenv_blocks.contains_key(&0xdead_0000u64), false )"
  ],
  "destroy_texture_rejects_stale_heap_and_breaks_at_owning_heap": [
   "( backend.heap_usage(second).expect(\"second usage\").0 > 0, true )",
@@ -3565,6 +3655,9 @@
   "(ticket.irql, 5)",
   "(manager.isr_invocations(), 1)"
  ],
+ "dispatch_collided_chaininfo_frame_fails_closed_unhandled": [
+  "(error.code, ReasonCode::SehException)"
+ ],
  "dispatch_stats_missing_partial_malformed_and_zero_documents_report_exact_reasons": [
   "(report.stats, None)",
   "( report.unavailable, Some(DispatchStatsUnavailable::Absent(missing.clone())) )",
@@ -3603,6 +3696,10 @@
   "(fixture.memory.read_u16(OUT + 8).unwrap(), 1)",
   "( call_slot( &mut fixture, type_info, 13, &[ type_info as u32, 1, 0, OUT as u32, (OUT + 4) as u32, (OUT + 8) as u32, ] ), S_OK, \"guest-path module discovery\" )",
   "(fixture.memory.read_u16(OUT + 8).unwrap(), 5)"
+ ],
+ "dll_main_drain_edge_disabled_thread_module_is_materialized_without_guest_entry": [
+  "( runtime.pending_dll_main_calls.len(), 0, \"the queued notification is consumed\" )",
+  "( memory.read_u8(base).expect(\"materialised image\"), b'M', \"materialise ran before the disabled-thread skip\" )"
  ],
  "dml_cross_node_fusion_edge_matches_wired_and_preserves_nan": [
   "(chains, vec![vec![0, 1, 2]])",
@@ -4220,11 +4317,31 @@
   "(render.is_mesh_pipeline_bound(), false)",
   "(render.is_mesh_pipeline_bound(), true)"
  ],
+ "end_doc_duplicate_output_is_never_overwritten_and_writes_a_numbered_copy": [
+  "( ps.end_doc_printer(job), true, \"the suffixed write must still complete the document\" )",
+  "( std::fs::read(&preferred).expect(\"earlier output\"), b\"earlier print\", \"the earlier print must be retained byte-for-byte\" )",
+  "( suffixed.is_file(), true, \"the numbered copy must exist next to the retained output\" )"
+ ],
+ "end_doc_output_write_failure_still_finalizes_the_job": [
+  "( ps.end_doc_printer(job), true, \"a failed save must not fail the document\" )",
+  "( ps.jobs.get(&job).expect(\"job\").status, PrintJobStatus::Completed )",
+  "( print_outputs_for(job, \"blocked_dir\").len(), 0, \"no PDF may exist under a blocked output directory\" )"
+ ],
+ "end_doc_printer_rejects_a_job_this_subsystem_never_issued": [
+  "( ps.end_doc_printer(0xDEAD_BEEF), false, \"EndDocPrinter of an unknown job must return FALSE\" )"
+ ],
+ "end_doc_rejects_duplicate_pdf_and_is_idempotent": [
+  "(after_first, before + 1, \"first EndDoc writes one PDF\")",
+  "( print_outputs_for(job, \"idempotent_doc\").len(), after_first, \"second EndDoc must not write another PDF\" )"
+ ],
  "end_frame_rejects_stale_second_commit_without_active_command_buffer": [
   "(renderer.command_buffer.is_none(), true)",
   "(renderer.encoder.is_none(), true)",
   "(renderer.frame_index, frame_index + 1)",
   "( renderer.pool_buffer.load(Ordering::Relaxed), (frame_index + 1) % POOL_BUFFER_COUNT, \"a frameless end_frame must rotate the pool exactly once\" )"
+ ],
+ "ending_one_of_two_jobs_leaves_the_other_active": [
+  "(ps.active_job_for_printer(handle), Some(newer))"
  ],
  "engine_capability_pcr_and_state_machine_reject_invalid_parameters": [
   "(rc(&nv_define(&mut tpm, 0x0150_0300, 8)), TPM_RC_SUCCESS)",
@@ -4468,6 +4585,12 @@
   "(exact.status, STATUS_SUCCESS, \"class {class}\")",
   "(exact.bytes, full.bytes, \"class {class}\")"
  ],
+ "eviction_never_drops_active_jobs_when_every_retained_slot_is_active": [
+  "(ps.jobs.len(), MAX_RETAINED_JOBS + 1)",
+  "(ps.active_jobs.len(), MAX_RETAINED_JOBS + 1)",
+  "( ps.jobs.len(), MAX_RETAINED_JOBS + 1, \"active jobs must never be evicted\" )",
+  "(ps.jobs.len(), 0, \"closing the printer cancels its jobs\")"
+ ],
  "evidence_codec_components_surfaces": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create_decoder, &[0, decoder_out as u32] ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create_reader, &[0, 0, reader_out as u32] ), 0 )",
@@ -4592,14 +4715,6 @@
   "( dispatch_x86_thunk(&mut runtime, &mut memory, open_adapter, &[open_info as u32]), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create_device, &[device_info as u32] ), 0 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, create_swapchain, &[swap_info as u32] ), 0 )"
- ],
- "evidence_dialogs_profiles_netprov_tsf_vb_surfaces": [
-  "( dispatch_x86_thunk(&mut runtime, &mut memory, open_file, &[open_struct as u32]), 0, \"no dialog host\" )",
-  "( dispatch_x86_thunk(&mut runtime, &mut memory, dialog_error, &[]), 0x0004, \"CDERR_INITIALIZATION\" )",
-  "( dispatch_x86_thunk( &mut runtime, &mut memory, create_block, &[block_out as u32, 0, 0] ), 1 )",
-  "( dispatch_x86_thunk(&mut runtime, &mut memory, destroy_block, &[block as u32]), 1 )",
-  "( dispatch_x86_thunk( &mut runtime, &mut memory, get_connection, &[0x41_300, 0x41_310, 0x41_320] ), 0x0248, \"WN_NOT_CONNECTED\" )",
-  "( dispatch_x86_thunk( &mut runtime, &mut memory, open_enum, &[0, 0, 0, 0, 0x41_330] ), 0x0249, \"WN_NO_NETWORK\" )"
  ],
  "evidence_expansion_corpus_is_deterministic_and_fully_computed": [
   "( result.output.get(\"runtime_unavailable\"), None, \"{} must be computed by the Casa1 runtime, not reported unavailable\", vector.id )"
@@ -4895,6 +5010,14 @@
   "(outcome.reason, JitExitReason::Safepoint)",
   "(outcome.final_block, 0x7000)"
  ],
+ "execute_tls_callbacks_error_on_faulting_callback_address": [
+  "(error.code, ReasonCode::RcUnimplInsn)",
+  "( error.message, \"unmapped guest memory at 0x77880100 while executing guest instruction at \\ 0x77880100: <unavailable> | rax=0x0 rbx=0x0 rcx=0x0 rdx=0x0 rsi=0x0 rdi=0x0 \\ rsp=0x4ffec rbp=0x0\" )"
+ ],
+ "execute_tls_callbacks_for_missing_module_is_noop": [
+  "(result.err().map(|error| error.code), None::<ReasonCode>)",
+  "( runtime.dll_info_table.len(), before, \"no module table entry is invented\" )"
+ ],
  "executes_driver_entry_for_real": [
   "(island.status(), STATUS_SUCCESS)",
   "(island.driver_name(), \"CasaDriver\")",
@@ -5041,6 +5164,13 @@
   "(first.guest_pc, 0x1111, \"first failure's guest_pc kept\")",
   "(first.detail, \"first cef failure\")",
   "(first.api.as_deref(), Some(\"CefInitialize\"))"
+ ],
+ "fixed_base_reserve_and_commit_conflicts_with_overlapping_reservation": [
+  "( nt_allocate_virtual_memory( &mut vm, occupied - 0x1000, 0, 0x2000, MEM_COMMIT | MEM_RESERVE, crate::ntdll::PAGE_READWRITE, ), Err(STATUS_CONFLICTING_ADDRESSES), \"a fixed reserve+commit overlapping a live reservation conflicts\" )",
+  "(vm.region_size(fixed), None, \"precondition: base is free\")",
+  "((base, size), (fixed, 0x2000))",
+  "(vm.query(fixed).state, VmState::Committed)",
+  "(occupied, 0)"
  ],
  "flat_window_four_gib_and_end_boundary_select_direct_or_owned_frames": [
   "(store.materialised_page_count(), 5)",
@@ -5213,6 +5343,12 @@
  ],
  "ge_run_defaults_to_all_trace_categories": [
   "(categories, trace::all_categories())"
+ ],
+ "generated_pdf_rejects_spool_hex_dump_and_non_ascii_names": [
+  "( pdf.iter().all(|byte| byte.is_ascii()), true, \"PDF must stay ASCII even for a non-ASCII document name\" )",
+  "( text.contains(\"Spool data:\"), false, \"the debug hex dump must be gone\" )",
+  "(text.contains(\"Printed from Casa1 - ??? \\\\(t?st\\\\)\"), true)",
+  "( escaped_text.contains(\"a\\\\\\\\b\\\\(c\\\\)\"), true, \"backslashes and parens must be PDF-escaped\" )"
  ],
  "generations_start_at_zero_and_increment_on_close": [
   "(table.handle_generation(handle), Some(0))"
@@ -5649,6 +5785,14 @@
   "( guest_call( &mut fixture, 0x2000, IFACE_PEER, 14, &[group, HOST_PLAYER_ID] ), u64::from(S_OK) )",
   "( guest_call( &mut fixture, 0x2000, IFACE_PEER, 19, &[group, members as u32, count as u32] ), u64::from(S_OK) )",
   "(guest_read_u32(&mut fixture.memory, count), 1)"
+ ],
+ "guest_hid_keyboard_mouse_system_and_consumer_usages_are_rejected_with_access_denied": [
+  "(device.is_guest_excluded(), true)",
+  "( bridge.apply(vec![device.clone()]), Vec::<HotplugEvent>::new() )",
+  "(bridge.devices().len(), 0)",
+  "( error, DeviceError::PermissionDenied { operation: \"IOHIDDeviceOpen\" } )",
+  "(error.windows_error(), 5)",
+  "( bridge .open_checked(device.id, device.vendor_id, device.product_id) .map(|_| ()), Err(DeviceError::PermissionDenied { operation: \"IOHIDDeviceOpen\" }), \"open_checked must refuse an excluded host-input device\" )"
  ],
  "guest_initial_upload_rejects_window_edges_and_keeps_zero_staging": [
   "(upload.stats().guest_backed, true)",
@@ -6424,6 +6568,42 @@
   "( device.iosurface_texture_builds(), 1, \"the aliasing texture is reused across frames (no per-frame leak)\" )",
   "(device.fallback_upload_count(), 0)"
  ],
+ "ipc_constant_time_eq_rejects_length_mismatch": [
+  "(constant_time_eq(&[1, 2, 3], &[1, 2, 3, 4]), false)",
+  "(constant_time_eq(&[1, 2, 3], &[1, 2, 3]), true)",
+  "(constant_time_eq(&[1, 2, 3], &[1, 2, 9]), false)"
+ ],
+ "ipc_receive_rejects_oversized_message_length": [
+  "(error.code, ReasonCode::RcRequestBodyTooLarge)"
+ ],
+ "ipc_receive_rejects_wrong_token_bytes": [
+  "(error.code, ReasonCode::RcWin32AccessDenied)"
+ ],
+ "ipc_receive_rejects_wrong_token_length": [
+  "(error.code, ReasonCode::RcWin32AccessDenied)"
+ ],
+ "ipc_receive_truncated_message_body_read_fails": [
+  "(error.code, ReasonCode::RcNetReadFailed)"
+ ],
+ "ipc_receive_truncated_token_body_read_fails": [
+  "(error.code, ReasonCode::RcNetReadFailed)"
+ ],
+ "ipc_receive_truncated_token_header_read_fails": [
+  "(error.code, ReasonCode::RcNetReadFailed)"
+ ],
+ "ipc_rejects_unauthenticated_loopback_requests_with_access_denied": [
+  "(port != 0, true, \"an ephemeral loopback port must be bound\")",
+  "(error.code, ReasonCode::RcWin32AccessDenied)",
+  "( manager.receive_message().expect(\"authenticated request\"), b\"x\" )"
+ ],
+ "ipc_send_message_hostile_responder_oversized_length_rejected": [
+  "( token, expected_token, \"request frame must carry the session token\" )",
+  "( msg, expected_msg, \"request frame must carry the request body\" )",
+  "(error.code, ReasonCode::RcRequestBodyTooLarge)"
+ ],
+ "ipc_start_bind_fails_when_port_occupied": [
+  "( manager.bound_port(), 0, \"port must stay unset when the loopback bind fails\" )"
+ ],
  "irp_cancel_is_exactly_once_and_works_cross_thread": [
   "(canceller.join().unwrap(), Ok(STATUS_CANCELLED))",
   "(core.status(irp).unwrap(), STATUS_CANCELLED)",
@@ -6460,6 +6640,18 @@
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::ExAllocatePool, &[u64::from(PAGED_POOL), 0], ), 0 )",
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::ExAllocatePool, &[9, 0x20], ), 0 )",
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::ExAllocatePoolWithTag, &[9, 0x20, 0x31747343], ), 0 )"
+ ],
+ "is_pe_image_edge_signature_within_dos_header_is_classified": [
+  "(is_pe_image(&path).expect(\"classify PE\"), true)",
+  "(is_pe_image(&not_pe).expect(\"classify non-PE\"), false)"
+ ],
+ "is_pe_image_missing_path_reports_io_error": [
+  "(error.code, ReasonCode::RcIo)",
+  "( error.message, format!(\"failed to open {}\", missing.display()) )"
+ ],
+ "is_pe_image_read_error_on_directory_reports_io_error": [
+  "(error.code, ReasonCode::RcIo)",
+  "( error.message, format!(\"failed to read {}\", dir.path().display()) )"
  ],
  "island_alpc_connect_uses_the_in_process_port_namespace": [
   "( call_kernel_shim( &island, &mut runtime, &mut memory, DriverShim::NtAlpcConnectPort, &[handle_pointer, port_name, 0, 0, 0, 0, 0], ), STATUS_SUCCESS )",
@@ -7285,6 +7477,20 @@
   "( image.dpi_x, WIC_DEFAULT_DPI, \"a truncated APP0 must not claim a density\" )",
   "( image.dpi_y, WIC_DEFAULT_DPI, \"a truncated APP0 must not claim a density\" )"
  ],
+ "jsonl_logger_drops_events_below_the_configured_level": [
+  "( std::fs::metadata(&path).expect(\"metadata\").len(), 0, \"info event must be filtered at warn level\" )"
+ ],
+ "jsonl_logger_new_pins_the_default_info_level_boundary_and_dtm_ticks": [
+  "(event.event_id, 1, \"the first event id is exactly 1\")",
+  "( event.ts_ticks, 1, \"dtm mode must stamp the monotonic event id, never wall time\" )",
+  "( std::fs::metadata(&path).expect(\"metadata\").len() > 0, true, \"the default Info level must keep the info event\" )"
+ ],
+ "jsonl_logger_rotates_at_the_size_boundary_and_creates_backup": [
+  "(path.exists(), true, \"active log must exist\")",
+  "(backup.exists(), true, \"rotation must create <path>.1\")",
+  "( std::fs::metadata(&path).expect(\"active\").len() > 0, true, \"active log must contain events\" )",
+  "( std::fs::metadata(&backup).expect(\"backup\").len() > 0, true, \"backup must contain the rotated events\" )"
+ ],
  "kernel_debugger_information_is_truthful_for_attached_and_detached_states": [
   "( serialize_kernel_debugger_information(false, true), vec![0, 1] )",
   "( serialize_kernel_debugger_information(true, false), vec![1, 0] )",
@@ -7863,6 +8069,10 @@
  "last_error_maps_pe_jit_codes": [
   "( AppError::new(*code, \"\").last_error(), *expected, \"last_error mismatch for {:?}\", code )"
  ],
+ "last_error_maps_pe_parse_invalid_to_bad_exe_format": [
+  "( last_error_from_app_error(&error), crate::error::ERROR_BAD_EXE_FORMAT )",
+  "(crate::error::ERROR_BAD_EXE_FORMAT, 193)"
+ ],
  "last_error_maps_seh_and_halted": [
   "(err.last_error(), ERROR_NOACCESS)",
   "(err.last_error(), ERROR_INVALID_PARAMETER)"
@@ -7948,6 +8158,24 @@
   "(runtime.real_guest_frames, 0, \"GDI pixels are not presents\")",
   "(runtime.real_guest_frames, 1)"
  ],
+ "load_real_dll_import_edge_missing_provider_and_ordinal_thunks_resolve_exactly": [
+  "(provider_status, 0)",
+  "(status, 0, \"the import probe must load\")",
+  "(handle, u64::from(PROBE_IMAGE_BASE))",
+  "(state.pointer_bytes, 4)",
+  "( state.import_thunks.len(), 3, \"self by-name + loaded provider + synthesizable kernel32\" )",
+  "(state.import_thunks[0], (IAT_SELF_BY_NAME, self_thunk))"
+ ],
+ "load_real_dll_rejects_driver_image_with_invalid_authenticode_signature": [
+  "(handle, 0, \"an invalidly signed driver must not load\")",
+  "(status, ERROR_MOD_NOT_FOUND)",
+  "( user_status, 0, \"an invalid signature must not block a user DLL\" )",
+  "(user_handle, 0x0E00_0000)"
+ ],
+ "load_real_dll_rejects_unaligned_image_base_with_bad_exe_format": [
+  "(handle, 0, \"the unaligned image must not map\")",
+  "(status, crate::error::ERROR_BAD_EXE_FORMAT)"
+ ],
  "load_rejects_tampered_private_blob_and_round_trips_exact_public_area": [
   "( rc(&load_child(&mut tpm, parent, &tampered, &public)), TPM_RC_INTEGRITY )",
   "(rc(&response), TPM_RC_SUCCESS)",
@@ -7986,6 +8214,10 @@
   "( dispatch_x86_thunk(&mut runtime, &mut memory, local_free, &[handle as u32]), 0 )",
   "(handle, 0)"
  ],
+ "locate_certificate_table_non_pe_boundary_reports_no_signature": [
+  "( locate_certificate_table(&dos_only), Ok(None), \"a DOS image without a PE signature has no certificate table\" )",
+  "( locate_certificate_table(b\"MZ\\x00\\x00\"), Ok(None), \"a file shorter than the DOS header has no certificate table\" )"
+ ],
  "lock_xadd_native_helper_boundary_mapped_add_and_unmapped_fault_are_exact": [
   "( state.get(Register::Rcx), 0, \"xadd returns the original value\" )",
   "( memory.read_u32(0x10_100).expect(\"counter mapped\"), 3, \"xadd adds the source into the memory operand\" )",
@@ -7993,6 +8225,16 @@
   "( state.jit_pending_fault, Some(unmapped), \"an unmapped xadd must report the precise faulting address\" )",
   "(state.jit_pending_fault_write, true)",
   "( state.get(Register::Rcx), 7, \"a faulted xadd must not modify the source register\" )"
+ ],
+ "log_level_labels_cover_the_severity_boundary_exactly": [
+  "(LogLevel::Error.label(), \"error\")",
+  "(LogLevel::Warn.label(), \"warn\")",
+  "(LogLevel::Info.label(), \"info\")",
+  "(LogLevel::Debug.label(), \"debug\")"
+ ],
+ "log_level_ordering_filters_more_verbose_levels": [
+  "(LogLevel::parse(\"WARNING\"), Some(LogLevel::Warn))",
+  "(LogLevel::parse(\"nonsense\"), None)"
  ],
  "lookaside_depth_limit_releases_memory": [
   "(list.held_bytes(), 32)",
@@ -8195,6 +8437,9 @@
   "(guest_ptr(&fixture, OUT), server)",
   "(stream, 0)"
  ],
+ "materialize_real_dll_image_edge_unmapped_state_and_x64_iat_width": [
+  "( read_u64(&memory, x64_base + 0x100).expect(\"64-bit IAT slot\"), 0x1122_3344_5566_7788 )"
+ ],
  "mdl_lifecycle_rejects_invalid_and_double_operations": [
   "( table.allocate(&memory, base, 0, false), Err(STATUS_INVALID_PARAMETER) )",
   "( table.allocate(&memory, base, u32::MAX as usize + 1, false), Err(STATUS_INVALID_PARAMETER) )",
@@ -8232,6 +8477,13 @@
   "( call( &mut session, HostThunk::MfAttrSetUint32, &[media_type, sample_rate_key, 48_000], ), 0 )",
   "( call( &mut session, HostThunk::MfAttrGetUint32, &[media_type, sample_rate_key, uint_out], ), 0 )",
   "(read_u32(&session, uint_out), 48_000)"
+ ],
+ "mem_commit_zeroes_only_new_pages_and_preserves_committed_contents": [
+  "(size, 0x2000)",
+  "((again, again_size), (base, 0x2000))",
+  "( memory.read_u64(base).expect(\"page 0 contents\"), u64::from_le_bytes([0xAA; 8]), \"MEM_COMMIT preserves already-committed contents\" )",
+  "( memory.read_u64(base).expect(\"recommitted page 0\"), 0, \"a newly committed page is zeroed in place, not left stale\" )",
+  "( memory.read_u64(base + 0x1000).expect(\"page 1 contents\"), u64::from_le_bytes([0xBB; 8]), \"the untouched committed page keeps its contents\" )"
  ],
  "memory_image_commit_zeroed_pages_creates_missing_pages": [
   "(memory.read_u8(0x5000).unwrap(), 0)"
@@ -8843,6 +9095,14 @@
   "(DeviceClass::Network.as_str(), \"network\")",
   "(DeviceClass::Audio.as_str(), \"audio\")"
  ],
+ "module_handle_from_address_edge_ranges_missing_info_and_saturation": [
+  "( runtime.module_handle_from_address(0x4000_0800), Some(0x4000_0000), \"addresses inside the main image resolve to it\" )",
+  "( runtime.module_handle_from_address(0x6000_1000), Some(0x6000_0000) )",
+  "( runtime.module_handle_from_address(0x6000_0000), Some(0x6000_0000), \"the exact module base is inside the module\" )",
+  "( runtime.module_handle_from_address(0x7000_0F00), Some(0x7000_0000), \"missing DllInfo falls back to a 0x1000 window\" )",
+  "( runtime.module_handle_from_address(0x6000_3000), None, \"past the module size and below the next handle\" )",
+  "( runtime.module_handle_from_address(0x4000_2000), None, \"the main-image handle is skipped before its size is consulted\" )"
+ ],
  "module_information_truncates_a_maximum_path_and_keeps_the_base_and_size_exact": [
   "(bytes.len(), 8 + SYSTEM_MODULE_ENTRY_SIZE * 2)",
   "(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 2)",
@@ -9214,6 +9474,9 @@
   "(manager.set_event(file), Err(STATUS_OBJECT_TYPE_MISMATCH))",
   "(manager.release_object(file).unwrap(), 1)"
  ],
+ "native_execute_job_trace_records_the_digest_not_the_raw_host_environment": [
+  "( outcome.canonical_output.exit_code, 0, \"/usr/bin/true must exit cleanly\" )"
+ ],
  "native_export_resolution_rejects_absent_symbols_and_empty_dirs": [
   "(native_export_available(runtime, \"coreclr_initialize\"), true)",
   "( native_export_available(runtime, \"casa1_no_such_clr_export_42\"), false )",
@@ -9309,12 +9572,24 @@
  "no_active_island_shim_is_rejected_with_unimplemented_reason": [
   "(error.code, ReasonCode::RcUnimplInsn)"
  ],
+ "non_pe_child_image_is_rejected_with_pe_parse_invalid_and_no_spawn": [
+  "(error.code, ReasonCode::RcPeParseInvalid)",
+  "( error.last_error(), crate::error::ERROR_BAD_EXE_FORMAT, \"CreateProcess failure must surface ERROR_BAD_EXE_FORMAT (193)\" )"
+ ],
+ "non_pe_image_is_rejected_without_native_execution": [
+  "(is_pe_image(&path).expect(\"classify script\"), false)"
+ ],
  "nonblocking_connect_returns_wouldblock_and_completes": [
   "(network.wsa_get_last_error(), 10035)",
   "(got, b\"pong\")"
  ],
  "nonblocking_socket_returns_wouldblock_immediately": [
   "(err.kind(), std::io::ErrorKind::WouldBlock)"
+ ],
+ "noncrypto_random_bytes_edge_boundaries_are_pinned": [
+  "(first.len(), 40, \"dtm request length is exact across blocks\")",
+  "( first, second, \"dtm mode must be deterministic for a fixed label\" )",
+  "(os.len(), 40, \"os path returns exactly the requested length\")"
  ],
  "normalize_rejects_paths_outside_the_hives": [
   "(ConfigManager::default().key_count(), 2)",
@@ -9343,6 +9618,13 @@
   "(events[1].kind, RegistryEventKind::ValueSet)",
   "(events[1].value_name.as_deref(), Some(\"Name\"))",
   "(software_events.len(), 4)"
+ ],
+ "nt_allocate_virtual_memory_dispatch_pins_bounds_and_conflicts": [
+  "( rax_status(&state), nt::STATUS_SUCCESS.raw(), \"fixed reserve+commit succeeds\" )",
+  "( memory.read_u64(size_ptr).expect(\"size out\"), 0x2000, \"the aligned size is written back\" )",
+  "( rax_status(&state), nt::STATUS_INVALID_PARAMETER.raw(), \"a zero region size is STATUS_INVALID_PARAMETER\" )",
+  "( rax_status(&state), nt::STATUS_CONFLICTING_ADDRESSES.raw(), \"reserving over a live reservation is STATUS_CONFLICTING_ADDRESSES\" )",
+  "(base, 0, \"the committed base is written back\")"
  ],
  "nt_allocate_virtual_memory_reserves_and_commits_through_the_canonical_vm": [
   "(NtStatus::from_raw(rax as u32), STATUS_SUCCESS)",
@@ -9427,6 +9709,14 @@
   "( nt_query_object_type_information(&win32, event).as_deref(), Ok(\"Event\") )",
   "( nt_query_object_type_information(&win32, handle).as_deref(), Ok(\"File\") )"
  ],
+ "nt_read_virtual_memory_dispatch_bounds_and_partial_copy_status": [
+  "( rax_status(&state), nt::STATUS_SUCCESS.raw(), \"an accessible read succeeds\" )",
+  "( memory.read_u64(bytes_read_ptr).expect(\"bytes read\"), 0x20, \"the byte count is written back\" )",
+  "( rax_status(&state), nt::memory::STATUS_PARTIAL_COPY.raw(), \"an oversized read that hits an unmapped page is STATUS_PARTIAL_COPY\" )",
+  "( memory.read_u64(bytes_read_ptr).expect(\"bytes read\"), 0x1000, \"only the accessible page was transferred\" )",
+  "( rax_status(&state), nt::STATUS_ACCESS_VIOLATION.raw(), \"an unmapped source is STATUS_ACCESS_VIOLATION\" )",
+  "( memory.read_u64(bytes_read_ptr).expect(\"bytes read\"), 0, \"no bytes are reported on an immediate fault\" )"
+ ],
  "nt_set_value_key_and_nt_query_value_key_round_trip_through_the_registry_store": [
   "(NtStatus::from_raw(rax as u32), STATUS_SUCCESS)",
   "( u32::from_le_bytes(session.read_guest(disposition_ptr, 4).try_into().unwrap()), 1, \"REG_CREATED_NEW_KEY\" )",
@@ -9459,6 +9749,14 @@
   "( session .win32() .thread_suspend_count(thread_id) .expect(\"count\"), 1 )",
   "(session.parked_waiter_count(), 2)",
   "(prev, 1)"
+ ],
+ "nt_write_virtual_memory_dispatch_bounds_and_partial_copy_status": [
+  "( rax_status(&state), nt::STATUS_SUCCESS.raw(), \"an accessible write succeeds\" )",
+  "( memory.read_u64(bytes_written_ptr).expect(\"bytes written\"), 0x20, \"the byte count is written back\" )",
+  "( memory.read_u64(dest).expect(\"dest\"), u64::from_le_bytes([0x3C; 8]), \"the payload landed in the destination\" )",
+  "( rax_status(&state), nt::STATUS_SUCCESS.raw(), \"a zero-length write succeeds\" )",
+  "( memory.read_u64(bytes_written_ptr).expect(\"bytes written\"), 0, \"a zero-length write transfers nothing\" )",
+  "( rax_status(&state), nt::memory::STATUS_PARTIAL_COPY.raw(), \"a partially readable source is STATUS_PARTIAL_COPY\" )"
  ],
  "nt_write_virtual_memory_to_unmapped_memory_returns_access_violation_and_never_creates_pages": [
   "(NtStatus::from_raw(rax as u32), STATUS_ACCESS_VIOLATION)",
@@ -9804,6 +10102,14 @@
   "(memory.read_u8(second).unwrap(), 0x20)",
   "( memory.read_u8(unmapped_in_chunk).is_err(), true, \"an absent entry in an allocated 2 MiB chunk must fault\" )"
  ],
+ "paged_transfers_stop_at_first_inaccessible_page_with_partial_status": [
+  "(status, STATUS_PARTIAL_COPY, \"mid-transfer fault is partial\")",
+  "( bytes, vec![0x5A; 16], \"only the accessible chunk is returned\" )",
+  "(status, STATUS_ACCESS_VIOLATION, \"immediate fault is AV\")",
+  "( bytes.len(), 0, \"no bytes are returned on an immediate fault\" )",
+  "(status, STATUS_SUCCESS, \"accessible read succeeds\")",
+  "(bytes, vec![0x5A; 0x20])"
+ ],
  "pagefile_information_rejects_a_short_buffer_and_names_the_file": [
   "(u32::from_le_bytes(pagefile[0..4].try_into().unwrap()), 0)",
   "( u32::from_le_bytes(pagefile[4..8].try_into().unwrap()), 0x40000 )",
@@ -10080,6 +10386,10 @@
   "( leftovers, 0, \"a failed atomic write must leave no temp file\" )",
   "(error, ProfileError::Io(_))"
  ],
+ "partial_write_failure_preserves_the_previous_contents": [
+  "(error.code, ReasonCode::RcIo)",
+  "( fs::read_to_string(&path).expect(\"read\"), \"old\", \"the destination must be untouched after a failed write\" )"
+ ],
  "partially_mapped_page_is_not_materialised": [
   "(detached.pages_materialised, 0)",
   "(detached.bytes_copied, 0)",
@@ -10174,6 +10484,10 @@
   "(memory.read_u32(driver + 0x34).unwrap(), 0)",
   "(memory.read_u16(header).unwrap(), 4)",
   "(memory.read_u16(header + 2).unwrap(), 6)"
+ ],
+ "pe_execute_job_trace_records_the_digest_not_the_raw_host_environment": [
+  "(program.is_file(), true, \"checked-in smoke PE fixture\")",
+  "( outcome.canonical_output.exit_code, 0, \"the smoke PE must exit cleanly in DTM mode\" )"
  ],
  "pe_host_runtime_is_send_and_sync": [
   "(std::mem::size_of::<super::PeHostRuntime>() > 0, true)",
@@ -11113,6 +11427,22 @@
   "(legacy.windows_version, WindowsVersion::Win10)",
   "(legacy.guest_arch, GuestArch::X86)"
  ],
+ "profiles_directory_small_buffer_is_rejected_without_overrun": [
+  "(result, 0)",
+  "(fixture.runtime.last_error, ERROR_INSUFFICIENT_BUFFER)",
+  "(read_u32(&fixture.memory, SIZE).expect(\"required size\"), 9)",
+  "( read_u16(&fixture.memory, BUFFER).expect(\"sentinel\"), 0xAAAA, \"a too-small buffer must not be written\" )"
+ ],
+ "profiles_directory_with_a_null_buffer_pointer_is_invalid_parameter": [
+  "(result, 0, \"a null buffer pointer must fail\")",
+  "(fixture.runtime.last_error, ERROR_INVALID_PARAMETER)",
+  "( read_u32(&fixture.memory, SIZE).expect(\"capacity\"), 9, \"a null buffer must not rewrite the caller's capacity\" )"
+ ],
+ "profiles_directory_without_a_size_pointer_is_invalid_parameter": [
+  "(result, 0, \"a null size pointer must fail\")",
+  "(fixture.runtime.last_error, ERROR_INVALID_PARAMETER)",
+  "( read_u16(&fixture.memory, BUFFER).expect(\"sentinel\"), 0xAAAA, \"nothing may be written without a size pointer\" )"
+ ],
  "progressive_jpeg_restart_markers_and_corrupt_restart_rejected": [
   "(pixel, &[expected, expected, expected, 255], \"pixel {x},{y}\")",
   "( wic_decode_jpeg(&corrupt).unwrap_err(), WINCODEC_ERR_BADIMAGE, \"a RESTART marker replaced by EOI truncates the scan\" )"
@@ -11234,6 +11564,23 @@
   "(promoted.tier, TranslationTier::Tier1)",
   "( promoted.ir, vec![ IrInstruction::MovImm { dst: Register::Rax, value: 0x1122_3344, }, IrInstruction::AddImm { dst: Register::Rax, value: 1, width: 8, }, ] )"
  ],
+ "rate_limited_stderr_fallback_for_a_poisoned_locker_still_emits_the_event": [
+  "( emissions.load(Ordering::Relaxed), 1, \"a poisoned rate-limiter registry must not swallow the event\" )"
+ ],
+ "rate_limited_stderr_rejects_debug_events_below_the_default_level": [
+  "( emitted, false, \"debug must be filtered out at the default info level\" )"
+ ],
+ "rate_limited_stderr_reports_suppressed_counts_after_the_window_boundary": [
+  "( emissions.load(Ordering::Relaxed), 1, \"the duplicate inside the window must be suppressed\" )",
+  "( emissions.load(Ordering::Relaxed), 2, \"the post-window event must emit exactly once\" )"
+ ],
+ "rate_limiter_suppresses_duplicates_and_reports_dropped_count": [
+  "(limiter.observe(base), Some(0))",
+  "(limiter.observe(base + Duration::from_secs(1)), None)",
+  "(limiter.observe(base + Duration::from_secs(2)), None)",
+  "( limiter.observe(base + Duration::from_secs(11)), Some(2), \"the next window reports the two suppressed messages\" )",
+  "(limiter.observe(base + Duration::from_secs(12)), None)"
+ ],
  "raw_input_registration_flags_and_remove_edges_are_exact": [
   "( user32.register_raw_input_devices(std::slice::from_ref(&registration)), Ok(()) )",
   "(user32.raw_input_device_count(), 1)",
@@ -11280,6 +11627,13 @@
   "(result, 0, \"ReadFile must fail on a write-only handle\")",
   "(runtime.last_error, ERROR_ACCESS_DENIED)",
   "(handle, INVALID_HANDLE_VALUE)"
+ ],
+ "read_only_drive_rejects_delete_remove_temp_move_and_copy": [
+  "(error.code, ReasonCode::RcSandboxPathViolation)"
+ ],
+ "read_printer_rejects_unknown_jobs_and_returns_zero_for_owned_ones": [
+  "( ps.read_printer(job, &mut [0u8; 8]), Some(0), \"an owned job reads zero bytes\" )",
+  "( ps.read_printer(job + 10_000, &mut [0u8; 8]), None, \"an unknown job must be rejected\" )"
  ],
  "read_u32_le_offset_at_boundary": [
   "(read_u32_le(&buf, 4), Some(0))",
@@ -11406,6 +11760,19 @@
  "recurrent_metal_numeric_edge_readback": [
   "( read_f32(&outputs[0]) .iter() .copied() .map(rounded) .collect::<Vec<_>>(), vec![expected] )"
  ],
+ "redaction_boundary_empty_marker_values_and_email_positions": [
+  "( redact_marked_paths(\"keep /Users/ rest\", &[\"/Users/\"]), \"keep /Users/ rest\", \"an empty marked value must not consume the separator\" )",
+  "( redact_marked_paths(\"x /Users//Users/bob\", &[\"/Users/\"]), \"x /Users//Users/<redacted>\", \"an empty marked value leaves the following marker intact\" )",
+  "( redact_marked_paths(\"open \\\"/Users/eve\\\", done\", &[\"/Users/\"]), \"open \\\"/Users/<redacted>\\\", done\", \"quotes and commas bound the redacted path\" )",
+  "( redact_marked_paths(\"a=/Users/gus;b]c}d>e<f\", &[\"/Users/\"]), \"a=/Users/<redacted>;b]c}d>e<f\", \"punctuation bounds the redacted path\" )",
+  "( redact_emails(\"ping a@b.com now\"), \"ping <redacted-email> now\", \"a mid-line email token is redacted\" )",
+  "( redact_emails(\"ping a@b.com\"), \"ping <redacted-email>\", \"an end-of-line email token is redacted\" )"
+ ],
+ "redaction_boundary_user_dirs_at_line_ends_and_mixed_separators": [
+  "( redact_pii(line), \"first /Users/<redacted>/x second /Users/<redacted> C:\\\\users\\\\<redacted>\\\\save.dat C:/USERS/<redacted>\" )",
+  "(redact_pii(\"tail=/Users/fixture3\"), \"tail=/Users/<redacted>\")",
+  "( redact_pii(\"tail=C:\\\\users\\\\fixture3\"), \"tail=C:\\\\users\\\\<redacted>\" )"
+ ],
  "redraw_window_queues_paint_like_invalidate_rect": [
   "(result, 1)",
   "(runtime.last_error, 0)"
@@ -11526,6 +11893,11 @@
   "( reliability .pending_relays .get(&(4, 5)) .expect(\"the relay still has one fragment\") .remaining .clone(), BTreeSet::from([6]) )",
   "(completions, Vec::<ReliableCompletion>::new())",
   "(reliability.retry_exhausted, 1)"
+ ],
+ "rename_failure_cleans_the_temp_file_and_leaves_the_target_alone": [
+  "(error.code, ReasonCode::RcIo)",
+  "( path.is_dir(), true, \"the existing target must not be removed\" )",
+  "( temp_files(dir.path()).len(), 0, \"rename failure must clean up its temp file\" )"
  ],
  "render_buffer_round_trips_real_accounting": [
   "(plan.buffer_frames, 400)",
@@ -11713,6 +12085,21 @@
   "( run_cpu(&align, &[&values, &align_values, &batch_values]), vec![2.5] )",
   "( invalid_samples.validate().unwrap_err().message, \"ROI align sample counts must satisfy 1 <= minimum <= maximum <= 64, got 3..2\" )"
  ],
+ "rotation_backup_removal_of_a_directory_fails_with_the_exact_error": [
+  "( error.message, format!(\"failed to remove {}\", backup.display()) )"
+ ],
+ "rotation_flush_failure_surfaces_the_exact_io_error": [
+  "(error.message, \"failed to flush JSONL logger\")"
+ ],
+ "rotation_recreate_under_emfile_child_reports_the_exact_error": [
+  "( unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0 )",
+  "(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0)",
+  "( error.message, format!(\"failed to recreate {}\", path.display()) )",
+  "( status.success(), true, \"the EMFILE child must complete the pinned failure path\" )"
+ ],
+ "rotation_rename_into_a_read_only_directory_fails_with_the_exact_error": [
+  "( error.message, format!( \"failed to rotate {} to {}\", path.display(), backup.display() ) )"
+ ],
  "roundtrip_hresult_to_dos_to_errno": [
   "(dos, ERROR_NOT_ENOUGH_MEMORY)",
   "(dos_error_to_errno(dos), libc::ENOMEM)"
@@ -11745,6 +12132,9 @@
   "(nt_set_event(session.win32_mut(), handle), Ok(false))",
   "(nt_set_event(session.win32_mut(), handle), Ok(true))"
  ],
+ "rtl_unwind_invalid_misaligned_context_is_rejected": [
+  "(error.code, ReasonCode::SehException)"
+ ],
  "running_object_table_rejects_unknown_monikers_and_wrong_state": [
   "( call_slot( &mut fixture, rot, 3, &[rot as u32, server as u32, server as u32, COOKIE as u32] ), E_INVALIDARG, \"non-moniker registration\" )",
   "( call_slot( &mut fixture, rot, 3, &[rot as u32, moniker as u32, 0, COOKIE as u32] ), E_INVALIDARG, \"null registered object\" )",
@@ -11771,6 +12161,9 @@
   "( rva_to_file_offset(&bytes, &[section.clone()], 0x2010), Some(0x110) )",
   "( rva_to_file_offset(&bytes, &[section.clone()], 0x1050), None, \"an RVA outside every section maps to no file offset\" )",
   "( rva_to_file_offset(&bytes, &[huge], 0x2000), None, \"an unbacked section never yields an offset\" )"
+ ],
+ "sanitized_print_filename_is_ascii_and_cannot_escape_the_directory": [
+  "( path.parent() .and_then(Path::file_name) .and_then(|v| v.to_str()), Some(PRINT_OUTPUT_DIR) )"
  ],
  "scancode_events_for_frame_deduplicate_alias_keys": [
   "(pressed, vec![0x1e])"
@@ -12203,6 +12596,26 @@
  "shim_x86_arg_bytes_abi_mismatch_or_zero_width_rejects": [
   "( shim.x86_arg_bytes(), want, \"{shim:?} must pop its exact stdcall byte count\" )"
  ],
+ "show_print_dialog_avoids_preview_race_by_keeping_the_pdf": [
+  "( PrintSubsystem::show_print_dialog_with_opener(b\"%PDF-1.4\\n\", \"/usr/bin/true\"), true, \"opener success must report TRUE\" )",
+  "( newest.exists(), true, \"PDF was deleted before Preview could read it\" )"
+ ],
+ "show_print_dialog_rejects_a_temp_dir_occupied_by_a_file": [
+  "( PrintSubsystem::show_print_dialog_with_opener(b\"%PDF-1.4\\n\", \"/usr/bin/true\"), false, \"a temp-dir creation failure must report FALSE\" )",
+  "( std::fs::remove_file(&dir).is_ok(), true, \"the blocker file must be the only artifact left behind\" )"
+ ],
+ "show_print_dialog_rejects_an_opener_that_cannot_run": [
+  "( PrintSubsystem::show_print_dialog_with_opener( b\"%PDF-1.4\\n\", \"/nonexistent/casa1-print-opener\" ), false, \"a failed spawn must report FALSE\" )"
+ ],
+ "show_print_dialog_reports_false_when_the_temp_pdf_write_fails": [
+  "( PrintSubsystem::show_print_dialog_with_opener(b\"%PDF-1.4\\n\", \"/usr/bin/true\"), false, \"a temp PDF write failure must report FALSE\" )"
+ ],
+ "show_print_dialog_via_system_open_never_deletes_the_stale_dialog_pdf": [
+  "( PrintSubsystem::show_print_dialog(b\"%PDF-1.4\\n\"), true, \"the system-opener wrapper must report TRUE on success\" )",
+  "( std::path::Path::new(&dir).join(\"marker\").exists(), true, \"the fake `open` resolved from PATH must have been executed\" )",
+  "( status.success(), true, \"the system-opener child must complete the pinned path\" )",
+  "( dir.join(\"marker\").exists(), true, \"the child must have invoked the fake system `open`\" )"
+ ],
  "sid_construction_rejects_an_empty_identity": [
   "(SecurityMonitor::default().token_count(), 0)",
   "(Sid::new(0, Vec::<u32>::new()), Err(STATUS_INVALID_SID))",
@@ -12372,6 +12785,11 @@
   "(memory.read_u64(low).unwrap(), value)",
   "(memory.read_u64(two_gib).unwrap(), value)"
  ],
+ "spawn_native_child_image_rejects_non_pe_program_without_native_execution": [
+  "(error.code, ReasonCode::RcPeParseInvalid)",
+  "( error.message, format!( \"native child image {} is not a PE image; native execution is forbidden\", host_image.display() ) )",
+  "( *claim.host_pid.lock().expect(\"host pid slot\"), None, \"no host child was spawned\" )"
+ ],
  "spirv_header_parsing": [
   "(translator.entry_points.len(), 1)",
   "(*id, 5)",
@@ -12387,6 +12805,9 @@
   "(drive, \"C\", \"CON.txt should default to C drive\")",
   "(drive2, \"C\", \"NUL.dat should default to C drive\")",
   "(drive3, \"C\", \"LPT1.000 should default to C drive\")"
+ ],
+ "spool_cap_drops_bytes_past_64_mib_and_never_grows_the_buffer": [
+  "(retained, MAX_SPOOL_BYTES, \"spool must be capped exactly\")"
  ],
  "stale_profile_wrong_image_translator_and_cpu_are_rejected_with_exact_reasons": [
   "( load_profile_file(&path, &wrong_image), Err(ProfileError::ImageHashMismatch { found: \"image-stale\".to_string(), expected: \"image-other\".to_string(), }) )",
@@ -12484,9 +12905,18 @@
   "(ipc.pipe_name(\"client\"), \"\\\\\\\\.\\\\pipe\\\\steam_client\")",
   "(ipc.active_pipes().len(), 1)"
  ],
+ "steam_url_registration_edge_injected_zero_status_marks_registered": [
+  "(handler.is_registered(), true)"
+ ],
+ "steam_url_registration_rejects_injected_nonzero_status": [
+  "(handler.is_registered(), false)"
+ ],
  "steam_web_helper_launch": [
   "(shim.frame_count(), 0)",
   "(shim.bridge.state(), CefState::Initialized)"
+ ],
+ "steam_zero_touch_execute_job_trace_records_the_digest_not_the_raw_host_environment": [
+  "( outcome.canonical_output.test_id, \"steam-trace-env\", \"the zero-touch run must produce its canonical output\" )"
  ],
  "steam_zero_touch_stack_uses_no_network": [
   "(stack.state, ConnectionState::Disconnected)"
@@ -12651,6 +13081,9 @@
   "(runtime.iosurface_channels[0].width(), 8)",
   "(runtime.iosurface_channels[0].height(), 4)",
   "(resized.pixel[0].width(), 16)"
+ ],
+ "symlink_ancestor_escape_is_rejected_with_sandbox_escape": [
+  "(error.code, ReasonCode::RcFsSandboxEscape)"
  ],
  "synchronization_invalid_handles_timeouts_and_backwards_signals_are_rejected": [
   "( subsystem .d3dkmt_create_synchronization_object(DeviceHandle(0xFFFF_FFFF), 0) .unwrap_err() .status(), STATUS_INVALID_HANDLE )",
@@ -13784,6 +14217,11 @@
   "( ray_entry_points(&malformed).expect(\"malformed entries\"), Vec::<String>::new() )",
   "(msl.contains(expected), true, \"missing {expected}\")"
  ],
+ "t_llvm_staging_and_spawn_failures_report_dxil_invalid": [
+  "(error.code, ReasonCode::RcDxilInvalid)",
+  "(error.message, \"failed to stage LLVM ll input\")",
+  "(error.message, \"failed to run llvm-as\")"
+ ],
  "t_msl_artifact_extractor_rejects_malformed_and_preserves_source": [
   "(error.code, ReasonCode::RcDxilInvalid)",
   "(error.message, \"translated MSL artifact is not UTF-8\")",
@@ -14771,6 +15209,21 @@
   "(format!(\"{:?}\", tpm).contains(\"Tpm\"), true)",
   "(Tpm::default().is_started(), false)"
  ],
+ "trace_environment_rejects_host_secrets_and_keeps_only_the_allowlist": [
+  "(traced.get(\"PATH\"), Some(&\"/usr/bin\".to_string()))",
+  "(traced.get(\"LANG\"), Some(&\"en_US.UTF-8\".to_string()))",
+  "(traced.get(\"CASA1_RUN_ID\"), Some(&\"run\".to_string()))",
+  "(traced.get(\"SECRET_TOKEN\"), None)",
+  "(traced.get(\"AWS_SECRET_ACCESS_KEY\"), None)",
+  "(traced.contains_key(\"__CASA1_HOST_ENV_SHA256\"), true)"
+ ],
+ "trace_environment_with_missing_host_variables_never_emits_a_digest": [
+  "( traced.contains_key(\"__CASA1_HOST_ENV_SHA256\"), false, \"an allowlist-only map must not grow a digest entry\" )",
+  "(traced.len(), 2)",
+  "(traced.get(\"PATH\"), Some(&\"/usr/bin\".to_string()))",
+  "( trace.contains(SECRET), false, \"raw job environment values must never reach the trace\" )",
+  "( trace.contains(\"__CASA1_HOST_ENV_SHA256\"), true, \"the trace must carry the host-environment digest instead\" )"
+ ],
  "trace_replay_matches_captured_output_and_rejects_env_mismatch": [
   "(replay_output, captured_canonical)",
   "(config_error.code, ReasonCode::RcTraceEnvMismatch)",
@@ -14831,6 +15284,9 @@
  "translation_cache_invalidate_code_write_zero_length": [
   "(cache.blocks.len(), 1, \"block should remain\")"
  ],
+ "traversal_denied_ancestor_is_rejected_with_sandbox_escape": [
+  "(error.code, ReasonCode::RcFsSandboxEscape)"
+ ],
  "truncate_existing_missing_file_returns_file_not_found": [
   "( result.expect_err(\"missing file must fail\").code, ReasonCode::RcFsNotFound, \"TruncateExisting on a missing file must be ERROR_FILE_NOT_FOUND\" )"
  ],
@@ -14840,6 +15296,9 @@
  ],
  "truncate_existing_requires_write_access": [
   "( result.expect_err(\"read-only access must fail\").code, ReasonCode::RcHelperPermissionDenied, \"TRUNCATE_EXISTING without write access must be ERROR_ACCESS_DENIED\" )"
+ ],
+ "truncated_and_oversized_e_lfanew_are_rejected_as_pe_parse_invalid": [
+  "(error.code, ReasonCode::RcPeParseInvalid)"
  ],
  "truncated_profile_record_is_rejected_with_exact_truncated_error": [
   "( ProfileTargets::decode(&bytes, &key), Err(ProfileError::Truncated(\"records\")) )"
@@ -14868,6 +15327,14 @@
   "( call_slot(&mut fixture, type_info, 17, &[0xDEAD_0000, 1, OUT as u32]), TYPE_E_ELEMENTNOTFOUND )",
   "( call_slot(&mut fixture, type_info, 4, &[type_info as u32, 0]), E_INVALIDARG )",
   "( call_slot(&mut fixture, type_info, 4, &[0xDEAD_0000, OUT as u32]), TYPE_E_ELEMENTNOTFOUND )"
+ ],
+ "typed_checked_writes_reject_unmapped_pages_with_exact_fault": [
+  "( memory.read_u64(page).expect(\"u64\"), 0x1122_3344_5566_7788, \"mapped u64 write lands\" )",
+  "( err.code, ReasonCode::RcMemoryAccessViolation, \"u64 write fault is a memory access violation\" )",
+  "( err.code, ReasonCode::RcMemoryAccessViolation, \"u16 write fault is a memory access violation\" )",
+  "( err.code, ReasonCode::RcMemoryAccessViolation, \"f64 write fault is a memory access violation\" )",
+  "( err.code, ReasonCode::RcMemoryAccessViolation, \"f32 write fault is a memory access violation\" )",
+  "( memory.read_u32(page + 12).expect(\"u32\"), 0xDEAD_BEEF, \"mapped u32 write lands\" )"
  ],
  "typed_statistics_reject_unknown_unsupported_types_and_node_bounds": [
   "( subsystem .d3dkmt_query_statistics_for(adapter, D3DKMT_QUERYSTATISTICS_HISTOGRAM, 0) .unwrap_err() .status(), STATUS_NOT_SUPPORTED )",
@@ -14907,12 +15374,23 @@
   "(objects.clone_enum(1, 0x1000), None)",
   "(objects.load_error(1, 0x1000), None)"
  ],
+ "unknown_printer_handle_is_rejected_by_close_and_doc_start": [
+  "(ps.read_printer(0xDEAD_BEEF, &mut [0u8; 4]), None)"
+ ],
  "unknown_store_handle_keeps_the_real_error": [
   "(select_certificate(&mut runtime, &mut memory), 0)",
   "(runtime.last_error, ERROR_INVALID_HANDLE)"
  ],
  "unload_error_restores_registration_and_reports_invalid_parameter": [
   "( dispatch_nt_thunk( &mut runtime, &mut memory, HostThunk::NtUnloadDriver, &[service_path], ), STATUS_INVALID_PARAMETER, \"a failed DriverUnload must be reported as INVALID_PARAMETER\" )"
+ ],
+ "unmap_range_incremental_paths_reject_stale_indices": [
+  "( memory.page_index(high), Some(2), \"high page is recorded in the high-page lookup\" )",
+  "(memory.page_index(low), None, \"low page removed\")",
+  "( memory.page_index(mid), Some(1), \"unchanged in-window entry keeps its index\" )",
+  "( memory.page_index(high), Some(0), \"swapped high page index was refreshed\" )",
+  "(memory.page_index(high), None, \"high page removed\")",
+  "( memory.store.high_page_count(), 0, \"the released high page's frame is gone from the store\" )"
  ],
  "unplug_during_in_flight_read_reports_device_not_connected": [
   "( proxy.read(handle, &mut [0_u8; 4], None, &CancelToken::new()), Err(ProxyError::Unplugged { id }) )",
@@ -14959,6 +15437,70 @@
   "( e.code, ReasonCode::RcUnimplInsn, \"XOP lower error should have precise code\" )",
   "( e.code, ReasonCode::RcUnimplInsn, \"XOP exec error should have precise code\" )"
  ],
+ "unwind_alloc_large_operand_slots_tampered_zero_fill_is_exact": [
+  "( info.codes, vec![ UnwindCode::AllocLarge { code_offset: 0x10, size: 0x800, }, UnwindCode::AllocLarge { code_offset: 0x20, size: 0x0001_0000, }, ], \"OpInfo 0 scales the 16-bit operand by 8; OpInfo 1 is unscaled 32-bit\" )",
+  "( info.codes, vec![UnwindCode::AllocLarge { code_offset: 0x00, size: 0, }], \"under-declared ALLOC_LARGE operand must zero-fill, not panic\" )"
+ ],
+ "unwind_epilog_size0_boundary_and_outside_replay": [
+  "(result, UnwindResult::Completed)",
+  "(ctx.rbx, 0, \"prolog codes are not replayed inside an epilog\")",
+  "(ctx.rip, 0x1234)",
+  "(ctx.rsp, base + 8)",
+  "(ctx.rbx, 0, \"push rbx@0x30 is past the control PC\")"
+ ],
+ "unwind_frame_pointer_header_slot_boundary_is_exact": [
+  "( info.codes, vec![ UnwindCode::SetFramePointer { code_offset: 0x10, register: 5, offset: 0x20, }, UnwindCode::AllocSmall { code_offset: 0x08, size: 0x10, }, ], \"SET_FPREG offset must be header frame_offset \u00d716; ALLOC_SMALL OpInfo \u00d78 + 8\" )"
+ ],
+ "unwind_frames_corrupt_return_slot_completes_without_rip": [
+  "(result, UnwindResult::Completed)",
+  "( ctx.rip, 0x1_4000_1001, \"unreadable return slot leaves RIP in the faulting function\" )",
+  "(ctx.rbp, 0x7777, \"unreadable push slot leaves RBP\")",
+  "( ctx.rsp, 0x7fff_0000 + 16, \"push undone, return slot skipped\" )"
+ ],
+ "unwind_machframe_error_code_slot_mismatch_is_pinned": [
+  "(result, UnwindResult::Completed)",
+  "(ctx.rip, 0x1111, \"RIP read at frame+0 without error code\")",
+  "(ctx.rsp, 0x2222, \"RSP read at frame+24 without error code\")",
+  "( ctx.rip, 0x3333, \"RIP shifts by 8 when an error code is present\" )",
+  "( ctx.rsp, 0x4444, \"RSP shifts by 8 when an error code is present\" )"
+ ],
+ "unwind_malformed_operand_counts_zero_fill_far_opcodes": [
+  "( info.codes, vec![UnwindCode::SaveNonVolatileFar { code_offset: 0, register: 5, offset: 0, }], \"under-declared SAVE_NONVOL_FAR must zero-fill\" )",
+  "( info.codes, vec![UnwindCode::Epilog { code_offset: 0, offset: 0, size: 0, flags: 0, }], \"under-declared v2 EPILOG must zero-fill the EpilogInfo\" )",
+  "( info.codes, vec![UnwindCode::SaveXmm128Far { code_offset: 0, register: 3, offset: 0, }], \"under-declared SAVE_XMM128_FAR must zero-fill\" )"
+ ],
+ "unwind_prolog_fault_offset_filter_boundary_is_exact": [
+  "(result, UnwindResult::Completed)",
+  "(ctx.rbx, 0, \"push rbx at offset 4 has not executed\")",
+  "(ctx.rbp, 0x2222, \"push rbp at offset 1 is replayed\")",
+  "(ctx.rip, 0xaaaa)",
+  "(ctx.rsp, base + 0x30 + 8, \"alloc 0x28 and one pop undone\")"
+ ],
+ "unwind_reserved_opcodes_7_and_11_rejected_in_any_version": [
+  "( parse_unwind_info(&spare_v1, 0), None, \"v1 opcode 7 is reserved and must be rejected\" )",
+  "( parse_unwind_info(&op11_v1, 0), None, \"opcode 11 is reserved in v1\" )",
+  "( parse_unwind_info(&op11_v2, 0), None, \"opcode 11 is reserved in v2\" )"
+ ],
+ "unwind_save_nonvolatile_far_slots_tampered_are_exact": [
+  "( info.codes, vec![ UnwindCode::SaveNonVolatile { code_offset: 0x10, register: 3, offset: 0x10, }, UnwindCode::SaveNonVolatileFar { code_offset: 0x20, register: 6, offset: 0x100, }, ], \"SAVE_NONVOL/FAR operand decoding must be exact\" )"
+ ],
+ "unwind_save_slots_frame_relative_boundary_are_exact": [
+  "(result, UnwindResult::Completed)",
+  "(ctx.rbx, 0xcccc, \"near save slot is frame-relative\")",
+  "(ctx.rsi, 0xeeee, \"far save slot is frame-relative\")",
+  "(ctx.rbp, 0xbbbb)",
+  "(ctx.rip, 0xaaaa)",
+  "(ctx.rsp, base + 0x28 + 16)"
+ ],
+ "unwind_save_xmm128_far_slots_tampered_are_exact": [
+  "( info.codes, vec![ UnwindCode::SaveXmm128 { code_offset: 0x10, register: 1, offset: 0x30, }, UnwindCode::SaveXmm128Far { code_offset: 0x20, register: 15, offset: 0x100, }, UnwindCode::PushMachineFrame { code_offset: 0x30, code: 2, }, ], \"ops 8/9/10 must decode with the renumbered layout\" )"
+ ],
+ "unwind_set_frame_pointer_rebase_slot_boundary_is_exact": [
+  "(result, UnwindResult::Completed)",
+  "( ctx.rbp, 0x9999, \"return/pop slots must be read from rbp - 0x20, not from RSP\" )",
+  "(ctx.rip, 0x7777, \"return slot sits past the rebased frame\")",
+  "( ctx.rsp, frame_base + 0x200 + 8 + 8, \"ALLOC_LARGE 0x200 plus one pop land above the rebased frame\" )"
+ ],
  "unwind_table_duplicate_entries": [
   "(table.len(), 1)",
   "( table.len(), 2, \"registering duplicate range adds another entry\" )",
@@ -14998,6 +15540,20 @@
   "(table.len(), 2)",
   "(table.len(), 1)",
   "( table.entries[0].start_rva, 0x2000, \"remaining entry should be 0x2000\" )"
+ ],
+ "unwind_v1_reserved_epilog_opcode_is_rejected": [
+  "( parse_unwind_info(&data, 0), None, \"v1 opcode 6 is reserved and must be rejected\" )"
+ ],
+ "unwind_v2_epilog_spare_slots_tampered_are_exact": [
+  "( info.codes, vec![ UnwindCode::Epilog { code_offset: 0, offset: 0x20, size: 8, flags: 0x5a, }, UnwindCode::Spare { code_offset: 0x10, value: 3, }, ], \"EPILOG must carry offset/size/flags; SPARE must keep its OpInfo\" )"
+ ],
+ "unwind_xmm128_slots_restore_boundary_is_exact": [
+  "(result, UnwindResult::Completed)",
+  "( ctx.xmm[1], Xmm128 { low: u64::from_le_bytes([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]), high: u64::from_le_bytes([0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20]), }, \"xmm1 must be restored from [frame+0x40]\" )",
+  "( ctx.xmm[15], Xmm128 { low: u64::from_le_bytes([0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68]), high: u64::from_le_bytes([0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70]), }, \"xmm15 must be restored from [frame+0x80]\" )",
+  "( ctx.xmm[0], Xmm128::default(), \"no other xmm slot is written\" )",
+  "(ctx.rip, 0xabcd)",
+  "(ctx.rsp, base + 8)"
  ],
  "upload_streamer_respects_ring_capacity": [
   "(streamer.allocate(buf, 3000).unwrap(), 0)"
@@ -15124,6 +15680,9 @@
   "( bytes, [ 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff ] )",
   "(uuid_smbios_bytes(\"garbage\"), [0u8; 16])"
  ],
+ "valid_pe_header_is_not_rejected_as_invalid": [
+  "(is_pe_image(&path).expect(\"classify PE\"), true)"
+ ],
  "values_are_typed_case_insensitive_and_bounded": [
   "( manager.get_value(CASA, \"dword\"), Ok(&RegistryValue::Dword(7)) )",
   "( manager.get_value(CASA, \"QWORD\"), Ok(&RegistryValue::Qword(9)) )",
@@ -15144,6 +15703,12 @@
   "(bytes_a, bytes_b, \"corpus generation must be deterministic\")",
   "(file[\"schema_version\"], 1)",
   "(ids.len(), vectors.len(), \"vector ids must be unique\")"
+ ],
+ "verbatim_dotdot_components_are_rejected_as_path_invalid": [
+  "(error.code, ReasonCode::RcFsPathInvalid)"
+ ],
+ "verbatim_dotdot_guest_path_rejected_for_chsize_and_gdip_load": [
+  "(error.code, ReasonCode::RcFsPathInvalid)"
  ],
  "verbatim_manifest_read_gate": [
   "( guest_bytes, manifest_bytes, \"verbatim \\\\\\\\?\\\\ read must match the disk bytes exactly\" )",
@@ -15245,6 +15810,30 @@
  "virtual_memory_runtime_executor_matches_reference_derived_truth": [
   "(results.len(), expected.len())",
   "( result, &expected[index], \"vector {} ({}) must match the reference-derived truth\", vector.id, vector.input[\"operation\"] )"
+ ],
+ "virtual_unwind_by_rva_corrupt_stack_boundary_is_pinned": [
+  "(result, UnwindResult::Completed)",
+  "( ctx.rip, image_base + 0x1010, \"unreadable return slot leaves RIP at its initial value\" )",
+  "(ctx.rbp, 0x4242, \"unreadable push slot leaves RBP\")",
+  "( ctx.rsp, 0x7fff_0000 + 16, \"push undone, return slot skipped\" )"
+ ],
+ "virtual_unwind_by_rva_missing_pdata_is_not_found": [
+  "( result, UnwindResult::NotFound, \"missing .pdata is not unwound\" )"
+ ],
+ "virtual_unwind_chained_frame_without_primary_is_rejected": [
+  "(info.flags, 0x04, \"CHAININFO flag must be parsed\")",
+  "(result, UnwindResult::Collided, \"CHAININFO defers the pop\")",
+  "(ctx.rip, 0xaaaa, \"no pop before the primary entry runs\")",
+  "(ctx.rsp, base, \"RSP unchanged on a collided unwind\")"
+ ],
+ "virtual_unwind_corrupt_unreadable_stack_completes_without_restore": [
+  "(result, UnwindResult::Completed)",
+  "(ctx.rbp, 0x5555, \"unreadable push slot leaves the register\")",
+  "(ctx.rip, 0xdead_beef, \"unreadable return slot leaves RIP\")",
+  "( ctx.rsp, 0x7fff_0000 + 16, \"RSP still advances past the slot\" )"
+ ],
+ "virtual_unwind_invalid_misaligned_rsp_is_rejected": [
+  "(result, UnwindResult::NotFound, \"misaligned RSP is rejected\")"
  ],
  "volatile_keys_unload_and_non_volatile_keys_survive": [
   "(manager.is_volatile(&volatile), Ok(true))",
@@ -15809,11 +16398,26 @@
   "( err.code, ReasonCode::RcMemoryAccessViolation, \"an offset above isize::MAX must be a memory-access violation\" )",
   "( err.message, \"file write offset is too large\", \"the overflow rejection must name the offending offset\" )"
  ],
+ "win_verify_trust_path_stale_reread_of_unchanged_file_hits_cache": [
+  "( first.error, win_trust_error::TRUST_E_NOSIGNATURE, \"unsigned fixture reports TRUST_E_NOSIGNATURE\" )",
+  "( second.error, first.error, \"an unchanged file is served from the cache\" )",
+  "( second.description, first.description, \"the cached verdict keeps its description\" )"
+ ],
+ "win_verify_trust_path_unreadable_file_without_cache_fails_closed": [
+  "( result.error, win_trust_error::TRUST_E_NOSIGNATURE, \"an unreadable file without a cache entry reports no signature\" )",
+  "( result.description, \"Cannot read the file to verify.\", \"exact description for the unreadable-file path\" )",
+  "(result.verdict.is_none(), true, \"no verdict is invented\")"
+ ],
  "win_verify_trust_rejects_invalid_signature_on_disk": [
   "(result, 0x8009_6010)"
  ],
  "win_verify_trust_rejects_non_file_union_choice": [
   "(result, 0x800B_0003)"
+ ],
+ "win_verify_trust_stale_cache_entry_survives_file_removal": [
+  "( first.error, win_trust_error::TRUST_E_NOSIGNATURE, \"an unsigned fixture reports TRUST_E_NOSIGNATURE\" )",
+  "( cached.error, win_trust_error::TRUST_E_NOSIGNATURE, \"the unchanged cached verdict is returned without re-reading the file\" )",
+  "( cached.description, first.description, \"cached hit returns the original description\" )"
  ],
  "windowed_present_double_stop_and_close_are_idempotent": [
   "(control.request_stop(), true)",
@@ -16159,6 +16763,9 @@
   "(manager.trim_working_set(0), 0)",
   "(manager.working_set_pages(), 1)"
  ],
+ "wrapper_script_has_no_bash_syntax_errors": [
+  "(status.code(), Some(0))"
+ ],
  "write_file_denied_on_read_only_handle": [
   "(runtime.last_error, 0)",
   "(result, 0, \"WriteFile must fail on a read-only handle\")",
@@ -16171,8 +16778,42 @@
  "write_memory_value_faults_on_unmapped_with_av_error_and_does_not_map": [
   "(error.code, ReasonCode::RcUnimplInsn)"
  ],
+ "write_new_print_file_exhausts_its_suffix_budget_and_reports_the_exact_error": [
+  "(error.to_string(), \"no free numbered print filename\")"
+ ],
+ "write_new_print_file_on_a_parentless_path_fails_with_enoent": [
+  "( error.raw_os_error(), Some(2), \"the pinned failure is ENOENT from the empty path\" )"
+ ],
+ "write_new_print_file_rejects_overwrite_with_numbered_suffix": [
+  "(std::fs::read(&first).expect(\"read first\"), b\"first\")",
+  "(std::fs::read(&second).expect(\"read second\"), b\"second\")",
+  "(first, second, \"earlier print must not be overwritten\")"
+ ],
+ "write_new_print_file_removes_the_partial_file_when_the_write_fails": [
+  "( unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut original) }, 0 )",
+  "(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limited) }, 0)",
+  "( error.raw_os_error(), Some(libc::EFBIG), \"the pinned write failure is EFBIG\" )",
+  "( preferred.exists(), false, \"the partial file must be removed after the failed write\" )",
+  "( unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &original) }, 0, \"the child must restore the file-size limit before exit\" )",
+  "( status.success(), true, \"the EFBIG child must complete the pinned failure path\" )"
+ ],
  "write_private_profile_string_w_missing_parent_fails_without_creating_directory": [
   "(result, 0, \"missing parent must fail the write\")"
+ ],
+ "write_string_temp_creation_failure_preserves_target_contents": [
+  "( error.code, ReasonCode::RcIo, \"temp creation failure must map to RcIo\" )",
+  "( fs::read_to_string(&path).expect(\"read\"), \"old\", \"the destination must be untouched after a failed creation\" )",
+  "( fs::read_to_string(&path).expect(\"read\"), \"new\", \"privileged write must still land atomically\" )"
+ ],
+ "write_utf16_buffer_uncommitted_tail_fails_without_partial_write": [
+  "( memory.read_u16(page + 4094).expect(\"marker\"), 0xBEEF, \"no byte of a rejected write may land in guest memory\" )",
+  "( memory.read_u16(page + 4090).expect(\"prefix\"), 0, \"the in-page prefix of a rejected write stays zero\" )",
+  "( memory.read_u16(page + 4).expect(\"terminator\"), 0, \"the UTF-16 terminator follows the payload\" )",
+  "( memory.read_u16(page + 6).expect(\"untouched\"), 0, \"nothing beyond the terminator is written\" )"
+ ],
+ "write_utf16_fixed_rejects_unmapped_destination": [
+  "( memory.read_u16(page + 6).expect(\"terminator\"), 0, \"the fixed buffer is NUL-terminated at capacity - 1\" )",
+  "( memory.read_u16(page + 8).expect(\"padding\"), 0, \"the remainder of the fixed buffer stays zero\" )"
  ],
  "wsa_lifecycle": [
   "(stack.wsa_refcount_check(), 2)",

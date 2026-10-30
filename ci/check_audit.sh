@@ -32,6 +32,12 @@ else
 fi
 
 # ── cargo audit ───────────────────────────────────────────────────────────────
+# Exact, reviewed exceptions live in .cargo/audit.toml (cargo-audit loads it
+# automatically). Only unfixable advisories are listed there:
+#   RUSTSEC-2023-0071  rsa 0.9.10 Marvin timing (no fixed rsa release)
+#   RUSTSEC-2026-0387  crypto-bigint 0.5.5 via elliptic-curve 0.13 (fix needs
+#                      an elliptic-curve/ecdsa major upgrade, tracked separately)
+info "Reviewed audit exceptions: RUSTSEC-2023-0071, RUSTSEC-2026-0387 (.cargo/audit.toml)"
 if command -v cargo-audit &>/dev/null || cargo audit --version &>/dev/null 2>&1; then
   info "Running cargo audit for known vulnerabilities ..."
   if cargo audit 2>&1; then

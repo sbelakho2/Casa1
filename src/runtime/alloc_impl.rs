@@ -217,7 +217,21 @@ impl PeHostRuntime {
         size: usize,
         protection: crate::vm::VmProtection,
     ) -> AppResult<u64> {
-        let size = align_up_u64(size.max(1) as u64, 0x1000) as usize;
+        // Bound the guest-controlled size before reserving/zeroing: an
+        // attacker-controlled VirtualAlloc size must not turn into an
+        // unbounded host allocation.  1 GiB is far above any guest request
+        // this runtime makes (thread stacks, TLS, heaps).
+        const MAX_PRIVATE_PAGES_ALLOCATION: u64 = 1 << 30;
+        let requested_size = align_up_u64(size.max(1) as u64, 0x1000);
+        if requested_size > MAX_PRIVATE_PAGES_ALLOCATION {
+            return Err(AppError::new(
+                ReasonCode::RcBufferLimitExceeded,
+                format!(
+                    "private page allocation of {requested_size:#x} bytes exceeds the {MAX_PRIVATE_PAGES_ALLOCATION:#x}-byte bound"
+                ),
+            ));
+        }
+        let size = requested_size as usize;
         let address = if requested_address == 0 {
             // The canonical VM's cursor picks the address (and advances).
             self.win32.address_space_mut().reserve(None, size as u64)
@@ -243,10 +257,45 @@ impl PeHostRuntime {
                 "PE runtime virtual allocation overflow",
             ));
         }
-        memory.map_bytes(address, &vec![0; size]);
+        // Zero in place (page by page) instead of building a `vec![0; size]`
+        // temporary, then commit the canonical pages.
+        memory.zero_range(address, size);
         self.win32
             .address_space_mut()
             .commit(address, size as u64, protection, false);
         Ok(address)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ge::{GameEnvironment, GeArch};
+    use crate::vm::VmProtection;
+    use tempfile::TempDir;
+
+    #[test]
+    fn alloc_private_pages_rejects_guest_sizes_above_the_host_allocation_bound() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "alloc-bound", GeArch::X64, "win11-23h2")
+                .expect("create ge");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+        let mut memory = MemoryImage::default();
+
+        // One byte over the 1 GiB bound, page-aligned up to 0x40001000:
+        // the bound must reject BEFORE any host reservation or zeroing.
+        let error = runtime
+            .alloc_private_pages(&mut memory, 0, (1 << 30) + 1, VmProtection::READ_WRITE)
+            .expect_err("over-bound VirtualAlloc size must fail");
+        assert_eq!(error.code, ReasonCode::RcBufferLimitExceeded);
+        assert_eq!(
+            error.message,
+            format!(
+                "private page allocation of {:#x} bytes exceeds the {:#x}-byte bound",
+                (1u64 << 30) + 0x1000,
+                1u64 << 30
+            )
+        );
     }
 }

@@ -157,7 +157,7 @@ fn section1_cli_process_model_and_artifacts_work_end_to_end() {
     let mut archive_names = Vec::new();
     for index in 0..archive.len() {
         let file = archive.by_index(index).expect("zip entry");
-        archive_names.push(file.name().to_string());
+        archive_names.push(file.name().expect("zip entry name").to_string());
     }
     assert!(archive_names.iter().any(|name| name == "ge.json"));
     assert!(

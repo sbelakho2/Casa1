@@ -12,14 +12,19 @@ env:
   # and manual runner invocations use the production worker pool by default.
   CASA1_COOPERATIVE_SCHEDULER: "1"
 
+# Least privilege: workflows only read repository contents; jobs that need
+# more (cross-run artifacts) add it at the job level.
+permissions:
+  contents: read
+
 jobs:
   integration-tests:
     name: Integration Tests
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Run all integration tests
         env:
           RUST_TEST_THREADS: "1"
@@ -30,12 +35,12 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       # `nightly_alloc_error_hook` uses std::alloc::set_alloc_error_hook,
       # which is nightly-only; the all-features matrix must not run it on
       # stable (that produced E0658 in the stable all-features Clippy job).
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install FFmpeg system dependencies (all-features build needs them)
         run: |
           set -euo pipefail
@@ -87,9 +92,9 @@ jobs:
     name: No Default Features
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Check with no default features
         run: cargo check --no-default-features
 
@@ -97,9 +102,9 @@ jobs:
     name: Check Metal
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Check all targets (Metal is mandatory, no feature flag)
         run: cargo check --all-targets
 
@@ -107,9 +112,9 @@ jobs:
     name: Check Vulkan
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Check with vulkan feature
         run: cargo check --all-targets --features vulkan
 
@@ -117,9 +122,9 @@ jobs:
     name: Check OpenGL
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Check with opengl feature
         run: cargo check --all-targets --features opengl
 
@@ -127,9 +132,9 @@ jobs:
     name: Check WebSocket
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Check with websocket feature
         run: cargo check --all-targets --features websocket
 
@@ -147,9 +152,9 @@ jobs:
             formula: "ffmpeg@7"
             pkg_config_major: "61"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install FFmpeg ${{ matrix.ffmpeg }} development libraries
         run: |
           set -euo pipefail
@@ -175,11 +180,11 @@ jobs:
     name: Nightly Sanitizer
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04
         with:
           components: rust-src
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
       - name: Run nightly lib/bins tests (cargo-invoking meta tests skipped)
@@ -203,9 +208,9 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       # Runs the real PE inventory + corpus harness over the checked-in Tetris
       # binaries: proves the harness is deterministic and resume-safe against
       # real PE32/PE32+ images (the app itself is expected to hit the timeout).
@@ -219,11 +224,11 @@ jobs:
     name: Fuzz Build (nightly)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04
         with:
           components: rust-src
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
       # cargo-fuzz does not accept --manifest-path; it discovers

@@ -517,6 +517,17 @@ pub(crate) struct RealDllState {
     pub(crate) handle: u64,
     /// Optional native macOS dylib loaded via `libloading` (if a native shim exists).
     pub(crate) native_library: Option<libloading::Library>,
+    /// The image as mapped by `pe::map_image_at` (sections + relocations).
+    /// `None` for synthetic modules.  The bytes are materialised into guest
+    /// memory before the first TLS callback / DllMain runs.
+    pub(crate) mapped_image: Option<crate::pe::MappedImage>,
+    /// True once `mapped_image` has been copied into the guest page map.
+    pub(crate) materialized: bool,
+    /// Resolved IAT entries `(iat_rva, thunk_address)` written into the
+    /// materialised image before DllMain.
+    pub(crate) import_thunks: Vec<(u32, u64)>,
+    /// Guest pointer width (4 or 8) for this image's IAT writes.
+    pub(crate) pointer_bytes: usize,
 }
 
 /// The Ldr loader-lock protocol state (LdrLockLoaderLock /

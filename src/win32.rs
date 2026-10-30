@@ -4128,6 +4128,7 @@ impl Win32Subsystem {
     }
 
     pub fn remove_directory_w(&mut self, path: &str) -> AppResult<()> {
+        self.ge.reject_write_to_read_only_drive(path)?;
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
         fs::remove_dir(&host_path).map_err(|error| {
             AppError::from_io(
@@ -4201,6 +4202,7 @@ impl Win32Subsystem {
     }
 
     pub fn delete_file_w(&mut self, path: &str) -> AppResult<()> {
+        self.ge.reject_write_to_read_only_drive(path)?;
         let (normalized_path, host_path) = self.resolve_host_path(path)?;
         // Windows refuses to delete a file carrying the readonly attribute:
         // DeleteFileW on a read-only file fails with ERROR_ACCESS_DENIED.
@@ -4258,6 +4260,8 @@ impl Win32Subsystem {
         replace_existing: bool,
         copy_allowed: bool,
     ) -> AppResult<()> {
+        self.ge.reject_write_to_read_only_drive(from)?;
+        self.ge.reject_write_to_read_only_drive(to)?;
         let (from_norm, from_host) = self.resolve_host_path(from)?;
         let (to_norm, to_host) = self.resolve_host_path(to)?;
         // Windows does not create the destination's parent directory: a
@@ -4339,6 +4343,8 @@ impl Win32Subsystem {
     }
 
     pub fn copy_file_ex_w(&mut self, from: &str, to: &str, fail_if_exists: bool) -> AppResult<u64> {
+        // Copying only reads the source; the destination is the write side.
+        self.ge.reject_write_to_read_only_drive(to)?;
         let (from_norm, from_host) = self.resolve_host_path(from)?;
         let (to_norm, to_host) = self.resolve_host_path(to)?;
         if fail_if_exists && to_host.exists() {
@@ -4407,6 +4413,8 @@ impl Win32Subsystem {
         } else {
             directory.to_string()
         };
+        // GetTempFileNameW creates a file, so the drive must be writable.
+        self.ge.reject_write_to_read_only_drive(&temp_path)?;
         let (normalized_directory, host_directory) =
             self.resolve_host_path(temp_path.trim_end_matches(['\\', '/']))?;
         // GetTempFileNameW does not create directories either: the target
@@ -7298,8 +7306,38 @@ impl Win32Subsystem {
         } else {
             PathBuf::from(&mapping.target)
         };
+        // Canonicalize the deepest existing ancestor and require it to stay
+        // under the canonical mapping root.  This catches host symlinks (and
+        // macOS firmlinks/reparse-like ancestors) planted inside the GE:
+        // lexical prefix checks alone would accept `root/link/../../outside`.
+        let canonical_root = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let mut deepest_existing = root.exists().then(|| root.clone());
         for component in &parsed.components {
             root.push(component);
+            if root.exists() {
+                deepest_existing = Some(root.clone());
+            }
+        }
+        let ancestor = deepest_existing.unwrap_or_else(|| root.clone());
+        let canonical_ancestor = fs::canonicalize(&ancestor).map_err(|error| {
+            AppError::new(
+                ReasonCode::RcFsSandboxEscape,
+                format!(
+                    "{} escapes the GE sandbox (cannot resolve {}): {error}",
+                    parsed.normalized_path,
+                    ancestor.display()
+                ),
+            )
+        })?;
+        if !canonical_ancestor.starts_with(&canonical_root) {
+            return Err(AppError::new(
+                ReasonCode::RcFsSandboxEscape,
+                format!(
+                    "{} escapes the GE sandbox through {}",
+                    parsed.normalized_path,
+                    ancestor.display()
+                ),
+            ));
         }
         Ok((parsed.normalized_path, root))
     }
@@ -10525,6 +10563,138 @@ mod tests {
         // Should return Some("") or None depending on platform
         if let Some(s) = result {
             assert!(s.is_empty(), "empty input should produce empty output");
+        }
+    }
+
+    #[test]
+    fn verbatim_dotdot_guest_path_rejected_for_chsize_and_gdip_load() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "c2-verbatim", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
+        let win32 = Win32Subsystem::new(ge, false);
+
+        // `guest_path_to_host_path` is the single resolution seam used by the
+        // CRT `_chsize` arm and the GDI+ `GdipCreate*FromFile` arms.
+        let error = win32
+            .guest_path_to_host_path("\\\\?\\C:\\..\\..\\escape")
+            .expect_err("a verbatim parent traversal must never resolve");
+        assert_eq!(error.code, ReasonCode::RcFsPathInvalid);
+    }
+
+    #[test]
+    fn symlink_ancestor_escape_is_rejected_with_sandbox_escape() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "c2-symlink", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        let link = ge.drive_c().join("escape-link");
+        std::os::unix::fs::symlink(&outside, &link).expect("create escaping symlink");
+        let win32 = Win32Subsystem::new(ge, false);
+
+        let error = win32
+            .guest_path_to_host_path("C:\\escape-link\\payload.txt")
+            .expect_err("a symlinked ancestor must never resolve outside the GE");
+        assert_eq!(error.code, ReasonCode::RcFsSandboxEscape);
+    }
+
+    #[test]
+    fn traversal_denied_ancestor_is_rejected_with_sandbox_escape() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "c2-uncanonicalize",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create game environment");
+        let win32 = Win32Subsystem::new(ge, false);
+        // `exists()` and `canonicalize()` fail identically on a single thread,
+        // so deny traversal above the mapping root: the deepest-existing
+        // ancestor probe finds nothing stat-able and canonicalizing the full
+        // path fails with EACCES instead of escaping.
+        let root = win32.ge.root.clone();
+        let original = fs::metadata(&root).expect("stat GE root").permissions();
+        let mut locked = original.clone();
+        locked.set_mode(0o000);
+        fs::set_permissions(&root, locked).expect("lock GE root traversal");
+        let result = win32.guest_path_to_host_path("C:\\secret.txt");
+        fs::set_permissions(&root, original).expect("restore GE root traversal");
+
+        let error = result.expect_err("an uncanonicalizable ancestor must never resolve");
+        assert_eq!(error.code, ReasonCode::RcFsSandboxEscape);
+        assert!(
+            error
+                .message
+                .starts_with("C:\\secret.txt escapes the GE sandbox (cannot resolve "),
+            "unexpected sandbox message: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn deep_path_inside_drive_root_is_not_rejected_as_escape() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "c2-deep", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let deep = ge.drive_c().join("deep/a/b");
+        fs::create_dir_all(&deep).expect("create deep directory");
+        let win32 = Win32Subsystem::new(ge, false);
+
+        let host = win32
+            .guest_path_to_host_path("C:\\deep\\a\\b\\file.txt")
+            .expect("a normal deep path must resolve");
+        assert_eq!(
+            win32
+                .ge
+                .parse_windows_path("C:\\deep\\a\\b\\file.txt", None)
+                .expect("parse deep path")
+                .normalized_path,
+            "C:\\deep\\a\\b\\file.txt",
+            "Windows preserves the caller's drive-letter case"
+        );
+        assert_eq!(host, win32.ge.drive_c().join("deep/a/b/file.txt"));
+    }
+
+    #[test]
+    fn read_only_drive_rejects_delete_remove_temp_move_and_copy() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(temp_dir.path(), "c2-ro", GeArch::X86, "win11-23h2")
+            .expect("create game environment");
+        let mut win32 = Win32Subsystem::new(ge, false);
+        let mapping = win32
+            .ge
+            .config
+            .drive_mappings
+            .iter_mut()
+            .find(|mapping| mapping.drive == "Z")
+            .expect("default Z mapping");
+        mapping.enabled = true;
+        mapping.read_only = true;
+        mapping.requires_permission = false;
+
+        let errors = [
+            win32
+                .delete_file_w("Z:\\tmp\\victim.txt")
+                .expect_err("delete on a read-only drive must fail"),
+            win32
+                .remove_directory_w("Z:\\tmp")
+                .expect_err("rmdir on a read-only drive must fail"),
+            win32
+                .get_temp_file_name_w("Z:\\tmp", "casa")
+                .expect_err("temp file creation on a read-only drive must fail"),
+            win32
+                .move_file_ex_w("C:\\src.txt", "Z:\\tmp\\dst.txt", true, false)
+                .expect_err("move destination on a read-only drive must fail"),
+            win32
+                .copy_file_ex_w("C:\\src.txt", "Z:\\tmp\\dst.txt", false)
+                .expect_err("copy destination on a read-only drive must fail"),
+        ];
+        for error in errors {
+            assert_eq!(error.code, ReasonCode::RcSandboxPathViolation);
         }
     }
 }

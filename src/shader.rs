@@ -4700,34 +4700,69 @@ fn llvm_tool(name: &str) -> AppResult<std::path::PathBuf> {
     ))
 }
 
-/// Assemble textual LLVM IR to real LLVM bitcode with `llvm-as`.
-pub fn llvm_assemble_ir(ir: &str) -> AppResult<Vec<u8>> {
-    let assembler = llvm_tool("llvm-as")?;
-    let mut file = std::env::temp_dir();
-    file.push(format!(
-        "casa1-ray-{}-{}-{}.ll",
+/// Stage guest-supplied compiler input in a uniquely named temp file. Failures
+/// are reported as `RcDxilInvalid` rather than panicking: the input comes from
+/// a guest payload, so an unwritable temp directory must not abort the host.
+fn llvm_stage_in(temp_dir: &Path, contents: &[u8], extension: &str) -> AppResult<PathBuf> {
+    let file = temp_dir.join(format!(
+        "casa1-ray-{}-{}-{}.{extension}",
         std::process::id(),
         LLVM_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-        util::sha256_bytes(ir.as_bytes())
+        util::sha256_bytes(contents)
     ));
-    std::fs::write(&file, ir).expect("stage LLVM IR");
-    let output = std::process::Command::new(assembler)
+    std::fs::write(&file, contents).map_err(|error| {
+        AppError::from_io(
+            ReasonCode::RcDxilInvalid,
+            format!("failed to stage LLVM {extension} input"),
+            &error,
+        )
+    })?;
+    Ok(file)
+}
+
+fn llvm_stage(contents: &[u8], extension: &str) -> AppResult<PathBuf> {
+    llvm_stage_in(&std::env::temp_dir(), contents, extension)
+}
+
+fn llvm_run_tool(
+    tool: &Path,
+    input: &Path,
+    args: &[&str],
+    label: &str,
+    rejection: &str,
+) -> AppResult<Vec<u8>> {
+    let output = std::process::Command::new(tool)
+        .args(args)
         .arg("-o")
         .arg("-")
-        .arg(&file)
+        .arg(input)
         .output()
-        .expect("run llvm-as");
-    let _ = std::fs::remove_file(&file);
+        .map_err(|error| {
+            AppError::from_io(
+                ReasonCode::RcDxilInvalid,
+                format!("failed to run {label}"),
+                &error,
+            )
+        })?;
     if !output.status.success() {
         return Err(AppError::new(
             ReasonCode::RcDxilInvalid,
             format!(
-                "llvm-as rejected IR: {}",
+                "{rejection}: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
         ));
     }
     Ok(output.stdout)
+}
+
+/// Assemble textual LLVM IR to real LLVM bitcode with `llvm-as`.
+pub fn llvm_assemble_ir(ir: &str) -> AppResult<Vec<u8>> {
+    let assembler = llvm_tool("llvm-as")?;
+    let file = llvm_stage(ir.as_bytes(), "ll")?;
+    let result = llvm_run_tool(&assembler, &file, &[], "llvm-as", "llvm-as rejected IR");
+    let _ = std::fs::remove_file(&file);
+    result
 }
 
 /// Disassemble real LLVM bitcode to textual IR using the bundled `opt`.
@@ -4739,32 +4774,11 @@ pub fn llvm_bitcode_to_ir(bitcode: &[u8]) -> AppResult<String> {
         ));
     }
     let opt = llvm_tool("opt")?;
-    let mut file = std::env::temp_dir();
-    file.push(format!(
-        "casa1-ray-{}-{}-{}.bc",
-        std::process::id(),
-        LLVM_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-        util::sha256_bytes(bitcode)
-    ));
-    std::fs::write(&file, bitcode).expect("stage LLVM bitcode");
-    let output = std::process::Command::new(opt)
-        .arg("-S")
-        .arg("-o")
-        .arg("-")
-        .arg(&file)
-        .output()
-        .expect("run opt");
+    let file = llvm_stage(bitcode, "bc")?;
+    let result = llvm_run_tool(&opt, &file, &["-S"], "opt", "opt rejected LLVM bitcode");
     let _ = std::fs::remove_file(&file);
-    if !output.status.success() {
-        return Err(AppError::new(
-            ReasonCode::RcDxilInvalid,
-            format!(
-                "opt rejected LLVM bitcode: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        ));
-    }
-    String::from_utf8(output.stdout)
+    let stdout = result?;
+    String::from_utf8(stdout)
         .map_err(|_| AppError::new(ReasonCode::RcDxilInvalid, "opt produced non-UTF-8 LLVM IR"))
 }
 
@@ -8341,6 +8355,30 @@ declare void @ray.storePayload(i32, i32)
             split_call_args("<3 x float> %x, i32 1"),
             vec!["<3 x float> %x", "i32 1"]
         );
+    }
+
+    #[test]
+    fn t_llvm_staging_and_spawn_failures_report_dxil_invalid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"file").expect("write blocker");
+        let error = llvm_stage_in(&blocker, b"define void @f() {}", "ll")
+            .expect_err("staging under a file must fail");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(error.message, "failed to stage LLVM ll input");
+
+        let input = llvm_stage(b"ir", "ll").expect("stage input");
+        let error = llvm_run_tool(
+            Path::new("/nonexistent/casa1-llvm-as"),
+            &input,
+            &[],
+            "llvm-as",
+            "llvm-as rejected IR",
+        )
+        .expect_err("missing tool must fail");
+        assert_eq!(error.code, ReasonCode::RcDxilInvalid);
+        assert_eq!(error.message, "failed to run llvm-as");
+        let _ = std::fs::remove_file(input);
     }
 
     #[test]

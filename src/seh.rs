@@ -32,15 +32,61 @@ pub struct RuntimeFunction {
 /// Unwind code operation codes (UWOP_*).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnwindCode {
-    PushNonVolatile { register: u8 },
-    AllocLarge { size: u32 },
-    AllocSmall { size: u8 },
-    SetFramePointer { register: u8, offset: u32 },
-    SaveNonVolatile { register: u8, offset: u32 },
-    SaveNonVolatileFar { register: u8, offset: u32 },
-    SaveXmm128 { register: u8, offset: u32 },
-    SaveXmm128Far { register: u8, offset: u32 },
-    PushMachineFrame { code: u8 },
+    PushNonVolatile {
+        code_offset: u8,
+        register: u8,
+    },
+    AllocLarge {
+        code_offset: u8,
+        size: u32,
+    },
+    AllocSmall {
+        code_offset: u8,
+        size: u8,
+    },
+    SetFramePointer {
+        code_offset: u8,
+        register: u8,
+        offset: u32,
+    },
+    SaveNonVolatile {
+        code_offset: u8,
+        register: u8,
+        offset: u32,
+    },
+    SaveNonVolatileFar {
+        code_offset: u8,
+        register: u8,
+        offset: u32,
+    },
+    /// `UWOP_EPILOG` (UNWIND_INFO version 2): describes an epilog region.
+    /// `offset`/`size` are prolog-relative bytes; `flags` carries the
+    /// documented epilog flags byte.
+    Epilog {
+        code_offset: u8,
+        offset: u32,
+        size: u8,
+        flags: u8,
+    },
+    /// `UWOP_SPARE` (UNWIND_INFO version 2): reserved, no effect.
+    Spare {
+        code_offset: u8,
+        value: u8,
+    },
+    SaveXmm128 {
+        code_offset: u8,
+        register: u8,
+        offset: u32,
+    },
+    SaveXmm128Far {
+        code_offset: u8,
+        register: u8,
+        offset: u32,
+    },
+    PushMachineFrame {
+        code_offset: u8,
+        code: u8,
+    },
 }
 
 /// Parsed UNWIND_INFO structure.
@@ -155,9 +201,9 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
     }
     let version_and_flags = data[offset];
     let version = version_and_flags & 0x07;
-    // Per the PE/COFF spec only UNWIND_INFO version 1 is defined; anything
-    // else is corrupt data and must fail closed instead of being mis-unwound.
-    if version != 1 {
+    // UNWIND_INFO version 1 is the baseline; version 2 adds UWOP_EPILOG and
+    // UWOP_SPARE.  Anything else is corrupt and must fail closed.
+    if version != 1 && version != 2 {
         return None;
     }
     let flags = (version_and_flags >> 3) & 0x1f;
@@ -174,75 +220,72 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
         return None;
     }
 
+    // UNWIND_CODE layout: byte 0 is CodeOffset, byte 1 is
+    // UnwindOp (low nibble) | OpInfo (high nibble).  The previous parser read
+    // the opcode from byte 0, which transposed every operation and made
+    // CodeOffset unusable.
     let mut codes = Vec::with_capacity(code_count as usize);
-    // Each unwind code occupies one or more 2-byte "nodes". Operations that
-    // carry an operand (ALLOC_LARGE, SAVE_NONVOL[_FAR], SAVE_XMM128[_FAR])
-    // consume additional nodes for the inline 16-/32-bit value. We must skip
-    // those operand nodes rather than mis-parsing them as further unwind codes.
     let mut i = 0usize;
     while i < code_count as usize {
         let code_offset = codes_start + i * 2;
-        let code_byte = data[code_offset];
-        let op = code_byte & 0x0f;
-        let op_info = code_byte >> 4;
-        match op {
-            0 => {
-                // UWOP_PUSH_NONVOL
-                codes.push(UnwindCode::PushNonVolatile { register: op_info });
-            }
+        let offset_byte = data[code_offset];
+        let op_byte = data[code_offset + 1];
+        let op = op_byte & 0x0f;
+        let op_info = op_byte >> 4;
+        let operation = match op {
+            0 => UnwindCode::PushNonVolatile {
+                code_offset: offset_byte,
+                register: op_info,
+            },
             1 => {
-                // UWOP_ALLOC_LARGE
-                if op_info == 0 {
-                    // 16-bit scaled
-                    let size = if code_offset + 3 < data.len() {
+                // UWOP_ALLOC_LARGE: OpInfo 0 => 16-bit value scaled by 8;
+                // OpInfo 1 => 32-bit unscaled value.
+                let size = if op_info == 0 {
+                    if code_offset + 3 < data.len() {
                         u16::from_le_bytes([data[code_offset + 2], data[code_offset + 3]]) as u32
                             * 8
                     } else {
                         0
-                    };
-                    codes.push(UnwindCode::AllocLarge { size });
+                    }
+                } else if code_offset + 5 < data.len() {
+                    u32::from_le_bytes([
+                        data[code_offset + 2],
+                        data[code_offset + 3],
+                        data[code_offset + 4],
+                        data[code_offset + 5],
+                    ])
                 } else {
-                    // 32-bit unscaled
-                    let size = if code_offset + 5 < data.len() {
-                        u32::from_le_bytes([
-                            data[code_offset + 2],
-                            data[code_offset + 3],
-                            data[code_offset + 4],
-                            data[code_offset + 5],
-                        ])
-                    } else {
-                        0
-                    };
-                    codes.push(UnwindCode::AllocLarge { size });
+                    0
+                };
+                UnwindCode::AllocLarge {
+                    code_offset: offset_byte,
+                    size,
                 }
             }
-            2 => {
-                // UWOP_ALLOC_SMALL
-                codes.push(UnwindCode::AllocSmall {
-                    size: op_info * 8 + 8,
-                });
-            }
-            3 => {
-                // UWOP_SET_FPREG
-                codes.push(UnwindCode::SetFramePointer {
-                    register: frame_register,
-                    offset: frame_offset as u32 * 16,
-                });
-            }
+            2 => UnwindCode::AllocSmall {
+                code_offset: offset_byte,
+                size: op_info * 8 + 8,
+            },
+            3 => UnwindCode::SetFramePointer {
+                code_offset: offset_byte,
+                register: frame_register,
+                offset: frame_offset as u32 * 16,
+            },
             4 => {
-                // UWOP_SAVE_NONVOL
+                // UWOP_SAVE_NONVOL: 16-bit offset scaled by 8.
                 let offset_val = if code_offset + 3 < data.len() {
                     u16::from_le_bytes([data[code_offset + 2], data[code_offset + 3]]) as u32 * 8
                 } else {
                     0
                 };
-                codes.push(UnwindCode::SaveNonVolatile {
+                UnwindCode::SaveNonVolatile {
+                    code_offset: offset_byte,
                     register: op_info,
                     offset: offset_val,
-                });
+                }
             }
             5 => {
-                // UWOP_SAVE_NONVOL_FAR
+                // UWOP_SAVE_NONVOL_FAR: 32-bit unscaled offset.
                 let offset_val = if code_offset + 5 < data.len() {
                     u32::from_le_bytes([
                         data[code_offset + 2],
@@ -253,25 +296,51 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
                 } else {
                     0
                 };
-                codes.push(UnwindCode::SaveNonVolatileFar {
+                UnwindCode::SaveNonVolatileFar {
+                    code_offset: offset_byte,
                     register: op_info,
                     offset: offset_val,
-                });
+                }
             }
-            6 => {
-                // UWOP_SAVE_XMM128
+            6 if version >= 2 => {
+                // UWOP_EPILOG: 32-bit EpilogInfo in the following two nodes:
+                // bits 0-15 offset, bits 16-23 size, bits 24-31 flags.
+                let info = if code_offset + 5 < data.len() {
+                    u32::from_le_bytes([
+                        data[code_offset + 2],
+                        data[code_offset + 3],
+                        data[code_offset + 4],
+                        data[code_offset + 5],
+                    ])
+                } else {
+                    0
+                };
+                UnwindCode::Epilog {
+                    code_offset: offset_byte,
+                    offset: info & 0xffff,
+                    size: ((info >> 16) & 0xff) as u8,
+                    flags: ((info >> 24) & 0xff) as u8,
+                }
+            }
+            7 if version >= 2 => UnwindCode::Spare {
+                code_offset: offset_byte,
+                value: op_info,
+            },
+            8 => {
+                // UWOP_SAVE_XMM128: 16-bit offset scaled by 16.
                 let offset_val = if code_offset + 3 < data.len() {
                     u16::from_le_bytes([data[code_offset + 2], data[code_offset + 3]]) as u32 * 16
                 } else {
                     0
                 };
-                codes.push(UnwindCode::SaveXmm128 {
+                UnwindCode::SaveXmm128 {
+                    code_offset: offset_byte,
                     register: op_info,
                     offset: offset_val,
-                });
+                }
             }
-            7 => {
-                // UWOP_SAVE_XMM128_FAR
+            9 => {
+                // UWOP_SAVE_XMM128_FAR: 32-bit unscaled offset.
                 let offset_val = if code_offset + 5 < data.len() {
                     u32::from_le_bytes([
                         data[code_offset + 2],
@@ -282,22 +351,25 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
                 } else {
                     0
                 };
-                codes.push(UnwindCode::SaveXmm128Far {
+                UnwindCode::SaveXmm128Far {
+                    code_offset: offset_byte,
                     register: op_info,
                     offset: offset_val,
-                });
+                }
             }
-            8 => {
-                // UWOP_PUSH_MACHINE_FRAME
-                codes.push(UnwindCode::PushMachineFrame { code: op_info });
-            }
+            10 => UnwindCode::PushMachineFrame {
+                code_offset: offset_byte,
+                code: op_info,
+            },
             _ => {
-                // Unknown unwind opcode (9–15) — corrupt data; fail closed
-                // rather than silently skipping it and mis-unwinding.
+                // Unknown/reserved opcode for this version (including 6/7 in
+                // v1) — corrupt data; fail closed instead of silently
+                // skipping it and mis-unwinding.
                 return None;
             }
-        }
-        // Advance past this code and any inline operand nodes it consumed.
+        };
+        codes.push(operation);
+        // Advance past this code and its inline operand nodes.
         let nodes = match op {
             1 => {
                 if op_info == 0 {
@@ -306,18 +378,18 @@ pub fn parse_unwind_info(data: &[u8], rva: u32) -> Option<UnwindInfo> {
                     3 // ALLOC_LARGE with 32-bit unscaled size
                 }
             }
-            4 | 6 => 2, // SAVE_NONVOL / SAVE_XMM128 (16-bit operand)
-            5 | 7 => 3, // SAVE_NONVOL_FAR / SAVE_XMM128_FAR (32-bit operand)
+            4 | 8 => 2,             // SAVE_NONVOL / SAVE_XMM128 (16-bit operand)
+            5 | 9 => 3,             // SAVE_NONVOL_FAR / SAVE_XMM128_FAR (32-bit operand)
+            6 if version >= 2 => 3, // EPILOG carries a 32-bit EpilogInfo
             _ => 1,
         };
         i += nodes;
     }
 
-    // After the unwind codes (padded to even count, then DWORD-aligned),
+    // After the unwind codes (padded to an even count, then DWORD-aligned),
     // optional handler RVAs follow for EHANDLER/UHANDLER.
-    let codes_raw_len = codes_len * 2; // codes_len is already even
+    let codes_raw_len = codes_len * 2;
     let handler_offset = codes_start + codes_raw_len;
-    // Align to 4 bytes
     let handler_offset = (handler_offset + 3) & !3;
 
     let handler_rva =
@@ -433,6 +505,21 @@ pub fn virtual_unwind(
     context: &mut X64Context,
     memory_reader: &MemoryReader<'_>,
 ) -> UnwindResult {
+    virtual_unwind_at(unwind_info, context, None, memory_reader)
+}
+
+/// Unwind one frame using the prolog offset of the control PC.
+///
+/// `target_offset` is `ControlPc - FunctionEntry` (the prolog byte offset).
+/// Codes that have not executed yet (their `CodeOffset` is greater than the
+/// target offset) are not replayed.  The codes array is stored in descending
+/// code-offset order, so the first such code ends the replay.
+pub fn virtual_unwind_at(
+    unwind_info: &UnwindInfo,
+    context: &mut X64Context,
+    target_offset: Option<u32>,
+    memory_reader: &MemoryReader<'_>,
+) -> UnwindResult {
     // Validate stack pointer before attempting unwind.
     // RSP must be non-zero and 8-byte aligned (x64 ABI requirement).
     // A zero or misaligned RSP indicates a corrupt context.
@@ -440,133 +527,147 @@ pub fn virtual_unwind(
         return UnwindResult::NotFound;
     }
 
-    // Replay the unwind codes in reverse order to restore the caller's frame.
-    // At entry, RSP points to the top of the current frame (= caller's return
-    // address slot after the prolog). We process codes in reverse so that the
-    // last prolog operation (which saved the deepest register) is undone first.
-    //
-    // UNW_FLAG_CHAININFO (0x04): this UNWIND_INFO describes a secondary code
-    // region whose prolog operations are a continuation of the chained
-    // (primary) entry. Its codes are replayed here, but the return-address pop
-    // is deferred — the caller follows `chained_info_rva` and replays the
-    // chained entry's codes as part of the same logical frame.
+    // Epilog detection: when the control PC lies inside a described epilog,
+    // the prolog unwind operations no longer describe the current stack
+    // (the epilog has already undone some of them).  Emulating the exact
+    // partial epilog would require disassembling the epilog; the documented
+    // conservative behaviour is to skip the prolog replay and pop the
+    // return address from the epilog's frame.
+    let in_epilog = target_offset.is_some_and(|target| {
+        unwind_info.codes.iter().any(|code| match code {
+            UnwindCode::Epilog { offset, size, .. } => {
+                let size = u32::from(*size).max(1);
+                target >= *offset && target < offset.saturating_add(size)
+            }
+            _ => false,
+        })
+    });
+
+    // Snapshot the frame base.  SAVE_NONVOL/SAVE_XMM offsets are relative to
+    // the FINAL RSP of the prolog (the frame base), not to the progressively
+    // adjusted RSP — reading them after undoing pushes/allocs would use the
+    // wrong slots.  Pushes and allocations accumulate into `stack_adjust`
+    // and are applied once at the end.
+    let mut frame_base = context.rsp;
+    let mut stack_adjust = 0u64;
     let mut machine_frame = false;
-    for code in unwind_info.codes.iter().rev() {
-        match *code {
-            UnwindCode::PushNonVolatile { register } => {
-                // The register was pushed at [RSP] in the prolog.
-                // Read the saved value from [RSP] and restore it.
-                let saved = read_u64_from_guest(memory_reader, context.rsp);
-                if let (Some(val), Some(reg_ref)) =
-                    (saved, get_nonvolatile_register(context, register))
-                {
-                    *reg_ref = val;
+
+    if !in_epilog {
+        for code in &unwind_info.codes {
+            let code_offset = match code {
+                UnwindCode::PushNonVolatile { code_offset, .. }
+                | UnwindCode::AllocLarge { code_offset, .. }
+                | UnwindCode::AllocSmall { code_offset, .. }
+                | UnwindCode::SetFramePointer { code_offset, .. }
+                | UnwindCode::SaveNonVolatile { code_offset, .. }
+                | UnwindCode::SaveNonVolatileFar { code_offset, .. }
+                | UnwindCode::Epilog { code_offset, .. }
+                | UnwindCode::Spare { code_offset, .. }
+                | UnwindCode::SaveXmm128 { code_offset, .. }
+                | UnwindCode::SaveXmm128Far { code_offset, .. }
+                | UnwindCode::PushMachineFrame { code_offset, .. } => *code_offset,
+            };
+            // The array is sorted by descending CodeOffset.  An operation
+            // whose CodeOffset is past the control PC has not executed, and
+            // neither has any later array entry.
+            if let Some(target) = target_offset
+                && u32::from(code_offset) > target
+            {
+                break;
+            }
+            match *code {
+                UnwindCode::PushNonVolatile { register, .. } => {
+                    let saved = read_u64_from_guest(memory_reader, frame_base + stack_adjust);
+                    if let (Some(val), Some(reg_ref)) =
+                        (saved, get_nonvolatile_register(context, register))
+                    {
+                        *reg_ref = val;
+                    }
+                    stack_adjust += 8;
                 }
-                context.rsp += 8;
-            }
-            UnwindCode::AllocLarge { size } => {
-                context.rsp += size as u64;
-            }
-            UnwindCode::AllocSmall { size } => {
-                context.rsp += size as u64;
-            }
-            UnwindCode::SetFramePointer { register, offset } => {
-                // The prolog established the frame register as
-                // `R[register] = RSP_final + offset` (e.g. `lea rbp,[rsp+N]`),
-                // so the unwind effect is `RSP = R[register] - offset`.
-                let fp_val = get_nonvolatile_register(context, register)
-                    .copied()
-                    .unwrap_or(0);
-                context.rsp = fp_val.wrapping_sub(offset as u64);
-            }
-            UnwindCode::SaveNonVolatile { register, offset } => {
-                // Register was saved at [final_RSP + offset] (offset scaled by 8).
-                let addr = context.rsp.wrapping_add(offset as u64);
-                let saved = read_u64_from_guest(memory_reader, addr);
-                if let (Some(val), Some(reg_ref)) =
-                    (saved, get_nonvolatile_register(context, register))
-                {
-                    *reg_ref = val;
+                UnwindCode::AllocLarge { size, .. } => {
+                    stack_adjust += u64::from(size);
                 }
-                // RSP is NOT adjusted — the save was relative to final RSP.
-            }
-            UnwindCode::SaveNonVolatileFar { register, offset } => {
-                // Same as SaveNonVolatile but with 32-bit unscaled offset.
-                let addr = context.rsp.wrapping_add(offset as u64);
-                let saved = read_u64_from_guest(memory_reader, addr);
-                if let (Some(val), Some(reg_ref)) =
-                    (saved, get_nonvolatile_register(context, register))
-                {
-                    *reg_ref = val;
+                UnwindCode::AllocSmall { size, .. } => {
+                    stack_adjust += u64::from(size);
                 }
-            }
-            UnwindCode::SaveXmm128 { register, offset } => {
-                // XMM register saved at [final_RSP + offset] (offset scaled by 16).
-                let addr = context.rsp.wrapping_add(offset as u64);
-                let saved = read_xmm128_from_guest(memory_reader, addr);
-                if let Some(val) = saved {
-                    let idx = (register % 16) as usize;
-                    context.xmm[idx] = val;
+                UnwindCode::SetFramePointer {
+                    register, offset, ..
+                } => {
+                    // `R[register] = RSP_final + offset` in the prolog; the
+                    // frame base is therefore `R[register] - offset` and any
+                    // pending pushes belong to the frame above it.
+                    let fp_val = get_nonvolatile_register(context, register)
+                        .copied()
+                        .unwrap_or(0);
+                    frame_base = fp_val.wrapping_sub(u64::from(offset));
+                    stack_adjust = 0;
                 }
-            }
-            UnwindCode::SaveXmm128Far { register, offset } => {
-                // Same as SaveXmm128 but with 32-bit unscaled offset.
-                let addr = context.rsp.wrapping_add(offset as u64);
-                let saved = read_xmm128_from_guest(memory_reader, addr);
-                if let Some(val) = saved {
-                    let idx = (register % 16) as usize;
-                    context.xmm[idx] = val;
+                UnwindCode::SaveNonVolatile {
+                    register, offset, ..
                 }
-            }
-            UnwindCode::PushMachineFrame { code } => {
-                // The CPU pushed a trap/exception frame.
-                // Code bit 0 indicates whether an error code was pushed.
-                let has_error_code = code & 0x01 != 0;
-                let error_code_offset: u64 = if has_error_code { 8 } else { 0 };
-                // Read RIP from the frame
-                // Layout: [error_code?] RIP CS RFLAGS OldRSP SS
-                // Offsets from RSP: err=0|RIP=0/8 CS=8/16 RFLAGS=16/24 OldRSP=24/32 SS=32/40
-                let rip_offset = error_code_offset;
-                if let Some(saved_rip) =
-                    read_u64_from_guest(memory_reader, context.rsp.wrapping_add(rip_offset))
-                {
-                    context.rip = saved_rip;
+                | UnwindCode::SaveNonVolatileFar {
+                    register, offset, ..
+                } => {
+                    let saved = read_u64_from_guest(memory_reader, frame_base + u64::from(offset));
+                    if let (Some(val), Some(reg_ref)) =
+                        (saved, get_nonvolatile_register(context, register))
+                    {
+                        *reg_ref = val;
+                    }
                 }
-                // Read the saved RSP (value before exception) from the frame
-                let rsp_offset = error_code_offset + 24; // 24 bytes past RIP = OldRSP
-                if let Some(saved_rsp) =
-                    read_u64_from_guest(memory_reader, context.rsp.wrapping_add(rsp_offset))
-                {
-                    context.rsp = saved_rsp;
-                } else {
-                    // If we can't read the old RSP, at least advance past the frame
-                    context.rsp = context.rsp.wrapping_add(error_code_offset + 40); // frame total = error + 5*8
+                UnwindCode::SaveXmm128 {
+                    register, offset, ..
                 }
-                // A machine frame is the complete return mechanism: it already
-                // supplies both RIP and the caller's RSP. There is no separate
-                // return-address slot to pop afterwards.
-                machine_frame = true;
+                | UnwindCode::SaveXmm128Far {
+                    register, offset, ..
+                } => {
+                    let saved =
+                        read_xmm128_from_guest(memory_reader, frame_base + u64::from(offset));
+                    if let Some(val) = saved {
+                        let idx = (register % 16) as usize;
+                        context.xmm[idx] = val;
+                    }
+                }
+                UnwindCode::PushMachineFrame { code, .. } => {
+                    // The CPU pushed a trap/exception frame.
+                    // Code bit 0 indicates whether an error code was pushed.
+                    let has_error_code = code & 0x01 != 0;
+                    let error_code_offset: u64 = if has_error_code { 8 } else { 0 };
+                    let rip_offset = error_code_offset;
+                    if let Some(saved_rip) =
+                        read_u64_from_guest(memory_reader, frame_base + stack_adjust + rip_offset)
+                    {
+                        context.rip = saved_rip;
+                    }
+                    let rsp_offset = error_code_offset + 24;
+                    if let Some(saved_rsp) =
+                        read_u64_from_guest(memory_reader, frame_base + stack_adjust + rsp_offset)
+                    {
+                        context.rsp = saved_rsp;
+                    } else {
+                        context.rsp = frame_base + stack_adjust + error_code_offset + 40;
+                    }
+                    machine_frame = true;
+                }
+                UnwindCode::Epilog { .. } | UnwindCode::Spare { .. } => {}
             }
         }
     }
 
-    // After processing all unwind codes, pop the return address from the stack.
-    // At this point RSP should point to the return address of the call. A
-    // machine frame already restored RIP and the caller's RSP, so it has no
-    // separate return-address slot to pop.
-    //
-    // For a CHAININFO entry the prolog description is not yet complete: the
-    // caller must follow the chained (primary) entry and replay its codes
-    // before the return address is reached. Defer the pop and signal Collided.
+    // CHAININFO defers the return-address pop to the chained entry.
     if unwind_info.flags & 0x04 != 0 {
         return UnwindResult::Collided;
     }
 
+    // After processing all unwind codes, RSP points at the return-address
+    // slot.  A machine frame already restored both RIP and the caller's RSP.
     if !machine_frame {
-        if let Some(return_rip) = read_u64_from_guest(memory_reader, context.rsp) {
+        let return_slot = frame_base + stack_adjust;
+        if let Some(return_rip) = read_u64_from_guest(memory_reader, return_slot) {
             context.rip = return_rip;
         }
-        context.rsp += 8;
+        context.rsp = return_slot + 8;
     }
 
     // If the function has an exception handler (EHANDLER or UHANDLER),
@@ -695,7 +796,8 @@ pub fn unwind_frames(
                 );
                 break UnwindResult::NotFound;
             }
-            let res = virtual_unwind(&active_info, context, memory_reader);
+            let target_offset = Some(rva.saturating_sub(rf.begin_addr));
+            let res = virtual_unwind_at(&active_info, context, target_offset, memory_reader);
             if res == UnwindResult::Collided {
                 chain_depth += 1;
                 match active_info.chained_info_rva.and_then(get_unwind_info) {
@@ -843,6 +945,7 @@ pub fn rtl_unwind(
         // is shared between all loaded images, so lookups must be scoped to
         // the image being unwound).
         let unwind_info_addr = rf.unwind_info_addr;
+        let function_begin = rf.begin_addr;
         let unwind_info = match seh.get_unwind_info_for_image(image_base, unwind_info_addr) {
             Some(ui) => ui.clone(),
             None => {
@@ -867,7 +970,8 @@ pub fn rtl_unwind(
                 );
                 break UnwindResult::NotFound;
             }
-            let res = virtual_unwind(&active_info, context, memory_reader);
+            let target_offset = Some(rva.saturating_sub(function_begin));
+            let res = virtual_unwind_at(&active_info, context, target_offset, memory_reader);
             if res == UnwindResult::Collided {
                 chain_depth += 1;
                 let Some(chained_rva) = active_info.chained_info_rva else {
@@ -1484,11 +1588,13 @@ impl SehSubsystem {
             Some(rf) => rf,
             None => return UnwindResult::NotFound,
         };
+        let begin_addr = rf.begin_addr;
         let unwind_info = match self.get_unwind_info_for_image(image_base, rf.unwind_info_addr) {
             Some(ui) => ui.clone(),
             None => return UnwindResult::NotFound,
         };
-        virtual_unwind(&unwind_info, context, memory_reader)
+        let target_offset = Some(rva.saturating_sub(begin_addr));
+        virtual_unwind_at(&unwind_info, context, target_offset, memory_reader)
     }
 
     /// Dispatch an exception: try VEH first, then SEH (full unwind).
@@ -1564,7 +1670,13 @@ impl SehSubsystem {
             // Use the caller-supplied guest memory reader so virtual_unwind
             // can read return addresses and saved registers from the actual
             // guest stack (which lives outside the image's unwind data).
-            let result = virtual_unwind(&unwind_info, &mut current_context, memory_reader);
+            let target_offset = Some(rva.saturating_sub(rf.begin_addr));
+            let result = virtual_unwind_at(
+                &unwind_info,
+                &mut current_context,
+                target_offset,
+                memory_reader,
+            );
             match result {
                 UnwindResult::Completed => {
                     // Unwound to the caller — verify forward progress before
@@ -1599,7 +1711,7 @@ impl SehSubsystem {
                         else {
                             break;
                         };
-                        match virtual_unwind(&next, &mut current_context, memory_reader) {
+                        match virtual_unwind_at(&next, &mut current_context, None, memory_reader) {
                             UnwindResult::Collided => {
                                 chain_rva = next.chained_info_rva;
                             }
@@ -1732,8 +1844,9 @@ mod tests {
             0x00,                                     // frame_register + frame_offset
         ];
         for &(code, info) in codes {
+            // UNWIND_CODE: byte 0 = CodeOffset, byte 1 = op | (OpInfo << 4).
+            buf.push(0x00); // code offset (all operations at prolog offset 0)
             buf.push((info << 4) | (code & 0x0f));
-            buf.push(0x00); // second byte (op-info)
         }
         // Pad to even count
         if codes.len() % 2 == 1 {
@@ -1845,8 +1958,9 @@ mod tests {
             0x00,                                     // frame_register + frame_offset
         ];
         for &(code, info) in codes {
-            buf.push((info << 4) | (code & 0x0f));
+            // UNWIND_CODE: byte 0 = CodeOffset, byte 1 = op | (OpInfo << 4).
             buf.push(0x00);
+            buf.push((info << 4) | (code & 0x0f));
         }
         // Pad to even count
         if codes.len() % 2 == 1 {
@@ -2241,11 +2355,17 @@ mod tests {
             "version 0 must be rejected"
         );
 
-        // Version > 1 is also undefined; reject it the same way.
+        // Version 2 is the real UNWIND_INFO v2 (adds UWOP_EPILOG/SPARE)
+        // and must parse; versions above 2 are undefined and rejected.
         let data2 = make_unwind_info(2, 0, &[]);
         assert!(
-            parse_unwind_info(&data2, 0).is_none(),
-            "version 2 must be rejected"
+            parse_unwind_info(&data2, 0).is_some(),
+            "version 2 must be accepted"
+        );
+        let data3 = make_unwind_info(3, 0, &[]);
+        assert!(
+            parse_unwind_info(&data3, 0).is_none(),
+            "version 3 must be rejected"
         );
     }
 
@@ -2633,6 +2753,816 @@ mod tests {
         assert!(
             result.is_err(),
             "cyclic stack must terminate with Err (frame limit), not hang"
+        );
+    }
+
+    fn encode_codes(version: u8, ops: &[(u8, u8, u32)]) -> Vec<u8> {
+        encode_codes_frame(version, 0x00, ops)
+    }
+
+    fn encode_codes_frame(version: u8, frame_byte: u8, ops: &[(u8, u8, u32)]) -> Vec<u8> {
+        // Each entry is (code_offset, UnwindOp|OpInfo<<4, operand).  Operand
+        // nodes are emitted as raw little-endian bytes exactly as the PE/COFF
+        // format stores them, and CodeCount counts every 2-byte slot
+        // (operation + operand nodes).
+        let mut bytes: Vec<u8> = Vec::new();
+        for &(offset, op_byte, operand) in ops {
+            let op = op_byte & 0x0f;
+            let info = op_byte >> 4;
+            let operand_bytes = match (op, info) {
+                (1, 0) => 2,
+                (1, _) => 4,
+                (4, _) | (8, _) => 2,
+                (5, _) | (9, _) => 4,
+                (6, _) => 4,
+                _ => 0,
+            };
+            bytes.push(offset);
+            bytes.push(op_byte);
+            for shift in 0..operand_bytes {
+                bytes.push((operand >> (shift * 8)) as u8);
+            }
+        }
+        let count = bytes.len() / 2;
+        let mut buf = vec![(version & 0x07), 0x10, count as u8, frame_byte];
+        buf.extend_from_slice(&bytes);
+        if count % 2 == 1 {
+            buf.push(0);
+            buf.push(0);
+        }
+        buf
+    }
+
+    /// E2: UWOP_EPILOG (6) and UWOP_SPARE (7) only exist in version 2; version
+    /// 1 must fail closed rather than parsing them as something else.
+    #[test]
+    fn unwind_v1_reserved_epilog_opcode_is_rejected() {
+        let data = encode_codes(1, &[(0x00, 0x16, 0x0000)]);
+        assert_eq!(
+            parse_unwind_info(&data, 0),
+            None,
+            "v1 opcode 6 is reserved and must be rejected"
+        );
+    }
+
+    /// E2: opcode 8 must parse as SAVE_XMM128 and 10 as PUSH_MACHFRAME; a
+    /// tampered CodeCount under-declaring the operand span must zero-fill
+    /// instead of reading out of bounds.
+    #[test]
+    fn unwind_alloc_large_operand_slots_tampered_zero_fill_is_exact() {
+        let data = encode_codes(1, &[(0x10, 0x01, 0x0100), (0x20, 0x11, 0x0001_0000)]);
+        let info = parse_unwind_info(&data, 0).expect("v1 unwind info");
+        assert_eq!(
+            info.codes,
+            vec![
+                UnwindCode::AllocLarge {
+                    code_offset: 0x10,
+                    size: 0x800,
+                },
+                UnwindCode::AllocLarge {
+                    code_offset: 0x20,
+                    size: 0x0001_0000,
+                },
+            ],
+            "OpInfo 0 scales the 16-bit operand by 8; OpInfo 1 is unscaled 32-bit"
+        );
+
+        // Tampered: CodeCount=1 under-declares the 3-slot ALLOC_LARGE-32
+        // span, so the operand read would run past the codes area.
+        let malformed = vec![0x01, 0x10, 0x01, 0x00, 0x00, 0x11, 0x00, 0x00];
+        let info = parse_unwind_info(&malformed, 0).expect("codes area intact");
+        assert_eq!(
+            info.codes,
+            vec![UnwindCode::AllocLarge {
+                code_offset: 0x00,
+                size: 0,
+            }],
+            "under-declared ALLOC_LARGE operand must zero-fill, not panic"
+        );
+    }
+
+    /// Op 4 (SAVE_NONVOL, 16-bit offset ×8) and op 5 (SAVE_NONVOL_FAR,
+    /// unscaled 32-bit offset) must decode their operand slots exactly.
+    #[test]
+    fn unwind_save_nonvolatile_far_slots_tampered_are_exact() {
+        let data = encode_codes(1, &[(0x10, 0x34, 0x0002), (0x20, 0x65, 0x0000_0100)]);
+        let info = parse_unwind_info(&data, 0).expect("v1 unwind info");
+        assert_eq!(
+            info.codes,
+            vec![
+                UnwindCode::SaveNonVolatile {
+                    code_offset: 0x10,
+                    register: 3,
+                    offset: 0x10,
+                },
+                UnwindCode::SaveNonVolatileFar {
+                    code_offset: 0x20,
+                    register: 6,
+                    offset: 0x100,
+                },
+            ],
+            "SAVE_NONVOL/FAR operand decoding must be exact"
+        );
+    }
+
+    /// v2 frames: op 6 (EPILOG) carries a 32-bit EpilogInfo across two
+    /// operand slots; op 7 (SPARE) is a reserved no-op with an OpInfo value.
+    #[test]
+    fn unwind_v2_epilog_spare_slots_tampered_are_exact() {
+        let epilog_info: u32 = 0x20 | (8 << 16) | (0x5a << 24);
+        let data = encode_codes(2, &[(0x00, 0x16, epilog_info), (0x10, 0x37, 0x0000)]);
+        let info = parse_unwind_info(&data, 0).expect("v2 unwind info");
+        assert_eq!(
+            info.codes,
+            vec![
+                UnwindCode::Epilog {
+                    code_offset: 0,
+                    offset: 0x20,
+                    size: 8,
+                    flags: 0x5a,
+                },
+                UnwindCode::Spare {
+                    code_offset: 0x10,
+                    value: 3,
+                },
+            ],
+            "EPILOG must carry offset/size/flags; SPARE must keep its OpInfo"
+        );
+    }
+
+    /// E2/E3: opcode 8 parses as SAVE_XMM128 (offset ×16), 9 as
+    /// SAVE_XMM128_FAR (unscaled), 10 as PUSH_MACHFRAME.
+    #[test]
+    fn unwind_save_xmm128_far_slots_tampered_are_exact() {
+        let data = encode_codes(
+            1,
+            &[(0x10, 0x18, 0x0003), (0x20, 0xf9, 0x0100), (0x30, 0x2a, 0)],
+        );
+        let info = parse_unwind_info(&data, 0).expect("v1 unwind info");
+        assert_eq!(
+            info.codes,
+            vec![
+                UnwindCode::SaveXmm128 {
+                    code_offset: 0x10,
+                    register: 1,
+                    offset: 0x30,
+                },
+                UnwindCode::SaveXmm128Far {
+                    code_offset: 0x20,
+                    register: 15,
+                    offset: 0x100,
+                },
+                UnwindCode::PushMachineFrame {
+                    code_offset: 0x30,
+                    code: 2,
+                },
+            ],
+            "ops 8/9/10 must decode with the renumbered layout"
+        );
+    }
+
+    /// Malformed CodeCounts that under-declare a 3-slot operand span must
+    /// zero-fill the far opcodes (5, 6, 9) instead of reading past the end.
+    #[test]
+    fn unwind_malformed_operand_counts_zero_fill_far_opcodes() {
+        let sav_far = vec![0x01, 0x10, 0x01, 0x00, 0x00, 0x55, 0x00, 0x00];
+        let info = parse_unwind_info(&sav_far, 0).expect("codes area intact");
+        assert_eq!(
+            info.codes,
+            vec![UnwindCode::SaveNonVolatileFar {
+                code_offset: 0,
+                register: 5,
+                offset: 0,
+            }],
+            "under-declared SAVE_NONVOL_FAR must zero-fill"
+        );
+
+        let epilog = vec![0x02, 0x10, 0x01, 0x00, 0x00, 0x16, 0x00, 0x00];
+        let info = parse_unwind_info(&epilog, 0).expect("codes area intact");
+        assert_eq!(
+            info.codes,
+            vec![UnwindCode::Epilog {
+                code_offset: 0,
+                offset: 0,
+                size: 0,
+                flags: 0,
+            }],
+            "under-declared v2 EPILOG must zero-fill the EpilogInfo"
+        );
+
+        let xmm_far = vec![0x01, 0x10, 0x01, 0x00, 0x00, 0x39, 0x00, 0x00];
+        let info = parse_unwind_info(&xmm_far, 0).expect("codes area intact");
+        assert_eq!(
+            info.codes,
+            vec![UnwindCode::SaveXmm128Far {
+                code_offset: 0,
+                register: 3,
+                offset: 0,
+            }],
+            "under-declared SAVE_XMM128_FAR must zero-fill"
+        );
+    }
+
+    /// Reserved opcodes must fail closed in every version: op 7 outside v2
+    /// and op 11+ everywhere.
+    #[test]
+    fn unwind_reserved_opcodes_7_and_11_rejected_in_any_version() {
+        let spare_v1 = encode_codes(1, &[(0x00, 0x07, 0x0000)]);
+        assert_eq!(
+            parse_unwind_info(&spare_v1, 0),
+            None,
+            "v1 opcode 7 is reserved and must be rejected"
+        );
+        let op11_v1 = encode_codes(1, &[(0x00, 0x0b, 0x0000)]);
+        assert_eq!(
+            parse_unwind_info(&op11_v1, 0),
+            None,
+            "opcode 11 is reserved in v1"
+        );
+        let op11_v2 = encode_codes(2, &[(0x00, 0x0b, 0x0000)]);
+        assert_eq!(
+            parse_unwind_info(&op11_v2, 0),
+            None,
+            "opcode 11 is reserved in v2"
+        );
+    }
+
+    /// The frame-register header byte must feed UWOP_SET_FPREG (offset ×16)
+    /// and UWOP_ALLOC_SMALL must scale OpInfo by 8 and add 8.
+    #[test]
+    fn unwind_frame_pointer_header_slot_boundary_is_exact() {
+        let data = encode_codes_frame(1, 0x25, &[(0x10, 0x03, 0x0000), (0x08, 0x12, 0x0000)]);
+        let info = parse_unwind_info(&data, 0).expect("v1 unwind info");
+        assert_eq!(
+            info.codes,
+            vec![
+                UnwindCode::SetFramePointer {
+                    code_offset: 0x10,
+                    register: 5,
+                    offset: 0x20,
+                },
+                UnwindCode::AllocSmall {
+                    code_offset: 0x08,
+                    size: 0x10,
+                },
+            ],
+            "SET_FPREG offset must be header frame_offset ×16; ALLOC_SMALL OpInfo ×8 + 8"
+        );
+    }
+
+    /// Forward replay with CodeOffset filtering: a control PC below an
+    /// operation's CodeOffset means that operation (and everything after it
+    /// in the array) never executed; a PC past the whole prolog replays all.
+    #[test]
+    fn unwind_prolog_fault_offset_filter_boundary_is_exact() {
+        // Ascending offsets: push rbp@1, alloc small 0x28@2, push rbx@4.
+        let data = encode_codes(1, &[(1, 0x50, 0), (2, 0x42, 0), (4, 0x30, 0)]);
+        let info = parse_unwind_info(&data, 0).expect("unwind info");
+
+        // Fault at offset 2: push rbx@4 has not executed.
+        let base = 0x7fff_0000u64;
+        let mut stack = vec![0u8; 0x100];
+        stack[0..8].copy_from_slice(&0x2222u64.to_le_bytes()); // saved rbp
+        stack[0x30..0x38].copy_from_slice(&0xaaaau64.to_le_bytes()); // return slot
+        let reader = slice_memory_reader(&stack, base);
+        let mut ctx = X64Context {
+            rsp: base,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind_at(&info, &mut ctx, Some(2), &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(ctx.rbx, 0, "push rbx at offset 4 has not executed");
+        assert_eq!(ctx.rbp, 0x2222, "push rbp at offset 1 is replayed");
+        assert_eq!(ctx.rip, 0xaaaa);
+        assert_eq!(ctx.rsp, base + 0x30 + 8, "alloc 0x28 and one pop undone");
+
+        // Fault past the whole prolog: every operation replays.
+        let mut stack = vec![0u8; 0x100];
+        stack[0..8].copy_from_slice(&0x2222u64.to_le_bytes());
+        stack[0x30..0x38].copy_from_slice(&0x3333u64.to_le_bytes()); // saved rbx
+        stack[0x38..0x40].copy_from_slice(&0xbbbbu64.to_le_bytes()); // return slot
+        let reader = slice_memory_reader(&stack, base);
+        let mut ctx = X64Context {
+            rsp: base,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind_at(&info, &mut ctx, Some(5), &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(
+            ctx.rbx, 0x3333,
+            "push rbx replays when the offset covers it"
+        );
+        assert_eq!(ctx.rbp, 0x2222);
+        assert_eq!(ctx.rip, 0xbbbb);
+        assert_eq!(ctx.rsp, base + 0x30 + 16);
+    }
+
+    /// SAVE_NONVOL / SAVE_NONVOL_FAR slots are frame-relative: undoing the
+    /// allocation first must not shift the slot each save is read from.
+    #[test]
+    fn unwind_save_slots_frame_relative_boundary_are_exact() {
+        let data = encode_codes(
+            1,
+            &[
+                (8, 0x34, 0x0002), // save rbx at [frame+0x10]
+                (8, 0x65, 0x0100), // save rsi far at [frame+0x100]
+                (4, 0x42, 0),      // alloc small 0x28
+                (1, 0x50, 0),      // push rbp
+            ],
+        );
+        let info = parse_unwind_info(&data, 0).expect("unwind info");
+        let base = 0x7fff_0000u64;
+        let mut stack = vec![0u8; 0x200];
+        stack[0x28..0x30].copy_from_slice(&0xbbbbu64.to_le_bytes()); // saved rbp
+        stack[0x10..0x18].copy_from_slice(&0xccccu64.to_le_bytes()); // saved rbx
+        stack[0x100..0x108].copy_from_slice(&0xeeeeu64.to_le_bytes()); // saved rsi
+        stack[0x30..0x38].copy_from_slice(&0xaaaau64.to_le_bytes()); // return
+        let reader = slice_memory_reader(&stack, base);
+        let mut ctx = X64Context {
+            rsp: base,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind(&info, &mut ctx, &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(ctx.rbx, 0xcccc, "near save slot is frame-relative");
+        assert_eq!(ctx.rsi, 0xeeee, "far save slot is frame-relative");
+        assert_eq!(ctx.rbp, 0xbbbb);
+        assert_eq!(ctx.rip, 0xaaaa);
+        assert_eq!(ctx.rsp, base + 0x28 + 16);
+    }
+
+    /// UWOP_SET_FPREG rebases the frame base to R[reg] - offset; pending
+    /// pushes and allocations belong to the frame above it, and a UWOP_
+    /// ALLOC_LARGE replay accumulates unscaled beyond it.
+    #[test]
+    fn unwind_set_frame_pointer_rebase_slot_boundary_is_exact() {
+        let data = encode_codes_frame(
+            1,
+            0x25, // frame register = rbp, frame offset = 2*16 = 0x20
+            &[
+                (8, 0x03, 0),      // SetFramePointer
+                (4, 0x01, 0x0040), // AllocLarge (OpInfo 0): 0x40 * 8 = 0x200
+                (1, 0x50, 0),      // push rbp
+            ],
+        );
+        let info = parse_unwind_info(&data, 0).expect("unwind info");
+        let base = 0x7fff_0000u64;
+        // RBP was established as RSP_final + 0x20, so frame_base = rbp - 0x20.
+        let frame_base = 0x7fff_0200u64 - 0x20;
+        let mut stack = vec![0u8; 0x800];
+        stack[0x3e0..0x3e8].copy_from_slice(&0x9999u64.to_le_bytes()); // saved rbp
+        stack[0x3e8..0x3f0].copy_from_slice(&0x7777u64.to_le_bytes()); // return
+        let reader = slice_memory_reader(&stack, base);
+        let mut ctx = X64Context {
+            rsp: base,
+            rbp: 0x7fff_0200,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind_at(&info, &mut ctx, Some(8), &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(
+            ctx.rbp, 0x9999,
+            "return/pop slots must be read from rbp - 0x20, not from RSP"
+        );
+        assert_eq!(ctx.rip, 0x7777, "return slot sits past the rebased frame");
+        assert_eq!(
+            ctx.rsp,
+            frame_base + 0x200 + 8 + 8,
+            "ALLOC_LARGE 0x200 plus one pop land above the rebased frame"
+        );
+    }
+
+    /// SAVE_XMM128 restores xmm[OpInfo] from [frame + offset] and
+    /// SAVE_XMM128_FAR does the same with a 32-bit unscaled offset.
+    #[test]
+    fn unwind_xmm128_slots_restore_boundary_is_exact() {
+        let data = encode_codes(
+            1,
+            &[
+                (0x10, 0x18, 0x0004), // SAVE_XMM128 xmm1 at [frame+0x40]
+                (0x20, 0xf9, 0x0080), // SAVE_XMM128_FAR xmm15 at [frame+0x80]
+            ],
+        );
+        let info = parse_unwind_info(&data, 0).expect("unwind info");
+        let base = 0x7fff_0000u64;
+        let mut stack = vec![0u8; 0x100];
+        stack[0..8].copy_from_slice(&0xabcd_u64.to_le_bytes()); // return
+        for (index, byte) in stack[0x40..0x50].iter_mut().enumerate() {
+            *byte = 0x11 + index as u8;
+        }
+        for (index, byte) in stack[0x80..0x90].iter_mut().enumerate() {
+            *byte = 0x61 + index as u8;
+        }
+        let reader = slice_memory_reader(&stack, base);
+        let mut ctx = X64Context {
+            rsp: base,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind(&info, &mut ctx, &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(
+            ctx.xmm[1],
+            Xmm128 {
+                low: u64::from_le_bytes([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]),
+                high: u64::from_le_bytes([0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20]),
+            },
+            "xmm1 must be restored from [frame+0x40]"
+        );
+        assert_eq!(
+            ctx.xmm[15],
+            Xmm128 {
+                low: u64::from_le_bytes([0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68]),
+                high: u64::from_le_bytes([0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70]),
+            },
+            "xmm15 must be restored from [frame+0x80]"
+        );
+        assert_eq!(
+            ctx.xmm[0],
+            Xmm128::default(),
+            "no other xmm slot is written"
+        );
+        assert_eq!(ctx.rip, 0xabcd);
+        assert_eq!(ctx.rsp, base + 8);
+    }
+
+    /// PUSH_MACHFRAME: OpInfo bit 0 marks an error code that shifts the saved
+    /// RIP/RSP slots by 8 bytes; an unreadable saved RSP falls back to the
+    /// computed frame address instead of clobbering the register.
+    #[test]
+    fn unwind_machframe_error_code_slot_mismatch_is_pinned() {
+        let base = 0x7fff_0000u64;
+
+        // No error code: RIP at [frame+0], RSP at [frame+24].
+        let plain = encode_codes(1, &[(0x10, 0x0a, 0x0000)]);
+        let plain = parse_unwind_info(&plain, 0).expect("machframe info");
+        let mut stack = vec![0u8; 0x40];
+        stack[0..8].copy_from_slice(&0x1111u64.to_le_bytes());
+        stack[24..32].copy_from_slice(&0x2222u64.to_le_bytes());
+        let reader = slice_memory_reader(&stack, base);
+        let mut ctx = X64Context {
+            rsp: base,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind(&plain, &mut ctx, &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(ctx.rip, 0x1111, "RIP read at frame+0 without error code");
+        assert_eq!(ctx.rsp, 0x2222, "RSP read at frame+24 without error code");
+
+        // Error code present: RIP at [frame+8], RSP at [frame+32].
+        let with_code = encode_codes(1, &[(0x10, 0x1a, 0x0000)]);
+        let with_code = parse_unwind_info(&with_code, 0).expect("machframe info");
+        let mut stack = vec![0u8; 0x40];
+        stack[8..16].copy_from_slice(&0x3333u64.to_le_bytes());
+        stack[32..40].copy_from_slice(&0x4444u64.to_le_bytes());
+        let reader = slice_memory_reader(&stack, base);
+        let mut ctx = X64Context {
+            rsp: base,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind(&with_code, &mut ctx, &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(
+            ctx.rip, 0x3333,
+            "RIP shifts by 8 when an error code is present"
+        );
+        assert_eq!(
+            ctx.rsp, 0x4444,
+            "RSP shifts by 8 when an error code is present"
+        );
+
+        // Error code present but the saved RSP slot is unmapped: the context
+        // RSP must fall back to frame + 8 + 40, not stay at the stale value.
+        let mut ctx = X64Context {
+            rsp: base,
+            ..X64Context::default()
+        };
+        let reader = |_addr: u64, buf: &mut [u8]| {
+            // Only the first 16 bytes are mapped: RIP (frame+8) reads,
+            // RSP (frame+32) does not.
+            let offset = _addr.wrapping_sub(base) as usize;
+            if offset >= 16 {
+                return false;
+            }
+            buf.fill(0x9a);
+            true
+        };
+        let result = virtual_unwind(&with_code, &mut ctx, &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(
+            ctx.rip,
+            u64::from_le_bytes([0x9a; 8]),
+            "RIP still reads from the error-code-shifted slot"
+        );
+        assert_eq!(
+            ctx.rsp,
+            base + 8 + 40,
+            "unreadable saved RSP falls back to frame + error-code + 40"
+        );
+    }
+
+    /// Epilog detection boundary: a control PC inside a v2 EPILOG region skips
+    /// the prolog replay; a size-0 EPILOG degenerates to one byte; a PC at the
+    /// epilog's end is outside it, so Epilog/Spare codes replay as no-ops.
+    #[test]
+    fn unwind_epilog_size0_boundary_and_outside_replay() {
+        let base = 0x7fff_0000u64;
+        let mut stack = vec![0u8; 0x100];
+        stack[0..8].copy_from_slice(&0x1234u64.to_le_bytes()); // return slot
+        stack[0x30..0x38].copy_from_slice(&0x5678u64.to_le_bytes()); // saved rbx
+        let reader = slice_memory_reader(&stack, base);
+
+        // EPILOG [0x20, 0x28) + SPARE + push rbx@0x30.
+        let epilog_info: u32 = 0x20 | (8 << 16);
+        let data = encode_codes(2, &[(0, 0x16, epilog_info), (4, 0x07, 0), (0x30, 0x30, 0)]);
+        let info = parse_unwind_info(&data, 0).expect("v2 unwind info");
+
+        // Inside the epilog: prolog replay is skipped entirely.
+        let mut ctx = X64Context {
+            rsp: base,
+            rbx: 0,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind_at(&info, &mut ctx, Some(0x22), &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(ctx.rbx, 0, "prolog codes are not replayed inside an epilog");
+        assert_eq!(ctx.rip, 0x1234);
+        assert_eq!(ctx.rsp, base + 8);
+
+        // At the epilog's exclusive end: outside → replay Epilog/Spare as
+        // no-ops, then the CodeOffset filter stops before push rbx@0x30.
+        let mut ctx = X64Context {
+            rsp: base,
+            rbx: 0,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind_at(&info, &mut ctx, Some(0x28), &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(ctx.rbx, 0, "push rbx@0x30 is past the control PC");
+        assert_eq!(ctx.rip, 0x1234, "epilog codes restore nothing themselves");
+        assert_eq!(ctx.rsp, base + 8);
+
+        // A size-0 EPILOG still catches a PC exactly at its offset.
+        let zero_size: u32 = 0x20 | (0 << 16);
+        let data = encode_codes(2, &[(0, 0x16, zero_size), (0x30, 0x30, 0)]);
+        let info = parse_unwind_info(&data, 0).expect("v2 unwind info");
+        let mut ctx = X64Context {
+            rsp: base,
+            rbx: 0,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind_at(&info, &mut ctx, Some(0x20), &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(ctx.rbx, 0, "size-0 epilog covers its own offset (max 1)");
+        assert_eq!(ctx.rsp, base + 8);
+    }
+
+    /// Corrupt stack: when nothing is readable, the unwind still completes
+    /// but restores no register — no panic, no invented return address.
+    #[test]
+    fn virtual_unwind_corrupt_unreadable_stack_completes_without_restore() {
+        let data = encode_codes(1, &[(1, 0x50, 0)]); // push rbp
+        let info = parse_unwind_info(&data, 0).expect("unwind info");
+        let reader = |_addr: u64, _buf: &mut [u8]| false;
+        let mut ctx = X64Context {
+            rip: 0xdead_beef,
+            rsp: 0x7fff_0000,
+            rbp: 0x5555,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind(&info, &mut ctx, &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(ctx.rbp, 0x5555, "unreadable push slot leaves the register");
+        assert_eq!(ctx.rip, 0xdead_beef, "unreadable return slot leaves RIP");
+        assert_eq!(
+            ctx.rsp,
+            0x7fff_0000 + 16,
+            "RSP still advances past the slot"
+        );
+    }
+
+    /// An invalid (misaligned) RSP must be rejected before any replay.
+    #[test]
+    fn virtual_unwind_invalid_misaligned_rsp_is_rejected() {
+        let data = encode_codes(1, &[(1, 0x50, 0)]);
+        let info = parse_unwind_info(&data, 0).expect("unwind info");
+        let reader = |_addr: u64, _buf: &mut [u8]| false;
+        let mut ctx = X64Context {
+            rsp: 0x7fff_0004,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind_at(&info, &mut ctx, Some(1), &reader);
+        assert_eq!(result, UnwindResult::NotFound, "misaligned RSP is rejected");
+    }
+
+    /// A CHAININFO frame defers the return-address pop to the primary entry:
+    /// virtual_unwind_at must report Collided and leave the context alone.
+    #[test]
+    fn virtual_unwind_chained_frame_without_primary_is_rejected() {
+        let mut data = encode_codes(1, &[(2, 0x42, 0)]); // alloc small, no stack access
+        data[0] = (1 & 0x07) | (0x04 << 3); // patch in UNW_FLAG_CHAININFO
+        let info = parse_unwind_info(&data, 0).expect("chained unwind info");
+        assert_eq!(info.flags, 0x04, "CHAININFO flag must be parsed");
+        let base = 0x7fff_0000u64;
+        let mut stack = vec![0u8; 0x40];
+        stack[0..8].copy_from_slice(&0x1234u64.to_le_bytes());
+        let reader = slice_memory_reader(&stack, base);
+        let mut ctx = X64Context {
+            rsp: base,
+            rip: 0xaaaa,
+            ..X64Context::default()
+        };
+        let result = virtual_unwind_at(&info, &mut ctx, Some(2), &reader);
+        assert_eq!(result, UnwindResult::Collided, "CHAININFO defers the pop");
+        assert_eq!(ctx.rip, 0xaaaa, "no pop before the primary entry runs");
+        assert_eq!(ctx.rsp, base, "RSP unchanged on a collided unwind");
+    }
+
+    /// unwind_frames must replay with the prolog offset of the control PC;
+    /// with a corrupt (unreadable) return slot it completes without ever
+    /// moving RIP out of the faulting function.
+    #[test]
+    fn unwind_frames_corrupt_return_slot_completes_without_rip() {
+        let unwind_data = encode_codes(1, &[(1, 0x50, 0)]); // push rbp
+        let rf = RuntimeFunction {
+            begin_addr: 0x1000,
+            end_addr: 0x1100,
+            unwind_info_addr: 0x1000,
+        };
+        let find = move |_image_base: u64, rva: u32| (0x1000..0x1100).contains(&rva).then_some(rf);
+        let get = move |rva: u32| {
+            (rva == 0x1000)
+                .then(|| parse_unwind_info(&unwind_data, 0))
+                .flatten()
+        };
+        let reader = |_addr: u64, _buf: &mut [u8]| false; // corrupt: nothing readable
+        let mut ctx = X64Context {
+            rip: 0x1_4000_1001,
+            rsp: 0x7fff_0000,
+            rbp: 0x7777,
+            ..X64Context::default()
+        };
+        let result = unwind_frames(
+            0x1_4000_0000,
+            &mut ctx,
+            &find,
+            &get,
+            &reader,
+            &mut |_rva, _ctx| false,
+        );
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(
+            ctx.rip, 0x1_4000_1001,
+            "unreadable return slot leaves RIP in the faulting function"
+        );
+        assert_eq!(ctx.rbp, 0x7777, "unreadable push slot leaves RBP");
+        assert_eq!(
+            ctx.rsp,
+            0x7fff_0000 + 16,
+            "push undone, return slot skipped"
+        );
+    }
+
+    /// rtl_unwind must reject an invalid context with the exact failing
+    /// stage pinned instead of unwinding on a misaligned stack.
+    #[test]
+    fn rtl_unwind_invalid_misaligned_context_is_rejected() {
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x1_4000_0000u64;
+        let unwind_data = encode_codes(1, &[(1, 0x50, 0)]);
+        let mut data = vec![0u8; 0x2000];
+        data[0x1000..0x1000 + unwind_data.len()].copy_from_slice(&unwind_data);
+        seh.register_unwind_data(image_base, data);
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1100u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        seh.register_pdata(image_base, &pdata);
+
+        let reader = |_addr: u64, _buf: &mut [u8]| false;
+        let mut ctx = X64Context {
+            rip: image_base + 0x1010,
+            rsp: 0x7fff_0004, // misaligned
+            ..X64Context::default()
+        };
+        let result = rtl_unwind(0, 0, image_base, &mut ctx, &mut seh, &reader);
+        let error = result.expect_err("misaligned context must be rejected");
+        assert_eq!(error.code, ReasonCode::SehException);
+        assert!(
+            error.message.contains("unwind returned NotFound"),
+            "error must pin the failing stage: {}",
+            error.message
+        );
+    }
+
+    /// virtual_unwind_by_rva resolves the frame and replays from
+    /// rva - begin; with a corrupt stack it must not invent a return value.
+    #[test]
+    fn virtual_unwind_by_rva_corrupt_stack_boundary_is_pinned() {
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x1_4000_0000u64;
+        let unwind_data = encode_codes(1, &[(1, 0x50, 0)]);
+        let mut data = vec![0u8; 0x2000];
+        data[0x1000..0x1000 + unwind_data.len()].copy_from_slice(&unwind_data);
+        seh.register_unwind_data(image_base, data);
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1100u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        seh.register_pdata(image_base, &pdata);
+
+        let reader = |_addr: u64, _buf: &mut [u8]| false;
+        let mut ctx = X64Context {
+            rip: image_base + 0x1010,
+            rsp: 0x7fff_0000,
+            rbp: 0x4242,
+            ..X64Context::default()
+        };
+        let result = seh.virtual_unwind_by_rva(image_base, 0x1010, &mut ctx, &reader);
+        assert_eq!(result, UnwindResult::Completed);
+        assert_eq!(
+            ctx.rip,
+            image_base + 0x1010,
+            "unreadable return slot leaves RIP at its initial value"
+        );
+        assert_eq!(ctx.rbp, 0x4242, "unreadable push slot leaves RBP");
+        assert_eq!(
+            ctx.rsp,
+            0x7fff_0000 + 16,
+            "push undone, return slot skipped"
+        );
+    }
+
+    /// Missing .pdata must not unwind: by_rva reports NotFound instead of
+    /// guessing a frame.
+    #[test]
+    fn virtual_unwind_by_rva_missing_pdata_is_not_found() {
+        let mut seh = SehSubsystem::new();
+        let reader = |_addr: u64, _buf: &mut [u8]| false;
+        let mut ctx = X64Context {
+            rip: 0x1_4000_1010,
+            rsp: 0x7fff_0000,
+            ..X64Context::default()
+        };
+        let result = seh.virtual_unwind_by_rva(0x1_4000_0000, 0x1010, &mut ctx, &reader);
+        assert_eq!(
+            result,
+            UnwindResult::NotFound,
+            "missing .pdata is not unwound"
+        );
+    }
+
+    /// dispatch must resolve a CHAININFO frame through its chained entry
+    /// (replaying it with no prolog offset) and then fail closed when no
+    /// handler claims the restored frame.
+    #[test]
+    fn dispatch_collided_chaininfo_frame_fails_closed_unhandled() {
+        let _guard = VEH_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        drain_pending_guest_veh();
+        let mut seh = SehSubsystem::new();
+        let image_base = 0x1_4000_0000u64;
+
+        // Primary entry at 0x1000: CHAININFO whose 12-byte RUNTIME_FUNCTION
+        // tail carries the chained unwind-info RVA 0x2000 in its third DWORD.
+        let mut primary = vec![(1 & 0x07) | (0x04 << 3), 0x10, 0x00, 0x00];
+        primary.extend_from_slice(&0x1000u32.to_le_bytes()); // begin
+        primary.extend_from_slice(&0x1100u32.to_le_bytes()); // end
+        primary.extend_from_slice(&0x2000u32.to_le_bytes()); // chained unwind RVA
+        let chained = encode_codes(1, &[(1, 0x50, 0)]); // push rbp + return pop
+
+        let mut data = vec![0u8; 0x3000];
+        data[0x1000..0x1000 + primary.len()].copy_from_slice(&primary);
+        data[0x2000..0x2000 + chained.len()].copy_from_slice(&chained);
+        seh.register_unwind_data(image_base, data);
+        let mut pdata = Vec::new();
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1100u32.to_le_bytes());
+        pdata.extend_from_slice(&0x1000u32.to_le_bytes());
+        seh.register_pdata(image_base, &pdata);
+
+        let base = 0x7fff_0000u64;
+        let mut stack = vec![0u8; 0x40];
+        stack[0..8].copy_from_slice(&0x5555u64.to_le_bytes()); // saved rbp
+        stack[8..16].copy_from_slice(&0xdeadu64.to_le_bytes()); // return into nowhere
+        let reader = slice_memory_reader(&stack, base);
+
+        let context = X64Context {
+            rip: image_base + 0x1000,
+            rsp: base,
+            ..X64Context::default()
+        };
+        let result = seh.dispatch(
+            STATUS_ACCESS_VIOLATION,
+            context.rip,
+            &context,
+            image_base,
+            &reader,
+        );
+        let error = result.expect_err("unhandled collided chain must fail closed");
+        assert_eq!(error.code, ReasonCode::SehException);
+        assert!(
+            error.message.contains("(collided unwind)"),
+            "error must pin the collided-unwind outcome: {}",
+            error.message
         );
     }
 }

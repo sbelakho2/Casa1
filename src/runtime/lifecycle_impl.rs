@@ -231,46 +231,16 @@ impl PeHostRuntime {
                 }
             });
         } else {
-            // For native macOS binaries, spawn directly via std::process::Command.
-            let argv: Vec<String> = result.argv.iter().skip(1).cloned().collect();
-            let mut cmd = std::process::Command::new(&host_program);
-            cmd.args(&argv)
-                .current_dir(&host_cwd)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            for (key, value) in environment {
-                cmd.env(key, value);
-            }
-
-            let sync = Some(sync);
-            std::thread::spawn(move || {
-                let exit_code = match cmd.spawn() {
-                    Ok(mut child) => {
-                        let status = child.wait();
-                        match status {
-                            Ok(status) => status.code().map(|c| c as u32).unwrap_or(u32::MAX),
-                            Err(e) => {
-                                eprintln!(
-                                    "[pe_runtime] failed to wait for native child {host_program:?}: {e:?}"
-                                );
-                                u32::MAX
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[pe_runtime] failed to spawn native child {host_program:?}: {e:?}"
-                        );
-                        u32::MAX
-                    }
-                };
-                if let Some(ref sync) = sync {
-                    let (lock, cvar) = &**sync;
-                    let mut guard = lock.lock().unwrap();
-                    *guard = Some(exit_code);
-                    cvar.notify_all();
-                }
-            });
+            // Guest processes may only run PE images.  A host binary (script,
+            // Mach-O, ELF) must never be exec'd from inside the sandbox: that
+            // would be an arbitrary native-execution escape.
+            return Err(AppError::new(
+                ReasonCode::RcPeParseInvalid,
+                format!(
+                    "child image {} is not a PE image; native execution is forbidden",
+                    host_program.display()
+                ),
+            ));
         }
 
         Ok(result)
@@ -504,5 +474,39 @@ impl PeHostRuntime {
         let address = self.alloc_heap(memory, bytes.len().max(2), false)?;
         memory.map_bytes(address, &bytes);
         Ok(address)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ge::{GameEnvironment, GeArch};
+
+    #[test]
+    fn non_pe_child_image_is_rejected_with_pe_parse_invalid_and_no_spawn() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let ge =
+            GameEnvironment::create_in(temp_dir.path(), "c3-launch", GeArch::X86, "win11-23h2")
+                .expect("create game environment");
+        std::fs::write(ge.drive_c().join("native.sh"), b"#!/bin/sh\nexit 0\n")
+            .expect("write non-PE child");
+        let mut runtime = PeHostRuntime::new(ge, true, Vec::new(), None, None);
+
+        let environment = std::collections::BTreeMap::new();
+        let error = runtime
+            .launch_guest_child_process(
+                "C:\\native.sh",
+                "C:\\native.sh",
+                &environment,
+                "C:\\",
+                false,
+            )
+            .expect_err("a non-PE child image must never be spawned");
+        assert_eq!(error.code, ReasonCode::RcPeParseInvalid);
+        assert_eq!(
+            error.last_error(),
+            crate::error::ERROR_BAD_EXE_FORMAT,
+            "CreateProcess failure must surface ERROR_BAD_EXE_FORMAT (193)"
+        );
     }
 }

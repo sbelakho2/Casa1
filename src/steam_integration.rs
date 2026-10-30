@@ -848,15 +848,20 @@ impl Default for SteamProtocolIntegration {
 /// Uses a simple TCP socket on loopback at the configured port. This
 /// replaces the Windows named pipe mechanism with a portable TCP equivalent.
 pub struct SteamIpcManager {
-    /// Port for TCP-based Steam IPC (default 57343).
+    /// Actual loopback port bound by `start` (0 before the random bind).
     port: u16,
     /// Whether IPC is enabled.
     enabled: bool,
+    /// Per-session authentication token; every accepted request must echo it.
+    token: Vec<u8>,
     /// Steam service process handle.
     service: Option<SteamServiceProcess>,
     /// Optional TCP listener (acceptor side).
     listener: Option<std::net::TcpListener>,
 }
+
+/// Authentication token length for the loopback IPC (256 bits).
+const IPC_TOKEN_LEN: usize = 32;
 
 /// Maximum accepted size of a single length-prefixed IPC message. Guards
 /// against unbounded allocations driven by an attacker-controlled length
@@ -864,18 +869,41 @@ pub struct SteamIpcManager {
 /// process).
 const MAX_IPC_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
+/// Constant-time byte comparison for the IPC session token.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        difference |= a ^ b;
+    }
+    difference == 0
+}
+
 /// How long `send_message` waits for a response header before giving up.
 const IPC_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl SteamIpcManager {
     /// Create a new TCP-based IPC manager.
-    pub fn new(port: u16, ge_root: &Path) -> Self {
+    pub fn new(_port: u16, ge_root: &Path) -> Self {
+        use rand::RngCore;
+        let mut token = vec![0u8; IPC_TOKEN_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut token);
         Self {
-            port,
+            // The loopback listener always takes an ephemeral port so another
+            // local process cannot pre-bind a well-known Steam IPC port.
+            port: 0,
             enabled: true,
+            token,
             service: Some(SteamServiceProcess::new(ge_root)),
             listener: None,
         }
+    }
+
+    /// Actual loopback port once `start` has bound the listener.
+    pub fn bound_port(&self) -> u16 {
+        self.port
     }
 
     /// Start the IPC system: starts the service process and binds the TCP
@@ -890,22 +918,34 @@ impl SteamIpcManager {
             svc.start(ge)?;
         }
 
-        // Bind the TCP listener on loopback
-        let addr = format!("127.0.0.1:{}", self.port);
-        match std::net::TcpListener::bind(&addr) {
+        // Bind an ephemeral loopback port: the peer learns it out of band,
+        // and every request must additionally present the session token.
+        self.bind_listener("127.0.0.1:0");
+
+        Ok(())
+    }
+
+    /// Bind the loopback IPC listener to `addr`.
+    ///
+    /// On success the bound port and non-blocking listener are installed;
+    /// on failure (e.g. the address is already occupied) the manager stays
+    /// listener-less and degraded instead of aborting startup.
+    fn bind_listener(&mut self, addr: &str) {
+        match std::net::TcpListener::bind(addr) {
             Ok(listener) => {
+                if let Ok(local) = listener.local_addr() {
+                    self.port = local.port();
+                }
                 if let Err(e) = listener.set_nonblocking(true) {
                     eprintln!("SteamIpcManager: failed to set nonblocking on listener: {e}");
                 }
                 self.listener = Some(listener);
             }
             Err(e) => {
-                // Port already in use or unavailable — degrade gracefully
+                // Degrade gracefully when loopback binding is unavailable.
                 eprintln!("SteamIpcManager: failed to bind to {}: {}", addr, e);
             }
         }
-
-        Ok(())
     }
 
     /// Stop the IPC system: stops the service and drops the listener.
@@ -956,11 +996,12 @@ impl SteamIpcManager {
                 )
             })?;
 
-        // Send length-prefixed message
-        let len = msg.len() as u32;
-        let header = len.to_le_bytes();
-        let mut packet = Vec::with_capacity(4 + msg.len());
-        packet.extend_from_slice(&header);
+        // Send token-prefixed, length-prefixed message:
+        // [u32 token_len][token][u32 msg_len][msg]
+        let mut packet = Vec::with_capacity(8 + self.token.len() + msg.len());
+        packet.extend_from_slice(&(self.token.len() as u32).to_le_bytes());
+        packet.extend_from_slice(&self.token);
+        packet.extend_from_slice(&(msg.len() as u32).to_le_bytes());
         packet.extend_from_slice(msg);
 
         use std::io::Write;
@@ -1023,12 +1064,46 @@ impl SteamIpcManager {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     use std::io::{Read, Write};
+                    // The listener accepts with O_NONBLOCK; on macOS the
+                    // accepted stream can inherit it, and read_exact then
+                    // fails with EWOULDBLOCK (35) instead of waiting for the
+                    // frame that was just written. Force blocking mode with a
+                    // bounded read timeout so a half-open peer cannot stall.
+                    let _ = stream.set_nonblocking(false);
                     // Bound how long a single request may stall this
                     // responder; a peer that connects but never sends must
                     // not block the caller indefinitely.
                     if let Err(e) = stream.set_read_timeout(Some(IPC_RESPONSE_TIMEOUT)) {
                         eprintln!("SteamIpcManager: failed to set read timeout: {e}");
                     }
+                    let mut token_len_buf = [0u8; 4];
+                    stream.read_exact(&mut token_len_buf).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcNetReadFailed,
+                            format!("SteamIpcManager: read token header failed: {e}"),
+                        )
+                    })?;
+                    let token_len = u32::from_le_bytes(token_len_buf) as usize;
+                    if token_len != self.token.len() {
+                        return Err(AppError::new(
+                            ReasonCode::RcWin32AccessDenied,
+                            "SteamIpcManager: rejected unauthenticated IPC request (bad token length)",
+                        ));
+                    }
+                    let mut presented = vec![0u8; token_len];
+                    stream.read_exact(&mut presented).map_err(|e| {
+                        AppError::new(
+                            ReasonCode::RcNetReadFailed,
+                            format!("SteamIpcManager: read token failed: {e}"),
+                        )
+                    })?;
+                    if !constant_time_eq(&presented, &self.token) {
+                        return Err(AppError::new(
+                            ReasonCode::RcWin32AccessDenied,
+                            "SteamIpcManager: rejected unauthenticated IPC request (bad token)",
+                        ));
+                    }
+
                     let mut len_buf = [0u8; 4];
                     stream.read_exact(&mut len_buf).map_err(|e| {
                         AppError::new(
@@ -5395,5 +5470,274 @@ mod tests {
         }
 
         println!("=== GE root loading test PASSED ===");
+    }
+
+    #[test]
+    fn ipc_rejects_unauthenticated_loopback_requests_with_access_denied() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp.path(),
+            "ipc-token",
+            crate::ge::GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create ge");
+        let mut manager = SteamIpcManager::new(0, temp.path());
+        manager.start(&ge).expect("start ipc");
+        let port = manager.bound_port();
+        assert_eq!(port != 0, true, "an ephemeral loopback port must be bound");
+
+        // No token at all: rejected before any message body is trusted.
+        let mut unauthenticated =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect ipc");
+        unauthenticated
+            .write_all(&0_u32.to_le_bytes())
+            .expect("token length");
+        unauthenticated
+            .write_all(&1_u32.to_le_bytes())
+            .expect("message length");
+        unauthenticated.write_all(b"x").expect("message");
+        unauthenticated.flush().expect("flush");
+        let error = manager
+            .receive_message()
+            .expect_err("unauthenticated request must be rejected");
+        assert_eq!(error.code, ReasonCode::RcWin32AccessDenied);
+
+        // A valid token is accepted.
+        let mut authenticated =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect ipc");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(manager.token.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&manager.token);
+        frame.extend_from_slice(&1_u32.to_le_bytes());
+        frame.extend_from_slice(b"x");
+        authenticated
+            .write_all(&frame)
+            .expect("authenticated frame");
+        authenticated.flush().expect("flush");
+        assert_eq!(
+            manager.receive_message().expect("authenticated request"),
+            b"x"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SteamIpcManager adversarial framing: token auth, length caps, bind
+    // failure, and hostile-responder handling on the loopback socket.
+    // -----------------------------------------------------------------------
+
+    /// Build a manager whose loopback listener is already bound to an
+    /// ephemeral port, without starting the SteamService process.
+    fn ipc_manager_with_listener() -> (TempDir, SteamIpcManager, u16) {
+        let temp = TempDir::new().expect("temp dir");
+        let mut manager = SteamIpcManager::new(0, temp.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        manager.port = port;
+        manager.listener = Some(listener);
+        (temp, manager, port)
+    }
+
+    #[test]
+    fn ipc_receive_truncated_token_header_read_fails() {
+        use std::io::Write;
+
+        let (_temp, mut manager, port) = ipc_manager_with_listener();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        // 2 of the 4 token-length bytes, then close: read_exact must fail
+        // instead of trusting a truncated frame.
+        stream.write_all(&[0x01, 0x02]).expect("partial header");
+        drop(stream);
+        let error = manager
+            .receive_message()
+            .expect_err("truncated token header must fail");
+        assert_eq!(error.code, ReasonCode::RcNetReadFailed);
+    }
+
+    #[test]
+    fn ipc_receive_truncated_token_body_read_fails() {
+        use std::io::Write;
+
+        let (_temp, mut manager, port) = ipc_manager_with_listener();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(&(manager.token.len() as u32).to_le_bytes())
+            .expect("token length");
+        stream
+            .write_all(&manager.token[..8])
+            .expect("partial token");
+        drop(stream);
+        let error = manager
+            .receive_message()
+            .expect_err("truncated token body must fail");
+        assert_eq!(error.code, ReasonCode::RcNetReadFailed);
+    }
+
+    #[test]
+    fn ipc_receive_rejects_wrong_token_length() {
+        use std::io::Write;
+
+        let (_temp, mut manager, port) = ipc_manager_with_listener();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        // Claim a token length that cannot match the 32-byte session token.
+        stream
+            .write_all(&((IPC_TOKEN_LEN - 1) as u32).to_le_bytes())
+            .expect("token length");
+        stream
+            .write_all(&[0u8; IPC_TOKEN_LEN - 1])
+            .expect("token bytes");
+        drop(stream);
+        let error = manager
+            .receive_message()
+            .expect_err("wrong token length must be rejected");
+        assert_eq!(error.code, ReasonCode::RcWin32AccessDenied);
+    }
+
+    #[test]
+    fn ipc_receive_rejects_wrong_token_bytes() {
+        use std::io::Write;
+
+        let (_temp, mut manager, port) = ipc_manager_with_listener();
+        // Forge a token of the correct length with every byte flipped, so it
+        // is guaranteed to differ from the session token.
+        let mut forged = manager.token.clone();
+        for byte in &mut forged {
+            *byte ^= 0xFF;
+        }
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(&(forged.len() as u32).to_le_bytes())
+            .expect("token length");
+        stream.write_all(&forged).expect("forged token");
+        drop(stream);
+        let error = manager
+            .receive_message()
+            .expect_err("forged token must be rejected");
+        assert_eq!(error.code, ReasonCode::RcWin32AccessDenied);
+    }
+
+    #[test]
+    fn ipc_receive_rejects_oversized_message_length() {
+        use std::io::Write;
+
+        let (_temp, mut manager, port) = ipc_manager_with_listener();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(&(manager.token.len() as u32).to_le_bytes())
+            .expect("token length");
+        stream.write_all(&manager.token).expect("token");
+        // A valid token must not let the peer bypass the length cap.
+        let oversized = MAX_IPC_MESSAGE_SIZE as u32 + 1;
+        stream
+            .write_all(&oversized.to_le_bytes())
+            .expect("message length");
+        drop(stream);
+        let error = manager
+            .receive_message()
+            .expect_err("oversized message length must be rejected");
+        assert_eq!(error.code, ReasonCode::RcRequestBodyTooLarge);
+    }
+
+    #[test]
+    fn ipc_receive_truncated_message_body_read_fails() {
+        use std::io::Write;
+
+        let (_temp, mut manager, port) = ipc_manager_with_listener();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .write_all(&(manager.token.len() as u32).to_le_bytes())
+            .expect("token length");
+        stream.write_all(&manager.token).expect("token");
+        stream
+            .write_all(&16_u32.to_le_bytes())
+            .expect("message length");
+        stream.write_all(b"only-nine").expect("partial message");
+        drop(stream);
+        let error = manager
+            .receive_message()
+            .expect_err("truncated message body must fail");
+        assert_eq!(error.code, ReasonCode::RcNetReadFailed);
+    }
+
+    #[test]
+    fn ipc_start_bind_fails_when_port_occupied() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut manager = SteamIpcManager::new(0, temp.path());
+        // Occupy a loopback port so the IPC bind cannot succeed.
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy port");
+        let port = occupied.local_addr().expect("local addr").port();
+        manager.bind_listener(&format!("127.0.0.1:{port}"));
+        assert!(
+            manager.listener.is_none(),
+            "bind onto an occupied port must not install a listener"
+        );
+        assert_eq!(
+            manager.bound_port(),
+            0,
+            "port must stay unset when the loopback bind fails"
+        );
+        // Keep the occupier alive until after the failed bind.
+        drop(occupied);
+    }
+
+    #[test]
+    fn ipc_send_message_hostile_responder_oversized_length_rejected() {
+        use std::io::{Read, Write};
+
+        let temp = TempDir::new().expect("temp dir");
+        let mut manager = SteamIpcManager::new(0, temp.path());
+        let responder = std::net::TcpListener::bind("127.0.0.1:0").expect("bind responder");
+        let port = responder.local_addr().expect("local addr").port();
+        manager.port = port;
+
+        let expected_token = manager.token.clone();
+        let payload = b"adversarial-payload".to_vec();
+        let expected_msg = payload.clone();
+        let responder_thread = std::thread::spawn(move || {
+            let (mut stream, _) = responder.accept().expect("accept");
+            // Parse the token-prefixed, length-prefixed frame:
+            // [u32 token_len][token][u32 msg_len][msg]
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).expect("token length");
+            let token_len = u32::from_le_bytes(len_buf) as usize;
+            let mut token = vec![0u8; token_len];
+            stream.read_exact(&mut token).expect("token");
+            stream.read_exact(&mut len_buf).expect("message length");
+            let msg_len = u32::from_le_bytes(len_buf) as usize;
+            let mut msg = vec![0u8; msg_len];
+            stream.read_exact(&mut msg).expect("message");
+            assert_eq!(
+                token, expected_token,
+                "request frame must carry the session token"
+            );
+            assert_eq!(
+                msg, expected_msg,
+                "request frame must carry the request body"
+            );
+            // Hostile response: claim a body larger than the cap allows.
+            let oversized = MAX_IPC_MESSAGE_SIZE as u32 + 1;
+            stream
+                .write_all(&oversized.to_le_bytes())
+                .expect("oversized response header");
+        });
+
+        let error = manager
+            .send_message(&payload)
+            .expect_err("oversized response length must be rejected");
+        assert_eq!(error.code, ReasonCode::RcRequestBodyTooLarge);
+        responder_thread.join().expect("responder thread");
+    }
+
+    #[test]
+    #[allow(clippy::bool_assert_comparison)]
+    fn ipc_constant_time_eq_rejects_length_mismatch() {
+        assert_eq!(constant_time_eq(&[1, 2, 3], &[1, 2, 3, 4]), false);
+        assert_eq!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]), true);
+        assert_eq!(constant_time_eq(&[1, 2, 3], &[1, 2, 9]), false);
     }
 }

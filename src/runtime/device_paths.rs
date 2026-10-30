@@ -57,8 +57,24 @@ pub fn last_error_from_app_error(error: &AppError) -> u32 {
         ReasonCode::RcFsSharingViolation => ERROR_SHARING_VIOLATION,
         ReasonCode::RcFsLockViolation => ERROR_LOCK_VIOLATION,
         ReasonCode::RcFsAlreadyExists => ERROR_ALREADY_EXISTS,
+        ReasonCode::RcPeParseInvalid => crate::error::ERROR_BAD_EXE_FORMAT,
         ReasonCode::RcCliInvalid => ERROR_INVALID_PARAMETER,
         ReasonCode::RcWin32NotOwner => 288, // ERROR_NOT_OWNER
         _ => ERROR_ACCESS_DENIED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_error_maps_pe_parse_invalid_to_bad_exe_format() {
+        let error = AppError::new(ReasonCode::RcPeParseInvalid, "probe: corrupt PE");
+        assert_eq!(
+            last_error_from_app_error(&error),
+            crate::error::ERROR_BAD_EXE_FORMAT
+        );
+        assert_eq!(crate::error::ERROR_BAD_EXE_FORMAT, 193);
     }
 }

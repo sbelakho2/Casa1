@@ -381,11 +381,6 @@ impl GuestPageBytes {
         // access while this slice is alive.
         unsafe { std::slice::from_raw_parts_mut(self.0, MEMORY_PAGE_SIZE) }
     }
-
-    #[inline]
-    fn fill(&mut self, value: u8) {
-        self.as_mut_slice().fill(value);
-    }
 }
 
 impl std::ops::Index<usize> for GuestPageBytes {
@@ -689,9 +684,17 @@ impl PageDirectory {
         self.tables[table_index as usize][entry] = index as u32;
     }
 
-    fn clear(&mut self) {
-        self.top.fill(PAGE_DIRECTORY_MISSING);
-        self.tables.clear();
+    /// Remove the mapping for `page_base`, leaving the chunk table allocated.
+    /// Used by the incremental `unmap_range` path so freeing one page never
+    /// rebuilds the whole directory.  Callers only pass in-window pages (the
+    /// `covers` check happens at the call site); `get_mut` also makes a
+    /// never-materialised chunk table a no-op.
+    fn remove(&mut self, page_base: u64) {
+        if let Some((chunk, entry)) = self.chunk_of(page_base)
+            && let Some(table) = self.tables.get_mut(self.top[chunk] as usize)
+        {
+            table[entry] = PAGE_DIRECTORY_MISSING;
+        }
     }
 }
 
@@ -934,18 +937,24 @@ impl MemoryImage {
         if len == 0 {
             return;
         }
+        // Zero exactly the requested half-open byte range.  The previous
+        // implementation rounded `len` UP to at least one page and then
+        // walked whole pages from the unaligned start address: a 1-byte
+        // zero at 0x1FFF cleared 0x1FFF..0x2FFF (two pages) instead of one
+        // byte, and a range that started mid-page never touched its last
+        // partial page as part of the same iteration.  Byte-exact chunking
+        // keeps both ends, and the page table, correct.
+        let end = address.saturating_add(len as u64);
         let mut current_address = address;
-        let remaining = len.max(MEMORY_PAGE_SIZE);
-        let end = current_address.wrapping_add(remaining as u64);
         while current_address < end {
             let page_base = current_address & MEMORY_PAGE_MASK;
+            let page_offset = (current_address - page_base) as usize;
+            let remaining = (end - current_address) as usize;
+            let chunk_len = (MEMORY_PAGE_SIZE - page_offset).min(remaining);
             let page = self.page_mut_or_insert(page_base);
-            // Zero the entire page contents
-            page.bytes.fill(0);
-            if !page.is_fully_mapped() {
-                page.mark_fully_mapped();
-            }
-            current_address = current_address.wrapping_add(MEMORY_PAGE_SIZE as u64);
+            page.bytes[page_offset..page_offset + chunk_len].fill(0);
+            page.mark_mapped_range(page_offset, chunk_len);
+            current_address = current_address.wrapping_add(chunk_len as u64);
         }
     }
 
@@ -963,34 +972,35 @@ impl MemoryImage {
         } else {
             (end - 1) & MEMORY_PAGE_MASK
         };
-        // Collect indices to remove (reverse order to keep indices stable)
-        let mut to_remove: Vec<usize> = self
-            .pages
-            .iter()
-            .enumerate()
-            .filter(|(_, (base, _))| *base >= start_page && *base <= end_page)
-            .map(|(i, _)| i)
-            .collect();
-        to_remove.sort_unstable_by(|a, b| b.cmp(a)); // reverse
-        for idx in to_remove {
-            let (page_base, _) = self.pages.swap_remove(idx);
-            // High-address frames are owned by the store; release them now.
-            // Flat-window pages remain part of the JIT window and are zeroed
-            // again when re-committed.
-            self.store.release_page(page_base);
-        }
-        // Rebuild lookup tables by collecting entries first to avoid
-        // borrowing self.pages immutably while calling record_page_index.
-        let entries: Vec<(u64, usize)> = self
-            .pages
-            .iter()
-            .enumerate()
-            .map(|(i, (base, _))| (*base, i))
-            .collect();
-        self.high_page_lookup.clear();
-        self.page_directory.clear();
-        for (base, index) in entries {
-            self.record_page_index(base, index);
+        // Incremental lookup maintenance: remove each page by its indexed
+        // position instead of scanning every mapped page and rebuilding both
+        // lookup tables.  `swap_remove` moves the last page into `idx`, so
+        // exactly that entry needs its recorded index refreshed.
+        let mut page_base = start_page;
+        loop {
+            if let Some(index) = self.page_index(page_base) {
+                let (removed_base, _) = self.pages.swap_remove(index);
+                // High-address frames are owned by the store; release them now.
+                // Flat-window pages remain part of the JIT window and are zeroed
+                // again when re-committed.
+                self.store.release_page(removed_base);
+                if self.page_directory.covers(removed_base) {
+                    self.page_directory.remove(removed_base);
+                } else {
+                    self.high_page_lookup.remove(&removed_base);
+                }
+                if index < self.pages.len() {
+                    let moved_base = self.pages[index].0;
+                    self.record_page_index(moved_base, index);
+                }
+            }
+            if page_base == end_page {
+                break;
+            }
+            let Some(next) = page_base.checked_add(MEMORY_PAGE_SIZE as u64) else {
+                break;
+            };
+            page_base = next;
         }
     }
 
@@ -1783,4 +1793,89 @@ pub(crate) fn resolve_memory_operand(
         value
     };
     Ok(address)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Incremental `unmap_range` adversarial edges: `swap_remove` must
+    /// refresh the moved page's recorded index, a page above the flat window
+    /// must be removed through the high-page lookup (and its frame released),
+    /// and a range that wraps off the end of the address space must stop the
+    /// walk instead of looping forever.
+    #[test]
+    fn unmap_range_incremental_paths_reject_stale_indices() {
+        let mut memory = MemoryImage::default();
+        let low = 0x2000_u64;
+        let mid = 0x5000_u64;
+        let high = 1_u64 << 45; // far above the 256 GiB flat window
+        memory.map_bytes(low, &[0xAA; 16]);
+        memory.map_bytes(mid, &[0xBB; 16]);
+        memory.map_bytes(high, &[0xCC; 16]);
+        assert_eq!(
+            memory.page_index(high),
+            Some(2),
+            "high page is recorded in the high-page lookup"
+        );
+        // Removing the FIRST page swaps the last page into its slot: exactly
+        // that moved entry needs its recorded index refreshed.
+        memory.unmap_range(low, MEMORY_PAGE_SIZE as usize);
+        assert_eq!(memory.page_index(low), None, "low page removed");
+        assert_eq!(
+            memory.page_index(mid),
+            Some(1),
+            "unchanged in-window entry keeps its index"
+        );
+        assert_eq!(
+            memory.page_index(high),
+            Some(0),
+            "swapped high page index was refreshed"
+        );
+        // The high page itself is removed through `high_page_lookup`, which
+        // also releases its individually allocated frame.
+        memory.unmap_range(high, MEMORY_PAGE_SIZE as usize);
+        assert_eq!(memory.page_index(high), None, "high page removed");
+        assert_eq!(
+            memory.store.high_page_count(),
+            0,
+            "the released high page's frame is gone from the store"
+        );
+        assert_eq!(memory.page_index(mid), Some(0), "mid page moved to index 0");
+        // A wrapping range [top + 0x800, +0x1000) starts in the last page of
+        // the address space and ends at 0x800: the first page is released and
+        // the page walk stops on the `checked_add` overflow instead of
+        // panicking or spinning.
+        let top = u64::MAX & MEMORY_PAGE_MASK;
+        memory.map_bytes(top, &[0xDD; 16]);
+        assert_eq!(memory.page_index(top), Some(1), "top page recorded");
+        memory.unmap_range(top.wrapping_add(0x800), 0x1000);
+        assert_eq!(
+            memory.page_index(top),
+            None,
+            "wrapping unmap released the top page"
+        );
+        assert_eq!(
+            memory.page_index(mid),
+            Some(0),
+            "surviving page is untouched by the wrapping walk"
+        );
+        // A multi-page walk with a HOLE exercises every loop edge: the
+        // skipped (absent) page, the page walk increment, and the terminal
+        // end-of-range break.
+        let walk_start = 0x8000_u64;
+        memory.map_bytes(walk_start, &[0x11; 8]);
+        memory.map_bytes(walk_start + 2 * MEMORY_PAGE_SIZE as u64, &[0x22; 8]);
+        memory.unmap_range(walk_start, 3 * MEMORY_PAGE_SIZE as usize);
+        assert_eq!(
+            memory.page_index(walk_start),
+            None,
+            "the first page of the walk is removed"
+        );
+        assert_eq!(
+            memory.page_index(walk_start + 2 * MEMORY_PAGE_SIZE as u64),
+            None,
+            "the walk reaches pages after an absent hole"
+        );
+    }
 }

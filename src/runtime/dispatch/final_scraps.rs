@@ -2526,46 +2526,15 @@ impl PeHostRuntime {
                 cvar.notify_all();
             });
         } else {
-            // Non-PE host executable: spawn directly, like the native-child
-            // branch of launch_guest_child_process.
-            let mut command = std::process::Command::new(&host_program);
-            command
-                .current_dir(&host_cwd)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            for (key, value) in environment {
-                command.env(key, value);
-            }
-            let mut child = command.spawn().map_err(|error| {
-                AppError::from_io(
-                    ReasonCode::RcRunnerSpawnFailed,
-                    format!(
-                        "failed to spawn native child {}: {error}",
-                        host_program.display()
-                    ),
-                    &error,
-                )
-            })?;
-            if let Ok(mut slot) = host_pid.lock() {
-                *slot = Some(child.id());
-            }
-            std::thread::spawn(move || {
-                let exit_code = match child.wait() {
-                    Ok(status) => status.code().map(|code| code as u32).unwrap_or(u32::MAX),
-                    Err(error) => {
-                        eprintln!(
-                            "[pe_runtime] failed to wait for native child {host_program:?}: {error:?}"
-                        );
-                        u32::MAX
-                    }
-                };
-                let (lock, cvar) = &*sync;
-                let mut guard = lock.lock().unwrap();
-                if guard.is_none() {
-                    *guard = Some(exit_code);
-                }
-                cvar.notify_all();
-            });
+            // Guest processes may only run PE images.  Exec'ing a host binary
+            // here would let a guest request arbitrary native execution.
+            return Err(AppError::new(
+                ReasonCode::RcPeParseInvalid,
+                format!(
+                    "native child image {} is not a PE image; native execution is forbidden",
+                    host_program.display()
+                ),
+            ));
         }
         Ok(())
     }
@@ -16695,5 +16664,49 @@ mod local_net_tests {
                 ERROR_INVALID_PARAMETER
             );
         })
+    }
+}
+
+#[cfg(test)]
+mod native_child_image_tests {
+    use super::final_scraps_test_support::*;
+    use super::*;
+
+    #[test]
+    fn spawn_native_child_image_rejects_non_pe_program_without_native_execution() {
+        let (mut runtime, temp_dir) = test_runtime("native-child-nonpe");
+        let guest_image = "C:\\child\\payload.sh";
+        let host_image = runtime
+            .win32
+            .guest_path_to_host_path(guest_image)
+            .expect("host path for child image");
+        std::fs::create_dir_all(host_image.parent().expect("parent dir")).expect("mkdir");
+        std::fs::write(&host_image, b"#!/bin/sh\nexit 0\n").expect("write host script");
+        let claim = NativeChildClaim {
+            image: guest_image.to_string(),
+            cwd: "C:\\child".to_string(),
+            environment: BTreeMap::new(),
+            process_id: 0xC0DE,
+            sync: Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())),
+            thread_start: None,
+            host_pid: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let error = runtime
+            .spawn_native_child_image(&claim)
+            .expect_err("a non-PE host program must never be spawned");
+        assert_eq!(error.code, ReasonCode::RcPeParseInvalid);
+        assert_eq!(
+            error.message,
+            format!(
+                "native child image {} is not a PE image; native execution is forbidden",
+                host_image.display()
+            )
+        );
+        assert_eq!(
+            *claim.host_pid.lock().expect("host pid slot"),
+            None,
+            "no host child was spawned"
+        );
+        drop(temp_dir);
     }
 }

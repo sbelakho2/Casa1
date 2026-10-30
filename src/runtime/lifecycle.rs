@@ -103,15 +103,85 @@ pub fn precompile_only_image(
     })
 }
 
+/// Shared `RcIo` error mapping for the [`is_pe_image`] header probes: every
+/// open/stat/read/seek failure surfaces the same Win32-visible code and the
+/// same `failed to <action> <path>` message the original inline mappings used.
+fn pe_image_io_error(path: &Path, action: &str, error: &std::io::Error) -> AppError {
+    AppError::from_io(
+        ReasonCode::RcIo,
+        format!("failed to {action} {}", path.display()),
+        error,
+    )
+}
+
 pub fn is_pe_image(path: &Path) -> AppResult<bool> {
-    let bytes = fs::read(path).map_err(|error| {
-        AppError::from_io(
-            ReasonCode::RcIo,
-            format!("failed to read {}", path.display()),
-            &error,
-        )
-    })?;
-    Ok(bytes.starts_with(b"MZ"))
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Read only the DOS header: never slurp an arbitrary (possibly huge or
+    // attacker-controlled) image just to classify it.  0x40 bytes covers
+    // IMAGE_DOS_HEADER including e_lfanew at 0x3C, and lets us validate the
+    // PE signature in-place for the common e_lfanew == 0x40 layout.
+    let mut file = fs::File::open(path).map_err(|error| pe_image_io_error(path, "open", &error))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| pe_image_io_error(path, "stat", &error))? // coverage: unreachable
+        .len();
+    let mut header = [0u8; 64];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) => {
+                return Err(pe_image_io_error(path, "read", &error));
+            }
+        }
+    }
+    if filled < 2 || &header[..2] != b"MZ" {
+        return Ok(false);
+    }
+    if filled < header.len() {
+        return Err(AppError::new(
+            ReasonCode::RcPeParseInvalid,
+            format!(
+                "{} has a truncated DOS header ({filled} of 64 bytes)",
+                path.display()
+            ),
+        ));
+    }
+    let e_lfanew = u64::from(u32::from_le_bytes([
+        header[0x3C],
+        header[0x3D],
+        header[0x3E],
+        header[0x3F],
+    ]));
+    // `e_lfanew` is a u32 zero-extended to u64, so `+ 4` cannot overflow:
+    // a value that points past the image is rejected by the file-length
+    // check below instead.
+    let signature_end = e_lfanew + 4;
+    if signature_end > file_len {
+        return Err(AppError::new(
+            ReasonCode::RcPeParseInvalid,
+            format!(
+                "{} e_lfanew {e_lfanew:#x} points outside the {file_len}-byte image",
+                path.display()
+            ),
+        ));
+    }
+    let signature = if signature_end <= header.len() as u64 {
+        header[e_lfanew as usize..signature_end as usize].to_vec()
+    } else {
+        // The length check above proves the four signature bytes exist, so
+        // the seek/read error closures below cannot fire for an image that
+        // `std::fs` could open and stat on a local filesystem.
+        file.seek(SeekFrom::Start(e_lfanew))
+            .map_err(|error| pe_image_io_error(path, "seek", &error))?; // coverage: unreachable
+        let mut signature = [0u8; 4];
+        file.read_exact(&mut signature)
+            .map_err(|error| pe_image_io_error(path, "read PE signature from", &error))?; // coverage: unreachable
+        signature.to_vec()
+    };
+    Ok(signature == b"PE\0\0")
 }
 
 /// Locate the `casa1-runner` binary on disk.
@@ -5043,5 +5113,99 @@ pub(crate) fn classify_execution_error(error: &AppError) -> ExecutionTermination
         ExecutionTermination::GuestException
     } else {
         ExecutionTermination::HostError
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_image(dir: &TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, bytes).expect("write image");
+        path
+    }
+
+    #[test]
+    fn non_pe_image_is_rejected_without_native_execution() {
+        let dir = TempDir::new().expect("temp dir");
+        // A real, executable host script: classified as non-PE, never spawn.
+        let path = write_image(&dir, "script.sh", b"#!/bin/sh\nexit 0\n");
+        assert_eq!(is_pe_image(&path).expect("classify script"), false);
+    }
+
+    #[test]
+    fn valid_pe_header_is_not_rejected_as_invalid() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut pe = vec![0u8; 0x80];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3C..0x40].copy_from_slice(&0x40_u32.to_le_bytes());
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        let path = write_image(&dir, "valid.exe", &pe);
+        assert_eq!(is_pe_image(&path).expect("classify PE"), true);
+    }
+
+    #[test]
+    fn truncated_and_oversized_e_lfanew_are_rejected_as_pe_parse_invalid() {
+        let dir = TempDir::new().expect("temp dir");
+
+        let truncated = write_image(&dir, "truncated.exe", b"MZ");
+        let error = is_pe_image(&truncated).expect_err("truncated DOS header must fail");
+        assert_eq!(error.code, ReasonCode::RcPeParseInvalid);
+
+        let mut oversized = vec![0u8; 64];
+        oversized[0] = b'M';
+        oversized[1] = b'Z';
+        oversized[0x3C..0x40].copy_from_slice(&0x1000_u32.to_le_bytes());
+        let oversized = write_image(&dir, "oversized.exe", &oversized);
+        let error = is_pe_image(&oversized).expect_err("out-of-image e_lfanew must fail");
+        assert_eq!(error.code, ReasonCode::RcPeParseInvalid);
+    }
+
+    #[test]
+    fn is_pe_image_missing_path_reports_io_error() {
+        let dir = TempDir::new().expect("temp dir");
+        let missing = dir.path().join("absent.exe");
+        let error = is_pe_image(&missing).expect_err("missing image must fail");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            format!("failed to open {}", missing.display())
+        );
+    }
+
+    #[test]
+    fn is_pe_image_read_error_on_directory_reports_io_error() {
+        // Opening a directory succeeds on Unix, stat succeeds, but reading
+        // header bytes from the descriptor fails with EISDIR: that is the
+        // read-error mapping of the 64-byte DOS-header loop.
+        let dir = TempDir::new().expect("temp dir");
+        let error = is_pe_image(dir.path()).expect_err("directory header read must fail");
+        assert_eq!(error.code, ReasonCode::RcIo);
+        assert_eq!(
+            error.message,
+            format!("failed to read {}", dir.path().display())
+        );
+    }
+
+    #[test]
+    fn is_pe_image_edge_signature_within_dos_header_is_classified() {
+        let dir = TempDir::new().expect("temp dir");
+        // e_lfanew == 0x38 puts the PE signature inside the already-read
+        // 64-byte header (signature_end 0x3C <= 64): no seek, no second read.
+        let mut pe = vec![0u8; 64];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x38..0x3C].copy_from_slice(b"PE\0\0");
+        pe[0x3C..0x40].copy_from_slice(&0x38_u32.to_le_bytes());
+        let path = write_image(&dir, "short-header.exe", &pe);
+        assert_eq!(is_pe_image(&path).expect("classify PE"), true);
+
+        // The same in-header layout with a non-PE signature is not a PE.
+        pe[0x38..0x3C].copy_from_slice(b"NE\0\0");
+        let not_pe = write_image(&dir, "short-header-notpe.exe", &pe);
+        assert_eq!(is_pe_image(&not_pe).expect("classify non-PE"), false);
     }
 }

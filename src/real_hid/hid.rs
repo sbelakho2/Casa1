@@ -66,6 +66,30 @@ impl HidDeviceInfo {
             .iter()
             .any(|pair| pair.usage_page == 0x01 && matches!(pair.usage, 0x04 | 0x05 | 0x08))
     }
+
+    /// Host keyboard/keypad/mouse/pointer collections and the System Control /
+    /// Consumer pages must never be exposed to (or opened by) the guest: they
+    /// are the host's user-input surface, not the game controller surface.
+    pub fn is_guest_excluded(&self) -> bool {
+        let primary = HidUsagePair {
+            usage_page: self.usage_page,
+            usage: self.usage,
+        };
+        std::iter::once(&primary)
+            .chain(self.usage_pairs.iter())
+            .any(is_forbidden_guest_usage)
+    }
+}
+
+fn is_forbidden_guest_usage(pair: &HidUsagePair) -> bool {
+    const GENERIC_DESKTOP: u16 = 0x01;
+    const SYSTEM_CONTROL: u16 = 0x02;
+    const CONSUMER: u16 = 0x0C;
+    match pair.usage_page {
+        GENERIC_DESKTOP => matches!(pair.usage, 0x01 | 0x02 | 0x06 | 0x07),
+        SYSTEM_CONTROL | CONSUMER => true,
+        _ => false,
+    }
 }
 
 /// A complete input report delivered by the IOKit callback.
@@ -81,6 +105,10 @@ type OpenRegistry = Arc<Mutex<BTreeSet<StableDeviceId>>>;
 #[derive(Debug, Clone, Default)]
 pub struct HidBridge {
     devices: Vec<HidDeviceInfo>,
+    /// Known host input devices (keyboard/mouse/etc.) retained only so an
+    /// explicit open can be refused with ERROR_ACCESS_DENIED; they are never
+    /// enumerated to the guest.
+    excluded: Vec<HidDeviceInfo>,
     table: DeviceTable,
     open_registry: OpenRegistry,
 }
@@ -103,10 +131,23 @@ impl HidBridge {
     }
 
     pub fn apply(&mut self, devices: Vec<HidDeviceInfo>) -> Vec<HotplugEvent> {
-        let mut devices = devices;
+        let mut excluded = Vec::new();
+        let mut devices: Vec<HidDeviceInfo> = devices
+            .into_iter()
+            .filter(|device| {
+                if device.is_guest_excluded() {
+                    excluded.push(device.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         devices.sort_by_key(|device| device.id);
+        excluded.sort_by_key(|device| device.id);
         let records = devices.iter().map(HidDeviceInfo::record).collect();
         self.devices = devices;
+        self.excluded = excluded;
         self.table.reconcile(records)
     }
 
@@ -116,6 +157,11 @@ impl HidBridge {
     }
 
     pub fn open(&self, id: StableDeviceId) -> Result<HidDevice, DeviceError> {
+        if self.excluded.iter().any(|device| device.id == id) {
+            return Err(DeviceError::PermissionDenied {
+                operation: "IOHIDDeviceOpen",
+            });
+        }
         let info = self
             .device(id)
             .ok_or(DeviceError::DeviceMissing { id })?
@@ -129,6 +175,11 @@ impl HidBridge {
         vendor_id: u16,
         product_id: u16,
     ) -> Result<HidDevice, DeviceError> {
+        if self.excluded.iter().any(|device| device.id == id) {
+            return Err(DeviceError::PermissionDenied {
+                operation: "IOHIDDeviceOpen",
+            });
+        }
         let info = self
             .device(id)
             .ok_or(DeviceError::DeviceMissing { id })?
@@ -138,6 +189,11 @@ impl HidBridge {
     }
 
     fn open_info(&self, info: &HidDeviceInfo) -> Result<HidDevice, DeviceError> {
+        if info.is_guest_excluded() {
+            return Err(DeviceError::PermissionDenied {
+                operation: "IOHIDDeviceOpen",
+            });
+        }
         match self.open_registry.lock() {
             Ok(mut open) => {
                 if !open.insert(info.id) {
@@ -1129,5 +1185,84 @@ mod tests {
             bridge.open(id).map(|_| ()),
             Err(DeviceError::DeviceMissing { id })
         );
+    }
+
+    #[test]
+    fn guest_hid_keyboard_mouse_system_and_consumer_usages_are_rejected_with_access_denied() {
+        let forbidden = [
+            (0x01_u16, 0x01_u16), // Generic Desktop Pointer
+            (0x01, 0x02),         // Generic Desktop Mouse
+            (0x01, 0x06),         // Generic Desktop Keyboard
+            (0x01, 0x07),         // Generic Desktop Keypad
+            (0x02, 0x00),         // System Control page
+            (0x0C, 0x00),         // Consumer page
+        ];
+        for (index, (page, usage)) in forbidden.into_iter().enumerate() {
+            let mut device = info();
+            device.id = StableDeviceId::from_raw(0x100 + index as u64);
+            device.usage_page = page;
+            device.usage = usage;
+            device.usage_pairs = vec![HidUsagePair {
+                usage_page: page,
+                usage,
+            }];
+            assert_eq!(device.is_guest_excluded(), true);
+            let mut bridge = HidBridge::new();
+            assert_eq!(
+                bridge.apply(vec![device.clone()]),
+                Vec::<HotplugEvent>::new()
+            );
+            assert_eq!(bridge.devices().len(), 0);
+            let error = bridge.open(device.id).map(|_| ()).unwrap_err();
+            assert_eq!(
+                error,
+                DeviceError::PermissionDenied {
+                    operation: "IOHIDDeviceOpen"
+                }
+            );
+            assert_eq!(error.windows_error(), 5);
+            assert_eq!(
+                bridge
+                    .open_checked(device.id, device.vendor_id, device.product_id)
+                    .map(|_| ()),
+                Err(DeviceError::PermissionDenied {
+                    operation: "IOHIDDeviceOpen"
+                }),
+                "open_checked must refuse an excluded host-input device"
+            );
+            assert_eq!(
+                bridge.open_info(&device).map(|_| ()),
+                Err(DeviceError::PermissionDenied {
+                    operation: "IOHIDDeviceOpen"
+                }),
+                "open_info itself must refuse an excluded usage even when the \
+                 caller bypasses the bridge filters"
+            );
+        }
+
+        // Vendor-defined pages are not host input surfaces: they must not be
+        // excluded by the keyboard/mouse/SystemControl/Consumer filter.
+        let mut vendor_device = info();
+        vendor_device.usage_page = 0xFF00;
+        vendor_device.usage = 0x01;
+        vendor_device.usage_pairs = vec![HidUsagePair {
+            usage_page: 0xFF00,
+            usage: 0x01,
+        }];
+        assert_eq!(
+            vendor_device.is_guest_excluded(),
+            false,
+            "a vendor-defined usage page must stay guest-visible"
+        );
+
+        // A real gamepad is still enumerable and openable.
+        let controller = info();
+        assert_eq!(controller.is_guest_excluded(), false);
+        let mut bridge = HidBridge::new();
+        assert_eq!(
+            bridge.apply(vec![controller.clone()]),
+            vec![HotplugEvent::Arrived(controller.record())]
+        );
+        assert_eq!(bridge.open(controller.id).is_ok(), true);
     }
 }

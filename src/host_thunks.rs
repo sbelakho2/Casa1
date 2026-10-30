@@ -26695,8 +26695,24 @@ pub fn write_guest_bytes_checked(
         return Ok(());
     }
     validate_guest_pointer(memory, address, bytes.len())?;
-    memory.map_bytes(address, bytes);
-    Ok(())
+    // Guest-facing writes must respect page protection and must never
+    // materialise a page: only the loader/allocator paths may allocate.
+    memory
+        .guest_write_checked(address, bytes)
+        .map_err(guest_write_fault_error)
+}
+
+/// Convert a checked guest-write fault into the exact Win32/NT error the
+/// caller observes: `ERROR_NOACCESS` (998), which the NTSTATUS conversion
+/// maps to `STATUS_ACCESS_VIOLATION`.
+pub fn guest_write_fault_error(fault: crate::cpu::GuestMemoryFault) -> AppError {
+    AppError::new(
+        ReasonCode::RcMemoryAccessViolation,
+        format!(
+            "guest memory at {:#x} is not writable ({}-byte access)",
+            fault.address, fault.read_len
+        ),
+    )
 }
 
 /// Read a `u16` from guest memory with pointer validation.
@@ -26724,8 +26740,9 @@ pub fn write_guest_u16_checked(
     value: u16,
 ) -> Result<(), AppError> {
     validate_guest_pointer(memory, address, 2)?;
-    memory.write_u16(address, value);
-    Ok(())
+    memory
+        .guest_write_checked(address, &value.to_le_bytes())
+        .map_err(guest_write_fault_error)
 }
 
 /// Write a `u32` to guest memory with pointer validation.
@@ -26735,8 +26752,9 @@ pub fn write_guest_u32_checked(
     value: u32,
 ) -> Result<(), AppError> {
     validate_guest_pointer(memory, address, 4)?;
-    memory.write_u32(address, value);
-    Ok(())
+    memory
+        .guest_write_checked(address, &value.to_le_bytes())
+        .map_err(guest_write_fault_error)
 }
 
 /// Write a `u64` to guest memory with pointer validation.
@@ -26746,8 +26764,9 @@ pub fn write_guest_u64_checked(
     value: u64,
 ) -> Result<(), AppError> {
     validate_guest_pointer(memory, address, 8)?;
-    memory.write_u64(address, value);
-    Ok(())
+    memory
+        .guest_write_checked(address, &value.to_le_bytes())
+        .map_err(guest_write_fault_error)
 }
 
 /// Read a UTF-16 string from guest memory with full validation.
@@ -26990,6 +27009,50 @@ mod tests {
     fn test_write_bytes_checked_null_rejected() {
         let mut mem = MemoryImage::default();
         assert!(write_guest_bytes_checked(&mut mem, 0, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn checked_guest_writers_reject_read_only_pages_with_noaccess_error() {
+        // vm first, image second: the VM must outlive the image that
+        // borrows it through `set_vm`.
+        let mut vm = crate::vm::VirtualMemory::new(0x7600_0000);
+        let base = 0x4000;
+        assert_eq!(vm.reserve(Some(base), 0x1000), base);
+        vm.commit(base, 0x1000, crate::vm::VmProtection::READ, false);
+        let mut mem = MemoryImage::default();
+        mem.map_bytes(base, &[0u8; 0x1000]);
+        mem.set_vm(&mut vm);
+        // The raw page map says "mapped" (so pointer validation passes) while
+        // the canonical VM denies the write: exactly the guest_write_checked
+        // fault path every checked writer maps to ERROR_NOACCESS.
+        let noaccess =
+            |len: usize| format!("guest memory at {base:#x} is not writable ({len}-byte access)");
+
+        let bytes_error = write_guest_bytes_checked(&mut mem, base, &[1, 2, 3, 4]).unwrap_err();
+        assert_eq!(bytes_error.code, ReasonCode::RcMemoryAccessViolation);
+        assert_eq!(bytes_error.message, noaccess(4));
+
+        let u16_error = write_guest_u16_checked(&mut mem, base, 0xBEEF).unwrap_err();
+        assert_eq!(u16_error.code, ReasonCode::RcMemoryAccessViolation);
+        assert_eq!(u16_error.message, noaccess(2));
+
+        let u32_error = write_guest_u32_checked(&mut mem, base, 0xDEAD_BEEF).unwrap_err();
+        assert_eq!(u32_error.code, ReasonCode::RcMemoryAccessViolation);
+        assert_eq!(u32_error.message, noaccess(4));
+
+        let u64_error = write_guest_u64_checked(&mut mem, base, 0x0123_4567_89AB_CDEF).unwrap_err();
+        assert_eq!(u64_error.code, ReasonCode::RcMemoryAccessViolation);
+        assert_eq!(u64_error.message, noaccess(8));
+
+        // The shared fault mapper produces the identical error for a raw
+        // GuestMemoryFault (the ERROR_NOACCESS/STATUS_ACCESS_VIOLATION row).
+        let mapped = guest_write_fault_error(crate::cpu::GuestMemoryFault {
+            address: base,
+            write: true,
+            read_len: 6,
+        });
+        assert_eq!(mapped.code, ReasonCode::RcMemoryAccessViolation);
+        assert_eq!(mapped.message, noaccess(6));
     }
 
     // ---- UTF-16 string tests ----

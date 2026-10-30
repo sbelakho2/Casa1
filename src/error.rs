@@ -118,7 +118,7 @@ impl AppError {
             ReasonCode::RcComObjectError => ERROR_INVALID_PARAMETER,
 
             // ── PE / JIT / Loader (2000–2019) ──────────────────────────
-            ReasonCode::RcPeParseInvalid => ERROR_BAD_FORMAT,
+            ReasonCode::RcPeParseInvalid => ERROR_BAD_EXE_FORMAT,
             ReasonCode::RcImportMissing => ERROR_PROC_NOT_FOUND,
             ReasonCode::RcUnimplInsn => ERROR_NOT_SUPPORTED,
             ReasonCode::RcD3dFeatureUnsupported => ERROR_NOT_SUPPORTED,
@@ -253,6 +253,7 @@ pub const ERROR_ACCESS_DENIED: u32 = 5;
 pub const ERROR_INVALID_HANDLE: u32 = 6;
 pub const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 pub const ERROR_BAD_FORMAT: u32 = 11;
+pub const ERROR_BAD_EXE_FORMAT: u32 = 193;
 pub const ERROR_OUTOFMEMORY: u32 = 14;
 pub const ERROR_WRITE_FAULT: u32 = 29;
 pub const ERROR_READ_FAULT: u32 = 30;
@@ -931,7 +932,7 @@ mod tests {
     #[test]
     fn last_error_maps_pe_jit_codes() {
         let cases: Vec<(ReasonCode, u32)> = vec![
-            (ReasonCode::RcPeParseInvalid, ERROR_BAD_FORMAT),
+            (ReasonCode::RcPeParseInvalid, ERROR_BAD_EXE_FORMAT),
             (ReasonCode::RcImportMissing, ERROR_PROC_NOT_FOUND),
             (ReasonCode::RcUnimplInsn, ERROR_NOT_SUPPORTED),
             (ReasonCode::RcD3dFeatureUnsupported, ERROR_NOT_SUPPORTED),

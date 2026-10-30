@@ -1954,7 +1954,7 @@ impl GameEnvironment {
         }
     }
 
-    fn reject_write_to_read_only_drive(&self, windows_path: &str) -> AppResult<()> {
+    pub(crate) fn reject_write_to_read_only_drive(&self, windows_path: &str) -> AppResult<()> {
         let parsed = self.parse_windows_path(windows_path, None)?;
         let drive = parsed.drive.clone().ok_or_else(|| {
             AppError::new(
@@ -2380,6 +2380,16 @@ fn parse_windows_path_impl(
     for component in remainder.split('\\') {
         if component.is_empty() {
             continue;
+        }
+        if verbatim && (component == "." || component == "..") {
+            // Verbatim (`\\?\`) paths must be taken literally: accepting a
+            // relative component would let a guest climb out of the drive
+            // root without the normal lexical normalization.  Reject it
+            // exactly like any other invalid guest path.
+            return Err(AppError::new(
+                ReasonCode::RcFsPathInvalid,
+                format!("verbatim path component {component} is not permitted in {input}"),
+            ));
         }
         let normalized_component = if verbatim {
             component.to_string()
@@ -3060,5 +3070,24 @@ mod tests {
         .expect_err("ambiguous legacy ge lookup should fail");
 
         assert_eq!(error.code, ReasonCode::RcCliInvalid);
+    }
+
+    #[test]
+    fn verbatim_dotdot_components_are_rejected_as_path_invalid() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(
+            temp_dir.path(),
+            "verbatim-dotdot",
+            GeArch::X86,
+            "win11-23h2",
+        )
+        .expect("create game environment");
+
+        for path in ["\\\\?\\C:\\..\\..\\escape", "\\\\?\\C:\\a\\.\\escape"] {
+            let error = ge
+                .parse_windows_path(path, None)
+                .expect_err("verbatim dot components must not be normalized");
+            assert_eq!(error.code, ReasonCode::RcFsPathInvalid);
+        }
     }
 }

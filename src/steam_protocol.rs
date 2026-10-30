@@ -206,15 +206,14 @@ const DEFAULT_SDR_SERVER: &str = "sdr.steam.com:27018";
 // LaunchServices (macOS) — steam:// URL scheme registration
 // ---------------------------------------------------------------------------
 
-// `LSSetDefaultHandlerForURLScheme` lives in LaunchServices, which is part
-// of the CoreServices framework; the link attribute must be present or the
-// final binary fails to link with an undefined symbol.
+// `LSSetDefaultHandlerForURLScheme` lives in LaunchServices (CoreServices)
+// and takes CoreFoundation strings, not C strings.
 #[cfg(target_os = "macos")]
 #[link(name = "CoreServices", kind = "framework")]
 unsafe extern "C" {
     fn LSSetDefaultHandlerForURLScheme(
-        inURLScheme: *const libc::c_char,
-        inHandlerBundleID: *const libc::c_char,
+        in_url_scheme: *const std::ffi::c_void,
+        in_handler_bundle_id: *const std::ffi::c_void,
     ) -> i32;
 }
 
@@ -3847,86 +3846,46 @@ impl SteamProtocolHandler {
     /// `HKCR\steam\shell\open\command`.
     ///
     /// This is a best-effort registration; it may fail silently if the
-    /// process lacks the necessary entitlements. The LaunchServices call is
-    /// performed in a forked child process so that a framework crash (seen
-    /// on some macOS releases inside `LSSetDefaultHandlerForURLScheme`)
-    /// cannot take down the caller.
+    /// process lacks the necessary entitlements. The LaunchServices call runs
+    /// synchronously in the main process; only a zero OSStatus counts as
+    /// success.
     pub fn register(&mut self) {
+        // Changing the user's default URL handler is a side effect, so it is
+        // opt-in and only ever runs in the main process.
+        let opt_in = std::env::var_os("CASA1_REGISTER_STEAM_URL_SCHEME").is_some();
+        self.register_with_opt_in(opt_in);
+    }
+
+    fn register_with_opt_in(&mut self, opt_in: bool) {
         if self.registered {
             return;
         }
 
         #[cfg(target_os = "macos")]
         {
-            // Use LaunchServices to register steam:// URL scheme handling.
-            use std::ffi::CString;
-
-            let scheme = match CString::new("steam") {
-                Ok(scheme) => scheme,
-                Err(_) => {
+            if !opt_in {
+                if self.verbose {
                     eprintln!(
-                        "[SteamProtocol] cannot register steam:// URL scheme (invalid scheme)"
+                        "[SteamProtocol] steam:// URL scheme registration skipped \
+                         (set CASA1_REGISTER_STEAM_URL_SCHEME=1 to opt in)"
                     );
-                    return;
                 }
-            };
-            let bundle_id = match CString::new("com.casa1.steam") {
-                Ok(bundle_id) => bundle_id,
-                Err(_) => {
-                    eprintln!(
-                        "[SteamProtocol] cannot register steam:// URL scheme (invalid bundle ID)"
-                    );
-                    return;
-                }
-            };
-
-            // Fork so a LaunchServices crash cannot kill this process. The
-            // child performs the registration; the parent waits briefly and
-            // treats any child crash as a failed registration.
-            unsafe {
-                let pid = libc::fork();
-                if pid == 0 {
-                    // Child: perform the registration, then exit.
-                    let _ = LSSetDefaultHandlerForURLScheme(scheme.as_ptr(), bundle_id.as_ptr());
-                    libc::_exit(0);
-                } else if pid > 0 {
-                    // Parent: wait up to 5 s for the child to finish.
-                    let mut status: libc::c_int = 0;
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    loop {
-                        let waited = libc::waitpid(pid, &mut status, libc::WNOHANG);
-                        if waited == pid {
-                            break;
-                        }
-                        if waited < 0 {
-                            break;
-                        }
-                        if std::time::Instant::now() >= deadline {
-                            let _ = libc::kill(pid, libc::SIGKILL);
-                            let _ = libc::waitpid(pid, &mut status, 0);
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    if self.verbose {
-                        eprintln!(
-                            "[SteamProtocol] LSSetDefaultHandlerForURLScheme child exited (status {status})"
-                        );
-                    }
-                } else {
-                    if self.verbose {
-                        eprintln!("[SteamProtocol] fork failed; skipping steam:// registration");
-                    }
-                }
+                return;
             }
 
-            if self.verbose {
-                eprintln!("[SteamProtocol] Registered steam:// URL scheme handler");
-            }
+            // The real LaunchServices call mutates the host's default
+            // steam:// handler, so it is compiled only outside the test
+            // suite; tests drive `register_with_ls_status` with injected
+            // statuses instead (see the registration tests below).
+            #[cfg(not(test))]
+            self.register_with_ls_status(|scheme, bundle_id| unsafe {
+                LSSetDefaultHandlerForURLScheme(scheme, bundle_id)
+            });
         }
 
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = opt_in;
             if self.verbose {
                 eprintln!(
                     "[SteamProtocol] steam:// URL scheme registration skipped \
@@ -3934,8 +3893,41 @@ impl SteamProtocolHandler {
                 );
             }
         }
+    }
 
-        self.registered = true;
+    /// Run the macOS LaunchServices registration with an injected status
+    /// provider.
+    ///
+    /// `status_fn` receives the raw `CFStringRef`s for the `steam` URL scheme
+    /// and the handler bundle id and returns the resulting `OSStatus`.
+    /// Production injects `LSSetDefaultHandlerForURLScheme` (a main-process,
+    /// synchronous, CFString-based call: no fork and no busy-wait); tests
+    /// inject synthetic statuses so the host's real steam:// handler is never
+    /// mutated. Only a zero `OSStatus` counts as success.
+    #[cfg(target_os = "macos")]
+    fn register_with_ls_status<F>(&mut self, status_fn: F)
+    where
+        F: FnOnce(*const std::ffi::c_void, *const std::ffi::c_void) -> i32,
+    {
+        use core_foundation::base::TCFType;
+        use core_foundation::string::CFString;
+
+        let scheme = CFString::new("steam");
+        let bundle_id = CFString::new("com.casa1.steam");
+        let status = status_fn(
+            scheme.as_concrete_TypeRef() as *const std::ffi::c_void,
+            bundle_id.as_concrete_TypeRef() as *const std::ffi::c_void,
+        );
+        if status == 0 {
+            self.registered = true;
+            if self.verbose {
+                eprintln!("[SteamProtocol] Registered steam:// URL scheme handler");
+            }
+        } else if self.verbose {
+            eprintln!(
+                "[SteamProtocol] LSSetDefaultHandlerForURLScheme failed with status {status}"
+            );
+        }
     }
 
     /// Check whether the protocol handler has been registered.
@@ -4419,5 +4411,43 @@ mod tests {
         let result = stack.connect(Some(""));
         // connect("") will attempt DNS resolution of "" and should fail.
         assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    #[test]
+    fn steam_url_registration_opt_out_never_reports_success() {
+        let mut handler = SteamProtocolHandler::new();
+        handler.register_with_opt_in(false);
+        assert_eq!(handler.registered, false);
+    }
+
+    // -----------------------------------------------------------------------
+    // LaunchServices registration via injected status: both OSStatus branches
+    // are pinned without ever mutating the host's real steam:// handler.
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::bool_assert_comparison)]
+    fn steam_url_registration_edge_injected_zero_status_marks_registered() {
+        let mut handler = SteamProtocolHandler::new_verbose();
+        handler.register_with_ls_status(|scheme, bundle_id| {
+            assert!(!scheme.is_null(), "scheme CFStringRef must be non-null");
+            assert!(
+                !bundle_id.is_null(),
+                "handler bundle id CFStringRef must be non-null"
+            );
+            0
+        });
+        assert_eq!(handler.is_registered(), true);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::bool_assert_comparison)]
+    fn steam_url_registration_rejects_injected_nonzero_status() {
+        let mut handler = SteamProtocolHandler::new_verbose();
+        // paramErr: a non-zero OSStatus must leave the handler unregistered.
+        handler.register_with_ls_status(|_scheme, _bundle_id| -10817);
+        assert_eq!(handler.is_registered(), false);
     }
 }

@@ -1,0 +1,23 @@
+# cargo-audit configuration.
+#
+# Only advisories that CANNOT be fixed on the currently pinned dependency lines
+# are listed here. Every entry is an exact RustSec ID with the reason it is
+# accepted; anything not listed fails `cargo audit` in CI.
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 (rsa 0.9.10, "Marvin Attack" timing sidechannel):
+  # rsa 0.9.x is the latest published line and has no fixed release. Casa1
+  # uses rsa only for CMS/PKCS#7 signature verification of guest-supplied
+  # content, not for decrypting attacker-timed secrets, so the attack surface
+  # is key-independent. Revisit when rsa 0.10 lands.
+  "RUSTSEC-2023-0071",
+
+  # RUSTSEC-2026-0387 (crypto-bigint 0.5.5, timing variability):
+  # crypto-bigint 0.5.5 is pulled transitively by elliptic-curve 0.13.8
+  # (ecdsa 0.16 / p256 0.13 / p384 0.13). The fix is only in crypto-bigint
+  # >= 0.7.6, which requires bumping the RustCrypto elliptic-curve stack
+  # (0.13 -> 0.14+) and its public key/ECDSA APIs. That upgrade is tracked
+  # separately from this advisory sweep; Casa1's ECDSA use is signature
+  # verification of guest artifacts, not long-term secret operations.
+  "RUSTSEC-2026-0387",
+]

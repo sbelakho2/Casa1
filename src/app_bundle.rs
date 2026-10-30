@@ -221,7 +221,7 @@ if [ ! -x "$CASA1_BIN" ]; then
     exit 1
 fi
 
-exec "$CASA1_BIN" ge:run --ge "{}" --exe "{}" {}
+exec "$CASA1_BIN" ge:run --ge {} --exe {} {}
 "#,
         comment_name,
         env!("CARGO_PKG_VERSION"),
@@ -860,4 +860,65 @@ mod tests {
     // -----------------------------------------------------------------------
     //  Item 237: Additional app bundle creation tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn wrapper_script_has_no_bash_syntax_errors() {
+        let config = AppBundleConfig {
+            app_name: "Syntax".to_string(),
+            executable_path: "/tmp/a b/$(touch /tmp/pwned)/`id`/game.exe".to_string(),
+            ge_name: "ge with 'quotes' and \"double\"".to_string(),
+            args: Some("--flag 'x y' `bad` $(worse)".to_string()),
+            ..Default::default()
+        };
+        let script = generate_wrapper_script(&config);
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("wrapper.sh");
+        fs::write(&path, &script).expect("write wrapper");
+        let status = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .expect("run bash -n");
+        assert_eq!(status.code(), Some(0));
+    }
+
+    #[test]
+    fn wrapper_exec_argv_passes_literal_path_with_spaces_substitutions_and_backticks() {
+        let executable = "/tmp/space $(echo pwned) `echo pwned`/game.exe";
+        let config = AppBundleConfig {
+            app_name: "Argv".to_string(),
+            executable_path: executable.to_string(),
+            ge_name: "ge name".to_string(),
+            args: Some("--arg literal".to_string()),
+            ..Default::default()
+        };
+        let script = generate_wrapper_script(&config);
+        let exec_line = script
+            .lines()
+            .find(|line| line.starts_with("exec "))
+            .expect("wrapper has an exec line");
+        // Use /usr/bin/printf as the interpreter to echo the exact argv.  The
+        // fixed subcommand token is rewritten to a format string; every
+        // guest-controlled argument stays exactly as the wrapper quoted it.
+        let probe = exec_line.replace("ge:run", "'%s\\n'");
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("CASA1_BIN=/usr/bin/printf; {probe}"))
+            .output()
+            .expect("run wrapper exec line");
+        assert_eq!(output.status.code(), Some(0));
+        let text = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "--ge",
+                "ge name",
+                "--exe",
+                executable,
+                "--args",
+                "--arg literal"
+            ]
+        );
+    }
 }

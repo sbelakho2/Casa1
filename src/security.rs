@@ -10,13 +10,14 @@ use roxmltree::Document;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use walkdir::WalkDir;
 use x509_cert::Certificate as X509Certificate;
 use zip::write::SimpleFileOptions;
@@ -887,29 +888,99 @@ fn tail_log_bytes(lines: &[String]) -> String {
     String::from_utf8_lossy(&redacted.as_bytes()[redacted.len() - 4096..]).to_string()
 }
 
-fn redact_pii(line: &str) -> String {
-    let redacted = match line.find("/Users/") {
-        Some(start) => match line[start + 7..].find('/') {
-            Some(end) => {
-                let prefix = &line[..start + 7];
-                let suffix = &line[start + 7 + end..];
-                format!("{prefix}<redacted>{suffix}")
+/// Values that must never leave the host in diagnostics: the home directory,
+/// the host login name, and the configured guest user name.
+fn sensitive_literals() -> Vec<String> {
+    let mut values = Vec::new();
+    for key in ["HOME", "USER", "LOGNAME", "USERNAME", "CASA1_USER_NAME"] {
+        if let Ok(value) = std::env::var(key)
+            && value.len() >= 3
+            && !values.contains(&value)
+        {
+            values.push(value);
+        }
+    }
+    // Longest first so `/Users/alice` is not shredded by a shorter prefix.
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
+}
+
+/// Replace every path that starts with `marker` (case-insensitively) up to the
+/// next path separator, whitespace, quote, or end of line.  The value is
+/// redacted even when the path ends the line.
+fn redact_marked_paths(line: &str, markers: &[&str]) -> String {
+    let mut result = line.to_string();
+    for marker in markers {
+        let lowered = result.to_ascii_lowercase();
+        let marker_lower = marker.to_ascii_lowercase();
+        let mut output = String::with_capacity(result.len());
+        let mut copied = 0usize;
+        let mut search = 0usize;
+        while let Some(relative) = lowered[search..].find(&marker_lower) {
+            let start = search + relative;
+            let value_start = start + marker.len();
+            let bytes = result.as_bytes();
+            let mut end = value_start;
+            while end < bytes.len() {
+                let ch = bytes[end] as char;
+                if ch == '/'
+                    || ch == '\\'
+                    || ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        '"' | '\'' | ':' | ';' | ',' | ')' | ']' | '}' | '<' | '>'
+                    )
+                {
+                    break;
+                }
+                end += 1;
             }
-            None => line.to_string(),
-        },
-        None => line.to_string(),
-    };
-    redacted
-        .split_whitespace()
-        .map(|token| {
+            if end == value_start {
+                search = value_start;
+                continue;
+            }
+            output.push_str(&result[copied..value_start]);
+            output.push_str("<redacted>");
+            copied = end;
+            search = end;
+        }
+        output.push_str(&result[copied..]);
+        result = output;
+    }
+    result
+}
+
+fn redact_emails(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut token = String::new();
+    for ch in line.chars() {
+        if ch.is_whitespace() {
             if token.contains('@') && token.contains('.') {
-                "<redacted-email>"
+                output.push_str("<redacted-email>");
             } else {
-                token
+                output.push_str(&token);
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            token.clear();
+            output.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    if token.contains('@') && token.contains('.') {
+        output.push_str("<redacted-email>");
+    } else {
+        output.push_str(&token);
+    }
+    output
+}
+
+fn redact_pii(line: &str) -> String {
+    let mut redacted = line.to_string();
+    for literal in sensitive_literals() {
+        redacted = redacted.replace(&literal, "<redacted>");
+    }
+    redacted = redact_marked_paths(&redacted, &["/Users/", "C:\\users\\", "C:/users/"]);
+    redact_emails(&redacted)
 }
 
 fn zip_error(error: zip::result::ZipError) -> AppError {
@@ -4149,6 +4220,14 @@ const OID_ECDSA_WITH_SHA256: &str = "1.2.840.10045.4.3.2";
 const OID_ECDSA_WITH_SHA384: &str = "1.2.840.10045.4.3.3";
 /// OID 2.5.29.14 — SubjectKeyIdentifier extension.
 const OID_SUBJECT_KEY_IDENTIFIER: &str = "2.5.29.14";
+/// OID 2.5.29.37 — ExtendedKeyUsage extension.
+const OID_EXTENDED_KEY_USAGE: &str = "2.5.29.37";
+/// OID 1.3.6.1.5.5.7.3.3 — id-kp-codeSigning EKU.
+const OID_EKU_CODE_SIGNING: &str = "1.3.6.1.5.5.7.3.3";
+/// OID 1.3.6.1.4.1.311.3.3.1 — Microsoft legacy SPC timestamp countersignature.
+const OID_SPC_TIME_STAMP: &str = "1.3.6.1.4.1.311.3.3.1";
+/// OID 1.2.840.113549.1.9.5 — PKCS#9 signingTime attribute.
+const OID_SIGNING_TIME: &str = "1.2.840.113549.1.9.5";
 
 // ===========================================================================
 // macOS Security Framework FFI declarations
@@ -4209,6 +4288,10 @@ unsafe extern "C" {
 
     /// Set whether network fetch (OCSP/CRL) is allowed.
     fn SecTrustSetNetworkFetchAllowed(trust: SecTrustRef, allow_fetch: u8) -> i32; // OSStatus
+
+    /// Evaluate the chain at a specific verification date (used for a
+    /// timestamped Authenticode countersignature).
+    fn SecTrustSetVerifyDate(trust: SecTrustRef, date: core_foundation::base::CFTypeRef) -> i32;
 
     /// Evaluate trust (returns true if trusted, false on error).
     fn SecTrustEvaluateWithError(trust: SecTrustRef, error: *mut CFErrorRef) -> u8; // Boolean
@@ -4288,7 +4371,20 @@ fn create_basic_x509_policy() -> core_foundation::base::CFTypeRef {
 ///
 /// Returns `Ok(())` if the certificate is trusted (chain leads to a trusted
 /// root, not expired, and optionally passes OCSP/CRL revocation checks).
+#[cfg(test)]
 fn validate_certificate_chain(leaf_der: &[u8], chain_ders: &[Vec<u8>]) -> Result<(), String> {
+    validate_certificate_chain_at(leaf_der, chain_ders, None)
+}
+
+/// Validate a certificate chain, optionally at the time recorded by a
+/// timestamp countersignature (`verify_unix_secs`).  A timestamp proves the
+/// signature existed while the signer certificate was valid, so the chain is
+/// evaluated at that instant instead of "now".
+fn validate_certificate_chain_at(
+    leaf_der: &[u8],
+    chain_ders: &[Vec<u8>],
+    verify_unix_secs: Option<i64>,
+) -> Result<(), String> {
     use core_foundation::base::CFRelease;
 
     // SAFETY: CFRelease decrements the reference count of a valid CoreFoundation object
@@ -4365,6 +4461,22 @@ fn validate_certificate_chain(leaf_der: &[u8], chain_ders: &[Vec<u8>]) -> Result
         }
         if trust.is_null() {
             return Err("SecTrustCreateWithCertificates returned null trust".into());
+        }
+
+        // Evaluate at the timestamped signing time when a valid countersignature
+        // supplied one; SecTrustSetVerifyDate expects a CFDate.
+        if let Some(unix_secs) = verify_unix_secs {
+            let absolute = unix_secs as f64 - 978_307_200.0;
+            let date = core_foundation::date::CFDate::new(absolute);
+            let status =
+                SecTrustSetVerifyDate(trust, core_foundation::base::TCFType::as_CFTypeRef(&date));
+            // Fail closed if the OS refuses the date: SecTrustSetVerifyDate
+            // documents failure only for a NULL trust, which cannot occur
+            // here (`trust` was checked non-null above), so this arm has no
+            // reachable input on any supported macOS release.
+            if status != 0 {
+                return Err(format!("date {unix_secs}: OSStatus {status}")); // coverage: unreachable
+            }
         }
 
         // 6. First attempt: evaluate with revocation (network fetch allowed).
@@ -4649,9 +4761,16 @@ fn read_u32_le(d: &[u8], off: usize) -> Option<u32> {
 /// - `Ok(None)` when the file is a well-formed PE with no signature;
 /// - `Err(_)` when the PE headers are malformed.
 fn locate_certificate_table(pe: &[u8]) -> Result<Option<(usize, usize)>, String> {
-    let e_lfanew = read_u32_le(pe, 0x3C).ok_or("missing e_lfanew")? as usize;
+    let Some(e_lfanew) = read_u32_le(pe, 0x3C) else {
+        // Not a PE image at all (DOS-less file): Windows reports
+        // TRUST_E_NOSIGNATURE rather than a verification failure.
+        return Ok(None);
+    };
+    let e_lfanew = e_lfanew as usize;
     if pe.get(e_lfanew..e_lfanew + 4) != Some(b"PE\0\0") {
-        return Err("missing PE signature".into());
+        // A DOS header without a PE signature is also "no Authenticode
+        // signature present".
+        return Ok(None);
     }
     let coff = e_lfanew + 4;
     let size_of_optional = read_u16_le(pe, coff + 16).ok_or("truncated COFF header")? as usize;
@@ -4835,6 +4954,81 @@ fn digest_with_oid(hash_oid: &str, data: &[u8]) -> Option<Vec<u8>> {
         OID_SHA512 => Some(<sha2::Sha512 as Digest>::digest(data).to_vec()),
         _ => None,
     }
+}
+
+/// True when the certificate is valid for code signing: either it has no
+/// ExtendedKeyUsage extension (Windows treats absent EKU as unconstrained) or
+/// its EKU set contains `id-kp-codeSigning` (1.3.6.1.5.5.7.3.3).
+fn certificate_allows_code_signing(cert: &X509Certificate) -> Result<bool, String> {
+    use der::Decode;
+    let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
+        return Ok(true);
+    };
+    for extension in extensions {
+        if extension.extn_id.to_string() != OID_EXTENDED_KEY_USAGE {
+            continue;
+        }
+        let eku = x509_cert::ext::pkix::ExtendedKeyUsage::from_der(extension.extn_value.as_bytes())
+            .map_err(|e| format!("malformed ExtendedKeyUsage extension: {e}"))?;
+        return Ok(eku
+            .0
+            .iter()
+            .any(|oid| oid.to_string() == OID_EKU_CODE_SIGNING));
+    }
+    Ok(true)
+}
+
+/// Seconds since the Unix epoch for a DER UTCTime / GeneralizedTime value.
+fn der_time_unix(value: &der::Any) -> Option<i64> {
+    if let Ok(time) = value.decode_as::<der::asn1::UtcTime>() {
+        return Some(time.to_unix_duration().as_secs() as i64);
+    }
+    if let Ok(time) = value.decode_as::<der::asn1::GeneralizedTime>() {
+        return Some(time.to_unix_duration().as_secs() as i64);
+    }
+    None
+}
+
+/// Extract the signing time from either a direct `signingTime` unsigned
+/// attribute or a Microsoft legacy `SPC_TIME_STAMP` countersignature.  The
+/// result is seconds since the Unix epoch.
+fn countersignature_signing_time(signer: &cms::signed_data::SignerInfo) -> Option<i64> {
+    use der::Decode;
+    let attrs = signer.unsigned_attrs.as_ref()?;
+    for attribute in attrs.iter() {
+        let oid = attribute.oid.to_string();
+        if oid == OID_SIGNING_TIME {
+            if let Some(value) = attribute.values.iter().next()
+                && let Some(time) = der_time_unix(value)
+            {
+                return Some(time);
+            }
+        }
+        if oid == OID_SPC_TIME_STAMP {
+            // The legacy value is a counter-SignerInfo whose signed attributes
+            // carry the signingTime.  Some producers wrap it in an OCTET STRING.
+            let value = attribute.values.iter().next()?;
+            let counter = value
+                .decode_as::<cms::signed_data::SignerInfo>()
+                .or_else(|_| {
+                    let octets = value.decode_as::<der::asn1::OctetString>()?;
+                    cms::signed_data::SignerInfo::from_der(octets.as_bytes())
+                });
+            if let Ok(counter) = counter
+                && let Some(signed) = counter.signed_attrs.as_ref()
+            {
+                for attr in signed.iter() {
+                    if attr.oid.to_string() == OID_SIGNING_TIME
+                        && let Some(value) = attr.values.iter().next()
+                        && let Some(time) = der_time_unix(value)
+                    {
+                        return Some(time);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Verify the embedded Authenticode signature on a PE image.
@@ -5046,7 +5240,33 @@ pub fn verify_pe_authenticode(pe_data: &[u8]) -> AuthenticodeVerdict {
 
     // Certificate chain validation: validate the signer certificate chain up to
     // a system-trusted root using the macOS Security framework.
+    //
+    // H4: the WinVerifyTrust generic policy is a CODE-SIGNING policy.  A
+    // signer certificate whose EKU set excludes id-kp-codeSigning must be
+    // rejected even when the cryptographic signature and the chain are
+    // otherwise valid.
     if let Some(signer_cert) = chain_validated_signer_cert {
+        match certificate_allows_code_signing(&signer_cert) {
+            Ok(true) => {}
+            Ok(false) => {
+                return AuthenticodeVerdict::Invalid(
+                    "signer certificate EKU does not include codeSigning (1.3.6.1.5.5.7.3.3)"
+                        .into(),
+                );
+            }
+            Err(reason) => {
+                return AuthenticodeVerdict::Invalid(reason);
+            }
+        }
+        // H4: honour a timestamp countersignature: evaluate the chain at the
+        // timestamped signing time so an expired-but-timestamped signature is
+        // accepted.
+        let timestamp = signed_data
+            .signer_infos
+            .0
+            .iter()
+            .find(|signer| locate_signer_certificate(signer, certs_vec).is_ok())
+            .and_then(countersignature_signing_time);
         match signer_cert.to_der() {
             Ok(cert_der) => {
                 // Include the intermediate CAs embedded in the signature's
@@ -5060,7 +5280,8 @@ pub fn verify_pe_authenticode(pe_data: &[u8]) -> AuthenticodeVerdict {
                     })
                     .filter(|der| der != &cert_der)
                     .collect();
-                if let Err(e) = validate_certificate_chain(&cert_der, &intermediates) {
+                if let Err(e) = validate_certificate_chain_at(&cert_der, &intermediates, timestamp)
+                {
                     return AuthenticodeVerdict::Invalid(format!("chain validation failed: {e}"));
                 }
             }
@@ -5201,7 +5422,7 @@ fn verify_rsa_signature(
 // ===========================================================================
 
 /// Well-known WinTrust policy GUIDs used by `WinVerifyTrust`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WinTrustPolicyGuid {
     /// WINTRUST_ACTION_GENERIC_VERIFY_V2 — default Authenticode verification.
     /// GUID: {00AAC56B-CD44-11d0-8CC2-00C04FC295EE}
@@ -5407,6 +5628,64 @@ pub fn win_verify_trust(policy_guid: WinTrustPolicyGuid, pe_data: &[u8]) -> WinV
             verdict: None,
         },
     }
+}
+
+/// Cached WinVerifyTrust verdicts keyed by (path, size, mtime).  The guest
+/// frequently re-verifies the same binaries; a verdict derived from file bytes
+/// is only valid for the exact file version that produced it.
+type TrustCacheKey = (PathBuf, u64, u64);
+static WIN_VERIFY_CACHE: LazyLock<Mutex<HashMap<TrustCacheKey, WinVerifyTrustResult>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn file_cache_key(path: &Path) -> Option<(TrustCacheKey, Vec<u8>)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let mtime = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let bytes = std::fs::read(path).ok()?;
+    Some(((path.to_path_buf(), metadata.len(), mtime), bytes))
+}
+
+/// `WinVerifyTrust` against an on-disk file, with a (path,size,mtime) verdict
+/// cache and the code-signing policy applied by [`verify_pe_authenticode`].
+///
+/// A changed file (different size or mtime) is re-verified; an unchanged one
+/// returns the cached verdict without re-hashing the image.
+pub fn win_verify_trust_path(policy_guid: WinTrustPolicyGuid, path: &Path) -> WinVerifyTrustResult {
+    let Some((key, bytes)) = file_cache_key(path) else {
+        // The file is unreadable or gone. The cache is keyed by
+        // (path, size, mtime), so an entry for this path still describes a
+        // verified image; serve it rather than degrading to a fresh
+        // "cannot read" verdict (a recreated file with a different size or
+        // mtime misses the key and re-verifies normally).
+        let cached = WIN_VERIFY_CACHE.lock().ok().and_then(|cache| {
+            cache
+                .iter()
+                .find(|((cached_path, _, _), _)| cached_path.as_path() == path)
+                .map(|(_, result)| result.clone())
+        });
+        return cached.unwrap_or_else(|| WinVerifyTrustResult {
+            error: win_trust_error::TRUST_E_NOSIGNATURE,
+            description: "Cannot read the file to verify.".to_string(),
+            verdict: None,
+        });
+    };
+    if let Ok(cache) = WIN_VERIFY_CACHE.lock()
+        && let Some(cached) = cache.get(&key)
+    {
+        return cached.clone();
+    }
+    let result = win_verify_trust(policy_guid, &bytes);
+    // Cache the fresh verdict; a poisoned cache mutex (another thread
+    // panicked while holding it) merely skips the insert — the verdict is
+    // returned either way.
+    let _ = WIN_VERIFY_CACHE.lock().map(|mut cache| {
+        cache.retain(|(cached_path, _, _), _| cached_path != path);
+        cache.insert(key, result.clone());
+    });
+    result
 }
 
 // ===========================================================================
@@ -5620,6 +5899,114 @@ mod tests {
         assert!(
             matches!(verdict, AuthenticodeVerdict::Invalid(_)),
             "expected Invalid, got {verdict:?}"
+        );
+    }
+
+    fn test_cert_der_with_eku(ekus: &[&str]) -> Vec<u8> {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+        use sha2::Sha256;
+        use spki::SubjectPublicKeyInfoOwned;
+        use std::str::FromStr;
+        use std::time::SystemTime;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::{Time, Validity};
+
+        let mut rng = StdRng::seed_from_u64(0xE000_0001);
+        let key = RsaPrivateKey::new(&mut rng, 1024).expect("rsa key");
+        let signer = SigningKey::<Sha256>::new(key.clone());
+        let spki = SubjectPublicKeyInfoOwned::from_der(
+            RsaPublicKey::from(&key)
+                .to_public_key_der()
+                .expect("spki der")
+                .as_bytes(),
+        )
+        .expect("spki");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock");
+        let at = |offset: i64| -> SystemTime {
+            if offset >= 0 {
+                std::time::UNIX_EPOCH + now + std::time::Duration::from_secs(offset as u64)
+            } else {
+                std::time::UNIX_EPOCH + now - std::time::Duration::from_secs(offset.unsigned_abs())
+            }
+        };
+        let validity = Validity {
+            not_before: Time::try_from(at(-60)).expect("notBefore"),
+            not_after: Time::try_from(at(3600)).expect("notAfter"),
+        };
+        let mut builder = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(1u32),
+            validity,
+            Name::from_str("CN=EkuTest").expect("subject"),
+            spki,
+            &signer,
+        )
+        .expect("builder");
+        let oids: Vec<der::oid::ObjectIdentifier> = ekus
+            .iter()
+            .map(|oid| der::oid::ObjectIdentifier::new_unwrap(oid))
+            .collect();
+        builder
+            .add_extension(&ExtendedKeyUsage(oids))
+            .expect("add EKU");
+        builder.build().expect("certificate").to_der().expect("der")
+    }
+
+    /// H4: the code-signing policy rejects a certificate whose EKU do not
+    /// include id-kp-codeSigning, even when the chain itself is valid.
+    #[test]
+    fn authenticode_code_signing_policy_rejects_wrong_eku() {
+        let time_stamping = test_cert_der_with_eku(&["1.3.6.1.5.5.7.3.8"]);
+        let cert = X509Certificate::from_der(&time_stamping).expect("certificate DER");
+        assert_eq!(
+            certificate_allows_code_signing(&cert),
+            Ok(false),
+            "a timestamping-only EKU must not satisfy the code-signing policy"
+        );
+        let code_signing = test_cert_der_with_eku(&[OID_EKU_CODE_SIGNING]);
+        let cert = X509Certificate::from_der(&code_signing).expect("certificate DER");
+        assert_eq!(
+            certificate_allows_code_signing(&cert),
+            Ok(true),
+            "id-kp-codeSigning must satisfy the code-signing policy"
+        );
+    }
+
+    /// H4: a verdict is cached by (path, size, mtime): removing the file does
+    /// not invalidate an unchanged cached entry.
+    #[test]
+    fn win_verify_trust_stale_cache_entry_survives_file_removal() {
+        let path = std::env::temp_dir().join(format!(
+            "casa1-wvt-cache-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"not a PE image").expect("write fixture");
+        let first = win_verify_trust_path(WinTrustPolicyGuid::GenericVerifyV2, &path);
+        assert_eq!(
+            first.error,
+            win_trust_error::TRUST_E_NOSIGNATURE,
+            "an unsigned fixture reports TRUST_E_NOSIGNATURE"
+        );
+        std::fs::remove_file(&path).expect("remove fixture");
+        let cached = win_verify_trust_path(WinTrustPolicyGuid::GenericVerifyV2, &path);
+        assert_eq!(
+            cached.error,
+            win_trust_error::TRUST_E_NOSIGNATURE,
+            "the unchanged cached verdict is returned without re-reading the file"
+        );
+        assert_eq!(
+            cached.description, first.description,
+            "cached hit returns the original description"
         );
     }
 
@@ -6186,6 +6573,662 @@ mod tests {
         let result = sanitize_entitlement_xml(xml);
         assert!(!result.is_empty(), "should strip PI inside plist");
         assert!(!result.contains("<?my-pi"), "PI should not remain");
+    }
+
+    #[test]
+    fn redaction_boundary_user_dirs_at_line_ends_and_mixed_separators() {
+        let line = "first /Users/fixture1/x second /Users/fixture2 C:\\users\\fixture1\\save.dat C:/USERS/Fixture2";
+        assert_eq!(
+            redact_pii(line),
+            "first /Users/<redacted>/x second /Users/<redacted> C:\\users\\<redacted>\\save.dat C:/USERS/<redacted>"
+        );
+
+        // A path ending the line has no trailing separator to bound it.
+        assert_eq!(redact_pii("tail=/Users/fixture3"), "tail=/Users/<redacted>");
+        assert_eq!(
+            redact_pii("tail=C:\\users\\fixture3"),
+            "tail=C:\\users\\<redacted>"
+        );
+    }
+
+    /// Redaction breadth: a marker with an EMPTY value (immediately followed
+    /// by a separator or whitespace) must not swallow the separator, quotes
+    /// and punctuation bound the value, and mid-line vs end-of-line emails
+    /// are both redacted.
+    #[test]
+    fn redaction_boundary_empty_marker_values_and_email_positions() {
+        // Marker immediately followed by whitespace: no value to redact.
+        assert_eq!(
+            redact_marked_paths("keep /Users/ rest", &["/Users/"]),
+            "keep /Users/ rest",
+            "an empty marked value must not consume the separator"
+        );
+        // Marker immediately followed by another marker: only the second has
+        // a value.
+        assert_eq!(
+            redact_marked_paths("x /Users//Users/bob", &["/Users/"]),
+            "x /Users//Users/<redacted>",
+            "an empty marked value leaves the following marker intact"
+        );
+        // Quote and comma bound the END of the redacted value; the marker
+        // itself is kept verbatim.
+        assert_eq!(
+            redact_marked_paths("open \"/Users/eve\", done", &["/Users/"]),
+            "open \"/Users/<redacted>\", done",
+            "quotes and commas bound the redacted path"
+        );
+        // Semicolon, bracket, brace, angle brackets bound the value too.
+        assert_eq!(
+            redact_marked_paths("a=/Users/gus;b]c}d>e<f", &["/Users/"]),
+            "a=/Users/<redacted>;b]c}d>e<f",
+            "punctuation bounds the redacted path"
+        );
+        // Emails: mid-line token and end-of-line token.
+        assert_eq!(
+            redact_emails("ping a@b.com now"),
+            "ping <redacted-email> now",
+            "a mid-line email token is redacted"
+        );
+        assert_eq!(
+            redact_emails("ping a@b.com"),
+            "ping <redacted-email>",
+            "an end-of-line email token is redacted"
+        );
+        assert_eq!(
+            redact_emails("no-mail here"),
+            "no-mail here",
+            "non-email tokens are preserved"
+        );
+    }
+
+    #[test]
+    fn redaction_replaces_every_login_name_occurrence() {
+        let Ok(login) = std::env::var("USER") else {
+            return;
+        };
+        if login.len() < 3 {
+            return;
+        }
+        let line = format!("login {login} again {login}");
+        assert_eq!(redact_pii(&line), "login <redacted> again <redacted>");
+    }
+
+    // =======================================================================
+    // Authenticode breadth: non-PE certificate tables, EKU policy, counter-
+    // signature parsing, timestamped chain evaluation, WinVerifyTrust cache
+    // =======================================================================
+
+    /// Minimal DER TLV helpers for handcrafted CMS structures in tests.
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = content.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else if len <= 0xFF {
+            out.extend_from_slice(&[0x81, len as u8]);
+        } else if len <= 0xFFFF {
+            out.extend_from_slice(&[0x82, (len >> 8) as u8, (len & 0xFF) as u8]);
+        } else {
+            out.extend_from_slice(&[
+                0x83,
+                (len >> 16) as u8,
+                ((len >> 8) & 0xFF) as u8,
+                (len & 0xFF) as u8,
+            ]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    fn der_oid_tlv(dotted: &str) -> Vec<u8> {
+        let mut arcs = dotted
+            .split('.')
+            .map(|part| part.parse::<u64>().expect("oid arc"));
+        let first = arcs.next().expect("first arc");
+        let second = arcs.next().expect("second arc");
+        let mut content = vec![((40 * first + second) as u8)];
+        for arc in arcs {
+            let mut chunks = Vec::new();
+            let mut value = arc;
+            loop {
+                chunks.push((value & 0x7f) as u8);
+                value >>= 7;
+                if value == 0 {
+                    break;
+                }
+            }
+            chunks.reverse();
+            let last = chunks.len() - 1;
+            for (index, chunk) in chunks.iter().enumerate() {
+                out_push_byte(&mut content, *chunk, index == last);
+            }
+        }
+        der_tlv(0x06, &content)
+    }
+
+    fn out_push_byte(content: &mut Vec<u8>, byte: u8, last: bool) {
+        content.push(if last { byte } else { byte | 0x80 });
+    }
+
+    fn der_alg_id(oid: &str) -> Vec<u8> {
+        let mut content = der_oid_tlv(oid);
+        content.extend_from_slice(&[0x05, 0x00]); // NULL parameters
+        der_tlv(0x30, &content)
+    }
+
+    fn der_attr(oid: &str, value: &[u8]) -> Vec<u8> {
+        let mut content = der_oid_tlv(oid);
+        content.extend_from_slice(&der_tlv(0x31, value)); // SET OF AttributeValue
+        der_tlv(0x30, &content)
+    }
+
+    /// 2024-01-01T00:00:00Z as UTCTime / GeneralizedTime and its Unix time.
+    const TEST_UTCTIME_2024: &[u8] = b"240101000000Z";
+    const TEST_UNIX_2024_01_01: i64 = 1_704_067_200;
+
+    /// A DOS header that never reaches a PE signature is "no Authenticode
+    /// signature present", not a verification failure.
+    #[test]
+    fn locate_certificate_table_non_pe_boundary_reports_no_signature() {
+        let mut dos_only = vec![0u8; 0x80];
+        dos_only[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        assert_eq!(
+            locate_certificate_table(&dos_only),
+            Ok(None),
+            "a DOS image without a PE signature has no certificate table"
+        );
+        assert_eq!(
+            locate_certificate_table(b"MZ\x00\x00"),
+            Ok(None),
+            "a file shorter than the DOS header has no certificate table"
+        );
+    }
+
+    /// H4 policy edges: a certificate WITHOUT an extensions field is
+    /// unconstrained (Windows semantics), while a malformed EKU extension
+    /// fails closed instead of being treated as unconstrained.
+    #[test]
+    fn code_signing_policy_boundary_absent_and_malformed_extensions() {
+        // Strip the extensions block: extensions == None.
+        let der = test_cert_der_with_eku(&[OID_EKU_CODE_SIGNING]);
+        let mut cert = X509Certificate::from_der(&der).expect("certificate DER");
+        cert.tbs_certificate.extensions = None;
+        let stripped = cert.to_der().expect("re-encode without extensions");
+        let parsed = X509Certificate::from_der(&stripped).expect("stripped DER");
+        assert_eq!(
+            certificate_allows_code_signing(&parsed),
+            Ok(true),
+            "a certificate without extensions is code-signing unconstrained"
+        );
+        // Extensions present but no EKU among them: the scan completes and
+        // the certificate stays unconstrained (Windows treats absent EKU as
+        // unconstrained, not as an error).
+        let mut no_eku = X509Certificate::from_der(&der).expect("certificate DER");
+        no_eku.tbs_certificate.extensions =
+            no_eku.tbs_certificate.extensions.as_ref().map(|exts| {
+                exts.iter()
+                    .filter(|ext| ext.extn_id.to_string() != OID_EXTENDED_KEY_USAGE)
+                    .cloned()
+                    .collect()
+            });
+        let no_eku_der = no_eku.to_der().expect("re-encode without the EKU");
+        let no_eku_cert = X509Certificate::from_der(&no_eku_der).expect("parse no-EKU DER");
+        assert_eq!(
+            certificate_allows_code_signing(&no_eku_cert),
+            Ok(true),
+            "extensions without an EKU are code-signing unconstrained"
+        );
+        // Corrupt the EKU extension value: parseable certificate, malformed
+        // ExtendedKeyUsage payload.
+        let mut broken = test_cert_der_with_eku(&[OID_EKU_CODE_SIGNING]);
+        let eku_oid: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x25];
+        let at = broken
+            .windows(5)
+            .position(|window| window == eku_oid)
+            .expect("EKU OID present");
+        let mut off = at + 5;
+        if broken[off] == 0x01 {
+            off += 3; // critical BOOLEAN
+        }
+        assert_eq!(broken[off], 0x04, "extnValue is an OCTET STRING");
+        let value_len = broken[off + 1] as usize;
+        for byte in &mut broken[off + 2..off + 2 + value_len] {
+            *byte = 0xFF;
+        }
+        let broken_cert = X509Certificate::from_der(&broken).expect("parses despite bad EKU");
+        let err = certificate_allows_code_signing(&broken_cert)
+            .expect_err("a malformed EKU extension must fail closed");
+        assert_eq!(
+            err.starts_with("malformed ExtendedKeyUsage extension"),
+            true,
+            "exact failure prefix, got: {err}"
+        );
+    }
+
+    fn parse_signer_info(der: &[u8]) -> cms::signed_data::SignerInfo {
+        cms::signed_data::SignerInfo::from_der(der).expect("SignerInfo DER")
+    }
+
+    /// A structurally valid SignerInfo whose unsigned attributes are supplied
+    /// by the caller (raw Attribute elements, or none).
+    fn minimal_signer_info_der(unsigned_attrs: Option<&[u8]>) -> Vec<u8> {
+        let mut si = Vec::new();
+        si.extend_from_slice(&[0x02, 0x01, 0x01]); // version 1
+        let mut sid = Vec::new();
+        sid.extend_from_slice(&[0x30, 0x00]); // issuer: empty Name
+        sid.extend_from_slice(&[0x02, 0x01, 0x00]); // serial 0
+        si.extend(der_tlv(0x30, &sid)); // IssuerAndSerialNumber
+        si.extend(der_alg_id(OID_SHA256));
+        si.extend(der_alg_id("1.2.840.113549.1.1.1"));
+        si.extend(der_tlv(0x04, &[0x11; 16]));
+        if let Some(attrs) = unsigned_attrs {
+            si.extend(der_tlv(0xA1, attrs)); // [1] IMPLICIT unsignedAttrs
+        }
+        der_tlv(0x30, &si)
+    }
+
+    /// A counter-SignerInfo (SPC_TIME_STAMP payload) whose SIGNED attributes
+    /// carry the signingTime.
+    fn counter_signer_info_with_signed_time_der() -> Vec<u8> {
+        let mut si = Vec::new();
+        si.extend_from_slice(&[0x02, 0x01, 0x01]);
+        let mut sid = Vec::new();
+        sid.extend_from_slice(&[0x30, 0x00]);
+        sid.extend_from_slice(&[0x02, 0x01, 0x00]);
+        si.extend(der_tlv(0x30, &sid));
+        si.extend(der_alg_id(OID_SHA256));
+        let signing_time = der_attr(OID_SIGNING_TIME, &der_tlv(0x17, TEST_UTCTIME_2024));
+        si.extend(der_tlv(0xA0, &signing_time)); // [0] IMPLICIT signedAttrs
+        si.extend(der_alg_id("1.2.840.113549.1.1.1"));
+        si.extend(der_tlv(0x04, &[0x22; 16]));
+        der_tlv(0x30, &si)
+    }
+
+    /// A counter-SignerInfo whose SIGNED attributes do NOT carry a
+    /// signingTime: the inner scan must fall through without inventing a
+    /// time from other attributes.
+    fn counter_signer_info_with_foreign_signed_attr_der() -> Vec<u8> {
+        let mut si = Vec::new();
+        si.extend_from_slice(&[0x02, 0x01, 0x01]);
+        let mut sid = Vec::new();
+        sid.extend_from_slice(&[0x30, 0x00]);
+        sid.extend_from_slice(&[0x02, 0x01, 0x00]);
+        si.extend(der_tlv(0x30, &sid));
+        si.extend(der_alg_id(OID_SHA256));
+        let foreign = der_attr(OID_MESSAGE_DIGEST, &der_tlv(0x04, &[0x42; 8]));
+        si.extend(der_tlv(0xA0, &foreign)); // [0] IMPLICIT signedAttrs
+        si.extend(der_alg_id("1.2.840.113549.1.1.1"));
+        si.extend(der_tlv(0x04, &[0x33; 16]));
+        der_tlv(0x30, &si)
+    }
+
+    /// Countersignature branches: absent unsigned attributes, a direct
+    /// signingTime (UTCTime and GeneralizedTime), a bare counter-SignerInfo,
+    /// and the OCTET STRING-wrapped legacy form — all pinning the exact
+    /// signing instant.
+    #[test]
+    fn countersignature_edges_pin_exact_signing_times() {
+        let signer = parse_signer_info(&minimal_signer_info_der(None));
+        assert_eq!(
+            countersignature_signing_time(&signer),
+            None,
+            "no unsigned attributes means no countersignature time"
+        );
+        let attr = der_attr(OID_SIGNING_TIME, &der_tlv(0x17, TEST_UTCTIME_2024));
+        let signer = parse_signer_info(&minimal_signer_info_der(Some(attr.as_slice())));
+        assert_eq!(
+            countersignature_signing_time(&signer),
+            Some(TEST_UNIX_2024_01_01),
+            "a UTCTime signingTime attribute yields its Unix instant"
+        );
+        let attr = der_attr(OID_SIGNING_TIME, &der_tlv(0x18, b"20240101000000Z"));
+        let signer = parse_signer_info(&minimal_signer_info_der(Some(attr.as_slice())));
+        assert_eq!(
+            countersignature_signing_time(&signer),
+            Some(TEST_UNIX_2024_01_01),
+            "a GeneralizedTime signingTime attribute yields its Unix instant"
+        );
+        let counter = counter_signer_info_with_signed_time_der();
+        let attr = der_attr(OID_SPC_TIME_STAMP, &counter);
+        let signer = parse_signer_info(&minimal_signer_info_der(Some(attr.as_slice())));
+        assert_eq!(
+            countersignature_signing_time(&signer),
+            Some(TEST_UNIX_2024_01_01),
+            "a bare SPC_TIME_STAMP counter-SignerInfo yields its signed time"
+        );
+        let attr = der_attr(OID_SPC_TIME_STAMP, &der_tlv(0x04, &counter));
+        let signer = parse_signer_info(&minimal_signer_info_der(Some(attr.as_slice())));
+        assert_eq!(
+            countersignature_signing_time(&signer),
+            Some(TEST_UNIX_2024_01_01),
+            "an OCTET STRING-wrapped SPC_TIME_STAMP yields its signed time"
+        );
+        // A signingTime attribute whose value is not a Time at all fails
+        // both decodes and yields no time instead of guessing.
+        let attr = der_attr(OID_SIGNING_TIME, &der_tlv(0x02, &[0x01]));
+        let signer = parse_signer_info(&minimal_signer_info_der(Some(attr.as_slice())));
+        assert_eq!(
+            countersignature_signing_time(&signer),
+            None,
+            "a non-Time signingTime value yields no countersignature time"
+        );
+        // The counter-SignerInfo's signed attrs carry no signingTime: the
+        // inner scan falls through without inventing a time.
+        let counter = counter_signer_info_with_foreign_signed_attr_der();
+        let attr = der_attr(OID_SPC_TIME_STAMP, &counter);
+        let signer = parse_signer_info(&minimal_signer_info_der(Some(attr.as_slice())));
+        assert_eq!(
+            countersignature_signing_time(&signer),
+            None,
+            "a counter-SignerInfo without a signed signingTime yields no time"
+        );
+        // An SPC_TIME_STAMP value that is neither a SignerInfo nor an OCTET
+        // STRING fails both decodes and falls out of the branch entirely.
+        let attr = der_attr(OID_SPC_TIME_STAMP, &der_tlv(0x02, &[0x05]));
+        let signer = parse_signer_info(&minimal_signer_info_der(Some(attr.as_slice())));
+        assert_eq!(
+            countersignature_signing_time(&signer),
+            None,
+            "an SPC_TIME_STAMP value of the wrong type yields no time"
+        );
+    }
+
+    /// Chain evaluation at a countersignature timestamp: an untrusted
+    /// self-signed chain stays rejected at the supplied instant.
+    #[test]
+    fn certificate_chain_at_timestamped_date_rejects_untrusted_self_signed() {
+        let cert_der = test_cert_der_with_eku(&[OID_EKU_CODE_SIGNING]);
+        let at_timestamp =
+            validate_certificate_chain_at(&cert_der, &[], Some(TEST_UNIX_2024_01_01));
+        assert_eq!(
+            at_timestamp.is_err(),
+            true,
+            "self-signed chain must fail at the timestamped date: {at_timestamp:?}"
+        );
+        let now = validate_certificate_chain_at(&cert_der, &[], None);
+        assert_eq!(
+            now.is_err(),
+            true,
+            "self-signed chain must fail at the current date: {now:?}"
+        );
+    }
+
+    /// Build a fully signed PE whose Authenticode signature is
+    /// cryptographically valid (correct PE hash, messageDigest and RSA
+    /// PKCS#1 v1.5 signature over the signed attributes) but whose signer
+    /// certificate is a test-issued self-signed root.  Options control the
+    /// signer EKU, a corrupted EKU extension, and a signingTime
+    /// countersignature attribute.
+    fn build_authenticode_signed_pe(
+        ekus: Option<&[&str]>,
+        corrupt_eku: bool,
+        signing_time: bool,
+    ) -> Vec<u8> {
+        use der::oid::ObjectIdentifier;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rsa::RsaPrivateKey;
+        use rsa::pkcs1v15::SigningKey;
+        use rsa::pkcs8::EncodePublicKey;
+        use rsa::signature::Signer as _;
+        use spki::SubjectPublicKeyInfoOwned;
+        use std::str::FromStr;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        use x509_cert::ext::pkix::ExtendedKeyUsage;
+        use x509_cert::name::Name;
+        use x509_cert::serial_number::SerialNumber;
+        use x509_cert::time::{Time, Validity};
+
+        let mut rng = StdRng::seed_from_u64(0x5EC7_0002);
+        let key = RsaPrivateKey::new(&mut rng, 1024).expect("rsa key");
+        let cert_signer = SigningKey::<Sha256>::new(key.clone());
+        let spki = SubjectPublicKeyInfoOwned::from_der(
+            rsa::RsaPublicKey::from(&key)
+                .to_public_key_der()
+                .expect("spki der")
+                .as_bytes(),
+        )
+        .expect("spki");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock");
+        let validity = Validity {
+            not_before: Time::try_from(UNIX_EPOCH + now - std::time::Duration::from_secs(60))
+                .expect("notBefore"),
+            not_after: Time::try_from(UNIX_EPOCH + now + std::time::Duration::from_secs(3600))
+                .expect("notAfter"),
+        };
+        let mut builder = CertificateBuilder::new(
+            Profile::Root,
+            SerialNumber::from(7u32),
+            validity,
+            Name::from_str("CN=Casa1AuthenticodeTest").expect("subject"),
+            spki,
+            &cert_signer,
+        )
+        .expect("builder");
+        if let Some(ekus) = ekus {
+            let oids: Vec<ObjectIdentifier> = ekus
+                .iter()
+                .map(|oid| ObjectIdentifier::new_unwrap(oid))
+                .collect();
+            builder
+                .add_extension(&ExtendedKeyUsage(oids))
+                .expect("add EKU");
+        }
+        let mut cert_der = builder.build().expect("certificate").to_der().expect("der");
+        if corrupt_eku {
+            let eku_oid: &[u8] = &[0x06, 0x03, 0x55, 0x1D, 0x25];
+            let at = cert_der
+                .windows(5)
+                .position(|window| window == eku_oid)
+                .expect("EKU OID present");
+            let mut off = at + 5;
+            if cert_der[off] == 0x01 {
+                off += 3;
+            }
+            assert_eq!(cert_der[off], 0x04, "extnValue is an OCTET STRING");
+            let value_len = cert_der[off + 1] as usize;
+            for byte in &mut cert_der[off + 2..off + 2 + value_len] {
+                *byte = 0xFF;
+            }
+        }
+        let cert = X509Certificate::from_der(&cert_der).expect("parse cert");
+        let issuer_der = cert.tbs_certificate.issuer.to_der().expect("issuer DER");
+        let serial_der = cert
+            .tbs_certificate
+            .serial_number
+            .to_der()
+            .expect("serial DER");
+
+        let build_pkcs7 = |pe_hash: &[u8]| -> Vec<u8> {
+            let mut di_content = der_alg_id(OID_SHA256);
+            di_content.extend_from_slice(&der_tlv(0x04, pe_hash));
+            let digest_info = der_tlv(0x30, &di_content);
+            let mut spc_content = vec![0xA0, 0x02, 0x31, 0x00]; // SpcAttributeTypeAndOptionalValue
+            spc_content.extend_from_slice(&digest_info);
+            let spc = der_tlv(0x30, &spc_content);
+            let mut eci_content = der_oid_tlv(OID_SPC_INDIRECT_DATA);
+            eci_content.extend_from_slice(&der_tlv(0xA0, &der_tlv(0x04, &spc)));
+            let eci = der_tlv(0x30, &eci_content);
+            let das = der_tlv(0x31, &der_alg_id(OID_SHA256));
+            let certs = der_tlv(0xA0, &cert_der);
+            let message_digest = Sha256::digest(&spc);
+            let mut si = Vec::new();
+            si.extend_from_slice(&[0x02, 0x01, 0x01]);
+            let mut sid = issuer_der.clone();
+            sid.extend_from_slice(&serial_der);
+            si.extend_from_slice(&der_tlv(0x30, &sid));
+            si.extend_from_slice(&der_alg_id(OID_SHA256));
+            let md_attr = der_attr(OID_MESSAGE_DIGEST, &der_tlv(0x04, &message_digest));
+            si.extend_from_slice(&der_tlv(0xA0, &md_attr)); // [0] IMPLICIT signedAttrs
+            si.extend_from_slice(&der_alg_id("1.2.840.113549.1.1.1"));
+            si.extend_from_slice(&der_tlv(0x04, &[0xA5; 128])); // placeholder signature
+            if signing_time {
+                let st = der_attr(OID_SIGNING_TIME, &der_tlv(0x17, TEST_UTCTIME_2024));
+                si.extend_from_slice(&der_tlv(0xA1, &st));
+            }
+            let signer_info = der_tlv(0x30, &si);
+            let sis = der_tlv(0x31, &signer_info);
+            let mut sd_content = vec![0x02, 0x01, 0x01];
+            sd_content.extend_from_slice(&das);
+            sd_content.extend_from_slice(&eci);
+            sd_content.extend_from_slice(&certs);
+            sd_content.extend_from_slice(&sis);
+            let sd = der_tlv(0x30, &sd_content);
+            let mut ci_content = der_oid_tlv(OID_SIGNED_DATA);
+            ci_content.extend_from_slice(&der_tlv(0xA0, &sd));
+            der_tlv(0x30, &ci_content)
+        };
+
+        // Pass 1 fixes the certificate-table geometry with a placeholder
+        // digest; pass 2 substitutes the real Authenticode hash, which keeps
+        // every TLV length identical.
+        let pkcs7 = build_pkcs7(&[0xBB; 32]);
+        let cert_va = 0x200_usize;
+        let cert_size = 8 + pkcs7.len();
+        let mut pe = create_minimal_pe(true);
+        write_cert_table(&mut pe, cert_va, cert_size);
+        pe.resize(cert_va + cert_size, 0);
+        let pe_hash = compute_authenticode_hash(&pe, OID_SHA256).expect("PE hash");
+        let mut pkcs7 = build_pkcs7(&pe_hash);
+        assert_eq!(pkcs7.len(), cert_size - 8, "hash substitution keeps sizes");
+
+        // Sign the exact attribute bytes the verifier will re-encode.
+        use cms::content_info::ContentInfo;
+        use cms::signed_data::SignedData;
+        let content_info = ContentInfo::from_der(&pkcs7).expect("parse PKCS#7");
+        let signed_data: SignedData = content_info.content.decode_as().expect("SignedData");
+        let signer = signed_data.signer_infos.0.iter().next().expect("signer");
+        let econtent = signed_data
+            .encap_content_info
+            .econtent
+            .as_ref()
+            .expect("eContent")
+            .to_der()
+            .expect("eContent DER");
+        let mut off = 0;
+        let (tag, start, len) = der_read_tlv(&econtent, &mut off).expect("eContent TLV");
+        assert_eq!(tag, 0x04, "eContent wraps an OCTET STRING");
+        let econtent_value = &econtent[start..start + len];
+        let message =
+            extract_signing_message(signer, OID_SHA256, econtent_value).expect("signing message");
+        let signature = SigningKey::<Sha256>::new(key).sign(&message);
+        let placeholder = [0xA5_u8; 128];
+        let at = pkcs7
+            .windows(128)
+            .position(|window| window == placeholder)
+            .expect("placeholder signature present");
+        let signature_bytes: Box<[u8]> = signature.into();
+        assert_eq!(signature_bytes.len(), 128, "RSA-1024 signature width");
+        pkcs7[at..at + 128].copy_from_slice(&signature_bytes);
+
+        // Embed the WIN_CERTIFICATE blob in the PE's certificate table.
+        let dw_length = (8 + pkcs7.len()) as u32;
+        pe[cert_va..cert_va + 4].copy_from_slice(&dw_length.to_le_bytes());
+        pe[cert_va + 4..cert_va + 6].copy_from_slice(&0x0200_u16.to_le_bytes());
+        pe[cert_va + 6..cert_va + 8].copy_from_slice(&WIN_CERT_TYPE_PKCS_SIGNED_DATA.to_le_bytes());
+        pe[cert_va + 8..cert_va + 8 + pkcs7.len()].copy_from_slice(&pkcs7);
+        pe
+    }
+
+    /// The cryptographic signature and PE hash are valid; an untrusted
+    /// self-signed chain is still rejected — with a signingTime attribute
+    /// the chain is evaluated at the timestamped instant first.
+    #[test]
+    fn authenticode_valid_signature_with_untrusted_chain_is_rejected() {
+        let pe = build_authenticode_signed_pe(Some(&[OID_EKU_CODE_SIGNING]), false, true);
+        let verdict = verify_pe_authenticode(&pe);
+        let AuthenticodeVerdict::Invalid(reason) = &verdict else {
+            panic!("self-signed chain must be rejected, got {verdict:?}");
+        };
+        assert_eq!(
+            reason.starts_with("chain validation failed: "),
+            true,
+            "must fail at chain validation (signature verified), got: {reason}"
+        );
+    }
+
+    /// H4 end-to-end: a cryptographically valid signature whose signer
+    /// certificate carries a non-code-signing EKU is rejected before chain
+    /// evaluation, with the exact policy message.
+    #[test]
+    fn authenticode_valid_signature_with_wrong_eku_is_rejected() {
+        let pe = build_authenticode_signed_pe(Some(&["1.3.6.1.5.5.7.3.8"]), false, false);
+        let verdict = verify_pe_authenticode(&pe);
+        let AuthenticodeVerdict::Invalid(reason) = &verdict else {
+            panic!("timestamping-only EKU must be rejected, got {verdict:?}");
+        };
+        assert_eq!(
+            reason,
+            "signer certificate EKU does not include codeSigning (1.3.6.1.5.5.7.3.3)"
+        );
+    }
+
+    /// A malformed EKU extension on an otherwise valid signature fails
+    /// closed with the parse error instead of being treated as unconstrained.
+    #[test]
+    fn authenticode_valid_signature_with_malformed_eku_is_rejected() {
+        let pe = build_authenticode_signed_pe(Some(&[OID_EKU_CODE_SIGNING]), true, false);
+        let verdict = verify_pe_authenticode(&pe);
+        let AuthenticodeVerdict::Invalid(reason) = &verdict else {
+            panic!("malformed EKU must be rejected, got {verdict:?}");
+        };
+        assert_eq!(
+            reason.starts_with("malformed ExtendedKeyUsage extension"),
+            true,
+            "exact failure prefix, got: {reason}"
+        );
+    }
+
+    /// WinVerifyTrust cache: an unchanged on-disk file is served from the
+    /// (path, size, mtime) cache without re-verifying.
+    #[test]
+    fn win_verify_trust_path_stale_reread_of_unchanged_file_hits_cache() {
+        let path = std::env::temp_dir().join(format!(
+            "casa1-wvt-cached-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"not a PE image").expect("write fixture");
+        let first = win_verify_trust_path(WinTrustPolicyGuid::GenericVerifyV2, &path);
+        assert_eq!(
+            first.error,
+            win_trust_error::TRUST_E_NOSIGNATURE,
+            "unsigned fixture reports TRUST_E_NOSIGNATURE"
+        );
+        let second = win_verify_trust_path(WinTrustPolicyGuid::GenericVerifyV2, &path);
+        assert_eq!(
+            second.error, first.error,
+            "an unchanged file is served from the cache"
+        );
+        assert_eq!(
+            second.description, first.description,
+            "the cached verdict keeps its description"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// WinVerifyTrust cache: an unreadable file with no cached entry fails
+    /// closed instead of inventing a verdict.
+    #[test]
+    fn win_verify_trust_path_unreadable_file_without_cache_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "casa1-wvt-missing-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&path).ok();
+        let result = win_verify_trust_path(WinTrustPolicyGuid::GenericVerifyV2, &path);
+        assert_eq!(
+            result.error,
+            win_trust_error::TRUST_E_NOSIGNATURE,
+            "an unreadable file without a cache entry reports no signature"
+        );
+        assert_eq!(
+            result.description, "Cannot read the file to verify.",
+            "exact description for the unreadable-file path"
+        );
+        assert_eq!(result.verdict.is_none(), true, "no verdict is invented");
     }
 }
 
@@ -7991,7 +9034,6 @@ impl Default for ProcessProtectionRegistry {
 }
 
 // Global process protection registry (lazy-initialized).
-use std::sync::Mutex;
 
 lazy_static::lazy_static! {
     static ref PPL_REGISTRY: Mutex<ProcessProtectionRegistry> =
