@@ -800,6 +800,7 @@ impl Rect {
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
     NcCreate,
+    NcCalcSize,
     Create,
     Paint,
     ShowWindow,
@@ -818,6 +819,13 @@ pub enum MessageKind {
     MouseMove,
     LButtonDown,
     LButtonUp,
+    LButtonDblClk,
+    RButtonDown,
+    RButtonUp,
+    RButtonDblClk,
+    MButtonDown,
+    MButtonUp,
+    MButtonDblClk,
     MouseWheel,
     MouseHWheel,
     XButtonDown,
@@ -1338,6 +1346,10 @@ struct WindowRecord {
     y: i32,
     width: u32,
     height: u32,
+    /// Client area size in pixels (excludes title bar/borders).  `GetWindowRect`
+    /// reports the outer `x/y/width/height`; `GetClientRect` reports this.
+    client_width: u32,
+    client_height: u32,
     visible: bool,
     enabled: bool,
     style: u32,
@@ -1517,6 +1529,11 @@ pub struct User32Subsystem {
     next_image_handle: u32,
     layout: KeyboardLayoutId,
     key_repeat: KeyRepeatConfig,
+    /// Last press time per (window, button) used to synthesize
+    /// WM_*BUTTONDBLCLK within the system double-click interval.
+    last_button_press: BTreeMap<(Hwnd, u8), std::time::Instant>,
+    /// System double-click interval in milliseconds (GetDoubleClickTime).
+    double_click_interval_ms: u64,
     dpi_context: DpiAwarenessContext,
     /// Per-thread DPI awareness override (0 = use process default).
     pub thread_dpi_context: usize,
@@ -1782,6 +1799,8 @@ impl User32Subsystem {
                 delay_ms: 250,
                 rate_hz: 31,
             },
+            last_button_press: BTreeMap::new(),
+            double_click_interval_ms: 500,
             dpi_context: DpiAwarenessContext::SystemAware,
             thread_dpi_context: 0,
             classes: BTreeMap::new(),
@@ -2058,6 +2077,46 @@ impl User32Subsystem {
         ex_style: u32,
         owner: Option<Hwnd>,
     ) -> AppResult<Hwnd> {
+        self.create_window_ex_styled_at(
+            class_name,
+            title,
+            0,
+            0,
+            width,
+            height,
+            visible,
+            requested_exclusive_fullscreen,
+            parent,
+            monitor_id,
+            style,
+            ex_style,
+            owner,
+        )
+    }
+
+    /// Create a window at an explicit initial position.
+    ///
+    /// `x`/`y` are Win32 screen coordinates (top-down from the primary
+    /// display) and are passed straight to the NSWindow, so the first
+    /// `MoveWindow`/`SetWindowPos` does not have to relocate a window that
+    /// was materialized at the origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_window_ex_styled_at(
+        &mut self,
+        class_name: &str,
+        title: &str,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        visible: bool,
+        requested_exclusive_fullscreen: bool,
+        parent: Option<Hwnd>,
+        monitor_id: u32,
+        style: u32,
+        ex_style: u32,
+        owner: Option<Hwnd>,
+    ) -> AppResult<Hwnd> {
         let atom = self.ensure_class_available(class_name).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcCliInvalid,
@@ -2094,11 +2153,8 @@ impl User32Subsystem {
             if !mac_window::init_nsapplication() {
                 std::ptr::null_mut()
             } else {
-                let nswin = mac_window::create_nswindow(
-                    title, 0, // x (will be set later via SetWindowPos/MoveWindow)
-                    0, // y
-                    width, height, style, ex_style,
-                );
+                let nswin = // coverage: unreachable
+                    mac_window::create_nswindow(title, x, y, width, height, style, ex_style); // coverage: unreachable
                 if !nswin.is_null() {
                     mac_window::associate_hwnd_nswindow(hwnd, nswin);
                 }
@@ -2106,6 +2162,13 @@ impl User32Subsystem {
             }
         } else {
             std::ptr::null_mut()
+        };
+
+        let (client_width, client_height) = if ns_window.is_null() {
+            client_size_for_style(style, width, height)
+        } else {
+            mac_window::nswindow_content_size(ns_window) // coverage: unreachable
+                .unwrap_or_else(|| client_size_for_style(style, width, height)) // coverage: unreachable
         };
 
         self.windows.insert(
@@ -2116,10 +2179,12 @@ impl User32Subsystem {
                 owner,
                 class_name: class_name.to_string(),
                 title: title.to_string(),
-                x: 0,
-                y: 0,
+                x,
+                y,
                 width,
                 height,
+                client_width,
+                client_height,
                 visible,
                 enabled: true,
                 style,
@@ -2191,7 +2256,9 @@ impl User32Subsystem {
                     device_id: None,
                 })?;
                 self.queue_resize(hwnd, width, height)?;
-                if self.foreground.is_none() {
+                if self.foreground.is_none()
+                    && window_can_be_activated(style, ex_style, is_child || parent.is_some())
+                {
                     self.foreground = Some(hwnd);
                     self.focus = Some(hwnd);
                     self.enqueue(Message {
@@ -2245,6 +2312,8 @@ impl User32Subsystem {
         };
         let was_visible = existing.visible;
         let should_show = command != 0;
+        let may_activate =
+            window_can_be_activated(existing.style, existing.ex_style, existing.parent.is_some());
         if was_visible == should_show {
             return Ok(was_visible);
         }
@@ -2269,7 +2338,7 @@ impl User32Subsystem {
                 (window.width, window.height)
             };
             self.queue_resize(hwnd, width, height)?;
-            if self.foreground.is_none() {
+            if self.foreground.is_none() && may_activate {
                 self.foreground = Some(hwnd);
                 self.focus = Some(hwnd);
                 self.enqueue(Message {
@@ -2311,7 +2380,11 @@ impl User32Subsystem {
         if let Ok(window) = self.window(hwnd).map(|w| w.ns_window)
             && window != 0
         {
-            mac_window::show_nswindow(window as *mut std::ffi::c_void, should_show);
+            mac_window::show_nswindow_with_activation(
+                window as *mut std::ffi::c_void,
+                should_show,
+                should_show && may_activate,
+            );
         }
 
         Ok(was_visible)
@@ -2380,6 +2453,41 @@ impl User32Subsystem {
         let handle = self.next_image_handle;
         self.next_image_handle += 4;
         handle
+    }
+
+    /// Abort a creation that a window procedure rejected.
+    ///
+    /// `CreateWindowEx` must send `WM_NCCREATE`/`WM_NCCALCSIZE`/`WM_CREATE`
+    /// synchronously and return 0 when any of them returns FALSE or -1.  The
+    /// runtime calls this for the partially-created window: it tears down all
+    /// state without delivering `WM_DESTROY`/`WM_NCDESTROY` (the guest never
+    /// owned the window) and closes any real NSWindow.
+    pub fn abort_window_creation(&mut self, hwnd: Hwnd) -> bool {
+        let Some(window) = self.windows.remove(&hwnd) else {
+            return false;
+        };
+        self.z_order.retain(|candidate| *candidate != hwnd);
+        self.window_longs.retain(|(owner, _), _| *owner != hwnd);
+        self.dialog_items.retain(|(owner, _), _| *owner != hwnd);
+        self.scroll_info.retain(|(owner, _), _| *owner != hwnd);
+        self.timers.retain(|(owner, _), _| *owner != hwnd);
+        self.touch_state
+            .registered_windows
+            .retain(|owner| *owner != hwnd);
+        if self.focus == Some(hwnd) {
+            self.focus = None;
+        }
+        if self.foreground == Some(hwnd) {
+            self.foreground = None;
+        }
+        if self.capture == Some(hwnd) {
+            self.capture = None;
+        }
+        if window.ns_window != 0 {
+            mac_window::close_nswindow(window.ns_window as *mut std::ffi::c_void);
+            mac_window::remove_hwnd_nswindow(hwnd);
+        }
+        true
     }
 
     pub fn destroy_window(&mut self, hwnd: Hwnd) -> AppResult<bool> {
@@ -2489,6 +2597,14 @@ impl User32Subsystem {
         window.y = y;
         window.width = width;
         window.height = height;
+        let (client_width, client_height) = if window.ns_window == 0 {
+            client_size_for_style(window.style, width, height)
+        } else {
+            mac_window::nswindow_content_size(window.ns_window as *mut std::ffi::c_void)
+                .unwrap_or_else(|| client_size_for_style(window.style, width, height))
+        };
+        window.client_width = client_width;
+        window.client_height = client_height;
         if window.ns_window != 0 {
             mac_window::set_nswindow_frame(
                 window.ns_window as *mut std::ffi::c_void,
@@ -2536,6 +2652,10 @@ impl User32Subsystem {
         if flags & SWP_NOSIZE == 0 && cx > 0 && cy > 0 {
             window.width = cx as u32;
             window.height = cy as u32;
+            let (client_width, client_height) =
+                client_size_for_style(window.style, window.width, window.height);
+            window.client_width = client_width;
+            window.client_height = client_height;
         }
         if flags & SWP_SHOWWINDOW != 0 {
             window.visible = true;
@@ -2568,6 +2688,12 @@ impl User32Subsystem {
                 new_w,
                 new_h,
             );
+            if let Some((client_width, client_height)) =
+                mac_window::nswindow_content_size(window.ns_window as *mut std::ffi::c_void)
+            {
+                window.client_width = client_width;
+                window.client_height = client_height;
+            }
 
             if flags & SWP_SHOWWINDOW != 0 {
                 mac_window::show_nswindow(window.ns_window as *mut std::ffi::c_void, true);
@@ -2941,6 +3067,11 @@ impl User32Subsystem {
         if let Some(hwnd) = message.hwnd.filter(|hwnd| self.windows.contains_key(hwnd)) {
             let window = self.window(hwnd)?.clone();
             match message.kind {
+                MessageKind::Other(0x0010) => {
+                    // WM_CLOSE default: destroy this window.  The AppKit
+                    // delegate only posts WM_CLOSE; destruction stays here.
+                    self.destroy_window(hwnd)?;
+                }
                 MessageKind::LButtonDown => {
                     if let Err(e) = self.set_focus(hwnd) {
                         eprintln!(
@@ -3094,6 +3225,8 @@ impl User32Subsystem {
                 y: 0,
                 width: 1,
                 height: 1,
+                client_width: 1,
+                client_height: 1,
                 visible: true,
                 enabled: true,
                 style: 0,
@@ -3137,6 +3270,72 @@ impl User32Subsystem {
     }
 
     // ── Dialog Manager ───────────────────────────────────────────────────────────
+
+    /// Create a dialog window and its controls from an in-memory `RT_DIALOG`
+    /// template (`DLGTEMPLATE`/`DLGTEMPLATEEX`).
+    ///
+    /// This is the user32 half of `DialogBoxParamW`/`CreateDialogParamW`: the
+    /// runtime resolves the PE resource and passes its bytes here.  Returns
+    /// the `#32770` HWND with every child control (class/style/text/id) the
+    /// template declares already materialized.
+    pub fn create_dialog_from_template(
+        &mut self,
+        template: &[u8],
+        parent: Hwnd,
+        fallback_title: &str,
+        monitor_id: u32,
+    ) -> AppResult<Hwnd> {
+        let parsed = parse_dialog_template(template)?;
+        self.register_class_ex_w("#32770");
+        let title = if parsed.title.is_empty() {
+            fallback_title
+        } else {
+            parsed.title.as_str()
+        };
+        let width = (parsed.cx.max(1)) as u32;
+        let height = (parsed.cy.max(1)) as u32;
+        let hwnd = self.create_window_ex_styled_at(
+            "#32770",
+            title,
+            i32::from(parsed.x),
+            i32::from(parsed.y),
+            width,
+            height,
+            parsed.style & WS_VISIBLE != 0,
+            false,
+            (parent != 0).then_some(parent),
+            monitor_id,
+            parsed.style,
+            parsed.ex_style,
+            None,
+        )?; // coverage: unreachable
+        for item in parsed.items {
+            let class_name = item
+                .class_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| dialog_item_class_name(item.class_atom));
+            let item_width = (item.cx.max(1)) as u32;
+            let item_height = (item.cy.max(1)) as u32;
+            let child = self.create_window_ex_styled_at(
+                class_name,
+                &item.title,
+                i32::from(item.x),
+                i32::from(item.y),
+                item_width,
+                item_height,
+                true,
+                false,
+                Some(hwnd),
+                monitor_id,
+                item.style | WS_CHILD,
+                item.ex_style,
+                None,
+            )?;
+            self.set_window_control_id(child, u32::from(item.id))?;
+        }
+        Ok(hwnd)
+    }
 
     /// DialogBoxParam — creates a modal dialog box.
     /// Creates a window of class "#32770" (dialog), optionally registers it,
@@ -3509,6 +3708,7 @@ impl User32Subsystem {
     }
 
     pub fn get_message_for_thread(&mut self, thread_id: u32) -> Option<Message> {
+        self.pump_native_close_requests();
         if let Some(queue) = self
             .thread_message_queues
             .get_mut(&thread_id)
@@ -3517,6 +3717,32 @@ impl User32Subsystem {
             return queue.pop_front();
         }
         self.message_queue.pop_front()
+    }
+
+    /// Turn native window-close gestures (the AppKit `windowShouldClose:`
+    /// delegate) into `WM_CLOSE` for the owning guest window.
+    ///
+    /// The delegate returns NO, so AppKit never destroys the window; the
+    /// guest decides (DefWindowProc handles an unhandled `WM_CLOSE` by
+    /// destroying the window, exactly like Windows).
+    fn pump_native_close_requests(&mut self) {
+        for hwnd in mac_window::take_pending_close_requests() {
+            if !self.windows.contains_key(&hwnd) {
+                continue;
+            }
+            if let Err(error) = self.enqueue(Message {
+                hwnd: Some(hwnd),
+                kind: MessageKind::Other(0x0010), // WM_CLOSE
+                wparam: 0,
+                lparam: 0,
+                translated: false,
+                device_id: None,
+            }) {
+                eprintln!(
+                    "[User32] failed to enqueue WM_CLOSE for native close of hwnd {hwnd}: {error}"
+                );
+            }
+        }
     }
 
     pub fn translate_message(&mut self, message: &Message) -> AppResult<Vec<Message>> {
@@ -5112,6 +5338,17 @@ impl User32Subsystem {
         self.key_repeat = config;
     }
 
+    /// GetDoubleClickTime: the double-click interval in milliseconds.
+    pub fn get_double_click_time(&self) -> u64 {
+        self.double_click_interval_ms
+    }
+
+    /// Override the system double-click interval (used by tests and by
+    /// guests that call SetDoubleClickTime).
+    pub fn set_double_click_time(&mut self, interval_ms: u64) {
+        self.double_click_interval_ms = interval_ms;
+    }
+
     pub fn synthesize_key_repeats(
         &self,
         hwnd: Hwnd,
@@ -5138,11 +5375,13 @@ impl User32Subsystem {
         let count = ((repeat_window_ms as u64 * self.key_repeat.rate_hz as u64 / 1000) as usize)
             .min(MAX_REPEATS);
         Ok((0..count)
-            .map(|_| Message {
+            .map(|index| Message {
                 hwnd: Some(hwnd),
                 kind: MessageKind::KeyDown,
                 wparam: modifiers.to_bits(),
-                lparam: scancode as i64,
+                // Repeat count in bits 16-23 and previous-key-state (bit 30)
+                // set: every synthesized message is an auto-repeat.
+                lparam: (scancode as i64) | (((index as i64) + 1) << 16) | (1 << 30),
                 translated: false,
                 device_id: Some(device_id.to_string()),
             })
@@ -5210,6 +5449,10 @@ impl User32Subsystem {
 
         // ── Update key state tracking ──────────────────────────────────
         let is_down = matches!(kind, MessageKind::KeyDown);
+        let was_down = {
+            let vk = self.scancode_to_vk_code(scancode);
+            vk < 256 && self.key_state[vk as usize] & 0x80 != 0
+        };
         self.update_key_state_for_scancode(scancode, is_down);
         if modifiers.shift {
             self.update_single_key_state(VK_SHIFT as u8, is_down);
@@ -5224,7 +5467,9 @@ impl User32Subsystem {
             hwnd: Some(hwnd),
             kind,
             wparam: modifiers.to_bits(),
-            lparam: scancode as i64,
+            // Bit 30 is the previous-key-state flag: set for an auto-repeat
+            // down so the guest can tell a held key from the first press.
+            lparam: (scancode as i64) | if is_down && was_down { 1 << 30 } else { 0 },
             translated: false,
             device_id: Some(device_id.to_string()),
         })
@@ -5644,45 +5889,61 @@ impl User32Subsystem {
                 device_id: Some(device_id.to_string()),
             })?;
         }
+        let now = std::time::Instant::now();
+        let double_click_window = std::time::Duration::from_millis(self.double_click_interval_ms);
         for button in buttons {
-            match (button.button, button.pressed) {
-                (MouseButton::Left, true) => {
-                    self.enqueue(Message {
-                        hwnd: Some(hwnd),
-                        kind: MessageKind::LButtonDown,
-                        wparam: cursor_x as i64,
-                        lparam: cursor_y as i64,
-                        translated: false,
-                        device_id: Some(device_id.to_string()),
-                    })?;
+            let button_index = match button.button {
+                MouseButton::Left => 0_u8,
+                MouseButton::Right => 1,
+                MouseButton::Middle => 2,
+                MouseButton::X1 | MouseButton::X2 => 3,
+            };
+            let is_double_click = if button.pressed && button_index < 3 {
+                let key = (hwnd, button_index);
+                let double = self
+                    .last_button_press
+                    .get(&key)
+                    .is_some_and(|last| now.duration_since(*last) < double_click_window);
+                self.last_button_press.insert(key, now);
+                double
+            } else {
+                false
+            };
+            let kind = match (button.button, button.pressed) {
+                (MouseButton::Left, true) if is_double_click => MessageKind::LButtonDblClk,
+                (MouseButton::Left, true) => MessageKind::LButtonDown,
+                (MouseButton::Left, false) => MessageKind::LButtonUp,
+                (MouseButton::Right, true) if is_double_click => MessageKind::RButtonDblClk,
+                (MouseButton::Right, true) => MessageKind::RButtonDown,
+                (MouseButton::Right, false) => MessageKind::RButtonUp,
+                (MouseButton::Middle, true) if is_double_click => MessageKind::MButtonDblClk,
+                (MouseButton::Middle, true) => MessageKind::MButtonDown,
+                (MouseButton::Middle, false) => MessageKind::MButtonUp,
+                (MouseButton::X1 | MouseButton::X2, true) => MessageKind::XButtonDown,
+                _ => continue,
+            };
+            let wparam = if kind == MessageKind::XButtonDown {
+                match button.button {
+                    MouseButton::X1 => 1,
+                    MouseButton::X2 => 2,
+                    _ => 0, // coverage: unreachable
                 }
-                (MouseButton::Left, false) => {
-                    self.enqueue(Message {
-                        hwnd: Some(hwnd),
-                        kind: MessageKind::LButtonUp,
-                        wparam: cursor_x as i64,
-                        lparam: cursor_y as i64,
-                        translated: false,
-                        device_id: Some(device_id.to_string()),
-                    })?;
-                }
-                (MouseButton::X1 | MouseButton::X2, true) => {
-                    let wparam = match button.button {
-                        MouseButton::X1 => 1,
-                        MouseButton::X2 => 2,
-                        _ => 0,
-                    };
-                    self.enqueue(Message {
-                        hwnd: Some(hwnd),
-                        kind: MessageKind::XButtonDown,
-                        wparam,
-                        lparam: 0,
-                        translated: false,
-                        device_id: Some(device_id.to_string()),
-                    })?;
-                }
-                _ => {}
-            }
+            } else {
+                cursor_x as i64
+            };
+            let lparam = if kind == MessageKind::XButtonDown {
+                0
+            } else {
+                cursor_y as i64
+            };
+            self.enqueue(Message {
+                hwnd: Some(hwnd),
+                kind,
+                wparam,
+                lparam,
+                translated: false,
+                device_id: Some(device_id.to_string()),
+            })?;
         }
         Ok(MousePacket {
             raw_dx,
@@ -6243,6 +6504,31 @@ impl User32Subsystem {
             fullscreen: window.fullscreen.clone(),
             monitor_id: window.monitor_id,
             dpi: window.dpi,
+        })
+    }
+
+    /// Screen-space outer window rectangle (title bar and borders included).
+    pub fn get_window_rect(&self, hwnd: Hwnd) -> AppResult<Rect> {
+        let window = self.window(hwnd)?;
+        Ok(Rect {
+            left: window.x,
+            top: window.y,
+            right: window.x.saturating_add(window.width as i32),
+            bottom: window.y.saturating_add(window.height as i32),
+        })
+    }
+
+    /// Client-area rectangle in client coordinates (origin 0,0).
+    ///
+    /// Unlike [`Self::get_window_rect`], this excludes the title bar and
+    /// frame borders: the two rectangles are intentionally distinct.
+    pub fn get_client_rect(&self, hwnd: Hwnd) -> AppResult<Rect> {
+        let window = self.window(hwnd)?;
+        Ok(Rect {
+            left: 0,
+            top: 0,
+            right: window.client_width as i32,
+            bottom: window.client_height as i32,
         })
     }
 
@@ -6819,6 +7105,304 @@ fn class_registry_key(class_name: &str) -> String {
     class_name.to_ascii_lowercase()
 }
 
+/// Whether showing this window may activate the host application.
+///
+/// Only the first top-level, non-popup window without `WS_EX_NOACTIVATE`
+/// activates; menus, tooltips, child controls and explicitly non-activating
+/// windows must never steal focus.
+fn window_can_be_activated(style: u32, ex_style: u32, is_child: bool) -> bool {
+    const WS_POPUP: u32 = 0x8000_0000;
+    !is_child && style & WS_POPUP == 0 && ex_style & WS_EX_NOACTIVATE == 0
+}
+
+/// Height of the non-client title bar for a captioned window.
+const TITLE_BAR_HEIGHT: u32 = 23;
+
+/// Client area size for an outer frame size.
+///
+/// On macOS the real content size is read back from the NSWindow; this pure
+/// fallback describes a captioned Win32 frame (title bar excluded) and is
+/// also what headless windows report.
+fn client_size_for_style(style: u32, width: u32, height: u32) -> (u32, u32) {
+    const WS_CAPTION: u32 = 0x00C0_0000;
+    let title_bar = if style & WS_CAPTION == WS_CAPTION {
+        TITLE_BAR_HEIGHT
+    } else {
+        0
+    };
+    (width, height.saturating_sub(title_bar))
+}
+
+// ── Dialog resource templates (RT_DIALOG) ────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialogItemTemplate {
+    style: u32,
+    ex_style: u32,
+    x: i16,
+    y: i16,
+    cx: i16,
+    cy: i16,
+    id: u16,
+    /// Predefined class atom (0xFFFF ordinal) or 0 when `class_name` is used.
+    class_atom: u16,
+    class_name: Option<String>,
+    title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialogTemplate {
+    style: u32,
+    ex_style: u32,
+    x: i16,
+    y: i16,
+    cx: i16,
+    cy: i16,
+    title: String,
+    items: Vec<DialogItemTemplate>,
+}
+
+/// Bounds-checked little-endian reader for dialog templates.
+struct DialogTemplateReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> DialogTemplateReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn require(&self, count: usize) -> AppResult<()> {
+        if self.pos.saturating_add(count) > self.bytes.len() {
+            return Err(AppError::new(
+                ReasonCode::RcCliInvalid,
+                "truncated dialog template",
+            ));
+        }
+        Ok(())
+    }
+
+    fn u16(&mut self) -> AppResult<u16> {
+        self.require(2)?;
+        let value = u16::from_le_bytes([self.bytes[self.pos], self.bytes[self.pos + 1]]);
+        self.pos += 2;
+        Ok(value)
+    }
+
+    fn i16(&mut self) -> AppResult<i16> {
+        Ok(self.u16()? as i16)
+    }
+
+    fn u32(&mut self) -> AppResult<u32> {
+        self.require(4)?;
+        let value = u32::from_le_bytes([
+            self.bytes[self.pos],
+            self.bytes[self.pos + 1],
+            self.bytes[self.pos + 2],
+            self.bytes[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(value)
+    }
+
+    fn skip(&mut self, count: usize) -> AppResult<()> {
+        self.require(count)?;
+        self.pos += count;
+        Ok(())
+    }
+
+    fn align4(&mut self) {
+        let aligned = (self.pos + 3) & !3;
+        self.pos = aligned.min(self.bytes.len());
+    }
+
+    /// Read a null-terminated UTF-16 string, capping hostile lengths.
+    fn utf16_string(&mut self) -> AppResult<String> {
+        const MAX_UNITS: usize = 4096;
+        let mut units = Vec::new();
+        loop {
+            let unit = self.u16()?;
+            if unit == 0 {
+                break;
+            }
+            if units.len() >= MAX_UNITS {
+                return Err(AppError::new(
+                    ReasonCode::RcCliInvalid,
+                    "dialog template string is too long",
+                ));
+            }
+            units.push(unit);
+        }
+        Ok(String::from_utf16_lossy(&units))
+    }
+
+    /// Skip one of the variable menu/class fields, which may be a null
+    /// string or `0xFFFF` followed by an ordinal.
+    fn skip_ordinal_or_string(&mut self) -> AppResult<()> {
+        if self.u16()? == 0xFFFF {
+            self.skip(2)?;
+        } else {
+            self.pos = self.pos.saturating_sub(2);
+            self.utf16_string()?;
+        }
+        Ok(())
+    }
+
+    /// Read a class/title field: ordinal, or UTF-16 text.
+    fn ordinal_or_string(&mut self) -> AppResult<(u16, Option<String>)> {
+        let head = self.u16()?;
+        if head == 0xFFFF {
+            Ok((self.u16()?, None))
+        } else if head == 0 {
+            Ok((0, None))
+        } else {
+            self.pos = self.pos.saturating_sub(2);
+            Ok((0, Some(self.utf16_string()?)))
+        }
+    }
+}
+
+/// Map a predefined dialog-item class atom to its Win32 class name.
+fn dialog_item_class_name(atom: u16) -> &'static str {
+    match atom {
+        0x0080 => "button",
+        0x0081 => "edit",
+        0x0082 => "static",
+        0x0083 => "listbox",
+        0x0084 => "scrollbar",
+        0x0085 => "combobox",
+        _ => "static",
+    }
+}
+
+/// Parse a standard `DLGTEMPLATE` or an extended `DLGTEMPLATEEX`.
+///
+/// The template is guest-controlled, so every read is bounds-checked and the
+/// item/string counts are capped.  A malformed template is rejected instead
+/// of producing a partially-initialized dialog.
+fn parse_dialog_template(bytes: &[u8]) -> AppResult<DialogTemplate> {
+    const MAX_ITEMS: u16 = 2048;
+    let mut reader = DialogTemplateReader::new(bytes);
+    let extended = bytes.len() >= 4
+        && u16::from_le_bytes([bytes[0], bytes[1]]) == 1
+        && u16::from_le_bytes([bytes[2], bytes[3]]) == 0xFFFF;
+    let (style, ex_style, item_count, x, y, cx, cy) = if extended {
+        let _version = reader.u16()?;
+        let _signature = reader.u16()?;
+        let _help_id = reader.u32()?;
+        let ex_style = reader.u32()?;
+        let style = reader.u32()?;
+        let item_count = reader.u16()?;
+        (
+            style,
+            ex_style,
+            item_count,
+            reader.i16()?,
+            reader.i16()?,
+            reader.i16()?,
+            reader.i16()?,
+        )
+    } else {
+        let style = reader.u32()?;
+        let ex_style = reader.u32()?;
+        let item_count = reader.u16()?;
+        (
+            style,
+            ex_style,
+            item_count,
+            reader.i16()?,
+            reader.i16()?,
+            reader.i16()?,
+            reader.i16()?,
+        )
+    };
+    if item_count > MAX_ITEMS {
+        return Err(AppError::new(
+            ReasonCode::RcCliInvalid,
+            "dialog template declares too many items",
+        ));
+    }
+    reader.skip_ordinal_or_string()?; // menu
+    reader.skip_ordinal_or_string()?; // dialog window class
+    let (_, title) = reader.ordinal_or_string()?;
+    reader.align4();
+    let mut items = Vec::with_capacity(usize::from(item_count));
+    for _ in 0..item_count {
+        let (style, ex_style, x, y, cx, cy, id, class_atom, class_name, item_title) = if extended {
+            let _help_id = reader.u32()?;
+            let ex_style = reader.u32()?;
+            let style = reader.u32()?;
+            let x = reader.i16()?;
+            let y = reader.i16()?;
+            let cx = reader.i16()?;
+            let cy = reader.i16()?;
+            let id = reader.u32()? as u16;
+            let (class_atom, class_name) = reader.ordinal_or_string()?;
+            let (_, title) = reader.ordinal_or_string()?;
+            (
+                style,
+                ex_style,
+                x,
+                y,
+                cx,
+                cy,
+                id,
+                class_atom,
+                class_name,
+                title.unwrap_or_default(),
+            )
+        } else {
+            let style = reader.u32()?;
+            let ex_style = reader.u32()?;
+            let x = reader.i16()?;
+            let y = reader.i16()?;
+            let cx = reader.i16()?;
+            let cy = reader.i16()?;
+            let id = reader.u16()?;
+            let (class_atom, class_name) = reader.ordinal_or_string()?;
+            let (_, title) = reader.ordinal_or_string()?;
+            (
+                style,
+                ex_style,
+                x,
+                y,
+                cx,
+                cy,
+                id,
+                class_atom,
+                class_name,
+                title.unwrap_or_default(),
+            )
+        };
+        let extra = reader.u16()? as usize;
+        reader.skip(extra)?;
+        reader.align4();
+        items.push(DialogItemTemplate {
+            style,
+            ex_style,
+            x,
+            y,
+            cx,
+            cy,
+            id,
+            class_atom,
+            class_name,
+            title: item_title,
+        });
+    }
+    Ok(DialogTemplate {
+        style,
+        ex_style,
+        x,
+        y,
+        cx,
+        cy,
+        title: title.unwrap_or_default(),
+        items,
+    })
+}
+
 fn stable_device_id(prefix: &str, source: &str) -> String {
     let hash = util::sha256_bytes(source.as_bytes());
     format!("{prefix}-{}", &hash[..16])
@@ -6903,6 +7487,16 @@ mod tests {
         ) {
         }
 
+        unsafe extern "C" fn content_layout_rect(
+            _: *mut Object,
+            _: Sel,
+        ) -> crate::mac_window::NSRect {
+            crate::mac_window::NSRect::new(
+                crate::mac_window::NSPoint::new(0.0, 0.0),
+                crate::mac_window::NSSize::new(300.0, 157.0),
+            )
+        }
+
         fn add_method(cls: *mut Class, selector: &str, imp: *const (), types: &CStr) {
             let imp: Imp = unsafe { std::mem::transmute(imp) };
             let added =
@@ -6921,6 +7515,12 @@ mod tests {
                 add_method(cls, "makeKeyAndOrderFront:", noop_arg as *const (), c"v@:@");
                 add_method(cls, "orderOut:", noop_arg as *const (), c"v@:@");
                 add_method(cls, "setTitle:", noop_arg as *const (), c"v@:@");
+                add_method(
+                    cls,
+                    "contentLayoutRect",
+                    content_layout_rect as *const (),
+                    c"{CGRect={CGPoint=dd}{CGSize=dd}}@:",
+                );
                 add_method(
                     cls,
                     "setFrame:display:animate:",
@@ -8661,6 +9261,662 @@ mod tests {
                 id: StableDeviceId::from_raw(0xdead)
             }
         );
+    }
+
+    // ── Window geometry / native close / activation (U2, U5, U6, U8) ──────
+
+    fn create_test_window(user32: &mut User32Subsystem, style: u32, ex_style: u32) -> Hwnd {
+        user32.register_class_ex_w("u2-test-window");
+        let hwnd = user32
+            .create_window_ex_styled_at(
+                "u2-test-window",
+                "u2",
+                50,
+                60,
+                320,
+                200,
+                false,
+                false,
+                None,
+                1,
+                style,
+                ex_style,
+                None,
+            )
+            .expect("create positioned window");
+        while user32.get_message_w().is_some() {}
+        hwnd
+    }
+
+    #[test]
+    fn user32_window_and_client_rects_reject_title_bar_mismatch() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hwnd = create_test_window(&mut user32, WS_CAPTION, 0);
+        let outer = user32.get_window_rect(hwnd).expect("outer rect");
+        assert_eq!(
+            (outer.left, outer.top, outer.right, outer.bottom),
+            (50, 60, 370, 260)
+        );
+        let client = user32.get_client_rect(hwnd).expect("client rect");
+        assert_eq!((client.left, client.top), (0, 0));
+        assert_eq!(
+            (client.right, client.bottom),
+            (320, (200 - TITLE_BAR_HEIGHT) as i32)
+        );
+        assert_ne!(outer.bottom - outer.top, client.bottom);
+    }
+
+    #[test]
+    fn user32_first_move_resize_mismatch_is_prevented() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hwnd = create_test_window(&mut user32, WS_CAPTION, 0);
+        let before = user32.window_state(hwnd).expect("state before");
+        assert_eq!((before.width, before.height), (320, 200));
+        assert_eq!(
+            user32
+                .move_window(hwnd, 50, 60, 320, 200, false)
+                .expect("move"),
+            true
+        );
+        let after = user32.window_state(hwnd).expect("state after");
+        assert_eq!((after.width, after.height), (320, 200));
+        assert_eq!(user32.window_origin(hwnd), (50, 60));
+        let client = user32.get_client_rect(hwnd).expect("client rect");
+        assert_eq!((client.right, client.bottom), (320, 177));
+    }
+
+    #[test]
+    fn user32_native_close_no_double_destroy_and_no_dangling_handle() {
+        let _direct = appkit_stub::force_direct();
+        let stub_window = appkit_stub::stub_window();
+        let _lock = mac_window::CLOSE_QUEUE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = mac_window::take_pending_close_requests();
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hwnd = create_test_window(&mut user32, WS_CAPTION, 0);
+        user32
+            .windows
+            .get_mut(&hwnd)
+            .expect("window record")
+            .ns_window = stub_window;
+        mac_window::associate_hwnd_nswindow(hwnd, stub_window as *mut std::ffi::c_void);
+
+        mac_window::queue_close_request_for_test(0xdead_beef);
+        mac_window::queue_close_request_for_test(hwnd);
+        let message = user32.get_message_w().expect("native close -> WM_CLOSE");
+        assert_eq!(message.kind, MessageKind::Other(0x0010));
+        assert_eq!(user32.has_window(hwnd), true);
+        assert_eq!(user32.dispatch_message_w(&message).expect("WM_CLOSE"), 0);
+        assert_eq!(user32.has_window(hwnd), false);
+        assert_eq!(mac_window::nswindow_for_hwnd(hwnd), None);
+        assert_eq!(user32.destroy_window(hwnd).expect("second destroy"), false);
+    }
+
+    #[test]
+    fn user32_destroy_releases_only_owned_nswindow_no_leak_boundary() {
+        let _direct = appkit_stub::force_direct();
+        let _shared = appkit_stub::stub_window();
+        let owned = mac_window::stub_window_instance_for_test();
+        assert_eq!(mac_window::mark_nswindow_owned(owned), false);
+        assert_eq!(mac_window::mark_nswindow_owned(owned), true);
+
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hwnd = create_test_window(&mut user32, WS_CAPTION, 0);
+        user32
+            .windows
+            .get_mut(&hwnd)
+            .expect("owned record")
+            .ns_window = owned as usize;
+        mac_window::associate_hwnd_nswindow(hwnd, owned);
+        assert_eq!(user32.destroy_window(hwnd).expect("destroy owned"), true);
+        assert_eq!(mac_window::nswindow_for_hwnd(hwnd), None);
+
+        let external = appkit_stub::stub_window();
+        let hwnd = create_test_window(&mut user32, WS_CAPTION, 0);
+        user32
+            .windows
+            .get_mut(&hwnd)
+            .expect("external record")
+            .ns_window = external;
+        mac_window::associate_hwnd_nswindow(hwnd, external as *mut std::ffi::c_void);
+        assert_eq!(user32.destroy_window(hwnd).expect("destroy external"), true);
+        assert_eq!(mac_window::nswindow_for_hwnd(hwnd), None);
+    }
+
+    #[test]
+    fn user32_activate_rejects_popup_child_and_noactivate_boundary() {
+        assert_eq!(window_can_be_activated(0, 0, false), true);
+        assert_eq!(window_can_be_activated(0x8000_0000, 0, false), false);
+        assert_eq!(window_can_be_activated(0, WS_EX_NOACTIVATE, false), false);
+        assert_eq!(window_can_be_activated(0, 0, true), false);
+    }
+
+    #[test]
+    fn user32_abort_creation_leaves_no_half_created_record() {
+        let _direct = appkit_stub::force_direct();
+        let stub_window = appkit_stub::stub_window();
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hwnd = create_test_window(&mut user32, WS_CAPTION, 0);
+        user32.focus = Some(hwnd);
+        user32.foreground = Some(hwnd);
+        user32.capture = Some(hwnd);
+        user32
+            .windows
+            .get_mut(&hwnd)
+            .expect("window record")
+            .ns_window = stub_window;
+        mac_window::associate_hwnd_nswindow(hwnd, stub_window as *mut std::ffi::c_void);
+        assert_eq!(user32.abort_window_creation(hwnd), true);
+        assert_eq!(user32.has_window(hwnd), false);
+        assert_eq!(user32.abort_window_creation(hwnd), false);
+        assert_eq!(user32.destroy_window(hwnd).expect("destroy aborted"), false);
+        assert_eq!(mac_window::nswindow_for_hwnd(hwnd), None);
+        assert_eq!(
+            crate::runtime::message_id(MessageKind::NcCalcSize),
+            0x0083,
+            "WM_NCCALCSIZE id"
+        );
+    }
+
+    fn sample_extended_dialog_template() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_u16(&mut bytes, 1); // dlgVer
+        push_u16(&mut bytes, 0xFFFF); // signature
+        push_u32(&mut bytes, 0); // helpID
+        push_u32(&mut bytes, 0); // exStyle
+        push_u32(&mut bytes, WS_CAPTION);
+        push_u16(&mut bytes, 1); // one item
+        push_u16(&mut bytes, 1);
+        push_u16(&mut bytes, 2);
+        push_u16(&mut bytes, 100);
+        push_u16(&mut bytes, 50);
+        push_u16(&mut bytes, 0xFFFF); // menu ordinal
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0xFFFF); // class ordinal
+        push_u16(&mut bytes, 0);
+        push_utf16z(&mut bytes, "ExtTitle");
+        align4(&mut bytes);
+        push_u32(&mut bytes, 0); // helpID
+        push_u32(&mut bytes, 0); // exStyle
+        push_u32(&mut bytes, WS_CHILD | WS_VISIBLE);
+        push_u16(&mut bytes, 3); // x
+        push_u16(&mut bytes, 4); // y
+        push_u16(&mut bytes, 40); // cx
+        push_u16(&mut bytes, 12); // cy
+        push_u32(&mut bytes, 9); // id
+        push_u16(&mut bytes, 0xFFFF); // class ordinal
+        push_u16(&mut bytes, 0x0081); // edit
+        push_utf16z(&mut bytes, "E");
+        push_u16(&mut bytes, 0); // no extra data
+        align4(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn dialog_template_zero_title_mismatch_falls_back_to_empty() {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 0); // no items
+        for _ in 0..4 {
+            push_u16(&mut bytes, 0);
+        }
+        push_u16(&mut bytes, 0); // menu
+        push_u16(&mut bytes, 0); // class
+        push_u16(&mut bytes, 0); // title = absent
+        align4(&mut bytes);
+        let parsed = parse_dialog_template(&bytes).expect("zero-title template");
+        assert_eq!(parsed.title, "");
+        assert_eq!(parsed.items.len(), 0);
+
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hwnd = user32
+            .create_dialog_from_template(&bytes, 0, "fallback", 1)
+            .expect("create zero-title dialog");
+        assert_eq!(user32.window_state(hwnd).expect("state").title, "fallback");
+    }
+
+    #[test]
+    fn dialog_template_unknown_control_class_is_rejected() {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, WS_CAPTION);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 1);
+        push_u16(&mut bytes, 1);
+        push_u16(&mut bytes, 2);
+        push_u16(&mut bytes, 100);
+        push_u16(&mut bytes, 50);
+        push_u16(&mut bytes, 0); // menu
+        push_u16(&mut bytes, 0); // class
+        push_utf16z(&mut bytes, "T");
+        align4(&mut bytes);
+        push_u32(&mut bytes, WS_CHILD | WS_VISIBLE);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 5);
+        push_u16(&mut bytes, 6);
+        push_u16(&mut bytes, 40);
+        push_u16(&mut bytes, 12);
+        push_u16(&mut bytes, 7);
+        push_utf16z(&mut bytes, "casa1-missing-class");
+        push_utf16z(&mut bytes, "X");
+        push_u16(&mut bytes, 0);
+        align4(&mut bytes);
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let error = user32
+            .create_dialog_from_template(&bytes, 0, "title", 1)
+            .unwrap_err();
+        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert_eq!(error.message, "unregistered class casa1-missing-class");
+    }
+
+    #[test]
+    fn dialog_template_extended_ordinal_class_mismatch_is_rejected() {
+        let template = sample_extended_dialog_template();
+        let parsed = parse_dialog_template(&template).expect("parse extended template");
+        assert_eq!(parsed.title, "ExtTitle");
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].id, 9);
+        assert_eq!(parsed.items[0].class_atom, 0x0081);
+        assert_eq!(parsed.items[0].title, "E");
+    }
+
+    #[test]
+    fn dialog_template_item_count_overflow_is_rejected() {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 2049);
+        for _ in 0..4 {
+            push_u16(&mut bytes, 0);
+        }
+        let error = parse_dialog_template(&bytes).unwrap_err();
+        assert_eq!(error.message, "dialog template declares too many items");
+    }
+
+    #[test]
+    fn dialog_template_overlong_string_is_rejected() {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        for _ in 0..4 {
+            push_u16(&mut bytes, 0);
+        }
+        push_u16(&mut bytes, 0); // menu
+        push_u16(&mut bytes, 0); // class
+        for _ in 0..=4096 {
+            push_u16(&mut bytes, u16::from(b'A'));
+        }
+        push_u16(&mut bytes, 0);
+        let error = parse_dialog_template(&bytes).unwrap_err();
+        assert_eq!(error.message, "dialog template string is too long");
+    }
+
+    #[test]
+    fn dialog_item_class_name_default_is_rejected_to_static() {
+        let cases = [
+            (0x0080, "button"),
+            (0x0081, "edit"),
+            (0x0082, "static"),
+            (0x0083, "listbox"),
+            (0x0084, "scrollbar"),
+            (0x0085, "combobox"),
+            (0x9999, "static"),
+        ];
+        for (atom, expected) in cases {
+            assert_eq!(dialog_item_class_name(atom), expected);
+        }
+    }
+
+    #[test]
+    fn native_close_queue_overflow_keeps_window_and_drops_close() {
+        let _lock = mac_window::CLOSE_QUEUE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = mac_window::take_pending_close_requests();
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hwnd = create_test_window(&mut user32, WS_CAPTION, 0);
+        let capacity = user32.input_queue_capacity;
+        for _ in 0..capacity {
+            user32
+                .enqueue(Message {
+                    hwnd: Some(hwnd),
+                    kind: MessageKind::Paint,
+                    wparam: 0,
+                    lparam: 0,
+                    translated: false,
+                    device_id: None,
+                })
+                .expect("fill input queue");
+        }
+        mac_window::queue_close_request_for_test(hwnd);
+        let first = user32.get_message_w().expect("queued message");
+        assert_ne!(first.kind, MessageKind::Other(0x0010));
+        let close_delivered = std::iter::from_fn(|| user32.get_message_w())
+            .any(|message| message.kind == MessageKind::Other(0x0010));
+        assert_eq!(close_delivered, false);
+        assert_eq!(user32.has_window(hwnd), true);
+    }
+
+    // ── Input (U11, U12) ─────────────────────────────────────────────────
+
+    fn setup_mouse_test() -> (User32Subsystem, Hwnd, String) {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hwnd = create_test_window(&mut user32, 0, 0);
+        let device_id = user32.register_mouse_device(&MouseDevice {
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            serial: "mouse".to_string(),
+        });
+        (user32, hwnd, device_id)
+    }
+
+    fn mouse_press(button: MouseButton) -> Vec<MouseButtonEvent> {
+        vec![MouseButtonEvent {
+            button,
+            pressed: true,
+        }]
+    }
+
+    fn mouse_release(button: MouseButton) -> Vec<MouseButtonEvent> {
+        vec![MouseButtonEvent {
+            button,
+            pressed: false,
+        }]
+    }
+
+    #[test]
+    fn user32_mouse_double_click_boundary_uses_system_interval() {
+        let (mut user32, hwnd, device_id) = setup_mouse_test();
+        user32.set_double_click_time(500);
+        assert_eq!(user32.get_double_click_time(), 500);
+        user32
+            .inject_mouse_input(
+                hwnd,
+                &device_id,
+                0,
+                0,
+                &mouse_press(MouseButton::Left),
+                0,
+                0,
+            )
+            .expect("first press");
+        user32
+            .inject_mouse_input(
+                hwnd,
+                &device_id,
+                0,
+                0,
+                &mouse_release(MouseButton::Left),
+                0,
+                0,
+            )
+            .expect("first release");
+        user32
+            .inject_mouse_input(
+                hwnd,
+                &device_id,
+                0,
+                0,
+                &mouse_press(MouseButton::Left),
+                0,
+                0,
+            )
+            .expect("second press");
+        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == MessageKind::LButtonDblClk)
+                .count(),
+            1
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == MessageKind::LButtonDown)
+                .count(),
+            1
+        );
+
+        // An interval of zero disables double-click coalescing.
+        user32.set_double_click_time(0);
+        user32
+            .inject_mouse_input(
+                hwnd,
+                &device_id,
+                0,
+                0,
+                &mouse_press(MouseButton::Left),
+                0,
+                0,
+            )
+            .expect("press after zero interval");
+        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == MessageKind::LButtonDblClk)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn user32_right_and_middle_buttons_emit_down_up_boundary() {
+        let (mut user32, hwnd, device_id) = setup_mouse_test();
+        let inject = |user32: &mut User32Subsystem, buttons: &[MouseButtonEvent]| {
+            user32
+                .inject_mouse_input(hwnd, &device_id, 0, 0, buttons, 0, 0)
+                .expect("inject mouse");
+        };
+        inject(&mut user32, &mouse_press(MouseButton::Right));
+        inject(&mut user32, &mouse_release(MouseButton::Right));
+        inject(&mut user32, &mouse_press(MouseButton::Middle));
+        inject(&mut user32, &mouse_release(MouseButton::Middle));
+        // A second press inside the interval is a double-click for each button.
+        inject(&mut user32, &mouse_press(MouseButton::Right));
+        inject(&mut user32, &mouse_press(MouseButton::Middle));
+        inject(&mut user32, &mouse_press(MouseButton::X1));
+        inject(&mut user32, &mouse_press(MouseButton::X2));
+        inject(&mut user32, &mouse_release(MouseButton::X1));
+        let kinds = std::iter::from_fn(|| user32.get_message_w().map(|message| message.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            [
+                kinds.contains(&MessageKind::RButtonDown),
+                kinds.contains(&MessageKind::RButtonUp),
+                kinds.contains(&MessageKind::MButtonDown),
+                kinds.contains(&MessageKind::RButtonDblClk),
+                kinds.contains(&MessageKind::MButtonDblClk),
+            ],
+            [true, true, true, true, true]
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == MessageKind::XButtonDown)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn user32_key_repeat_sets_lparam_bit_30_boundary() {
+        let (mut user32, hwnd, device_id) = setup_keyboard_test();
+        user32
+            .inject_keyboard_input(
+                hwnd,
+                &device_id,
+                0x1e,
+                KeyModifiers {
+                    shift: false,
+                    altgr: false,
+                },
+            )
+            .expect("first down");
+        user32
+            .inject_keyboard_input(
+                hwnd,
+                &device_id,
+                0x1e,
+                KeyModifiers {
+                    shift: false,
+                    altgr: false,
+                },
+            )
+            .expect("repeat down");
+        let downs = std::iter::from_fn(|| user32.get_message_w())
+            .filter(|message| message.kind == MessageKind::KeyDown)
+            .collect::<Vec<_>>();
+        assert_eq!(downs.len(), 2);
+        assert_eq!(downs[0].lparam & (1 << 30), 0);
+        assert_eq!(downs[1].lparam & (1 << 30), 1 << 30);
+
+        user32.set_key_repeat_config(KeyRepeatConfig {
+            delay_ms: 0,
+            rate_hz: 1000,
+        });
+        let repeats = user32
+            .synthesize_key_repeats(
+                hwnd,
+                &device_id,
+                0x1e,
+                KeyModifiers {
+                    shift: false,
+                    altgr: false,
+                },
+                10,
+            )
+            .expect("repeat messages");
+        assert_eq!(repeats.len(), 10);
+        assert_eq!(
+            repeats
+                .iter()
+                .all(|message| message.lparam & (1 << 30) != 0),
+            true
+        );
+    }
+
+    #[test]
+    fn user32_mouse_and_nc_message_ids_never_mismatch_kind_roundtrip() {
+        let cases = [
+            (MessageKind::LButtonDblClk, 0x0203),
+            (MessageKind::RButtonDown, 0x0204),
+            (MessageKind::RButtonUp, 0x0205),
+            (MessageKind::RButtonDblClk, 0x0206),
+            (MessageKind::MButtonDown, 0x0207),
+            (MessageKind::MButtonUp, 0x0208),
+            (MessageKind::MButtonDblClk, 0x0209),
+            (MessageKind::NcCalcSize, 0x0083),
+        ];
+        for (kind, id) in cases {
+            assert_eq!(crate::runtime::message_id(kind), id);
+            assert_eq!(crate::runtime::message_kind(id), Ok(kind));
+        }
+    }
+
+    #[test]
+    fn mac_window_hwnd_reverse_lookup_rejects_dangling_pointer() {
+        let _direct = appkit_stub::force_direct();
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let hwnd = create_test_window(&mut user32, 0, 0);
+        let pointer = 0x1234_5678_usize as *mut std::ffi::c_void;
+        assert_eq!(mac_window::hwnd_for_nswindow(std::ptr::null_mut()), None);
+        assert_eq!(mac_window::hwnd_for_nswindow(pointer), None);
+        mac_window::associate_hwnd_nswindow(hwnd, pointer);
+        assert_eq!(mac_window::hwnd_for_nswindow(pointer), Some(hwnd));
+        let _ = mac_window::remove_hwnd_nswindow(hwnd);
+        assert_eq!(mac_window::hwnd_for_nswindow(pointer), None);
+        mac_window::show_nswindow(std::ptr::null_mut(), false);
+        assert_eq!(
+            mac_window::nswindow_content_size(std::ptr::null_mut()),
+            None
+        );
+    }
+
+    // ── Dialog resources (U7) ───────────────────────────────────────────
+
+    fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_utf16z(bytes: &mut Vec<u8>, value: &str) {
+        for unit in value.encode_utf16() {
+            push_u16(bytes, unit);
+        }
+        push_u16(bytes, 0);
+    }
+
+    fn align4(bytes: &mut Vec<u8>) {
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+    }
+
+    fn sample_dialog_template() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, WS_CAPTION);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 1); // one item
+        push_u16(&mut bytes, 1); // x
+        push_u16(&mut bytes, 2); // y
+        push_u16(&mut bytes, 100); // cx
+        push_u16(&mut bytes, 50); // cy
+        push_u16(&mut bytes, 0); // menu
+        push_u16(&mut bytes, 0); // class
+        push_utf16z(&mut bytes, "DialogTitle");
+        align4(&mut bytes);
+        push_u32(&mut bytes, WS_CHILD | WS_VISIBLE);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, 5); // x
+        push_u16(&mut bytes, 6); // y
+        push_u16(&mut bytes, 40); // cx
+        push_u16(&mut bytes, 12); // cy
+        push_u16(&mut bytes, 7); // id
+        push_u16(&mut bytes, 0xFFFF); // ordinal class
+        push_u16(&mut bytes, 0x0080); // button
+        push_utf16z(&mut bytes, "OK");
+        push_u16(&mut bytes, 2); // 2 bytes of creation data
+        push_u16(&mut bytes, 0xbeef);
+        align4(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn dialog_template_malformed_truncation_is_rejected() {
+        let template = sample_dialog_template();
+        let error = parse_dialog_template(&template[..template.len() / 2]).unwrap_err();
+        assert_eq!(error.message, "truncated dialog template");
+    }
+
+    #[test]
+    fn dialog_template_control_ids_mismatch_is_rejected() {
+        let mut user32 = User32Subsystem::new(KeyboardLayoutId::Us);
+        let template = sample_dialog_template();
+        let hwnd = user32
+            .create_dialog_from_template(&template, 0, "fallback", 1)
+            .expect("create dialog");
+        let parse = parse_dialog_template(&template).expect("parse template");
+        assert_eq!(parse.title, "DialogTitle");
+        assert_eq!(parse.items.len(), 1);
+        assert_eq!(parse.items[0].id, 7);
+        assert_eq!(parse.items[0].class_atom, 0x0080);
+        let child = user32
+            .window_previews()
+            .into_iter()
+            .find(|preview| preview.parent == Some(hwnd) && preview.control_id == 7)
+            .expect("dialog control");
+        assert_eq!(child.class_name, "button");
+        assert_eq!(child.title, "OK");
+        assert_eq!(user32.get_parent(child.hwnd), hwnd);
     }
 }
 

@@ -2021,16 +2021,44 @@ impl Drop for DownloadInFlightGuard {
     }
 }
 
+/// Maximum size of a single guest-requested download.
+const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The only protocols `curl` may use for the request and for redirects.
+///
+/// The first list stops a `file:`/`scp:` request; the redirect list stops a
+/// server from bouncing an allowed http(s) URL to a protocol that reads host
+/// files or speaks to arbitrary services.
+const DOWNLOAD_PROTOCOLS: &str = "=https,http";
+
+/// Origins allowed to drive the privileged CEF query handlers.
+///
+/// Queries from these hosts may open URLs, download files, read/write cookies
+/// and execute script; a query claiming any other origin is refused before the
+/// side effect happens.
+const ALLOWED_QUERY_ORIGINS: &[&str] = &[
+    "steampowered.com",
+    "steamcommunity.com",
+    "steamloopback.host",
+    "localhost",
+];
+
 /// Reduce an untrusted download filename to a safe bare basename.
 ///
-/// Rejects path separators (`/`, `\`), `..`, leading dots, and empty or
-/// overlong names, so a crafted filename cannot escape the Downloads dir.
+/// Rejects path separators (`/`, `\`), `..`, leading dots, control characters,
+/// and empty or overlong names, so a crafted filename cannot escape the
+/// Downloads dir or smuggle terminal control sequences into logs.
 fn sanitize_download_filename(name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 255 {
         return None;
     }
-    if name.contains('/') || name.contains('\\') || name.contains("..") || name.starts_with('.') {
+    if name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.starts_with('.')
+        || name.chars().any(char::is_control)
+    {
         return None;
     }
     Some(name.to_string())
@@ -2038,11 +2066,152 @@ fn sanitize_download_filename(name: &str) -> Option<String> {
 
 /// The directory downloads are written to: the user's ~/Downloads.
 fn downloads_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(directory) = DOWNLOADS_DIR_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return directory;
+        }
+    }
     if let Some(home) = std::env::var_os("HOME") {
         std::path::PathBuf::from(home).join("Downloads")
     } else {
         std::path::PathBuf::from("/tmp")
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only redirect of the download destination (never the real
+    /// ~/Downloads directory).
+    static DOWNLOADS_DIR_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_downloads_dir_override(directory: Option<std::path::PathBuf>) {
+    DOWNLOADS_DIR_OVERRIDE.with(|slot| *slot.borrow_mut() = directory);
+}
+
+/// Parse the host of a query origin and require an acceptable transport.
+///
+/// `https` is required for every real origin; plain `http` is accepted only
+/// for the loopback host Steam uses for its own UI.
+fn query_origin_host(origin: &str) -> Option<String> {
+    let parsed = url::Url::parse(origin.trim()).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    match parsed.scheme() {
+        "https" => Some(host),
+        "http" if host == "localhost" || host == "steamloopback.host" => Some(host),
+        _ => None,
+    }
+}
+
+/// Whether `origin` is (a subdomain of) an allowlisted Steam host.
+fn query_origin_allowed(origin: &str) -> bool {
+    let Some(host) = query_origin_host(origin) else {
+        return false;
+    };
+    ALLOWED_QUERY_ORIGINS
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+}
+
+/// The effective origin of a query: the explicit `origin` field when present,
+/// otherwise the browser's current URL.  An empty origin never matches.
+fn query_origin<'a>(query: &'a serde_json::Value, current_url: &'a str) -> &'a str {
+    query
+        .get("origin")
+        .and_then(|value| value.as_str())
+        .filter(|origin| !origin.trim().is_empty())
+        .unwrap_or(current_url)
+}
+
+/// Whether this query may perform a privileged side effect.
+fn privileged_query_origin_allowed(query: &serde_json::Value, current_url: &str) -> bool {
+    query_origin_allowed(query_origin(query, current_url))
+}
+
+/// Parse a download URL, accepting only http(s).
+fn download_url(url: &str) -> Option<url::Url> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then_some(parsed)
+}
+
+/// The `curl` arguments for a checked download: protocol allowlists for the
+/// request and redirects, a hard size cap, and the sanitized destination.
+fn download_curl_args(destination: &std::path::Path, url: &str) -> Vec<String> {
+    vec![
+        "-L".to_string(),
+        "--proto".to_string(),
+        DOWNLOAD_PROTOCOLS.to_string(),
+        "--proto-redir".to_string(),
+        DOWNLOAD_PROTOCOLS.to_string(),
+        "--max-filesize".to_string(),
+        MAX_DOWNLOAD_BYTES.to_string(),
+        "-o".to_string(),
+        destination.to_string_lossy().into_owned(),
+        url.to_string(),
+    ]
+}
+
+/// The program used to fetch a guest download.
+fn download_program() -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(program) = DOWNLOAD_PROGRAM_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return program;
+        }
+    }
+    std::path::PathBuf::from("curl")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only redirect of the download program (never a real network fetch).
+    static DOWNLOAD_PROGRAM_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_download_program_override(program: Option<std::path::PathBuf>) {
+    DOWNLOAD_PROGRAM_OVERRIDE.with(|slot| *slot.borrow_mut() = program);
+}
+
+/// Finish a completed download: enforce the size cap and quarantine the file
+/// before it becomes visible to the host.  Fails closed.
+fn complete_download(path: &std::path::Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("download output missing at {}: {error}", path.display()))?;
+    if metadata.len() > MAX_DOWNLOAD_BYTES {
+        let _ = std::fs::remove_file(path);
+        return Err(format!(
+            "download exceeds {MAX_DOWNLOAD_BYTES}-byte cap ({})",
+            metadata.len()
+        ));
+    }
+    crate::runtime::quarantine_guest_file(path)
+        .map_err(|error| format!("download quarantine failed: {}", error.message))
+}
+
+/// Run one checked download synchronously.  Used by the background worker and
+/// directly by tests so every exit path is exercised without a network.
+fn run_download(
+    program: &std::path::Path,
+    destination: &std::path::Path,
+    url: &str,
+) -> Result<(), String> {
+    let output = std::process::Command::new(program)
+        .args(download_curl_args(destination, url))
+        .output()
+        .map_err(|error| format!("download spawn failed: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "download failed: exit={:?} stderr={stderr}",
+            output.status.code()
+        ));
+    }
+    complete_download(destination)
 }
 
 impl CefBridge {
@@ -4629,6 +4798,14 @@ impl CefBridge {
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+        // Privileged handlers validate this against the Steam origin allowlist
+        // before performing any side effect.
+        let current_url = self
+            .browsers
+            .values()
+            .next()
+            .map(|browser| browser.current_url.clone())
+            .unwrap_or_default();
 
         // Helper: navigate the first available browser to a URL
         let navigate_to = |bridge: &mut Self, url: &str| -> AppResult<()> {
@@ -4660,8 +4837,8 @@ impl CefBridge {
                 })
             }
 
-            // Handle file downloads — trigger macOS download via NSWorkspace
-            // or save to Downloads folder
+            // Handle file downloads — checked origin, filename, protocol and
+            // size, then save into the Downloads folder and quarantine it.
             "download" => {
                 let url = request;
                 let filename = query
@@ -4672,61 +4849,58 @@ impl CefBridge {
                 // untrusted: reject path separators, `..`, and leading dots,
                 // and force the destination into the user's Downloads dir.
                 let safe_filename = sanitize_download_filename(filename);
-                // Only http/https URLs may be downloaded.
-                let url_is_http = url::Url::parse(url)
-                    .map(|u| matches!(u.scheme(), "http" | "https"))
-                    .unwrap_or(false);
-                if let Some(name) = safe_filename
-                    && url_is_http
-                    && !url.is_empty()
+                let parsed_url = download_url(url);
+                if !privileged_query_origin_allowed(&query, &current_url) {
+                    serde_json::json!({
+                        "success": false,
+                        "requestId": request_id,
+                        "result": "download_rejected",
+                        "error": "origin not allowed",
+                    })
+                } else if let Some(name) = safe_filename
+                    && let Some(parsed_url) = parsed_url
                     && ACTIVE_DOWNLOADS.load(Ordering::Relaxed) < MAX_CONCURRENT_DOWNLOADS
                 {
                     eprintln!(
                         "[CefBridge] dispatch_cef_query: download requested url={url} filename={name}",
                     );
-                    let dest = downloads_dir().join(name);
-                    let url_copy = url.to_string();
+                    let dest = downloads_dir().join(&name);
+                    let url_copy = parsed_url.to_string();
+                    let program = download_program();
                     ACTIVE_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
                     std::thread::spawn(move || {
                         // Guard decrements the counter on every exit path.
                         let _guard = DownloadInFlightGuard;
-                        let result = std::process::Command::new("curl")
-                            .args(["-L", "-o", &dest.to_string_lossy(), &url_copy])
-                            .output();
-                        match result {
-                            Ok(output) if output.status.success() => {
-                                eprintln!(
-                                    "[CefBridge] download completed: {} -> {}",
-                                    url_copy,
-                                    dest.display()
-                                );
-                            }
-                            Ok(output) => {
-                                eprintln!(
-                                    "[CefBridge] download failed: {} exit={:?} stderr={}",
-                                    url_copy,
-                                    output.status.code(),
-                                    String::from_utf8_lossy(&output.stderr),
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("[CefBridge] download error for {url_copy}: {e}");
+                        match run_download(&program, &dest, &url_copy) {
+                            Ok(()) => eprintln!(
+                                "[CefBridge] download completed: {} -> {}",
+                                url_copy,
+                                dest.display()
+                            ),
+                            Err(error) => {
+                                eprintln!("[CefBridge] download rejected for {url_copy}: {error}")
                             }
                         }
                     });
+                    serde_json::json!({
+                        "success": true,
+                        "requestId": request_id,
+                        "result": "download_started",
+                        "filename": name,
+                    })
                 } else {
                     eprintln!(
                         "[CefBridge] dispatch_cef_query: download rejected url={url} \
                          filename={filename} (unsafe filename, non-http(s) URL, \
                          or too many concurrent downloads)",
                     );
+                    serde_json::json!({
+                        "success": false,
+                        "requestId": request_id,
+                        "result": "download_rejected",
+                        "error": "unsafe filename, non-http(s) URL, or too many concurrent downloads",
+                    })
                 }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "download_started",
-                    "filename": filename,
-                })
             }
 
             // Handle authentication credentials requests
@@ -4748,20 +4922,49 @@ impl CefBridge {
                 })
             }
 
-            // Open a URL in the system's default browser
+            // Open a URL in the system's default browser.  Only the checked
+            // host_ui classifier target is handed to `/usr/bin/open`, and the
+            // query origin must be on the Steam allowlist.
             "open_external_url" => {
-                if !request.is_empty()
-                    && let Err(e) = std::process::Command::new("open").arg(request).spawn()
-                {
-                    eprintln!(
-                        "[CefBridge] dispatch_cef_query: failed to open external URL '{request}': {e}",
-                    );
+                if !privileged_query_origin_allowed(&query, &current_url) {
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "requestId": request_id,
+                        "result": "open_rejected",
+                        "error": "origin not allowed",
+                    })
+                    .to_string());
                 }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "opened"
-                })
+                let plan = crate::runtime::classify_host_open_target(request, |_| {
+                    Err(AppError::new(
+                        ReasonCode::RcFsSandboxEscape,
+                        "CEF external open accepts URL targets only",
+                    ))
+                });
+                match plan {
+                    Ok(plan) => match crate::runtime::spawn_host_open(
+                        &crate::runtime::host_open_program(),
+                        &plan,
+                    ) {
+                        Ok(()) => serde_json::json!({
+                            "success": true,
+                            "requestId": request_id,
+                            "result": "opened"
+                        }),
+                        Err(error) => serde_json::json!({
+                            "success": false,
+                            "requestId": request_id,
+                            "result": "open_rejected",
+                            "error": error.reason(),
+                        }),
+                    },
+                    Err(reject) => serde_json::json!({
+                        "success": false,
+                        "requestId": request_id,
+                        "result": "open_rejected",
+                        "error": reject.reason(),
+                    }),
+                }
             }
 
             // Navigate to the Steam community hub
@@ -4873,6 +5076,15 @@ impl CefBridge {
 
             // Set a cookie via the cookie manager
             "set_cookie" => {
+                if !privileged_query_origin_allowed(&query, &current_url) {
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "requestId": request_id,
+                        "result": "cookie_rejected",
+                        "error": "origin not allowed",
+                    })
+                    .to_string());
+                }
                 let name = query.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let value = query.get("value").and_then(|v| v.as_str()).unwrap_or("");
                 let domain = query.get("domain").and_then(|v| v.as_str()).unwrap_or("");
@@ -4919,6 +5131,15 @@ impl CefBridge {
 
             // Get all cookies
             "get_cookies" => {
+                if !privileged_query_origin_allowed(&query, &current_url) {
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "requestId": request_id,
+                        "result": "cookies_rejected",
+                        "error": "origin not allowed",
+                    })
+                    .to_string());
+                }
                 let cache_path = self.cookie_cache_path();
                 let mgr = CefCookieManager::get_global(&cache_path);
                 let cookies = if let Ok(mgr) = mgr.lock() {
@@ -4935,6 +5156,15 @@ impl CefBridge {
 
             // Execute JavaScript in the browser context
             "execute_javascript" => {
+                if !privileged_query_origin_allowed(&query, &current_url) {
+                    return Ok(serde_json::json!({
+                        "success": false,
+                        "requestId": request_id,
+                        "result": "script_rejected",
+                        "error": "origin not allowed",
+                    })
+                    .to_string());
+                }
                 let script = request;
                 if let Some(&bh) = self.browsers.keys().next()
                     && let Err(error) = self.cef_frame_execute_java_script(bh, 0, script)
@@ -5636,329 +5866,9 @@ impl SteamWebHelperShim {
     /// Returns a JSON response string to be delivered via
     /// `window.externalCallback(response)` in the web page.
     pub fn handle_cef_query(&mut self, query_json: &str) -> AppResult<String> {
-        // Parse the query JSON
-        let query: serde_json::Value = serde_json::from_str(query_json).map_err(|e| {
-            AppError::new(
-                ReasonCode::RcCliInvalid,
-                format!("handle_cef_query: invalid JSON: {e}"),
-            )
-        })?;
-
-        let request = query.get("request").and_then(|v| v.as_str()).unwrap_or("");
-        let request_id = query.get("requestId").and_then(|v| v.as_u64()).unwrap_or(0);
-        let query_type = query
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        let response = match query_type {
-            "store_navigation" => {
-                let store_url = format!("https://store.steampowered.com{}", request);
-                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
-                    self.bridge.cef_frame_load_url(browser_handle, &store_url)?;
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "navigated"
-                })
-            }
-            "community_navigation" => {
-                let community_url = format!("https://steamcommunity.com{}", request);
-                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
-                    self.bridge
-                        .cef_frame_load_url(browser_handle, &community_url)?;
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "navigated"
-                })
-            }
-            "library_navigation" => {
-                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
-                    self.bridge.cef_frame_load_url(
-                        browser_handle,
-                        "https://steamcommunity.com/my/games",
-                    )?;
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "navigated"
-                })
-            }
-            "friends_navigation" => {
-                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
-                    self.bridge.cef_frame_load_url(
-                        browser_handle,
-                        "https://steamcommunity.com/my/friends",
-                    )?;
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "navigated"
-                })
-            }
-            "settings_navigation" => {
-                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
-                    self.bridge.cef_frame_load_url(
-                        browser_handle,
-                        "https://steamcommunity.com/my/settings",
-                    )?;
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "navigated"
-                })
-            }
-            "login" => {
-                if let Some(&browser_handle) = self.bridge.browsers().keys().next() {
-                    self.bridge
-                        .cef_frame_load_url(browser_handle, "https://steamcommunity.com/login")?;
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "login_initiated"
-                })
-            }
-            "download" => {
-                // Acknowledge download request — WKWebView handles downloads natively.
-                let filename = query
-                    .get("filename")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("download");
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "download_started",
-                    "filename": filename,
-                })
-            }
-            "auth_credentials" => {
-                let realm = query.get("realm").and_then(|v| v.as_str()).unwrap_or("");
-                let host = query.get("host").and_then(|v| v.as_str()).unwrap_or("");
-                eprintln!(
-                    "[CefBridge] handle_cef_query: auth_credentials realm=\"{realm}\" host=\"{host}\"",
-                );
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "cancel",
-                    "error": "user cancelled authentication"
-                })
-            }
-            "open_external_url" => {
-                if !request.is_empty()
-                    && let Err(e) = std::process::Command::new("open").arg(request).spawn()
-                {
-                    eprintln!(
-                        "[CefBridge] handle_cef_query: failed to open external URL '{request}': {e}",
-                    );
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "opened"
-                })
-            }
-            "browser_back" => {
-                if let Some(&bh) = self.bridge.browsers().keys().next()
-                    && let Err(error) = self.bridge.cef_browser_go_back(bh)
-                {
-                    eprintln!("[CefBridge] SteamWebHelper browser_back failed: {}", error);
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "navigated_back"
-                })
-            }
-            "browser_forward" => {
-                if let Some(&bh) = self.bridge.browsers().keys().next()
-                    && let Err(error) = self.bridge.cef_browser_go_forward(bh)
-                {
-                    eprintln!(
-                        "[CefBridge] SteamWebHelper browser_forward failed: {}",
-                        error
-                    );
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "navigated_forward"
-                })
-            }
-            "browser_reload" => {
-                if let Some(&bh) = self.bridge.browsers().keys().next()
-                    && let Err(error) = self.bridge.cef_browser_reload(bh)
-                {
-                    eprintln!(
-                        "[CefBridge] SteamWebHelper browser_reload failed: {}",
-                        error
-                    );
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "reloaded"
-                })
-            }
-            "get_current_url" => {
-                let url = self
-                    .bridge
-                    .browsers()
-                    .values()
-                    .next()
-                    .map(|b| b.current_url.clone())
-                    .unwrap_or_default();
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": url
-                })
-            }
-            "set_cookie" => {
-                let name = query.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let value = query.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                let domain = query.get("domain").and_then(|v| v.as_str()).unwrap_or("");
-                let path = query.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-                let secure = query
-                    .get("secure")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let httponly = query
-                    .get("httponly")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let same_site = query
-                    .get("same_site")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unspecified");
-                let cookie = CefCookie {
-                    name: name.to_string(),
-                    value: value.to_string(),
-                    domain: domain.to_string(),
-                    path: path.to_string(),
-                    secure,
-                    httponly,
-                    same_site: same_site.to_string(),
-                    creation: 0,
-                    last_access: 0,
-                    expires: 0,
-                };
-                // Use the same cookie store as dispatch_cef_query (the
-                // bridge's configured cache path, never the CWD).
-                let cache_path = self.bridge.cookie_cache_path();
-                let mgr = CefCookieManager::get_global(&cache_path);
-                if let Ok(mut mgr) = mgr.lock()
-                    && let Err(error) = mgr.set_cookie(cookie)
-                {
-                    eprintln!("[CefBridge] SteamWebHelper set_cookie failed: {}", error);
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "cookie_set"
-                })
-            }
-            "get_cookies" => {
-                let cache_path = self.bridge.cookie_cache_path();
-                let mgr = CefCookieManager::get_global(&cache_path);
-                let cookies = if let Ok(mgr) = mgr.lock() {
-                    mgr.visit_all_cookies()
-                } else {
-                    Vec::new()
-                };
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": cookies
-                })
-            }
-            "execute_javascript" => {
-                let script = request;
-                if let Some(&bh) = self.bridge.browsers().keys().next()
-                    && let Err(error) = self.bridge.cef_frame_execute_java_script(bh, 0, script)
-                {
-                    eprintln!(
-                        "[CefBridge] SteamWebHelper execute_javascript failed: {}",
-                        error
-                    );
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": "script_executed"
-                })
-            }
-            "get_dimensions" => {
-                // Extract wk_handle first to avoid borrow conflicts
-                let wk_handle = self
-                    .bridge
-                    .browsers()
-                    .values()
-                    .next()
-                    .and_then(|b| b.wk_handle);
-                let (w, h) = if let Some(wk) = wk_handle {
-                    self.bridge
-                        .webview_manager
-                        .as_ref()
-                        .and_then(|mgr| mgr.dimensions(wk))
-                        .unwrap_or((1280.0, 720.0))
-                } else {
-                    (1280.0, 720.0)
-                };
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": { "width": w, "height": h }
-                })
-            }
-            "resize" => {
-                let w = query
-                    .get("width")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1280.0);
-                let h = query
-                    .get("height")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(720.0);
-                // Extract wk_handle first to avoid borrow conflicts
-                let wk_handle = self
-                    .bridge
-                    .browsers()
-                    .values()
-                    .next()
-                    .and_then(|b| b.wk_handle);
-                if let Some(wk) = wk_handle
-                    && let Some(mgr) = self.bridge.webview_manager.as_mut()
-                {
-                    let _ = mgr.resize(wk, w, h);
-                }
-                serde_json::json!({
-                    "success": true,
-                    "requestId": request_id,
-                    "result": { "width": w, "height": h }
-                })
-            }
-            _ => {
-                // Unknown query type — log and return error
-                eprintln!(
-                    "[CefBridge] handle_cef_query: unknown query type=\"{query_type}\" request=\"{request}\"",
-                );
-                serde_json::json!({
-                    "success": false,
-                    "requestId": request_id,
-                    "error": format!("unknown query type: {query_type}")
-                })
-            }
-        };
-
-        Ok(response.to_string())
+        // Single implementation: the bridge owns query dispatch so the two
+        // copies can never drift (origin checks, download checks, etc.).
+        self.bridge.dispatch_cef_query(query_json)
     }
 
     /// Inject the CefQuery bridge JavaScript into all WKWebView instances.
@@ -7755,4 +7665,447 @@ mod tests {
     // -----------------------------------------------------------------------
     // Thread safety tests
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // CefQuery origin allowlist and checked download tests
+    // -----------------------------------------------------------------------
+
+    fn query_bridge_with_cache(directory: &tempfile::TempDir) -> CefBridge {
+        let mut bridge = CefBridge::new();
+        bridge.settings.cache_path = Some(directory.path().to_string_lossy().into_owned());
+        bridge
+    }
+
+    fn query_json(value: serde_json::Value) -> String {
+        value.to_string()
+    }
+
+    #[test]
+    fn cef_privileged_queries_reject_untrusted_origin_every_time() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let mut bridge = query_bridge_with_cache(&directory);
+        for (query_type, expected_result) in [
+            ("download", "download_rejected"),
+            ("open_external_url", "open_rejected"),
+            ("set_cookie", "cookie_rejected"),
+            ("get_cookies", "cookies_rejected"),
+            ("execute_javascript", "script_rejected"),
+        ] {
+            for origin in [
+                "https://evil.example",
+                "https://store.steampowered.com.evil.example",
+                "javascript:alert(1)",
+                "",
+            ] {
+                let response = bridge
+                    .dispatch_cef_query(&query_json(serde_json::json!({
+                        "type": query_type,
+                        "request": "https://store.steampowered.com/",
+                        "filename": "safe.txt",
+                        "origin": origin,
+                        "name": "sid",
+                        "value": "x",
+                        "domain": "store.steampowered.com",
+                    })))
+                    .expect("query dispatch");
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&response).expect("response JSON");
+                assert_eq!(
+                    parsed["success"], false,
+                    "type={query_type} origin={origin}"
+                );
+                assert_eq!(parsed["error"], "origin not allowed");
+                assert_eq!(parsed["result"], expected_result);
+            }
+        }
+    }
+
+    #[test]
+    fn cef_query_origin_allowlist_rejects_boundary_hosts() {
+        for allowed in [
+            "https://store.steampowered.com",
+            "https://steamcommunity.com/my",
+            "https://help.steampowered.com",
+            "https://steamloopback.host/index.html",
+            "http://localhost:8080",
+        ] {
+            assert_eq!(
+                query_origin_allowed(allowed),
+                true,
+                "{allowed} must be allowed"
+            );
+        }
+        for rejected in [
+            "https://evil.example",
+            "https://steampowered.com.evil.example",
+            "https://notsteampowered.com",
+            "http://store.steampowered.com",
+            "file:///etc/passwd",
+            "about:blank",
+            "",
+        ] {
+            assert!(
+                !query_origin_allowed(rejected),
+                "{rejected} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cef_trusted_origin_still_rejects_unsafe_targets_and_filename_boundaries() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let mut bridge = query_bridge_with_cache(&directory);
+        let origin = "https://store.steampowered.com";
+
+        // Trusted origin permits script execution (no browser → no side effect).
+        let script = bridge
+            .dispatch_cef_query(&query_json(serde_json::json!({
+                "type": "execute_javascript",
+                "request": "0",
+                "origin": origin,
+            })))
+            .expect("script query");
+        let script: serde_json::Value = serde_json::from_str(&script).expect("script JSON");
+        assert_eq!(script["success"], true);
+        assert_eq!(script["result"], "script_executed");
+
+        // Trusted origin permits cookie round-trips in the configured store.
+        let set = bridge
+            .dispatch_cef_query(&query_json(serde_json::json!({
+                "type": "set_cookie",
+                "origin": origin,
+                "name": "sid",
+                "value": "abc",
+                "domain": "store.steampowered.com",
+            })))
+            .expect("set cookie");
+        let set: serde_json::Value = serde_json::from_str(&set).expect("set JSON");
+        assert_eq!(set["success"], true);
+        assert_eq!(set["result"], "cookie_set");
+        let get = bridge
+            .dispatch_cef_query(&query_json(serde_json::json!({
+                "type": "get_cookies",
+                "origin": origin,
+            })))
+            .expect("get cookies");
+        let get: serde_json::Value = serde_json::from_str(&get).expect("get JSON");
+        assert_eq!(get["success"], true);
+        assert_eq!(get["result"][0]["name"], "sid");
+
+        // Trusted origin is not enough for traversal, file URLs or non-URL opens.
+        for (query_type, request, filename, expected) in [
+            (
+                "download",
+                "https://store.steampowered.com/x",
+                "../escape",
+                "unsafe filename, non-http(s) URL, or too many concurrent downloads",
+            ),
+            (
+                "download",
+                "file:///etc/passwd",
+                "passwd",
+                "unsafe filename, non-http(s) URL, or too many concurrent downloads",
+            ),
+            (
+                "open_external_url",
+                "C:\\\\game\\\\payload.sh",
+                "",
+                "guest path did not resolve inside the GE",
+            ),
+            (
+                "open_external_url",
+                "javascript:alert(1)",
+                "",
+                "url scheme outside http/https/mailto",
+            ),
+        ] {
+            let response = bridge
+                .dispatch_cef_query(&query_json(serde_json::json!({
+                    "type": query_type,
+                    "request": request,
+                    "filename": filename,
+                    "origin": origin,
+                })))
+                .expect("query dispatch");
+            let parsed: serde_json::Value = serde_json::from_str(&response).expect("response JSON");
+            assert_eq!(
+                parsed["success"], false,
+                "type={query_type} request={request}"
+            );
+            assert_eq!(
+                parsed["error"], expected,
+                "type={query_type} request={request}"
+            );
+        }
+
+        // A trusted URL open uses the checked host_ui path only.
+        crate::runtime::set_host_open_program_override(Some(std::path::PathBuf::from(
+            "/usr/bin/true",
+        )));
+        let opened = bridge
+            .dispatch_cef_query(&query_json(serde_json::json!({
+                "type": "open_external_url",
+                "request": "https://store.steampowered.com/app/730",
+                "origin": origin,
+            })))
+            .expect("open query");
+        crate::runtime::set_host_open_program_override(None);
+        let opened: serde_json::Value = serde_json::from_str(&opened).expect("open JSON");
+        assert_eq!(opened["success"], true);
+        assert_eq!(opened["result"], "opened");
+    }
+
+    #[test]
+    fn cef_download_filename_url_and_curl_arguments_reject_unsafe_inputs() {
+        for unsafe_name in [
+            "../escape.txt",
+            "sub/dir.txt",
+            "sub\\dir.txt",
+            ".hidden",
+            "line\nbreak",
+            "tab\tname",
+            "",
+        ] {
+            assert_eq!(
+                sanitize_download_filename(unsafe_name),
+                None,
+                "{unsafe_name:?}"
+            );
+        }
+        assert_eq!(
+            sanitize_download_filename("  steam_setup.dmg  "),
+            Some("steam_setup.dmg".to_string())
+        );
+        assert_eq!(
+            sanitize_download_filename(&"a".repeat(256)),
+            None,
+            "overlong names must be rejected"
+        );
+
+        for rejected in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/plain,x",
+            "ftp://example.com/x",
+            "not a url",
+            "",
+        ] {
+            assert_eq!(download_url(rejected), None, "{rejected} must be rejected");
+        }
+        assert_eq!(
+            download_url("https://store.steampowered.com/x")
+                .expect("https allowed")
+                .scheme(),
+            "https"
+        );
+
+        let args = download_curl_args(
+            std::path::Path::new("/tmp/casa1-download.bin"),
+            "https://store.steampowered.com/x",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-L".to_string(),
+                "--proto".to_string(),
+                "=https,http".to_string(),
+                "--proto-redir".to_string(),
+                "=https,http".to_string(),
+                "--max-filesize".to_string(),
+                MAX_DOWNLOAD_BYTES.to_string(),
+                "-o".to_string(),
+                "/tmp/casa1-download.bin".to_string(),
+                "https://store.steampowered.com/x".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cef_download_completion_rejects_oversize_and_quarantines_boundary() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let missing = directory.path().join("missing.bin");
+        assert_eq!(
+            complete_download(&missing).unwrap_err(),
+            format!(
+                "download output missing at {}: No such file or directory (os error 2)",
+                missing.display()
+            )
+        );
+
+        let oversize = directory.path().join("oversize.bin");
+        let file = std::fs::File::create(&oversize).expect("create oversize");
+        file.set_len(MAX_DOWNLOAD_BYTES + 1).expect("set length");
+        let error = complete_download(&oversize).expect_err("size cap must fail closed");
+        assert!(error.starts_with("download exceeds "), "{error}");
+        assert!(!oversize.exists(), "oversize output must be removed");
+
+        let accepted = directory.path().join("accepted.bin");
+        std::fs::write(&accepted, b"payload").expect("write accepted");
+        assert_eq!(complete_download(&accepted), Ok(()));
+        let mut buffer = [0_u8; 64];
+        let c_path = std::ffi::CString::new(accepted.as_os_str().as_encoded_bytes()).expect("path");
+        let c_name =
+            std::ffi::CString::new(crate::real_fs::XATTR_COM_APPLE_QUARANTINE).expect("xattr name");
+        let read = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+                0,
+            )
+        };
+        assert_ne!(read, -1, "accepted download must be quarantined");
+    }
+
+    #[test]
+    fn cef_download_worker_failure_paths_are_rejected() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let dest = directory.path().join("out.bin");
+        let missing_program = directory.path().join("no-such-program");
+        let spawn_error = run_download(&missing_program, &dest, "https://example.com/x")
+            .expect_err("missing program must fail");
+        assert!(
+            spawn_error.starts_with("download spawn failed: "),
+            "{spawn_error}"
+        );
+
+        let failed = run_download(
+            std::path::Path::new("/usr/bin/false"),
+            &dest,
+            "https://example.com/x",
+        )
+        .expect_err("nonzero exit must fail");
+        assert!(failed.starts_with("download failed: exit="), "{failed}");
+
+        use std::os::unix::fs::PermissionsExt;
+        let writer = directory.path().join("fake-curl.sh");
+        std::fs::write(
+            &writer,
+            "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then shift; out=\"$1\"; fi\n  shift\ndone\nprintf payload > \"$out\"\n",
+        )
+        .expect("write fake curl");
+        let mut permissions = std::fs::metadata(&writer)
+            .expect("stat fake curl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&writer, permissions).expect("chmod fake curl");
+        assert_eq!(
+            run_download(&writer, &dest, "https://example.com/x"),
+            Ok(())
+        );
+        assert_eq!(std::fs::read(&dest).expect("read downloaded"), b"payload");
+    }
+
+    #[test]
+    fn cef_download_dispatch_allowed_origin_spawns_worker_and_pins_started_response() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let downloads = directory.path().join("downloads");
+        std::fs::create_dir_all(&downloads).expect("create downloads dir");
+        set_downloads_dir_override(Some(downloads.clone()));
+        let writer = directory.path().join("fake-curl.sh");
+        std::fs::write(
+            &writer,
+            "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then shift; out=\"$1\"; fi\n  shift\ndone\nprintf payload > \"$out\"\n",
+        )
+        .expect("write fake curl");
+        let mut permissions = std::fs::metadata(&writer)
+            .expect("stat fake curl")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&writer, permissions).expect("chmod fake curl");
+        set_download_program_override(Some(writer));
+
+        let mut bridge = query_bridge_with_cache(&directory);
+        let response = bridge
+            .dispatch_cef_query(&query_json(serde_json::json!({
+                "type": "download",
+                "request": "https://store.steampowered.com/app/730",
+                "filename": "payload.bin",
+                "origin": "https://store.steampowered.com",
+            })))
+            .expect("download query");
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("download JSON");
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["result"], "download_started");
+        assert_eq!(parsed["filename"], "payload.bin");
+
+        // The detached worker completes, quarantines and decrements the
+        // in-flight counter; wait for it so coverage sees the worker body.
+        let destination = downloads.join("payload.bin");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !destination.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        while ACTIVE_DOWNLOADS.load(Ordering::Relaxed) != 0 && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read(&destination).expect("downloaded payload"),
+            b"payload"
+        );
+        assert_eq!(ACTIVE_DOWNLOADS.load(Ordering::Relaxed), 0);
+
+        // A worker whose fetch fails logs the rejection and still releases
+        // the in-flight slot.
+        set_download_program_override(Some(std::path::PathBuf::from("/usr/bin/false")));
+        let failed = bridge
+            .dispatch_cef_query(&query_json(serde_json::json!({
+                "type": "download",
+                "request": "https://store.steampowered.com/app/730",
+                "filename": "failed.bin",
+                "origin": "https://store.steampowered.com",
+            })))
+            .expect("failed download query");
+        let failed: serde_json::Value = serde_json::from_str(&failed).expect("failed JSON");
+        assert_eq!(failed["success"], true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ACTIVE_DOWNLOADS.load(Ordering::Relaxed) != 0 && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(ACTIVE_DOWNLOADS.load(Ordering::Relaxed), 0);
+        set_download_program_override(None);
+        set_downloads_dir_override(None);
+        // With no override the real ~/Downloads (or /tmp) path is used; this
+        // only verifies the fallback path is well formed.
+        assert!(!downloads_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn cef_open_external_url_spawn_failure_is_rejected_not_faked() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let mut bridge = query_bridge_with_cache(&directory);
+        crate::runtime::set_host_open_program_override(Some(std::path::PathBuf::from(
+            "/nonexistent/casa1-open",
+        )));
+        let response = bridge
+            .dispatch_cef_query(&query_json(serde_json::json!({
+                "type": "open_external_url",
+                "request": "https://store.steampowered.com/app/730",
+                "origin": "https://store.steampowered.com",
+            })))
+            .expect("open query");
+        crate::runtime::set_host_open_program_override(None);
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("open JSON");
+        assert_eq!(parsed["success"], false);
+        assert_eq!(parsed["result"], "open_rejected");
+        assert_eq!(parsed["error"], "host open program failed to start");
+    }
+
+    #[test]
+    fn steam_web_helper_query_delegation_rejects_invalid_json() {
+        let mut shim = SteamWebHelperShim::new(
+            "https://store.steampowered.com".to_string(),
+            SteamRenderMode::Headless,
+        );
+        let error = shim
+            .handle_cef_query("not json")
+            .expect_err("invalid JSON must be rejected by the single implementation");
+        assert_eq!(error.code, ReasonCode::RcCliInvalid);
+        assert!(error.message.contains("invalid JSON"));
+    }
 }

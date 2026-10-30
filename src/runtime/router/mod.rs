@@ -1,8 +1,397 @@
 //! The thunk dispatch router: the `dispatch_import` match (verbatim).
 
 use super::*;
+use std::sync::Condvar;
+use std::time::{Duration, Instant};
+
+/// `E_ACCESSDENIED`: HRESULT returned by `IContextMenu::InvokeCommand`
+/// when the checked HostOpen classifier refuses a target.
+const E_ACCESSDENIED: u32 = 0x8007_0005;
+
+/// `CW_USEDEFAULT`: the Win32 sentinel asking the system to pick the
+/// coordinate/size (0x8000_0000 as `INT`, `i32::MIN` bit-for-bit).
+const CW_USEDEFAULT: u32 = 0x8000_0000;
+
+/// Pixel step between cascaded defaulted top-level windows.
+const CASCADE_STEP: i32 = 32;
+
+/// Number of cascade slots before the offset wraps back to the origin
+/// (keeps every cascaded default window inside the work area).
+const CASCADE_SLOTS: u32 = 8;
+
+/// Bounded housekeeping fallback for the `GetMessageW` idle wait when no
+/// `SetTimer` is armed.  This is not a per-poll sleep: a timer deadline (when
+/// present) or any pump notification wakes the condvar immediately, and this
+/// value only bounds the wait when nothing else can.
+const PUMP_IDLE_FALLBACK: Duration = Duration::from_millis(100);
+
+/// Idle-wake signal for the emulated message pump.
+///
+/// `GetMessageW` blocks on this condvar with the next `SetTimer` deadline
+/// instead of sleeping a fixed 16 ms/1 ms per poll.  The pattern mirrors
+/// `scheduler::PumpWake`: the waiter observes the epoch before running its
+/// readiness checks, and every wake source in this router (the
+/// `CreateTimerQueueTimer`/timer-queue workers) advances the epoch and
+/// notifies, so a wake that arrives before the wait starts is never lost.
+struct PumpIdle {
+    epoch: std::sync::Mutex<u64>,
+    wake: Condvar,
+}
+
+impl PumpIdle {
+    const fn new() -> Self {
+        Self {
+            epoch: std::sync::Mutex::new(0),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Current wake epoch (observed before the readiness checks).
+    fn epoch(&self) -> u64 {
+        *self
+            .epoch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Publish a wake: the epoch always advances, so a notification issued
+    /// with no waiter is still observed by the next wait.
+    fn notify(&self) {
+        let mut epoch = self
+            .epoch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *epoch = epoch.wrapping_add(1);
+        drop(epoch);
+        self.wake.notify_all();
+    }
+
+    /// Block until the epoch differs from `observed` or `deadline` passes.
+    fn wait_until(&self, observed: u64, deadline: Instant) {
+        let mut epoch = self
+            .epoch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if *epoch != observed {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let (guard, _) = self
+                .wake
+                .wait_timeout(epoch, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            epoch = guard;
+        }
+    }
+}
+
+/// Process-wide message-pump idle wake (one emulator UI thread waits here).
+static PUMP_IDLE: PumpIdle = PumpIdle::new();
+
+/// Wake a blocked `GetMessageW` idle wait.  Safe from any host thread.
+pub(crate) fn notify_pump_idle() {
+    PUMP_IDLE.notify();
+}
+
+/// How long the `GetMessageW` idle path may block.
+///
+/// `next_timer` is `user32::next_timer_timeout()` — the time until the next
+/// armed `SetTimer`.  A due timer wakes the wait exactly on time; without one
+/// the bounded housekeeping fallback applies.  Either way the wait is a
+/// condvar block, never a fixed polling sleep.
+fn pump_idle_budget(next_timer: Option<Duration>) -> Duration {
+    next_timer.unwrap_or(PUMP_IDLE_FALLBACK)
+}
+
+/// Resolve one `CreateWindowEx` geometry against the emulated work area.
+///
+/// `CW_USEDEFAULT` x/y become a cascade slot inside the work area and a
+/// default width/height becomes the system default of about two thirds of
+/// the work area.  Explicit values pass through unchanged (still floored at
+/// one pixel, as before).
+fn resolve_create_window_geometry(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    work_area: (i32, i32, u32, u32),
+    cascade_ordinal: u32,
+) -> (i32, i32, u32, u32) {
+    let (work_x, work_y, work_w, work_h) = work_area;
+    let slot = (cascade_ordinal % CASCADE_SLOTS) as i32 * CASCADE_STEP;
+    let default_width = ((work_w * 2) / 3).max(1);
+    let default_height = ((work_h * 2) / 3).max(1);
+    let x = if x as u32 == CW_USEDEFAULT {
+        work_x + slot
+    } else {
+        x
+    };
+    let y = if y as u32 == CW_USEDEFAULT {
+        work_y + slot
+    } else {
+        y
+    };
+    let width = if width == CW_USEDEFAULT {
+        default_width
+    } else {
+        width
+    };
+    let height = if height == CW_USEDEFAULT {
+        default_height
+    } else {
+        height
+    };
+    (x, y, width.max(1), height.max(1))
+}
+
+thread_local! {
+    /// `CreateWindowEx`'s `lpParam`, remembered per window so the queued
+    /// `WM_NCCREATE`/`WM_CREATE` dispatch can carry a real `CREATESTRUCT`
+    /// whose `lpCreateParams` is that parameter (Windows passes it during
+    /// creation; the queued messages previously carried `lParam = 0`).
+    static WINDOW_CREATE_STRUCTS: std::cell::RefCell<HashMap<u32, u64>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Remember the guest `CREATESTRUCT` pointer for a new window.
+fn remember_window_create_struct(hwnd: u32, create_struct: u64) {
+    WINDOW_CREATE_STRUCTS.with(|map| map.borrow_mut().insert(hwnd, create_struct));
+}
+
+/// The remembered `CREATESTRUCT` pointer for `hwnd`, if `lpParam` was set.
+fn window_create_struct(hwnd: u32) -> Option<u64> {
+    WINDOW_CREATE_STRUCTS.with(|map| map.borrow().get(&hwnd).copied())
+}
+
+/// Drop the remembered `CREATESTRUCT` when the window is destroyed.
+fn forget_window_create_struct(hwnd: u32) {
+    WINDOW_CREATE_STRUCTS.with(|map| map.borrow_mut().remove(&hwnd));
+}
+
+/// Everything a new window's `CREATESTRUCT` carries.
+struct CreateWindowContext<'a> {
+    class_name: &'a str,
+    title: &'a str,
+    instance: u64,
+    hmenu: u32,
+    parent: u32,
+    style: u32,
+    ex_style: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    create_param: u64,
+}
+
+/// Result of routing one shell-open target through the checked HostOpen
+/// classifier (`crate::runtime::host_ui`).
+#[derive(Debug)]
+enum HostOpenOutcome {
+    /// The checked value was handed to `/usr/bin/open` (or the allowlisted
+    /// URL was handed over) and the child was reaped in the background.
+    Opened,
+    /// Empty target: nothing to open, success without spawning.
+    Nothing,
+    /// Refused by the classifier or the executor; `reason` is a stable
+    /// short string and `detail` carries the offending value.
+    Rejected {
+        reason: &'static str,
+        detail: String,
+    },
+}
+
+/// Result of the `ShellExecuteExW` argument inspection.
+#[derive(Debug)]
+enum ShellExecuteOutcome {
+    /// Null or undersized `SHELLEXECUTEINFOW`: there is no `hInstApp`
+    /// field to write, so the caller reports failure only.
+    Malformed,
+    /// Well-formed structure: `Ok(())` when the open was performed (or
+    /// there was nothing to open), `Err((reason, detail))` when the target
+    /// or verb was refused.  Never reports success for a refused open.
+    WellFormed {
+        result: Result<(), (&'static str, String)>,
+        hinst_offset: usize,
+        process_offset: usize,
+    },
+}
+
+/// Work area of a monitor, or the legacy 1024x768 fallback when the monitor
+/// registry has no entry.  Width/height are floored at one pixel so a
+/// degenerate monitor rect never produces a zero-sized window.
+fn work_area_from_monitor(info: Option<&crate::user32::MonitorInfo>) -> (i32, i32, u32, u32) {
+    info.map(|info| {
+        (
+            info.work_rect.left,
+            info.work_rect.top,
+            (info.work_rect.right - info.work_rect.left).max(1) as u32,
+            (info.work_rect.bottom - info.work_rect.top).max(1) as u32,
+        )
+    })
+    .unwrap_or((0, 0, 1024, 768))
+}
 
 impl PeHostRuntime {
+    /// Route one `ShellExecute*`/`InvokeCommand` target through the single
+    /// checked HostOpen classifier: allowlisted URL schemes only, file
+    /// targets resolved through `win32::guest_path_to_host_path`, blocked
+    /// extensions and traversal refused, directories revealed with
+    /// `open -R`, and `/usr/bin/open` spawned with the checked value only.
+    fn run_host_open(&mut self, target: &str, force_reveal: bool) -> HostOpenOutcome {
+        let plan = classify_host_open_target(target, |guest_path| {
+            self.win32.guest_path_to_host_path(guest_path)
+        });
+        let plan = match plan {
+            Ok(HostOpenPlan::Nothing) => return HostOpenOutcome::Nothing,
+            Ok(HostOpenPlan::Url(url)) => HostOpenPlan::Url(url),
+            Ok(HostOpenPlan::Path { path, reveal }) => HostOpenPlan::Path {
+                path,
+                reveal: reveal || force_reveal,
+            },
+            Err(reject) => {
+                return HostOpenOutcome::Rejected {
+                    reason: reject.reason(),
+                    detail: reject.detail(),
+                };
+            }
+        };
+        match spawn_host_open(&host_open_program(), &plan) {
+            Ok(()) => HostOpenOutcome::Opened,
+            Err(error) => HostOpenOutcome::Rejected {
+                reason: error.reason(),
+                detail: error.detail(),
+            },
+        }
+    }
+
+    /// Write a guest-side `CREATESTRUCTW` for a new window and return its
+    /// pointer, so `CreateWindowEx`'s `lpParam` reaches the window procedure
+    /// as `CREATESTRUCT.lpCreateParams` on `WM_NCCREATE`/`WM_CREATE`.
+    fn write_window_create_struct(
+        &mut self,
+        memory: &mut MemoryImage,
+        context: &CreateWindowContext<'_>,
+    ) -> AppResult<u64> {
+        let arch = self.guest_arch;
+        // CREATESTRUCTW field offsets (x86 packs to 48 bytes, x64 aligns the
+        // two string pointers to 8 bytes and grows the struct to 80).
+        let (
+            size,
+            instance_off,
+            menu_off,
+            parent_off,
+            cy_off,
+            cx_off,
+            y_off,
+            x_off,
+            style_off,
+            name_off,
+            class_off,
+            ex_off,
+        ) = match arch {
+            GuestArch::X86 => (48_usize, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44),
+            GuestArch::X64 => (80_usize, 8, 16, 24, 32, 36, 40, 44, 48, 56, 64, 72),
+        };
+        let pointer = self.alloc_heap(memory, size, true)?;
+        let class_ptr = self.alloc_utf16_string(memory, context.class_name)?;
+        let title_ptr = self.alloc_utf16_string(memory, context.title)?;
+        write_guest_pointer(memory, pointer, context.create_param, arch)?;
+        write_guest_pointer(memory, pointer + instance_off, context.instance, arch)?;
+        write_guest_pointer(memory, pointer + menu_off, u64::from(context.hmenu), arch)?;
+        let parent = u64::from(context.parent);
+        write_guest_pointer(memory, pointer + parent_off, parent, arch)?;
+        write_u32(memory, pointer + cy_off, context.height);
+        write_u32(memory, pointer + cx_off, context.width);
+        write_u32(memory, pointer + y_off, context.y as u32);
+        write_u32(memory, pointer + x_off, context.x as u32);
+        write_u32(memory, pointer + style_off, context.style);
+        write_guest_pointer(memory, pointer + name_off, title_ptr, arch)?;
+        write_guest_pointer(memory, pointer + class_off, class_ptr, arch)?;
+        write_u32(memory, pointer + ex_off, context.ex_style);
+        Ok(pointer)
+    }
+
+    /// Write a guest-side `NCCALCSIZE_PARAMS` for the synchronous
+    /// `WM_NCCALCSIZE` sent during window creation.  `rgrc[0]` is the
+    /// proposed window rect, `rgrc[1]` the old window rect, `rgrc[2]` the
+    /// old client rect; `lppos` is NULL (the proposed rect is authoritative
+    /// during creation).
+    fn write_nccalcsize_params(&mut self, memory: &mut MemoryImage, hwnd: u32) -> AppResult<u64> {
+        let window = self.user32.get_window_rect(hwnd)?;
+        let client = self.user32.get_client_rect(hwnd)?;
+        let arch = self.guest_arch;
+        let pointer_size = arch.pointer_bytes();
+        let pointer = self.alloc_heap(memory, 48 + pointer_size, true)?;
+        for (index, rect) in [window, window, client].iter().enumerate() {
+            let base = pointer + index as u64 * 16;
+            write_u32(memory, base, rect.left as u32);
+            write_u32(memory, base + 4, rect.top as u32);
+            write_u32(memory, base + 8, rect.right as u32);
+            write_u32(memory, base + 12, rect.bottom as u32);
+        }
+        write_guest_pointer(memory, pointer + 48, 0, arch)?;
+        Ok(pointer)
+    }
+
+    /// Whether `hwnd` has a guest window procedure (or dialog procedure) that
+    /// must receive the synchronous creation messages.
+    fn window_has_guest_proc(&self, hwnd: u32) -> bool {
+        self.dialog_procs.contains_key(&hwnd)
+            || self
+                .user32
+                .get_window_long_w(hwnd, GWL_WNDPROC)
+                .is_some_and(|window_proc| window_proc != 0)
+    }
+
+    /// Resolve a `RT_DIALOG` resource from `module_handle` and return its raw
+    /// template bytes for `User32Subsystem::create_dialog_from_template`.
+    fn load_dialog_template(
+        &self,
+        module_handle: u64,
+        name: &crate::pe::ResourceName,
+    ) -> AppResult<Option<Vec<u8>>> {
+        let (module_path, _) = self.module_for_resource(module_handle)?;
+        let bytes = std::fs::read(&module_path).map_err(|_| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("cannot read module {module_path} for RT_DIALOG"),
+            )
+        })?;
+        let parsed = crate::pe::parse(&bytes).map_err(|_| {
+            AppError::new(
+                ReasonCode::RcCliInvalid,
+                format!("cannot parse module {module_path} for RT_DIALOG"),
+            )
+        })?;
+        let Some((data_rva, size)) = crate::pe::find_resource_data_entry_by_key(
+            &bytes,
+            &parsed.sections,
+            &parsed.data_directories,
+            5,
+            name,
+        )?
+        else {
+            return Ok(None);
+        };
+        crate::pe::extract_resource_payload(&bytes, &parsed.sections, data_rva, size)
+    }
+
+    /// The emulated work area of the primary monitor as `(x, y, w, h)`,
+    /// matching the `SPI_GETWORKAREA` answer (monitors are always
+    /// registered, so the closure runs for every real window).
+    fn window_work_area(&self) -> (i32, i32, u32, u32) {
+        work_area_from_monitor(
+            self.user32
+                .monitor_info(self.user32.primary_monitor_id())
+                .as_ref(),
+        )
+    }
+
     pub(crate) fn dispatch_import(
         &mut self,
         thunk_address: u64,
@@ -9715,12 +10104,14 @@ impl PeHostRuntime {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_INVALID_PARAMETER;
                 } else {
-                    match self.user32.window_state(hwnd) {
-                        Ok(window) => {
-                            let left = 0_i32;
-                            let top = 0_i32;
-                            let right = window.width as i32;
-                            let bottom = window.height as i32;
+                    let rect = match thunk {
+                        HostThunk::GetClientRect => self.user32.get_client_rect(hwnd),
+                        _ => self.user32.get_window_rect(hwnd),
+                    };
+                    match rect {
+                        Ok(rect) => {
+                            let (left, top, right, bottom) =
+                                (rect.left, rect.top, rect.right, rect.bottom);
                             memory.map_bytes(rect_ptr, &left.to_le_bytes());
                             memory.map_bytes(rect_ptr + 4, &top.to_le_bytes());
                             memory.map_bytes(rect_ptr + 8, &right.to_le_bytes());
@@ -9816,13 +10207,40 @@ impl PeHostRuntime {
                 let height = guest_call_arg(state, memory, 7)? as u32;
                 let parent = guest_call_arg(state, memory, 8)? as u32;
                 let menu_or_control = guest_call_arg(state, memory, 9)? as u32;
-                let _instance = guest_call_arg(state, memory, 10)?;
-                let _param_ptr = guest_call_arg(state, memory, 11)?;
-                let hwnd = self.user32.create_window_ex_styled(
+                let instance = guest_call_arg(state, memory, 10)?;
+                let param_ptr = guest_call_arg(state, memory, 11)?;
+                // CW_USEDEFAULT (0x8000_0000) resolves to a cascade slot and
+                // the default ~2/3-of-work-area size instead of a 2 GiB
+                // window at i32::MIN.  The cascade ordinal counts existing
+                // top-level windows so each default window steps along.
+                let needs_default_geometry = (x as u32) == CW_USEDEFAULT
+                    || (y as u32) == CW_USEDEFAULT
+                    || width == CW_USEDEFAULT
+                    || height == CW_USEDEFAULT;
+                let cascade_ordinal = if needs_default_geometry {
+                    self.user32
+                        .window_previews()
+                        .iter()
+                        .filter(|window| window.parent.is_none())
+                        .count() as u32
+                } else {
+                    0
+                };
+                let (x, y, width, height) = resolve_create_window_geometry(
+                    x,
+                    y,
+                    width,
+                    height,
+                    self.window_work_area(),
+                    cascade_ordinal,
+                );
+                let hwnd = self.user32.create_window_ex_styled_at(
                     &class_name,
                     &title,
-                    width.max(1),
-                    height.max(1),
+                    x,
+                    y,
+                    width,
+                    height,
                     style & WS_VISIBLE != 0,
                     false,
                     (parent != 0).then_some(parent),
@@ -9831,9 +10249,78 @@ impl PeHostRuntime {
                     ex_style,
                     None,
                 )?;
-                self.user32.set_window_position(hwnd, x, y)?;
                 if parent != 0 {
                     self.user32.set_window_control_id(hwnd, menu_or_control)?;
+                } else if menu_or_control != 0 {
+                    // `hMenu` on a non-child window is a real menu handle
+                    // created before the window: attach it now so GetMenu,
+                    // SetMenu and DrawMenuBar all see it.
+                    self.user32.register_menu_handle(menu_or_control);
+                    self.window_menus.insert(hwnd, menu_or_control);
+                    let _attached = self.user32.set_menu(hwnd, menu_or_control);
+                }
+                // Windows always materialises a CREATESTRUCT, even when
+                // lpParam is NULL, and delivers it synchronously to
+                // WM_NCCREATE and WM_CREATE.
+                let context = CreateWindowContext {
+                    class_name: &class_name,
+                    title: &title,
+                    instance,
+                    hmenu: menu_or_control,
+                    parent,
+                    style,
+                    ex_style,
+                    x,
+                    y,
+                    width,
+                    height,
+                    create_param: param_ptr,
+                };
+                let create_struct = self.write_window_create_struct(memory, &context)?;
+                remember_window_create_struct(hwnd, create_struct);
+                // CreateWindowEx sends WM_NCCREATE, WM_NCCALCSIZE and
+                // WM_CREATE synchronously.  A window/dialog procedure that
+                // rejects any of them (FALSE or -1) aborts the creation and
+                // CreateWindowEx returns NULL.
+                if self.window_has_guest_proc(hwnd) {
+                    let nccalcsize = self.write_nccalcsize_params(memory, hwnd)?;
+                    let creation_messages = [
+                        (MessageKind::NcCreate, 0, create_struct as i64),
+                        (MessageKind::NcCalcSize, 1, nccalcsize as i64),
+                        (MessageKind::Create, 0, create_struct as i64),
+                    ];
+                    for (kind, wparam, lparam) in creation_messages {
+                        let result = match self.dispatch_window_message(
+                            state,
+                            memory,
+                            hwnd,
+                            crate::runtime::message_id(kind),
+                            wparam,
+                            lparam,
+                            "CreateWindowExW::synchronous-create",
+                        ) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                self.user32.abort_window_creation(hwnd);
+                                self.window_menus.remove(&hwnd);
+                                forget_window_create_struct(hwnd);
+                                state.set(Register::Rax, 0);
+                                self.last_error = 0;
+                                return Err(error);
+                            }
+                        };
+                        let rejected = result == 0
+                            || result == -1
+                            || (self.guest_arch == GuestArch::X86 && result as i32 == -1);
+                        if rejected {
+                            self.user32.abort_window_creation(hwnd);
+                            self.window_menus.remove(&hwnd);
+                            forget_window_create_struct(hwnd);
+                            state.set(Register::Rax, 0);
+                            self.last_error = 0;
+                            return Ok(None);
+                        }
+                    }
                 }
                 if self.live_session.is_some() {
                     emit_live_ui_debug(format!(
@@ -9868,6 +10355,7 @@ impl PeHostRuntime {
                 self.poll_live_input()?;
             }
             HostThunk::DialogBoxParamW => {
+                let module_handle = guest_call_arg(state, memory, 0)?;
                 let template_name_ptr = guest_call_arg(state, memory, 1)?;
                 let parent = guest_call_arg(state, memory, 2)? as u32;
                 let dialog_proc = guest_call_arg(state, memory, 3)?;
@@ -9877,15 +10365,28 @@ impl PeHostRuntime {
                 } else {
                     read_utf16_string(memory, template_name_ptr)?
                 };
-                self.user32.register_class_ex_w("#32770");
-                let hwnd = self.user32.create_window_ex_w(
-                    "#32770",
+                let resource_name = if template_name_ptr >> 16 == 0 {
+                    crate::pe::ResourceName::Id((template_name_ptr as u32) & 0xffff)
+                } else {
+                    crate::pe::ResourceName::Str(template_name.clone())
+                };
+                let template = match self.load_dialog_template(module_handle, &resource_name) {
+                    Ok(Some(template)) => template,
+                    Ok(None) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_RESOURCE_NOT_FOUND;
+                        return Ok(None);
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_MOD_NOT_FOUND;
+                        return Ok(None);
+                    }
+                };
+                let hwnd = self.user32.create_dialog_from_template(
+                    &template,
+                    parent,
                     &template_name,
-                    1,
-                    1,
-                    false,
-                    false,
-                    (parent != 0).then_some(parent),
                     1,
                 )?;
                 if dialog_proc != 0 {
@@ -9926,6 +10427,7 @@ impl PeHostRuntime {
                 self.poll_live_input()?;
             }
             HostThunk::CreateDialogParamW => {
+                let module_handle = guest_call_arg(state, memory, 0)?;
                 let template_name_ptr = guest_call_arg(state, memory, 1)?;
                 let parent = guest_call_arg(state, memory, 2)? as u32;
                 let dialog_proc = guest_call_arg(state, memory, 3)?;
@@ -9935,15 +10437,28 @@ impl PeHostRuntime {
                 } else {
                     read_utf16_string(memory, template_name_ptr)?
                 };
-                self.user32.register_class_ex_w("#32770");
-                let hwnd = self.user32.create_window_ex_w(
-                    "#32770",
+                let resource_name = if template_name_ptr >> 16 == 0 {
+                    crate::pe::ResourceName::Id((template_name_ptr as u32) & 0xffff)
+                } else {
+                    crate::pe::ResourceName::Str(template_name.clone())
+                };
+                let template = match self.load_dialog_template(module_handle, &resource_name) {
+                    Ok(Some(template)) => template,
+                    Ok(None) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_RESOURCE_NOT_FOUND;
+                        return Ok(None);
+                    }
+                    Err(_) => {
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_MOD_NOT_FOUND;
+                        return Ok(None);
+                    }
+                };
+                let hwnd = self.user32.create_dialog_from_template(
+                    &template,
+                    parent,
                     &template_name,
-                    1,
-                    1,
-                    false,
-                    false,
-                    (parent != 0).then_some(parent),
                     1,
                 )?;
                 if dialog_proc != 0 {
@@ -10215,6 +10730,9 @@ impl PeHostRuntime {
                     self.dialog_procs.remove(&hwnd);
                     self.window_surfaces.remove(&hwnd);
                     self.progress_bar_states.remove(&hwnd);
+                    // Drop the remembered CREATESTRUCT so a recycled hwnd
+                    // can never inherit another window's lpParam.
+                    forget_window_create_struct(hwnd);
                 }
                 state.set(Register::Rax, u64::from(destroyed));
                 self.last_error = if destroyed { 0 } else { ERROR_INVALID_WINDOW_HANDLE };
@@ -14265,6 +14783,12 @@ impl PeHostRuntime {
                 let max_filter = guest_call_arg(state, memory, 3)? as u32;
                 let thread_id = self.win32.current_thread_id();
                 loop {
+                    // Observe the pump-idle wake epoch BEFORE the readiness
+                    // checks below: a notification that arrives during them
+                    // advances the epoch, so the condvar wait at the bottom
+                    // returns immediately instead of blocking through the
+                    // event that already happened.
+                    let observed = PUMP_IDLE.epoch();
                     self.poll_live_input()?;
                     // Drain all XAudio2 engines to keep audio playing during
                     // the message loop even when no Windows messages arrive.
@@ -14318,15 +14842,24 @@ impl PeHostRuntime {
                         }
                         continue;
                     }
-                    self.win32.sleep_ex(16, false, None)?;
-                    // Always yield the CPU between GetMessageW polls to prevent
-                    // 99% CPU usage.  Use a shorter sleep (1 ms) when a live
-                    // session is active so audio/frame processing isn't starved;
-                    // use a longer sleep (16 ms) when fully idle.
-                    if self.live_session.is_some() || self.dtm {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    // Idle: block on the pump condvar until a wake or the
+                    // next timer deadline (housekeeping-capped) instead of
+                    // sleeping 16 ms/1 ms on every poll.  The timer budget is
+                    // computed from `user32::next_timer_timeout`, so a due
+                    // SetTimer wakes this wait exactly on time.
+                    let budget = pump_idle_budget(self.user32.next_timer_timeout());
+                    let started = Instant::now();
+                    PUMP_IDLE.wait_until(observed, started + budget);
+                    let elapsed_ms = started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    if elapsed_ms > 0 {
+                        // Guest-visible time passed while the host waited:
+                        // advance the guest clock by the observed interval so
+                        // timeouts progress without a fixed polling tick.
+                        self.win32
+                            .record_sleep_observation(elapsed_ms, elapsed_ms);
                     }
                 }
             }
@@ -14407,18 +14940,13 @@ impl PeHostRuntime {
                     );
                 } else {
                     state.set(Register::Rax, 0);
-                    // Yield CPU when no messages are available to prevent
-                    // 99% CPU usage from tight PeekMessageW polling loops
-                    // (common in Chromium/CEF-based UI frameworks like
-                    // Steam's UI).  A 1 ms sleep is enough to reduce CPU
-                    // from 100% to ~1% without introducing noticeable lag.
-                    //
-                    // Always sleep (even during live sessions / DTM mode):
-                    // `std::thread::yield_now()` is effectively a no-op on
-                    // macOS — the thread immediately resumes and CPU stays
-                    // at 99%.  This is the exact hazard documented at the
-                    // same-RIP loop-detection guard in the main CPU loop.
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    // PeekMessageW is non-blocking: an empty peek must not
+                    // sleep (the previous fixed 1 ms sleep added latency to
+                    // every guest poll and still burned a core).  Yield the
+                    // host timeslice only — no condvar, no timer budget:
+                    // the caller decides when to poll again, exactly as on
+                    // Windows.
+                    std::thread::yield_now();
                 }
                 self.last_error = 0;
             }
@@ -14435,13 +14963,25 @@ impl PeHostRuntime {
                     ));
                 }
                 let result = if let Some(hwnd) = message.hwnd {
+                    let message_id = message_id(message.kind);
+                    // WM_NCCREATE/WM_CREATE carry the CREATESTRUCT whose
+                    // lpCreateParams is CreateWindowEx's lpParam (the
+                    // queued message was enqueued with lParam = 0).
+                    let lparam = match message.kind {
+                        MessageKind::Create | MessageKind::NcCreate => {
+                            window_create_struct(hwnd)
+                                .map(|create_struct| create_struct as i64)
+                                .unwrap_or(message.lparam)
+                        }
+                        _ => message.lparam,
+                    };
                     self.dispatch_window_message(
                         state,
                         memory,
                         hwnd,
-                        message_id(message.kind),
+                        message_id,
                         message.wparam,
-                        message.lparam,
+                        lparam,
                         "DispatchMessageW::WindowProc",
                     )?
                 } else {
@@ -33920,19 +34460,19 @@ impl PeHostRuntime {
             HostThunk::ShellExecuteExW => {
                 let exec_info_ptr = guest_call_arg(state, memory, 0)?;
 
-                let result = (|| -> AppResult<bool> {
+                let outcome = (|| -> AppResult<ShellExecuteOutcome> {
                     if exec_info_ptr == 0 {
-                        return Ok(false);
+                        return Ok(ShellExecuteOutcome::Malformed);
                     }
 
                     let cb_size = read_guest_u32(memory, exec_info_ptr)?;
                     let (verb_offset, file_offset, hinst_offset, process_offset) = match self.guest_arch {
                         GuestArch::X64 => {
-                            if cb_size < 104 { return Ok(false); }
+                            if cb_size < 104 { return Ok(ShellExecuteOutcome::Malformed); }
                             (0x10_usize, 0x18_usize, 0x38_usize, 0x68_usize)
                         }
                         GuestArch::X86 => {
-                            if cb_size < 60 { return Ok(false); }
+                            if cb_size < 60 { return Ok(ShellExecuteOutcome::Malformed); }
                             (0x0c_usize, 0x10_usize, 0x20_usize, 0x38_usize)
                         }
                     };
@@ -33951,30 +34491,30 @@ impl PeHostRuntime {
                         String::new()
                     };
 
-                    // Support the "open" verb for files and URLs
-                    if verb.eq_ignore_ascii_case("open") && !file.is_empty() {
-                        // Delegate to the host OS via the `open` command (macOS/Linux)
-                        if let Err(_error) = Command::new("open").arg(&file).spawn() {
-                            // If `open` isn't available (e.g. Linux), try `xdg-open`
-                            let _ = Command::new("xdg-open").arg(&file).spawn();
-                            // On Windows hosts this would use the real ShellExecuteExW,
-                            // but we always have open/xdg-open on macOS/Linux.
+                    // Only the "open" verb is routed through the checked
+                    // classifier; any other verb is a refusal instead of a
+                    // faked success value.
+                    let result = if verb.eq_ignore_ascii_case("open") {
+                        match self.run_host_open(&file, false) {
+                            HostOpenOutcome::Opened | HostOpenOutcome::Nothing => Ok(()),
+                            HostOpenOutcome::Rejected { reason, detail } => Err((reason, detail)),
                         }
-                    }
-
-                    // Write hInstApp > 32 to indicate success
-                    let hinst_value: u64 = match self.guest_arch {
-                        GuestArch::X64 => 42,
-                        GuestArch::X86 => 42,
+                    } else {
+                        Err(("verb", format!("unsupported ShellExecuteExW verb {verb:?}")))
                     };
-                    write_guest_pointer(memory, exec_info_ptr + hinst_offset as u64, hinst_value, self.guest_arch)?;
-                    // Write hProcess = 0 (we don't track the child process handle)
-                    write_guest_pointer(memory, exec_info_ptr + process_offset as u64, 0, self.guest_arch)?;
-
-                    Ok(true)
+                    Ok(ShellExecuteOutcome::WellFormed {
+                        result,
+                        hinst_offset,
+                        process_offset,
+                    })
                 })();
-                match result {
-                    Ok(true) => {
+                match outcome {
+                    Ok(ShellExecuteOutcome::WellFormed { result: Ok(()), hinst_offset, process_offset }) => {
+                        // Success: hInstApp > 32 (SE_ERR_* range).
+                        let hinst_value: u64 = 42;
+                        write_guest_pointer(memory, exec_info_ptr + hinst_offset as u64, hinst_value, self.guest_arch)?;
+                        // Write hProcess = 0 (we don't track the child process handle)
+                        write_guest_pointer(memory, exec_info_ptr + process_offset as u64, 0, self.guest_arch)?;
                         state.set(Register::Rax, 1);
                         self.last_error = 0;
                         self.push_trace(
@@ -33984,7 +34524,29 @@ impl PeHostRuntime {
                             json!(1),
                         );
                     }
-                    Ok(false) => {
+                    Ok(ShellExecuteOutcome::WellFormed {
+                        result: Err((reason, detail)),
+                        hinst_offset,
+                        process_offset,
+                    }) => {
+                        // A refused target reports SE_ERR_ACCESSDENIED in
+                        // hInstApp and FALSE to the caller — 42 is never
+                        // written on a failure path.
+                        write_guest_pointer(memory, exec_info_ptr + hinst_offset as u64, SE_ERR_ACCESSDENIED, self.guest_arch)?;
+                        write_guest_pointer(memory, exec_info_ptr + process_offset as u64, 0, self.guest_arch)?;
+                        state.set(Register::Rax, 0);
+                        self.last_error = ERROR_ACCESS_DENIED;
+                        self.push_trace(
+                            "shell32",
+                            "ShellExecuteExW",
+                            BTreeMap::from([
+                                ("refused".to_string(), json!(reason)),
+                                ("detail".to_string(), json!(detail)),
+                            ]),
+                            json!(0),
+                        );
+                    }
+                    Ok(ShellExecuteOutcome::Malformed) => {
                         state.set(Register::Rax, 0);
                         self.last_error = ERROR_ACCESS_DENIED;
                         self.push_trace(
@@ -34312,13 +34874,28 @@ impl PeHostRuntime {
                 } else {
                     read_utf16_string(memory, file_ptr)?
                 };
-                if verb.eq_ignore_ascii_case("open") && !file.is_empty() {
-                    if let Err(_error) = Command::new("open").arg(&file).spawn() {
-                        let _ = Command::new("xdg-open").arg(&file).spawn();
+                if verb.eq_ignore_ascii_case("open") {
+                    // One checked classifier decides the outcome: the
+                    // target is never handed to the host shell raw, and a
+                    // refusal is reported as SE_ERR_ACCESSDENIED(5) —
+                    // never as a success value above 32.
+                    match self.run_host_open(&file, false) {
+                        HostOpenOutcome::Opened => {
+                            // Success: a HINSTANCE value above 32 (SE_ERR_* range).
+                            state.set(Register::Rax, 42);
+                            self.last_error = 0;
+                        }
+                        HostOpenOutcome::Nothing => {
+                            // No file to open: the documented failure with
+                            // nothing to hand to the host shell.
+                            state.set(Register::Rax, 0);
+                            self.last_error = ERROR_ACCESS_DENIED;
+                        }
+                        HostOpenOutcome::Rejected { .. } => {
+                            state.set(Register::Rax, SE_ERR_ACCESSDENIED);
+                            self.last_error = ERROR_ACCESS_DENIED;
+                        }
                     }
-                    // Success: a HINSTANCE value above 32 (SE_ERR_* range).
-                    state.set(Register::Rax, 42);
-                    self.last_error = 0;
                 } else {
                     state.set(Register::Rax, 0);
                     self.last_error = ERROR_ACCESS_DENIED;
@@ -40829,53 +41406,32 @@ impl PeHostRuntime {
                 self.last_error = 0;
             }
             HostThunk::MessageBoxA => {
-                // MessageBoxA(hwnd, text, caption, type) — a modal message
-                // box.  The headless runtime has no interactive dialog: the
-                // text is surfaced through the live debug channel and IDOK
-                // (1) is returned, which is the answer a dismissed
-                // OK-only box produces.  The button style never includes
-                // IDOK-less combinations, so IDOK is always a legal answer.
-                let hwnd = arg(0) as u32;
                 let text_ptr = arg(1);
                 let caption_ptr = arg(2);
-                let mb_type = arg(3) as u32;
-                let text = if text_ptr != 0 {
+                let style = arg(3) as u32;
+                let text = if text_ptr == 0 {
+                    String::new()
+                } else {
                     read_c_string(memory, text_ptr).unwrap_or_default()
-                } else {
-                    String::new()
                 };
-                let caption = if caption_ptr != 0 {
+                let caption = if caption_ptr == 0 {
+                    String::new()
+                } else {
                     read_c_string(memory, caption_ptr).unwrap_or_default()
-                } else {
-                    String::new()
                 };
-                emit_live_ui_debug(format!(
-                    "[MessageBoxA hwnd={hwnd:#x}] {caption}: {text}"
-                ));
-                let _ = hwnd;
-                // The button style maps to the headless default answer:
-                // OK-only boxes answer IDOK; OK/Cancel the OK button;
-                // Yes/No the Yes button; Retry/Cancel the Retry button;
-                // Abort/Retry/Ignore the Abort button.
-                const MB_OKCANCEL: u32 = 0x1;
-                const MB_ABORTRETRYIGNORE: u32 = 0x2;
-                const MB_YESNOCANCEL: u32 = 0x3;
-                const MB_YESNO: u32 = 0x4;
-                const MB_RETRYCANCEL: u32 = 0x5;
-                const IDOK: u32 = 1;
-                const IDCANCEL: u32 = 2;
-                const IDABORT: u32 = 3;
-                const IDRETRY: u32 = 4;
-                const IDYES: u32 = 6;
-                let default_answer = match mb_type & 0x0f {
-                    MB_ABORTRETRYIGNORE => IDABORT,
-                    MB_YESNOCANCEL | MB_YESNO => IDYES,
-                    MB_RETRYCANCEL => IDRETRY,
-                    MB_OKCANCEL => IDOK,
-                    _ => IDOK,
-                };
-                let _ = IDCANCEL;
-                state.set(Register::Rax, u64::from(default_answer));
+                show_host_message_box(&caption, &text, self.dtm)?;
+                let response = message_box_response(style);
+                self.push_trace(
+                    "input",
+                    "MessageBoxA",
+                    BTreeMap::from([
+                        ("text".to_string(), json!(text)),
+                        ("caption".to_string(), json!(caption)),
+                        ("style".to_string(), json!(style)),
+                    ]),
+                    json!(response),
+                );
+                state.set(Register::Rax, response as i64 as u64);
                 self.last_error = 0;
             }
             // --- I3: Scrollbars ---
@@ -45647,6 +46203,7 @@ impl PeHostRuntime {
                     std::thread::sleep(std::time::Duration::from_millis(due_time as u64));
                     sink.lock().unwrap().push_back((callback, parameter));
                     crate::runtime::scheduler::notify_pump_wake();
+                    notify_pump_idle();
 
                     // If period > 0, repeat at the period interval
                     if period > 0 {
@@ -45654,6 +46211,7 @@ impl PeHostRuntime {
                             std::thread::sleep(std::time::Duration::from_millis(period as u64));
                             sink.lock().unwrap().push_back((callback, parameter));
                             crate::runtime::scheduler::notify_pump_wake();
+                            notify_pump_idle();
                         }
                     }
                 });
@@ -45722,6 +46280,7 @@ impl PeHostRuntime {
                         std::thread::sleep(std::time::Duration::from_millis(poll_ms));
                         sink.lock().unwrap().push_back((callback, context));
                         crate::runtime::scheduler::notify_pump_wake();
+                        notify_pump_idle();
                         if one_shot {
                             break;
                         }
@@ -51014,26 +51573,23 @@ impl PeHostRuntime {
                     };
                     // Look up the paths for this context menu
                     let paths = self.context_menu_paths.get(&this).cloned().unwrap_or_default();
-                    if let Some(verb) = verb_str {
-                        match verb.as_str() {
-                            "open" | "default" => {
-                                // Open each path using macOS `open` command
+                    // Every menu target is routed through the one checked
+                    // HostOpen classifier; the first refusal decides the
+                    // HRESULT instead of being silently ignored.
+                    let mut refusal: Option<(&'static str, String)> = None;
+                    if let Some(verb) = verb_str.as_deref() {
+                        match verb {
+                            "open" | "default" | "explore" | "explorer" => {
+                                // `explore` reveals in Finder: every target
+                                // uses the `open -R` semantics.
+                                let force_reveal =
+                                    matches!(verb, "explore" | "explorer");
                                 for path in &paths {
-                                    if let Ok(host_path) = self.win32.guest_path_to_host_path(path) {
-                                        let _ = std::process::Command::new("open")
-                                            .arg(host_path.as_os_str())
-                                            .spawn();
-                                    }
-                                }
-                            }
-                            "explore" | "explorer" => {
-                                // Reveal in Finder (open -R)
-                                for path in &paths {
-                                    if let Ok(host_path) = self.win32.guest_path_to_host_path(path) {
-                                        let _ = std::process::Command::new("open")
-                                            .arg("-R")
-                                            .arg(host_path.as_os_str())
-                                            .spawn();
+                                    if let HostOpenOutcome::Rejected { reason, detail } =
+                                        self.run_host_open(path, force_reveal)
+                                    {
+                                        refusal = Some((reason, detail));
+                                        break;
                                     }
                                 }
                             }
@@ -51054,8 +51610,29 @@ impl PeHostRuntime {
                             }
                         }
                     }
-                    state.set(Register::Rax, 0); // S_OK
-                    self.last_error = 0;
+                    match refusal {
+                        Some((reason, detail)) => {
+                            // E_ACCESSDENIED == HRESULT_FROM_WIN32(5): a
+                            // refused target is never reported as S_OK.
+                            state.set(Register::Rax, u64::from(E_ACCESSDENIED));
+                            self.last_error = ERROR_ACCESS_DENIED;
+                            self.push_trace(
+                                "shell",
+                                "ContextMenuInvokeCommand",
+                                BTreeMap::from([
+                                    ("verb".to_string(), json!(verb_str.clone().unwrap_or_default())),
+                                    ("path_count".to_string(), json!(paths.len())),
+                                    ("refused".to_string(), json!(reason)),
+                                    ("detail".to_string(), json!(detail)),
+                                ]),
+                                json!(format!("{E_ACCESSDENIED:#x}")),
+                            );
+                        }
+                        None => {
+                            state.set(Register::Rax, 0); // S_OK
+                            self.last_error = 0;
+                        }
+                    }
                 }
             }
             HostThunk::ContextMenuGetCommandString => {
@@ -51610,5 +52187,1189 @@ impl PeHostRuntime {
             );
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cpu::GuestArch;
+    use crate::ge::{GameEnvironment, GeArch};
+    use crate::pe_runtime::NtThunkSession;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    fn test_session(name: &str) -> (TempDir, NtThunkSession) {
+        let directory = TempDir::new().expect("temp dir");
+        let ge = GameEnvironment::create_in(directory.path(), name, GeArch::X64, "win11-23h2")
+            .expect("create ge");
+        (directory, NtThunkSession::new(ge))
+    }
+
+    fn with_big_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .name("router-unit-test".to_string())
+            .spawn(body)
+            .expect("spawn big-stack test thread")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
+
+    fn map_utf16(session: &mut NtThunkSession, address: u64, text: &str) -> u64 {
+        let mut bytes = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        session.map_guest(address, &bytes);
+        address
+    }
+
+    fn read_u64(session: &NtThunkSession, address: u64) -> u64 {
+        let bytes = session.read_guest(address, 8);
+        u64::from_le_bytes(bytes.try_into().expect("u64 bytes"))
+    }
+
+    fn read_u32(session: &NtThunkSession, address: u64) -> u32 {
+        let bytes = session.read_guest(address, 4);
+        u32::from_le_bytes(bytes.try_into().expect("u32 bytes"))
+    }
+
+    fn write_u64(buffer: &mut [u8], offset: usize, value: u64) {
+        buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(buffer: &mut [u8], offset: usize, value: u32) {
+        buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u16(buffer: &mut [u8], offset: usize, value: u16) {
+        buffer[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn call(session: &mut NtThunkSession, thunk: HostThunk, args: &[u64]) -> u64 {
+        let address = session.alloc_thunk(thunk);
+        session.call(address, args)
+    }
+
+    #[test]
+    fn pump_idle_budget_boundary_uses_timer_deadline_without_polling_ticks() {
+        with_big_stack(|| {
+            assert_eq!(
+                pump_idle_budget(Some(Duration::from_millis(3))),
+                Duration::from_millis(3)
+            );
+            assert_eq!(
+                pump_idle_budget(None),
+                Duration::from_millis(100),
+                "the fallback is bounded housekeeping, not a 1ms/16ms poll"
+            );
+            assert_ne!(PUMP_IDLE_FALLBACK, Duration::from_millis(1));
+            assert_ne!(PUMP_IDLE_FALLBACK, Duration::from_millis(16));
+        });
+    }
+
+    #[test]
+    fn pump_idle_wait_blocks_until_notified_and_has_no_lost_wakeup_race() {
+        with_big_stack(|| {
+            // A notification before the wait is observed immediately.
+            let wake = Arc::new(PumpIdle::new());
+            let observed = wake.epoch();
+            wake.notify();
+            let started = Instant::now();
+            wake.wait_until(observed, started + Duration::from_secs(5));
+            assert_eq!(wake.epoch(), observed.wrapping_add(1));
+            assert!(started.elapsed() < Duration::from_secs(1));
+
+            // A notification from another thread wakes a blocked waiter before
+            // its far deadline.
+            let observed = wake.epoch();
+            let notifier = Arc::clone(&wake);
+            let handle = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                notifier.notify();
+            });
+            let started = Instant::now();
+            wake.wait_until(observed, started + Duration::from_secs(5));
+            handle.join().expect("notifier thread");
+            assert_eq!(wake.epoch(), observed.wrapping_add(1));
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn pump_idle_wait_returns_at_deadline_boundary_without_a_spurious_wake() {
+        with_big_stack(|| {
+            let wake = PumpIdle::new();
+            let observed = wake.epoch();
+            let started = Instant::now();
+            wake.wait_until(observed, started + Duration::from_millis(15));
+            assert!(started.elapsed() >= Duration::from_millis(15));
+            assert_eq!(
+                wake.epoch(),
+                observed,
+                "deadline expiry must not advance the epoch"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_create_window_geometry_cascades_cw_usedefault_at_slot_boundary() {
+        with_big_stack(|| {
+            // All-default window at cascade slot 0: two thirds of the work area,
+            // anchored at the work-area origin.
+            assert_eq!(
+                resolve_create_window_geometry(
+                    CW_USEDEFAULT as i32,
+                    CW_USEDEFAULT as i32,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    (10, 20, 900, 600),
+                    0,
+                ),
+                (10, 20, 600, 400)
+            );
+            // Slot 1 steps by 32 pixels; the ninth default window wraps to slot 1
+            // (CASCADE_SLOTS boundary) instead of walking off the work area.
+            assert_eq!(
+                resolve_create_window_geometry(
+                    CW_USEDEFAULT as i32,
+                    CW_USEDEFAULT as i32,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    (10, 20, 900, 600),
+                    9,
+                ),
+                (42, 52, 600, 400)
+            );
+            // Explicit negative coordinates pass through; zero sizes floor to 1px.
+            assert_eq!(
+                resolve_create_window_geometry(-7, -9, 0, 0, (10, 20, 900, 600), 3),
+                (-7, -9, 1, 1)
+            );
+            // A partial default keeps the explicit coordinate and defaults size.
+            assert_eq!(
+                resolve_create_window_geometry(
+                    100,
+                    CW_USEDEFAULT as i32,
+                    0,
+                    0,
+                    (0, 0, 300, 300),
+                    0
+                ),
+                (100, 0, 1, 1)
+            );
+        });
+    }
+
+    #[test]
+    fn work_area_from_monitor_rejects_degenerate_rect_and_uses_fallback() {
+        with_big_stack(|| {
+            assert_eq!(work_area_from_monitor(None), (0, 0, 1024, 768));
+        });
+    }
+
+    #[test]
+    fn create_window_ex_honours_default_cascade_hmenu_and_lp_param_edge_cases() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-create-window");
+            let class = map_utf16(&mut session, 0x30_000, "STATIC");
+            let (work_x, work_y, work_w, work_h) = session.runtime.window_work_area();
+
+            let hwnd = call(
+                &mut session,
+                HostThunk::CreateWindowExW,
+                &[
+                    0,
+                    class,
+                    0,
+                    0,
+                    CW_USEDEFAULT as u64,
+                    CW_USEDEFAULT as u64,
+                    CW_USEDEFAULT as u64,
+                    CW_USEDEFAULT as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ) as u32;
+            assert_ne!(hwnd, 0);
+            let preview = session
+                .runtime
+                .user32
+                .window_previews()
+                .into_iter()
+                .find(|window| window.hwnd == hwnd)
+                .expect("default window preview");
+            assert_eq!(
+                (preview.x, preview.y, preview.width, preview.height),
+                (
+                    work_x,
+                    work_y,
+                    ((work_w * 2) / 3).max(1),
+                    ((work_h * 2) / 3).max(1)
+                )
+            );
+
+            // The next default window cascades one 32px slot from the first.
+            let cascaded = call(
+                &mut session,
+                HostThunk::CreateWindowExW,
+                &[
+                    0,
+                    class,
+                    0,
+                    0,
+                    CW_USEDEFAULT as u64,
+                    CW_USEDEFAULT as u64,
+                    CW_USEDEFAULT as u64,
+                    CW_USEDEFAULT as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ) as u32;
+            let cascaded_preview = session
+                .runtime
+                .user32
+                .window_previews()
+                .into_iter()
+                .find(|window| window.hwnd == cascaded)
+                .expect("cascaded preview");
+            assert_eq!(
+                (cascaded_preview.x, cascaded_preview.y),
+                (work_x + CASCADE_STEP, work_y + CASCADE_STEP)
+            );
+
+            // hMenu on a top-level window is attached (GetMenu sees it).
+            let menu = 0x1234_u64;
+            let window = call(
+                &mut session,
+                HostThunk::CreateWindowExW,
+                &[0, class, 0, 0, 5, 6, 100, 50, 0, menu, 0, 0],
+            ) as u32;
+            assert_ne!(window, 0);
+            assert_eq!(
+                call(&mut session, HostThunk::GetMenu, &[u64::from(window)]),
+                menu
+            );
+
+            // lpParam is materialised in a CREATESTRUCT and dropped on destroy.
+            let param = 0xCAFE_BABE_u64;
+            let owner = call(
+                &mut session,
+                HostThunk::CreateWindowExW,
+                &[0, class, 0, 0, 5, 6, 100, 50, 0, 0, 0, param],
+            ) as u32;
+            assert_ne!(owner, 0);
+            let create_struct = window_create_struct(owner).expect("lpParam CREATESTRUCT");
+            assert_eq!(read_u64(&session, create_struct), param);
+            assert_eq!(
+                call(&mut session, HostThunk::DestroyWindow, &[u64::from(owner)]),
+                1
+            );
+            assert_eq!(window_create_struct(owner), None);
+        });
+    }
+
+    #[test]
+    fn write_window_create_struct_rejects_no_layout_aliasing_for_x86_and_x64() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-create-struct-layout");
+            for (arch, expected_size) in [(GuestArch::X86, 48_usize), (GuestArch::X64, 80_usize)] {
+                session.set_guest_arch(arch);
+                let context = CreateWindowContext {
+                    class_name: "STATIC",
+                    title: "title",
+                    instance: 0x1111,
+                    hmenu: 0x2222,
+                    parent: 0x3333,
+                    style: 0x4444,
+                    ex_style: 0x5555,
+                    x: -3,
+                    y: -4,
+                    width: 640,
+                    height: 480,
+                    create_param: 0xDEAD_BEEF,
+                };
+                let pointer = session
+                    .runtime
+                    .write_window_create_struct(&mut session.memory, &context)
+                    .expect("write CREATESTRUCT");
+                assert_eq!(
+                    read_guest_pointer(&session.memory, pointer, arch),
+                    Ok(0xDEAD_BEEF)
+                );
+                // The struct is fully writable for both layouts (no overlap with
+                // the next heap allocation).
+                let struct_size = if arch == GuestArch::X86 { 48 } else { 80 };
+                assert_eq!(expected_size, struct_size);
+                let instance_offset = if arch == GuestArch::X86 { 4 } else { 8 };
+                assert_eq!(
+                    read_guest_pointer(&session.memory, pointer + instance_offset, arch),
+                    Ok(0x1111)
+                );
+            }
+        });
+    }
+
+    fn shell_execute_ex_info(
+        session: &mut NtThunkSession,
+        verb: &str,
+        file: &str,
+        cb_size: u32,
+    ) -> u64 {
+        let verb_ptr = map_utf16(session, 0x30_000, verb);
+        let file_ptr = map_utf16(session, 0x31_000, file);
+        let mut info = [0_u8; 0x90];
+        write_u32(&mut info, 0, cb_size);
+        write_u64(&mut info, 0x10, verb_ptr);
+        write_u64(&mut info, 0x18, file_ptr);
+        write_u64(&mut info, 0x38, 0xAAAA);
+        write_u64(&mut info, 0x68, 0xBBBB);
+        session.map_guest(0x40_000, &info);
+        0x40_000
+    }
+
+    #[test]
+    fn shell_execute_ex_w_refused_target_pins_se_err_accessdenied_never_42() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-shell-exec-ex");
+            let info = shell_execute_ex_info(&mut session, "open", "javascript:alert(1)", 104);
+            assert_eq!(call(&mut session, HostThunk::ShellExecuteExW, &[info]), 0);
+            assert_eq!(read_u64(&session, info + 0x38), SE_ERR_ACCESSDENIED);
+            assert_eq!(read_u64(&session, info + 0x68), 0);
+            assert_eq!(session.last_error(), crate::error::ERROR_ACCESS_DENIED);
+
+            // Unsupported verbs are refusals, not silently successful opens.
+            let info = shell_execute_ex_info(&mut session, "edit", "https://example.com", 104);
+            assert_eq!(call(&mut session, HostThunk::ShellExecuteExW, &[info]), 0);
+            assert_eq!(read_u64(&session, info + 0x38), SE_ERR_ACCESSDENIED);
+
+            // Malformed structures report failure without touching hInstApp.
+            let info = shell_execute_ex_info(&mut session, "open", "https://example.com", 0);
+            assert_eq!(call(&mut session, HostThunk::ShellExecuteExW, &[info]), 0);
+            assert_eq!(read_u64(&session, info + 0x38), 0xAAAA);
+            assert_eq!(session.last_error(), crate::error::ERROR_ACCESS_DENIED);
+        });
+    }
+
+    #[test]
+    fn shell_execute_ex_w_success_and_refusal_boundary_never_fakes_42() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-shell-exec-ex-success");
+            crate::runtime::set_host_open_program_override(Some(std::path::PathBuf::from(
+                "/usr/bin/true",
+            )));
+            let info = shell_execute_ex_info(&mut session, "open", "https://example.com", 104);
+            let result = call(&mut session, HostThunk::ShellExecuteExW, &[info]);
+            crate::runtime::set_host_open_program_override(None);
+            assert_eq!(result, 1);
+            assert_eq!(read_u64(&session, info + 0x38), 42);
+            assert_eq!(read_u64(&session, info + 0x68), 0);
+            assert_eq!(session.last_error(), 0);
+        });
+    }
+
+    #[test]
+    fn shell_execute_w_refusal_and_empty_target_boundaries_are_exact() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-shell-exec-w");
+            let verb = map_utf16(&mut session, 0x30_000, "open");
+            let blocked = map_utf16(&mut session, 0x31_000, "javascript:alert(1)");
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::ShellExecuteW,
+                    &[0, verb, blocked, 0, 0, 1]
+                ),
+                SE_ERR_ACCESSDENIED
+            );
+            assert_eq!(session.last_error(), crate::error::ERROR_ACCESS_DENIED);
+
+            let empty = map_utf16(&mut session, 0x32_000, "");
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::ShellExecuteW,
+                    &[0, verb, empty, 0, 0, 1]
+                ),
+                0
+            );
+
+            let allowed = map_utf16(&mut session, 0x33_000, "https://example.com");
+            crate::runtime::set_host_open_program_override(Some(std::path::PathBuf::from(
+                "/usr/bin/true",
+            )));
+            let opened = call(
+                &mut session,
+                HostThunk::ShellExecuteW,
+                &[0, verb, allowed, 0, 0, 1],
+            );
+            crate::runtime::set_host_open_program_override(None);
+            assert_eq!(opened, 42);
+            assert_eq!(session.last_error(), 0);
+        });
+    }
+
+    #[test]
+    fn context_menu_invoke_command_refusal_pins_e_accessdenied_not_s_ok() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-context-menu");
+            let this = 0x1234_5678_u64;
+            let info = 0x40_000_u64;
+            let mut buffer = [0_u8; 0x60];
+            write_u32(&mut buffer, 0, 0x48);
+            // lpVerb resource id 0 == "open"; traversal is refused by host_ui.
+            write_u64(&mut buffer, 16, 0);
+            session.map_guest(info, &buffer);
+            session
+                .runtime
+                .context_menu_paths
+                .insert(this, vec!["C:\\game\\..\\..\\payload.sh".to_string()]);
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::ContextMenuInvokeCommand,
+                    &[this, info]
+                ),
+                u64::from(E_ACCESSDENIED)
+            );
+            assert_eq!(session.last_error(), crate::error::ERROR_ACCESS_DENIED);
+
+            // A "properties" verb has no host-open side effect and returns S_OK.
+            write_u64(&mut buffer, 16, 2);
+            session.map_guest(info, &buffer);
+            session.runtime.context_menu_paths.insert(this, Vec::new());
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::ContextMenuInvokeCommand,
+                    &[this, info]
+                ),
+                0
+            );
+            assert_eq!(session.last_error(), 0);
+        });
+    }
+
+    #[test]
+    fn get_message_w_idle_wait_blocks_until_timer_deadline_boundary() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-get-message-idle");
+            let class = map_utf16(&mut session, 0x30_000, "STATIC");
+            let hwnd = call(
+                &mut session,
+                HostThunk::CreateWindowExW,
+                &[0, class, 0, 0, 5, 6, 100, 50, 0, 0, 0, 0],
+            ) as u32;
+            assert_ne!(hwnd, 0);
+            // Drain the WM_NCCREATE/WM_CREATE pair queued by window creation
+            // so the retrieval below must block on the timer deadline.
+            let msg = 0x40_000_u64;
+            session.map_guest(msg, &[0_u8; 48]);
+            for _ in 0..16 {
+                if call(&mut session, HostThunk::PeekMessageW, &[msg, 0, 0, 0, 1]) == 0 {
+                    break;
+                }
+            }
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::SetTimer,
+                    &[u64::from(hwnd), 1, 15, 0]
+                ),
+                1
+            );
+            session.map_guest(msg, &[0_u8; 48]);
+            let result = call(&mut session, HostThunk::GetMessageW, &[msg, 0, 0, 0]);
+            assert_eq!(result, 1, "the due WM_TIMER must wake the idle wait");
+            assert_eq!(read_u32(&session, msg + 8), crate::user32::WM_TIMER);
+        });
+    }
+
+    #[test]
+    fn peek_message_w_empty_queue_returns_zero_without_sleeping() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-peek-empty");
+            let msg = 0x40_000_u64;
+            session.map_guest(msg, &[0_u8; 48]);
+            assert_eq!(
+                call(&mut session, HostThunk::PeekMessageW, &[msg, 0, 0, 0, 0]),
+                0
+            );
+            assert_eq!(session.last_error(), 0);
+        });
+    }
+
+    #[test]
+    fn dispatch_message_w_create_message_uses_lp_param_createstruct_boundary() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-dispatch-create");
+            let class = map_utf16(&mut session, 0x30_000, "STATIC");
+            let param = 0xFEED_FACE_u64;
+            let hwnd = call(
+                &mut session,
+                HostThunk::CreateWindowExW,
+                &[0, class, 0, 0, 5, 6, 100, 50, 0, 0, 0, param],
+            ) as u32;
+            assert_ne!(hwnd, 0);
+            let create_struct = window_create_struct(hwnd).expect("remembered CREATESTRUCT");
+            let msg = 0x40_000_u64;
+            let mut buffer = [0_u8; 48];
+            write_u64(&mut buffer, 0, u64::from(hwnd));
+            write_u32(&mut buffer, 8, 0x0001); // WM_CREATE
+            session.map_guest(msg, &buffer);
+            assert_eq!(call(&mut session, HostThunk::DispatchMessageW, &[msg]), 0);
+            assert_eq!(read_u64(&session, create_struct), param);
+
+            // A non-create message keeps its queued lParam instead of the
+            // remembered CREATESTRUCT.
+            write_u32(&mut buffer, 8, 0x000F); // WM_PAINT
+            write_u64(&mut buffer, 24, 0x55);
+            session.map_guest(msg, &buffer);
+            assert_eq!(call(&mut session, HostThunk::DispatchMessageW, &[msg]), 0);
+        });
+    }
+
+    #[test]
+    fn shell_execute_ex_w_null_and_x86_malformed_boundaries_report_failure() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-shell-exec-ex-malformed");
+            assert_eq!(call(&mut session, HostThunk::ShellExecuteExW, &[0]), 0);
+            assert_eq!(session.last_error(), crate::error::ERROR_ACCESS_DENIED);
+
+            session.set_guest_arch(GuestArch::X86);
+            let mut info = [0_u8; 60];
+            write_u32(&mut info, 0, 0);
+            session.map_guest(0x40_000, &info);
+            let thunk = session.alloc_thunk(HostThunk::ShellExecuteExW);
+            assert_eq!(session.call_x86(thunk, &[0x40_000]), 0);
+            assert_eq!(session.last_error(), crate::error::ERROR_ACCESS_DENIED);
+        });
+    }
+
+    #[test]
+    fn host_open_path_and_spawn_failure_boundaries_are_routed_through_host_ui() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-host-open-paths");
+            crate::runtime::set_host_open_program_override(Some(std::path::PathBuf::from(
+                "/usr/bin/true",
+            )));
+            let host_path = session
+                .runtime
+                .win32
+                .guest_path_to_host_path("C:\\game\\notes.txt")
+                .expect("guest path resolves");
+            std::fs::create_dir_all(host_path.parent().expect("parent")).expect("create dirs");
+            std::fs::write(&host_path, b"notes").expect("write guest file");
+            assert!(matches!(
+                session.runtime.run_host_open("C:\\game\\notes.txt", true),
+                HostOpenOutcome::Opened
+            ));
+
+            crate::runtime::set_host_open_program_override(Some(std::path::PathBuf::from(
+                "/nonexistent/casa1-open",
+            )));
+            match session.runtime.run_host_open("https://example.com", false) {
+                HostOpenOutcome::Rejected { reason, .. } => {
+                    assert_eq!(reason, "host open program failed to start");
+                }
+                other => panic!("expected rejection, got {other:?}"),
+            }
+            crate::runtime::set_host_open_program_override(None);
+        });
+    }
+
+    #[test]
+    fn timer_queue_workers_notify_pump_idle_on_due_and_periodic_boundaries() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-timer-pump-wake");
+            let observed = PUMP_IDLE.epoch();
+            let out = 0x40_000_u64;
+            session.map_guest(out, &[0_u8; 16]);
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::CreateTimerQueueTimer,
+                    &[out, 0, 0, 0, 0, 0, 0]
+                ),
+                1
+            );
+            PUMP_IDLE.wait_until(observed, Instant::now() + Duration::from_secs(2));
+            assert_ne!(PUMP_IDLE.epoch(), observed);
+
+            // A periodic timer delivers a second notification after its
+            // period; the thread is detached and ends with the process.
+            let observed = PUMP_IDLE.epoch();
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::CreateTimerQueueTimer,
+                    &[out, 0, 0, 0, 0, 1, 0]
+                ),
+                1
+            );
+            PUMP_IDLE.wait_until(observed, Instant::now() + Duration::from_secs(2));
+            let first = PUMP_IDLE.epoch();
+            assert!(first > observed);
+            PUMP_IDLE.wait_until(first, Instant::now() + Duration::from_secs(2));
+            assert!(PUMP_IDLE.epoch() > first);
+        });
+    }
+
+    #[test]
+    fn register_wait_worker_notifies_pump_idle_on_timeout_boundary() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-register-wait-wake");
+            let observed = PUMP_IDLE.epoch();
+            let out = 0x40_000_u64;
+            session.map_guest(out, &[0_u8; 16]);
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::RegisterWaitForSingleObject,
+                    &[out, 0, 0, 0, 1, 0]
+                ),
+                1
+            );
+            PUMP_IDLE.wait_until(observed, Instant::now() + Duration::from_secs(2));
+            assert_ne!(PUMP_IDLE.epoch(), observed);
+        });
+    }
+
+    #[test]
+    fn notify_pump_idle_advances_the_process_epoch_without_a_lost_wakeup() {
+        let observed = PUMP_IDLE.epoch();
+        notify_pump_idle();
+        assert_eq!(PUMP_IDLE.epoch(), observed.wrapping_add(1));
+    }
+
+    fn make_guest_executable(session: &mut NtThunkSession, address: u64) {
+        session.win32_mut().address_space_mut().commit(
+            address,
+            0x1000,
+            crate::vm::VmProtection::READ_WRITE_EXECUTE,
+            false,
+        );
+    }
+
+    fn map_ansi(session: &mut NtThunkSession, address: u64, text: &str) -> u64 {
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        session.map_guest(address, &bytes);
+        address
+    }
+
+    fn window_class_info(window_proc: u64) -> WindowClassInfo {
+        WindowClassInfo {
+            style: 0,
+            wnd_proc: window_proc,
+            cls_extra: 0,
+            wnd_extra: 0,
+            instance: 0,
+            icon: 0,
+            cursor: 0,
+            background: 0,
+            menu_name: 0,
+            class_name_ptr: 0,
+            icon_small: 0,
+        }
+    }
+
+    /// x86 window procedure that logs (message id, lParam) pairs for each
+    /// creation message in `log + count*8` and returns TRUE.
+    fn x86_creation_log_proc(log: u32, counter: u32) -> Vec<u8> {
+        let mut code = Vec::new();
+        code.push(0x53); // push ebx
+        code.extend_from_slice(&[0x8B, 0x1D]);
+        code.extend_from_slice(&counter.to_le_bytes()); // mov ebx, [counter]
+        code.extend_from_slice(&[0x8B, 0x4C, 0x24, 0x0C]); // mov ecx, [esp+12] (message)
+        code.extend_from_slice(&[0x89, 0x0C, 0xDD]);
+        code.extend_from_slice(&log.to_le_bytes()); // mov [log+ebx*8], ecx
+        code.extend_from_slice(&[0x8B, 0x54, 0x24, 0x14]); // mov edx, [esp+20] (lParam)
+        code.extend_from_slice(&[0x89, 0x94, 0xDD]);
+        code.extend_from_slice(&(log + 4).to_le_bytes()); // mov [log+ebx*8+4], edx
+        code.extend_from_slice(&[0xFF, 0xC3]); // inc ebx
+        code.extend_from_slice(&[0x89, 0x1D]);
+        code.extend_from_slice(&counter.to_le_bytes()); // mov [counter], ebx
+        code.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
+        code.push(0x5B); // pop ebx
+        code.extend_from_slice(&[0xC2, 0x10, 0x00]); // ret 16
+        code
+    }
+
+    fn push_utf16z(bytes: &mut Vec<u8>, value: &str) {
+        for unit in value.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+    }
+
+    fn align4(bytes: &mut Vec<u8>) {
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+    }
+
+    fn dialog_template_with_button() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&crate::user32::WS_CAPTION.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // exStyle
+        bytes.extend_from_slice(&1_u16.to_le_bytes()); // one control
+        bytes.extend_from_slice(&5_u16.to_le_bytes()); // x
+        bytes.extend_from_slice(&6_u16.to_le_bytes()); // y
+        bytes.extend_from_slice(&120_u16.to_le_bytes()); // cx
+        bytes.extend_from_slice(&80_u16.to_le_bytes()); // cy
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // menu
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // class
+        push_utf16z(&mut bytes, "DialogTitle");
+        align4(&mut bytes);
+        bytes.extend_from_slice(
+            &(crate::user32::WS_CHILD | crate::user32::WS_VISIBLE).to_le_bytes(),
+        );
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // exStyle
+        bytes.extend_from_slice(&7_u16.to_le_bytes()); // x
+        bytes.extend_from_slice(&8_u16.to_le_bytes()); // y
+        bytes.extend_from_slice(&40_u16.to_le_bytes()); // cx
+        bytes.extend_from_slice(&12_u16.to_le_bytes()); // cy
+        bytes.extend_from_slice(&42_u16.to_le_bytes()); // control id
+        bytes.extend_from_slice(&0xFFFF_u16.to_le_bytes()); // ordinal class
+        bytes.extend_from_slice(&0x0080_u16.to_le_bytes()); // button
+        push_utf16z(&mut bytes, "OK");
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // no creation data
+        align4(&mut bytes);
+        bytes
+    }
+
+    fn dialog_resource_pe(template: &[u8]) -> Vec<u8> {
+        let section_rva = 0x1000_u32;
+        let root_offset = 0_usize;
+        let type_dir_offset = 24_usize;
+        let name_dir_offset = type_dir_offset + 32;
+        let data_entry_offset = name_dir_offset + 24;
+        let blob_offset = data_entry_offset + 16;
+        let resource_name: Vec<u16> = "NAMED".encode_utf16().collect();
+        let name_offset = (blob_offset + template.len()).div_ceil(4) * 4;
+        let mut rsrc = vec![0_u8; name_offset + (resource_name.len() + 1) * 2];
+        // Root directory: one ID entry for RT_DIALOG.
+        write_u16(&mut rsrc, root_offset + 12, 0);
+        write_u16(&mut rsrc, root_offset + 14, 1);
+        write_u32(&mut rsrc, root_offset + 16, 5);
+        write_u32(
+            &mut rsrc,
+            root_offset + 20,
+            0x8000_0000 | type_dir_offset as u32,
+        );
+        // Type directory: one named entry ("NAMED") and one ID entry (100).
+        write_u16(&mut rsrc, type_dir_offset + 12, 1);
+        write_u16(&mut rsrc, type_dir_offset + 14, 1);
+        write_u32(
+            &mut rsrc,
+            type_dir_offset + 16,
+            0x8000_0000 | name_offset as u32,
+        );
+        write_u32(
+            &mut rsrc,
+            type_dir_offset + 20,
+            0x8000_0000 | name_dir_offset as u32,
+        );
+        write_u32(&mut rsrc, type_dir_offset + 24, 100);
+        write_u32(
+            &mut rsrc,
+            type_dir_offset + 28,
+            0x8000_0000 | name_dir_offset as u32,
+        );
+        // Name directory: one language entry pointing at the data entry.
+        write_u16(&mut rsrc, name_dir_offset + 12, 0);
+        write_u16(&mut rsrc, name_dir_offset + 14, 1);
+        write_u32(&mut rsrc, name_dir_offset + 16, 1033);
+        write_u32(&mut rsrc, name_dir_offset + 20, data_entry_offset as u32);
+        // Data entry -> template payload.
+        let data_rva = section_rva + blob_offset as u32;
+        write_u32(&mut rsrc, data_entry_offset, data_rva);
+        write_u32(&mut rsrc, data_entry_offset + 4, template.len() as u32);
+        write_u32(&mut rsrc, data_entry_offset + 8, 1200);
+        rsrc[blob_offset..blob_offset + template.len()].copy_from_slice(template);
+        for (index, unit) in resource_name.iter().enumerate() {
+            let offset = name_offset + index * 2;
+            rsrc[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let raw_size = rsrc.len().div_ceil(0x200) * 0x200;
+        rsrc.resize(raw_size, 0);
+
+        let dos_stub_size = 0x80;
+        let pe_offset = dos_stub_size;
+        let optional_header_size = 0xE0;
+        let section_table_offset = pe_offset + 24 + optional_header_size;
+        let size_of_headers = 0x200;
+        let mut bytes = vec![0_u8; size_of_headers];
+        bytes[0] = b'M';
+        bytes[1] = b'Z';
+        write_u32(&mut bytes, 0x3C, dos_stub_size as u32);
+        bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        write_u16(&mut bytes, pe_offset + 4, 0x014C); // I386
+        write_u16(&mut bytes, pe_offset + 6, 1); // one section
+        write_u16(&mut bytes, pe_offset + 20, optional_header_size as u16);
+        write_u16(&mut bytes, pe_offset + 22, 0x0102); // EXECUTABLE_IMAGE
+        let optional = pe_offset + 24;
+        write_u16(&mut bytes, optional, 0x010B); // PE32
+        write_u32(&mut bytes, optional + 16, 0); // entry point
+        write_u32(&mut bytes, optional + 20, 0x0040_0000); // image base
+        write_u32(&mut bytes, optional + 32, 0x1000); // section alignment
+        write_u32(&mut bytes, optional + 36, 0x200); // file alignment
+        write_u32(&mut bytes, optional + 56, 0x3000); // size of image
+        write_u32(&mut bytes, optional + 60, size_of_headers as u32);
+        write_u16(&mut bytes, optional + 68, 3); // console subsystem
+        write_u32(&mut bytes, optional + 92, 16); // number of rva+sizes
+        write_u32(&mut bytes, optional + 96 + 2 * 8, section_rva);
+        write_u32(&mut bytes, optional + 96 + 2 * 8 + 4, rsrc.len() as u32);
+        bytes[section_table_offset..section_table_offset + 8].copy_from_slice(b".rsrc\0\0\0");
+        write_u32(&mut bytes, section_table_offset + 8, 0x2000); // virtual size
+        write_u32(&mut bytes, section_table_offset + 12, section_rva);
+        write_u32(&mut bytes, section_table_offset + 16, rsrc.len() as u32);
+        write_u32(&mut bytes, section_table_offset + 20, 0x200); // raw ptr
+        write_u32(&mut bytes, section_table_offset + 36, 0x4000_0040);
+        bytes.extend_from_slice(&rsrc);
+        bytes
+    }
+
+    fn corrupt_dialog_type_directory(mut pe: Vec<u8>) -> Vec<u8> {
+        // Keep the resource directory itself valid so PE parsing (which only
+        // looks up RT_VERSION/RT_MANIFEST) succeeds; only the RT_DIALOG child
+        // pointer becomes an offset outside the resource section.
+        write_u32(&mut pe, 0x200 + 20, 0x8000_0000 | 0x7000);
+        pe
+    }
+
+    #[test]
+    fn create_window_ex_w_synchronous_creation_messages_pass_createstruct_boundary() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-sync-create");
+            session.set_guest_arch(GuestArch::X86);
+            session.stack = 0x10_100;
+            let log = 0x50_000_u64;
+            let counter = 0x51_000_u64;
+            let proc = 0x52_000_u64;
+            session.map_guest(log, &[0_u8; 24]);
+            session.map_guest(counter, &[0_u8; 4]);
+            session.map_guest(proc, &x86_creation_log_proc(log as u32, counter as u32));
+            make_guest_executable(&mut session, proc);
+            session
+                .runtime
+                .user32
+                .register_class_info("sync-create", window_class_info(proc));
+            let class = map_utf16(&mut session, 0x30_000, "sync-create");
+            let thunk = session.alloc_thunk(HostThunk::CreateWindowExW);
+            let param = 0xDEAD_BEEF_u32;
+            let hwnd = session.call_x86(
+                thunk,
+                &[0, class as u32, 0, 0, 5, 6, 100, 50, 0, 0, 0, param],
+            ) as u32;
+            assert_ne!(hwnd, 0, "a TRUE WM_NCCREATE must keep the window");
+            assert_eq!(
+                read_u32(&session, counter),
+                3,
+                "all three creation messages must be delivered synchronously"
+            );
+            assert_eq!(read_u32(&session, log), 0x0081, "WM_NCCREATE first");
+            let create_struct = u64::from(read_u32(&session, log + 4));
+            assert_ne!(create_struct, 0, "WM_NCCREATE must receive CREATESTRUCT");
+            assert_eq!(
+                read_u32(&session, create_struct),
+                param,
+                "CREATESTRUCT.lpCreateParams is CreateWindowEx's lpParam"
+            );
+            assert_eq!(read_u32(&session, log + 8), 0x0083, "WM_NCCALCSIZE second");
+            let nccalcsize = u64::from(read_u32(&session, log + 12));
+            assert_ne!(nccalcsize, 0, "WM_NCCALCSIZE must receive params");
+            assert_eq!(
+                read_u32(&session, nccalcsize),
+                5,
+                "NCCALCSIZE_PARAMS.rgrc[0] carries the proposed rect"
+            );
+            assert_eq!(read_u32(&session, log + 16), 0x0001, "WM_CREATE third");
+            assert_eq!(
+                u64::from(read_u32(&session, log + 20)),
+                create_struct,
+                "WM_CREATE receives the same CREATESTRUCT"
+            );
+        });
+    }
+
+    #[test]
+    fn create_window_ex_w_aborts_creation_on_false_or_minus_one() {
+        with_big_stack(|| {
+            for (label, code) in [
+                ("FALSE", vec![0x31, 0xC0, 0xC2, 0x10, 0x00]),
+                ("-1", vec![0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xC2, 0x10, 0x00]),
+            ] {
+                let (_directory, mut session) =
+                    test_session(&format!("router-sync-create-abort-{label}"));
+                session.set_guest_arch(GuestArch::X86);
+                session.stack = 0x10_100;
+                let proc = 0x52_000_u64;
+                session.map_guest(proc, &code);
+                make_guest_executable(&mut session, proc);
+                session
+                    .runtime
+                    .user32
+                    .register_class_info("reject-create", window_class_info(proc));
+                let class = map_utf16(&mut session, 0x30_000, "reject-create");
+                let thunk = session.alloc_thunk(HostThunk::CreateWindowExW);
+                let hwnd =
+                    session.call_x86(thunk, &[0, class as u32, 0, 0, 5, 6, 100, 50, 0, 0, 0, 0]);
+                assert_eq!(hwnd, 0, "WM_NCCREATE {label} must abort creation");
+                assert_eq!(
+                    session.runtime.user32.window_previews().len(),
+                    0,
+                    "no half-created window may survive {label}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn create_window_ex_w_proc_fault_aborts_without_half_window() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-sync-create-fault");
+            session.set_guest_arch(GuestArch::X86);
+            session.stack = 0x10_100;
+            let unmapped_proc = 0xDEAD_0000_u64;
+            session
+                .runtime
+                .user32
+                .register_class_info("fault-create", window_class_info(unmapped_proc));
+            let class = map_utf16(&mut session, 0x30_000, "fault-create");
+            let thunk = session.alloc_thunk(HostThunk::CreateWindowExW);
+            let hwnd = session.call_x86(thunk, &[0, class as u32, 0, 0, 5, 6, 100, 50, 0, 0, 0, 0]);
+            assert_eq!(hwnd, 0, "a faulting window proc aborts creation");
+            assert_eq!(
+                session.runtime.user32.window_previews().len(),
+                0,
+                "a faulting window proc must not leave a half-created window"
+            );
+        });
+    }
+
+    #[test]
+    fn get_window_rect_and_client_rect_mismatch_is_pinned() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-rect-mismatch");
+            let class = map_utf16(&mut session, 0x30_000, "STATIC");
+            let hwnd = call(
+                &mut session,
+                HostThunk::CreateWindowExW,
+                &[
+                    0,
+                    class,
+                    0,
+                    u64::from(crate::user32::WS_CAPTION),
+                    10,
+                    20,
+                    200,
+                    100,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            ) as u32;
+            assert_ne!(hwnd, 0);
+            let rect = 0x40_000_u64;
+            session.map_guest(rect, &[0_u8; 16]);
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::GetWindowRect,
+                    &[u64::from(hwnd), rect]
+                ),
+                1
+            );
+            assert_eq!(
+                (
+                    read_u32(&session, rect) as i32,
+                    read_u32(&session, rect + 4) as i32,
+                    read_u32(&session, rect + 8) as i32,
+                    read_u32(&session, rect + 12) as i32,
+                ),
+                (10, 20, 210, 120),
+                "GetWindowRect is the screen-space outer rectangle"
+            );
+            session.map_guest(rect, &[0_u8; 16]);
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::GetClientRect,
+                    &[u64::from(hwnd), rect]
+                ),
+                1
+            );
+            assert_eq!(
+                (
+                    read_u32(&session, rect) as i32,
+                    read_u32(&session, rect + 4) as i32,
+                    read_u32(&session, rect + 8) as i32,
+                    read_u32(&session, rect + 12) as i32,
+                ),
+                (0, 0, 200, 77),
+                "GetClientRect excludes the title bar and starts at 0,0"
+            );
+            assert_eq!(
+                call(&mut session, HostThunk::GetWindowRect, &[0xDEAD, rect]),
+                0
+            );
+            assert_eq!(
+                session.last_error(),
+                crate::runtime::ERROR_INVALID_WINDOW_HANDLE
+            );
+        });
+    }
+
+    #[test]
+    fn create_dialog_param_w_loads_rt_dialog_template_with_controls_boundary() {
+        with_big_stack(|| {
+            let (directory, mut session) = test_session("router-dialog-template");
+            let module_path = directory.path().join("dialog.exe");
+            std::fs::write(
+                &module_path,
+                dialog_resource_pe(&dialog_template_with_button()),
+            )
+            .expect("write dialog resource PE");
+            session.runtime.main_module_path = module_path.to_string_lossy().into_owned();
+
+            let named = map_utf16(&mut session, 0x31_000, "NAMED");
+            for (label, thunk, expected_result) in [
+                ("CreateDialogParamW", HostThunk::CreateDialogParamW, None),
+                ("DialogBoxParamW", HostThunk::DialogBoxParamW, Some(0)),
+            ] {
+                for template_ptr in [100_u64, named] {
+                    let hwnd =
+                        call(&mut session, thunk.clone(), &[0, template_ptr, 0, 0, 0]) as u32;
+                    if let Some(expected) = expected_result {
+                        assert_eq!(hwnd, expected as u32, "{label} dialog result");
+                        let preview = session
+                            .runtime
+                            .user32
+                            .window_previews()
+                            .into_iter()
+                            .filter(|preview| preview.title == "DialogTitle")
+                            .max_by_key(|preview| preview.hwnd)
+                            .expect("dialog window for DialogBoxParamW");
+                        assert_eq!(preview.class_name, "#32770", "{label}");
+                    } else {
+                        assert_ne!(hwnd, 0, "{label} must create the dialog");
+                        let preview = session
+                            .runtime
+                            .user32
+                            .window_previews()
+                            .into_iter()
+                            .find(|preview| preview.hwnd == hwnd)
+                            .expect("created dialog preview");
+                        assert_eq!(preview.title, "DialogTitle", "{label} template title");
+                        assert_eq!(
+                            (preview.x, preview.y, preview.width, preview.height),
+                            (5, 6, 120, 80),
+                            "{label} template geometry"
+                        );
+                        let control = session
+                            .runtime
+                            .user32
+                            .window_previews()
+                            .into_iter()
+                            .find(|preview| {
+                                preview.parent == Some(hwnd) && preview.control_id == 42
+                            })
+                            .expect("template control");
+                        assert_eq!(control.class_name, "button", "{label} control class");
+                        assert_eq!(control.title, "OK", "{label} control text");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn dialog_param_missing_resource_and_unreadable_module_are_exact() {
+        with_big_stack(|| {
+            let (directory, mut session) = test_session("router-dialog-errors");
+            let module_path = directory.path().join("dialog.exe");
+            std::fs::write(
+                &module_path,
+                dialog_resource_pe(&dialog_template_with_button()),
+            )
+            .expect("write dialog resource PE");
+            session.runtime.main_module_path = module_path.to_string_lossy().into_owned();
+
+            for thunk in [HostThunk::CreateDialogParamW, HostThunk::DialogBoxParamW] {
+                assert_eq!(call(&mut session, thunk, &[0, 999, 0, 0, 0]), 0);
+                assert_eq!(
+                    session.last_error(),
+                    crate::runtime::ERROR_RESOURCE_NOT_FOUND
+                );
+            }
+
+            std::fs::write(
+                &module_path,
+                corrupt_dialog_type_directory(dialog_resource_pe(&dialog_template_with_button())),
+            )
+            .expect("write malformed resource PE");
+            for thunk in [HostThunk::CreateDialogParamW, HostThunk::DialogBoxParamW] {
+                assert_eq!(call(&mut session, thunk, &[0, 100, 0, 0, 0]), 0);
+                assert_eq!(session.last_error(), crate::error::ERROR_MOD_NOT_FOUND);
+            }
+
+            session.runtime.main_module_path = directory
+                .path()
+                .join("does-not-exist.exe")
+                .to_string_lossy()
+                .into_owned();
+            for thunk in [HostThunk::CreateDialogParamW, HostThunk::DialogBoxParamW] {
+                assert_eq!(call(&mut session, thunk, &[0, 100, 0, 0, 0]), 0);
+                assert_eq!(session.last_error(), crate::error::ERROR_MOD_NOT_FOUND);
+            }
+
+            let garbage_path = directory.path().join("garbage.exe");
+            std::fs::write(&garbage_path, b"not a PE").expect("write garbage module");
+            session.runtime.main_module_path = garbage_path.to_string_lossy().into_owned();
+            for thunk in [HostThunk::CreateDialogParamW, HostThunk::DialogBoxParamW] {
+                assert_eq!(call(&mut session, thunk, &[0, 100, 0, 0, 0]), 0);
+                assert_eq!(session.last_error(), crate::error::ERROR_MOD_NOT_FOUND);
+            }
+        });
+    }
+
+    #[test]
+    fn message_box_a_style_mapping_matches_message_box_response_boundary() {
+        with_big_stack(|| {
+            let (_directory, mut session) = test_session("router-message-box-a");
+            let text = map_ansi(&mut session, 0x30_000, "Continue?");
+            let caption = map_ansi(&mut session, 0x31_000, "Question");
+            assert_eq!(
+                call(
+                    &mut session,
+                    HostThunk::MessageBoxA,
+                    &[0, text, caption, u64::from(0x0000_0104_u32)]
+                ),
+                7,
+                "MB_YESNO|MB_DEFBUTTON2 maps to IDNO"
+            );
+            assert_eq!(session.last_error(), 0);
+            assert_eq!(
+                call(&mut session, HostThunk::MessageBoxA, &[0, text, caption, 0]),
+                1,
+                "MB_OK maps to IDOK"
+            );
+            assert_eq!(session.last_error(), 0);
+            assert_eq!(
+                call(&mut session, HostThunk::MessageBoxA, &[0, 0, 0, 0]),
+                1,
+                "NULL text/caption still map MB_OK to IDOK"
+            );
+        });
     }
 }

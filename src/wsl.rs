@@ -137,6 +137,40 @@ fn shell_quote(s: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether `image` is a safe Docker image reference.
+///
+/// Allowed: ASCII alphanumerics and `._-/:@` (registry, repository, tag and
+/// digest syntax).  Rejected: empty, a leading `-` (option injection), `..`
+/// (path traversal), and every shell/argument metacharacter (space, `;`, `$`,
+/// backtick, quotes, pipes, redirections, globs, control bytes, ...).
+fn docker_image_is_safe(image: &str) -> bool {
+    !image.is_empty()
+        && !image.starts_with('-')
+        && !image.contains("..")
+        && image.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':' | b'@')
+        })
+}
+
+/// Validate a guest-supplied distribution name used as a Docker image.
+///
+/// Failure is `ERROR_INVALID_PARAMETER` so callers can surface the exact
+/// Win32 status instead of a generic launch error.
+fn validate_docker_image(distribution: &str) -> Result<(), String> {
+    let image = if distribution.eq_ignore_ascii_case(DEFAULT_WSL_DISTRO) {
+        "ubuntu:22.04".to_string()
+    } else {
+        distribution.to_lowercase()
+    };
+    if docker_image_is_safe(&image) {
+        Ok(())
+    } else {
+        Err(format!(
+            "ERROR_INVALID_PARAMETER: invalid docker image '{distribution}'"
+        ))
+    }
+}
+
 impl WslSupport {
     /// Create a new [`WslSupport`] instance and auto-detect the platform.
     pub fn new() -> Self {
@@ -256,6 +290,10 @@ impl WslSupport {
         let _distro = self
             .find_distribution(distribution)
             .ok_or_else(|| format!("distribution '{distribution}' not found"))?;
+        // A distribution name is also the Docker image on macOS.  Refuse a
+        // leading '-' (which Docker would parse as an option) and every
+        // metacharacter before the name reaches an argument vector.
+        validate_docker_image(distribution)?;
 
         if self.platform.host_is_windows {
             launch_wsl_command_windows(distribution, command, timeout_secs)
@@ -640,6 +678,9 @@ fn launch_via_docker(
     command: &str,
     timeout_secs: Option<u64>,
 ) -> Result<WslCommandResult, String> {
+    // Defense in depth: this is the last point before the image becomes a
+    // Docker argument, and it also covers direct callers of this helper.
+    validate_docker_image(distribution)?;
     let image = if distribution.eq_ignore_ascii_case(DEFAULT_WSL_DISTRO) {
         "ubuntu:22.04"
     } else {
@@ -774,6 +815,18 @@ impl std::fmt::Display for WslApiError {
     }
 }
 
+/// Map a `launch_command` failure string onto its Win32 status.
+///
+/// Invalid distribution/image names carry `ERROR_INVALID_PARAMETER(87)`; every
+/// other launch failure keeps the historical generic code 4.
+fn wsl_error_code(message: &str) -> u32 {
+    if message.starts_with("ERROR_INVALID_PARAMETER") {
+        crate::error::ERROR_INVALID_PARAMETER
+    } else {
+        4
+    }
+}
+
 /// Represents the emulated `wslapi.dll` API surface.
 ///
 /// These functions mirror the exported symbols of `wslapi.dll` that Windows
@@ -861,7 +914,7 @@ impl WslApi {
         };
         support
             .launch_command(distro_name, &effective_command, None)
-            .map_err(|e| WslApiError::new(4, e))
+            .map_err(|e| WslApiError::new(wsl_error_code(&e), e))
     }
 
     /// `WslLaunch` — Launch a command in a distribution with a timeout.
@@ -880,7 +933,7 @@ impl WslApi {
         };
         support
             .launch_command(distro_name, command, timeout_secs)
-            .map_err(|e| WslApiError::new(4, e))
+            .map_err(|e| WslApiError::new(wsl_error_code(&e), e))
     }
 }
 
@@ -1086,6 +1139,84 @@ mod tests {
         assert_eq!(map_wsl_to_windows_path("/home/user"), None);
         // Valid
         assert_eq!(map_wsl_to_windows_path("/mnt/c/"), Some("C:\\".to_string()));
+    }
+
+    #[test]
+    fn wsl_docker_image_rejects_leading_dash_and_metacharacter_names() {
+        for rejected in [
+            "-rf",
+            "--privileged",
+            "ubuntu;rm -rf /",
+            "ubuntu`id`",
+            "ubuntu\nid",
+            "ubuntu$(id)",
+            "ubuntu name",
+            "ubuntu&whoami",
+            "ubuntu|cat",
+            "ubuntu>out",
+            "ubuntu/../escape",
+            "ubuntu's",
+            "ubuntu\\path",
+            "",
+        ] {
+            assert!(
+                !docker_image_is_safe(rejected),
+                "{rejected:?} must be rejected"
+            );
+            assert_eq!(
+                validate_docker_image(rejected).unwrap_err(),
+                format!("ERROR_INVALID_PARAMETER: invalid docker image '{rejected}'")
+            );
+        }
+        for allowed in [
+            "Ubuntu",
+            "ubuntu:22.04",
+            "ghcr.io/example/ubuntu:22.04",
+            "registry.example.com/team/image@sha256:abc123",
+            "image_name-1.2",
+        ] {
+            assert!(docker_image_is_safe(allowed), "{allowed:?} must be allowed");
+            assert_eq!(validate_docker_image(allowed), Ok(()));
+        }
+        // The helper itself is also a defense-in-depth gate.
+        assert_eq!(
+            launch_via_docker("-rf", "id", None).unwrap_err(),
+            "ERROR_INVALID_PARAMETER: invalid docker image '-rf'"
+        );
+    }
+
+    #[test]
+    fn wsl_launch_rejects_bad_image_with_error_invalid_parameter() {
+        let support = WslSupport::with_distributions(vec![]);
+        support.register_distribution(WslDistribution {
+            name: "--privileged".to_string(),
+            ..Default::default()
+        });
+        let error = support
+            .launch_command("--privileged", "id", None)
+            .expect_err("bad image must be rejected");
+        assert_eq!(
+            error,
+            "ERROR_INVALID_PARAMETER: invalid docker image '--privileged'"
+        );
+
+        let api_error = WslApi::launch(&support, "--privileged", "id", 1000)
+            .expect_err("WslLaunch must surface ERROR_INVALID_PARAMETER");
+        assert_eq!(api_error.code, crate::error::ERROR_INVALID_PARAMETER);
+        assert!(api_error.message.starts_with("ERROR_INVALID_PARAMETER"));
+
+        let interactive = WslApi::launch_interactive(&support, "--privileged", "id", false)
+            .expect_err("WslLaunchInteractive must surface ERROR_INVALID_PARAMETER");
+        assert_eq!(interactive.code, crate::error::ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn wsl_error_code_boundary_maps_invalid_parameter_and_generic_failure() {
+        assert_eq!(
+            wsl_error_code("ERROR_INVALID_PARAMETER: invalid docker image '-rf'"),
+            crate::error::ERROR_INVALID_PARAMETER
+        );
+        assert_eq!(wsl_error_code("no Linux runtime available"), 4);
     }
 
     #[test]

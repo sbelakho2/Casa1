@@ -1187,6 +1187,31 @@
   "(frame1.unwrap().width, 800)",
   "(frame2.unwrap().width, 1024)"
  ],
+ "cef_download_completion_rejects_oversize_and_quarantines_boundary": [
+  "( complete_download(&missing).unwrap_err(), format!( \"download output missing at {}: No such file or directory (os error 2)\", missing.display() ) )",
+  "(complete_download(&accepted), Ok(()))",
+  "(read, -1, \"accepted download must be quarantined\")"
+ ],
+ "cef_download_dispatch_allowed_origin_spawns_worker_and_pins_started_response": [
+  "(parsed[\"success\"], true)",
+  "(parsed[\"result\"], \"download_started\")",
+  "(parsed[\"filename\"], \"payload.bin\")",
+  "( std::fs::read(&destination).expect(\"downloaded payload\"), b\"payload\" )",
+  "(ACTIVE_DOWNLOADS.load(Ordering::Relaxed), 0)",
+  "(failed[\"success\"], true)"
+ ],
+ "cef_download_filename_url_and_curl_arguments_reject_unsafe_inputs": [
+  "( sanitize_download_filename(unsafe_name), None, \"{unsafe_name:?}\" )",
+  "( sanitize_download_filename(\" steam_setup.dmg \"), Some(\"steam_setup.dmg\".to_string()) )",
+  "( sanitize_download_filename(&\"a\".repeat(256)), None, \"overlong names must be rejected\" )",
+  "(download_url(rejected), None, \"{rejected} must be rejected\")",
+  "( download_url(\"https://store.steampowered.com/x\") .expect(\"https allowed\") .scheme(), \"https\" )",
+  "( args, vec![ \"-L\".to_string(), \"--proto\".to_string(), \"=https,http\".to_string(), \"--proto-redir\".to_string(), \"=https,http\".to_string(), \"--max-filesize\".to_string(), MAX_DOWNLOAD_BYTES.to_string(), \"-o\".to_string(), \"/tmp/casa1-download.bin\".to_string(), \"https://store.steampowered.com/x\".to_string(), ] )"
+ ],
+ "cef_download_worker_failure_paths_are_rejected": [
+  "( run_download(&writer, &dest, \"https://example.com/x\"), Ok(()) )",
+  "(std::fs::read(&dest).expect(\"read downloaded\"), b\"payload\")"
+ ],
  "cef_handler_do_close_and_before_close": [
   "( bridge.close_pending_for, Some(browser), \"close_pending_for should be set\" )",
   "( bridge.close_pending_for, None, \"close_pending_for should be cleared\" )"
@@ -1217,11 +1242,32 @@
   "(bridge.state(), CefState::Initialized)",
   "(bridge.state(), CefState::ShuttingDown)"
  ],
+ "cef_open_external_url_spawn_failure_is_rejected_not_faked": [
+  "(parsed[\"success\"], false)",
+  "(parsed[\"result\"], \"open_rejected\")",
+  "(parsed[\"error\"], \"host open program failed to start\")"
+ ],
  "cef_operations_before_init_fail": [
   "(bridge.state(), CefState::Uninitialized)"
  ],
+ "cef_privileged_queries_reject_untrusted_origin_every_time": [
+  "( parsed[\"success\"], false, \"type={query_type} origin={origin}\" )",
+  "(parsed[\"error\"], \"origin not allowed\")",
+  "(parsed[\"result\"], expected_result)"
+ ],
+ "cef_query_origin_allowlist_rejects_boundary_hosts": [
+  "( query_origin_allowed(allowed), true, \"{allowed} must be allowed\" )"
+ ],
  "cef_readback_failure_publishes_nothing": [
   "( bridge.live_frame_counter, 0, \"a failed readback must never count a fabricated frame\" )"
+ ],
+ "cef_trusted_origin_still_rejects_unsafe_targets_and_filename_boundaries": [
+  "(script[\"success\"], true)",
+  "(script[\"result\"], \"script_executed\")",
+  "(set[\"success\"], true)",
+  "(set[\"result\"], \"cookie_set\")",
+  "(get[\"success\"], true)",
+  "(get[\"result\"][0][\"name\"], \"sid\")"
  ],
  "cef_undersized_on_paint_publishes_real_bytes": [
   "(frame.width, 100, \"width is preserved from the paint\")",
@@ -1857,6 +1903,12 @@
   "(info.priority, MAX_SCHEDULING_PRIORITY)",
   "(info.submit_count, 0)"
  ],
+ "context_menu_invoke_command_refusal_pins_e_accessdenied_not_s_ok": [
+  "( call( &mut session, HostThunk::ContextMenuInvokeCommand, &[this, info] ), u64::from(E_ACCESSDENIED) )",
+  "(session.last_error(), crate::error::ERROR_ACCESS_DENIED)",
+  "( call( &mut session, HostThunk::ContextMenuInvokeCommand, &[this, info] ), 0 )",
+  "(session.last_error(), 0)"
+ ],
  "convert_and_resample_partial_frame_does_not_panic": [
   "(result.len(), 2)"
  ],
@@ -2034,6 +2086,14 @@
   "( error.message, \"inline data entry at binding 3 has zero size\" )",
   "( error.message, \"binding range at 4294967295 overflows the 32-bit index space\" )"
  ],
+ "create_dialog_param_w_loads_rt_dialog_template_with_controls_boundary": [
+  "(hwnd, expected as u32, \"{label} dialog result\")",
+  "(preview.class_name, \"#32770\", \"{label}\")",
+  "(preview.title, \"DialogTitle\", \"{label} template title\")",
+  "( (preview.x, preview.y, preview.width, preview.height), (5, 6, 120, 80), \"{label} template geometry\" )",
+  "(control.class_name, \"button\", \"{label} control class\")",
+  "(control.title, \"OK\", \"{label} control text\")"
+ ],
  "create_directory_missing_parent_returns_path_not_found": [
   "( result.expect_err(\"missing parent must fail\").code, ReasonCode::RcFsPathInvalid, \"CreateDirectoryW with a missing parent must be ERROR_PATH_NOT_FOUND\" )"
  ],
@@ -2138,6 +2198,30 @@
   "(required, \"http://example.com:8080/x\".len() as u32 + 1)",
   "( dispatch_x86( &mut fixture, HostThunk::WinHttpCreateUrl, &[COMPONENTS as u32, 0, URL as u32, SIZE_OUT as u32] ), 0 )",
   "( dispatch_x86( &mut fixture, HostThunk::WinHttpCreateUrl, &[COMPONENTS as u32, 0, URL as u32, SIZE_OUT as u32] ), 1 )"
+ ],
+ "create_window_ex_honours_default_cascade_hmenu_and_lp_param_edge_cases": [
+  "( (preview.x, preview.y, preview.width, preview.height), ( work_x, work_y, ((work_w * 2) / 3).max(1), ((work_h * 2) / 3).max(1) ) )",
+  "( (cascaded_preview.x, cascaded_preview.y), (work_x + CASCADE_STEP, work_y + CASCADE_STEP) )",
+  "( call(&mut session, HostThunk::GetMenu, &[u64::from(window)]), menu )",
+  "(read_u64(&session, create_struct), param)",
+  "( call(&mut session, HostThunk::DestroyWindow, &[u64::from(owner)]), 1 )",
+  "(window_create_struct(owner), None)"
+ ],
+ "create_window_ex_w_aborts_creation_on_false_or_minus_one": [
+  "(hwnd, 0, \"WM_NCCREATE {label} must abort creation\")",
+  "( session.runtime.user32.window_previews().len(), 0, \"no half-created window may survive {label}\" )"
+ ],
+ "create_window_ex_w_proc_fault_aborts_without_half_window": [
+  "(hwnd, 0, \"a faulting window proc aborts creation\")",
+  "( session.runtime.user32.window_previews().len(), 0, \"a faulting window proc must not leave a half-created window\" )"
+ ],
+ "create_window_ex_w_synchronous_creation_messages_pass_createstruct_boundary": [
+  "( read_u32(&session, counter), 3, \"all three creation messages must be delivered synchronously\" )",
+  "(read_u32(&session, log), 0x0081, \"WM_NCCREATE first\")",
+  "( read_u32(&session, create_struct), param, \"CREATESTRUCT.lpCreateParams is CreateWindowEx's lpParam\" )",
+  "(read_u32(&session, log + 8), 0x0083, \"WM_NCCALCSIZE second\")",
+  "( read_u32(&session, nccalcsize), 5, \"NCCALCSIZE_PARAMS.rgrc[0] carries the proposed rect\" )",
+  "(read_u32(&session, log + 16), 0x0001, \"WM_CREATE third\")"
  ],
  "critical_section_thunks_use_x86_stack_argument": [
   "( dispatch_x86_thunk(&mut runtime, &mut memory, initialize, &[critical_section]), 1 )",
@@ -3334,6 +3418,48 @@
   "(manager.next_lower_device(upper).unwrap(), Some(middle))",
   "(manager.next_attached_device(lower).unwrap(), Some(middle))"
  ],
+ "dialog_item_class_name_default_is_rejected_to_static": [
+  "(dialog_item_class_name(atom), expected)"
+ ],
+ "dialog_param_missing_resource_and_unreadable_module_are_exact": [
+  "(call(&mut session, thunk, &[0, 999, 0, 0, 0]), 0)",
+  "( session.last_error(), crate::runtime::ERROR_RESOURCE_NOT_FOUND )",
+  "(call(&mut session, thunk, &[0, 100, 0, 0, 0]), 0)",
+  "(session.last_error(), crate::error::ERROR_MOD_NOT_FOUND)"
+ ],
+ "dialog_template_control_ids_mismatch_is_rejected": [
+  "(parse.title, \"DialogTitle\")",
+  "(parse.items.len(), 1)",
+  "(parse.items[0].id, 7)",
+  "(parse.items[0].class_atom, 0x0080)",
+  "(child.class_name, \"button\")",
+  "(child.title, \"OK\")"
+ ],
+ "dialog_template_extended_ordinal_class_mismatch_is_rejected": [
+  "(parsed.title, \"ExtTitle\")",
+  "(parsed.items.len(), 1)",
+  "(parsed.items[0].id, 9)",
+  "(parsed.items[0].class_atom, 0x0081)",
+  "(parsed.items[0].title, \"E\")"
+ ],
+ "dialog_template_item_count_overflow_is_rejected": [
+  "(error.message, \"dialog template declares too many items\")"
+ ],
+ "dialog_template_malformed_truncation_is_rejected": [
+  "(error.message, \"truncated dialog template\")"
+ ],
+ "dialog_template_overlong_string_is_rejected": [
+  "(error.message, \"dialog template string is too long\")"
+ ],
+ "dialog_template_unknown_control_class_is_rejected": [
+  "(error.code, ReasonCode::RcCliInvalid)",
+  "(error.message, \"unregistered class casa1-missing-class\")"
+ ],
+ "dialog_template_zero_title_mismatch_falls_back_to_empty": [
+  "(parsed.title, \"\")",
+  "(parsed.items.len(), 0)",
+  "(user32.window_state(hwnd).expect(\"state\").title, \"fallback\")"
+ ],
  "direct_input8_create_writes_a_managed_device_object": [
   "(result, 0, \"DirectInput8Create returns DI_OK\")",
   "( runtime.guest_object_kind(dinput_object).expect(\"kind\"), GuestObjectKind::DirectInput8 )",
@@ -3657,6 +3783,11 @@
  ],
  "dispatch_collided_chaininfo_frame_fails_closed_unhandled": [
   "(error.code, ReasonCode::SehException)"
+ ],
+ "dispatch_message_w_create_message_uses_lp_param_createstruct_boundary": [
+  "(call(&mut session, HostThunk::DispatchMessageW, &[msg]), 0)",
+  "(read_u64(&session, create_struct), param)",
+  "(hwnd, 0)"
  ],
  "dispatch_stats_missing_partial_malformed_and_zero_documents_report_exact_reasons": [
   "(report.stats, None)",
@@ -5188,6 +5319,11 @@
   "( store.flat_base() % GUEST_FLAT_ALIGN as u64, 0, \"the flat base must be aligned for direct guest addressing\" )",
   "(store.flat_base() % 4096, 0)"
  ],
+ "flip_y_secondary_screen_height_mismatch_is_rejected": [
+  "(flip_y(1080.0, 0, 100), 980.0)",
+  "(flip_y(1080.0, 200, 50), 830.0)",
+  "(flip_y(1080.0, 0, 100), flip_y(1440.0, 0, 100))"
+ ],
  "flush_file_buffers_requires_write_access": [
   "( result.expect_err(\"read-only flush must fail\").code, ReasonCode::RcHelperPermissionDenied, \"FlushFileBuffers on a read-only handle must be ERROR_ACCESS_DENIED\" )"
  ],
@@ -5441,6 +5577,12 @@
   "(runtime.last_error, ERROR_INSUFFICIENT_BUFFER)",
   "(exact, path_length as u64)"
  ],
+ "get_message_w_idle_wait_blocks_until_timer_deadline_boundary": [
+  "( call( &mut session, HostThunk::SetTimer, &[u64::from(hwnd), 1, 15, 0] ), 1 )",
+  "(result, 1, \"the due WM_TIMER must wake the idle wait\")",
+  "(read_u32(&session, msg + 8), crate::user32::WM_TIMER)",
+  "(hwnd, 0)"
+ ],
  "get_module_file_name_a_query_and_truncation_return_required_size": [
   "(query, required_with_nul as u64)",
   "(runtime.last_error, 0)",
@@ -5501,6 +5643,14 @@
   "( read_u32(&rtl, offset), read_u32(&win32, offset), \"version field at +0x{offset:x} agrees\" )",
   "( u16::from_le_bytes(rtl[0x114..0x116].try_into().unwrap()), u16::from_le_bytes(win32[0x114..0x116].try_into().unwrap()), \"wServicePackMajor agrees\" )",
   "(rtl[0x11A], win32[0x11A], \"wProductType agrees\")"
+ ],
+ "get_window_rect_and_client_rect_mismatch_is_pinned": [
+  "( call( &mut session, HostThunk::GetWindowRect, &[u64::from(hwnd), rect] ), 1 )",
+  "( ( read_u32(&session, rect) as i32, read_u32(&session, rect + 4) as i32, read_u32(&session, rect + 8) as i32, read_u32(&session, rect + 12) as i32, ), (10, 20, 210, 120), \"GetWindowRect is the screen-space outer rectangle\" )",
+  "( call( &mut session, HostThunk::GetClientRect, &[u64::from(hwnd), rect] ), 1 )",
+  "( ( read_u32(&session, rect) as i32, read_u32(&session, rect + 4) as i32, read_u32(&session, rect + 8) as i32, read_u32(&session, rect + 12) as i32, ), (0, 0, 200, 77), \"GetClientRect excludes the title bar and starts at 0,0\" )",
+  "( call(&mut session, HostThunk::GetWindowRect, &[0xDEAD, rect]), 0 )",
+  "( session.last_error(), crate::runtime::ERROR_INVALID_WINDOW_HANDLE )"
  ],
  "gfx_shared_dynamic_buffer_update_fallback_counts_are_exact": [
   "(storage, MetalStorageMode::Shared)",
@@ -6061,6 +6211,59 @@
  "host_module_integrity_rejects_mismatch_and_missing_files": [
   "(size, 0)",
   "(hash, [0u8; 32])"
+ ],
+ "host_open_classifier_allows_only_http_and_mailto_url_schemes": [
+  "(outcome, Ok(HostOpenPlan::Url(target.to_string())))",
+  "( outcome, Err(HostOpenReject::UnsupportedScheme(scheme.to_string())) )",
+  "( drive, Ok(HostOpenPlan::Path { path: PathBuf::from(\"/ge/drive_c/game/note.txt\"), reveal: false, }) )"
+ ],
+ "host_open_classifier_refuses_traversal_targets_before_resolution": [
+  "(outcome, Err(HostOpenReject::Traversal), \"target {target}\")"
+ ],
+ "host_open_classifier_rejects_every_blocked_extension_exactly": [
+  "( outcome, Err(HostOpenReject::BlockedExtension( extension.to_ascii_lowercase() )), \"extension {extension} must be refused\" )",
+  "( outcome, Err(HostOpenReject::BlockedExtension(\"sh\".to_string())) )",
+  "( allowed, Ok(HostOpenPlan::Path { path: PathBuf::from(\"/ge/drive_c/game/notes.txt\"), reveal: false, }) )"
+ ],
+ "host_open_classifier_surfaces_resolution_failure_and_reveals_directories": [
+  "( unresolved, Err(HostOpenReject::Unresolvable( \"drive C is not enabled\".to_string() )) )",
+  "(empty, Ok(HostOpenPlan::Nothing))",
+  "( directory, Ok(HostOpenPlan::Path { path: temp.path().to_path_buf(), reveal: true, }) )",
+  "( missing, Ok(HostOpenPlan::Path { path: temp.path().join(\"gone.txt\"), reveal: false, }) )"
+ ],
+ "host_open_path_and_spawn_failure_boundaries_are_routed_through_host_ui": [
+  "(reason, \"host open program failed to start\")"
+ ],
+ "host_open_quarantine_fails_closed_for_a_missing_guest_file": [
+  "( outcome.err().map(|error| error.code), Some(ReasonCode::RcIo) )"
+ ],
+ "host_open_quarantine_rejects_nul_path_without_touching_the_filesystem": [
+  "(error.code, ReasonCode::RcIo)",
+  "( crate::real_fs::XATTR_COM_APPLE_QUARANTINE.as_bytes(), b\"com.apple.quarantine\" )"
+ ],
+ "host_open_reaper_worker_joins_the_child_without_leaking_a_zombie": [
+  "(status.map(|status| status.code()), Some(Some(0)))"
+ ],
+ "host_open_reject_reasons_and_details_cover_every_variant_boundary": [
+  "(reject.reason(), reason)",
+  "(reject.detail(), detail)",
+  "(error.reason(), reason)",
+  "(error.detail(), detail)"
+ ],
+ "host_open_spawn_failure_and_success_paths_are_exact": [
+  "( spawn_host_open(Path::new(\"/nonexistent/casa1-open\"), &HostOpenPlan::Nothing), Ok(()) )",
+  "( failure.err().map(|error| error.reason()), Some(\"host open program failed to start\") )",
+  "( spawn_host_open( &program, &HostOpenPlan::Path { path: absent.clone(), reveal: false } ), Ok(()) )",
+  "( spawn_host_open( &program, &HostOpenPlan::Path { path: absent, reveal: true } ), Ok(()) )",
+  "( spawn_host_open( &program, &HostOpenPlan::Path { path: present.clone(), reveal: false } ), Ok(()) )",
+  "( read, -1, \"spawning an open for a guest file must quarantine it first\" )"
+ ],
+ "host_open_url_scheme_parser_rejects_invalid_scheme_boundaries": [
+  "(url_scheme(\"1http://example.com\"), None)",
+  "(url_scheme(\":no-head\"), None)",
+  "(url_scheme(\"C:\\\\game\\\\x.txt\"), None)",
+  "( url_scheme(\"HTTP+ext-1.0://x\"), Some(\"http+ext-1.0\".to_string()) )",
+  "(url_scheme(\"C:\\\\game\"), None)"
  ],
  "host_send_paths_pin_network_failures_and_async_completion": [
   "( host.host(&DplayAppDesc::new(\"Send Paths\", 8), localhost()), S_OK )",
@@ -8301,6 +8504,12 @@
   "( run_cpu(&mvn, &[&mvn_values]) .iter() .copied() .map(rounded) .collect::<Vec<_>>(), vec![-10000, 10000, -10000, 10000] )",
   "( invalid.validate().unwrap_err().message, \"mean variance normalization axis 4 is out of range for rank 4\" )"
  ],
+ "mac_window_hwnd_reverse_lookup_rejects_dangling_pointer": [
+  "(mac_window::hwnd_for_nswindow(std::ptr::null_mut()), None)",
+  "(mac_window::hwnd_for_nswindow(pointer), None)",
+  "(mac_window::hwnd_for_nswindow(pointer), Some(hwnd))",
+  "( mac_window::nswindow_content_size(std::ptr::null_mut()), None )"
+ ],
  "machine_guid_reuse_across_reopen_rejects_new_install_mismatch": [
   "(first.machine_guid, second.machine_guid)",
   "(first.install_id, second.install_id)",
@@ -8534,6 +8743,40 @@
   "(error.code, ReasonCode::RcCliInvalid)",
   "( error.message.starts_with(\"Mesh shader compilation failed:\"), true )",
   "( error.message.starts_with(\"mesh_main function not found:\"), true )"
+ ],
+ "message_box_a_style_mapping_matches_message_box_response_boundary": [
+  "( call( &mut session, HostThunk::MessageBoxA, &[0, text, caption, u64::from(0x0000_0104_u32)] ), 7, \"MB_YESNO|MB_DEFBUTTON2 maps to IDNO\" )",
+  "(session.last_error(), 0)",
+  "( call(&mut session, HostThunk::MessageBoxA, &[0, text, caption, 0]), 1, \"MB_OK maps to IDOK\" )",
+  "( call(&mut session, HostThunk::MessageBoxA, &[0, 0, 0, 0]), 1, \"NULL text/caption still map MB_OK to IDOK\" )"
+ ],
+ "message_box_button_ids_never_mismatch_their_labels": [
+  "( parse_message_box_button(&format!(\"button returned:{label}\\n\"), style), expected )"
+ ],
+ "message_box_default_button_boundary_is_clamped": [
+  "(default_message_box_response(0x0004 | 0x0100), IDNO)",
+  "(default_message_box_response(0x0004 | 0x0200), IDNO)",
+  "(default_message_box_response(0x0004 | 0x0300), IDNO)",
+  "(message_box_default_index(0x0300, 0), 0)",
+  "(message_box_default_index(0x0100, 3), 1)"
+ ],
+ "message_box_dtm_mode_default_boundary_never_spawns": [
+  "(message_box_response(0x0004 | 0x0100), IDNO)",
+  "(message_box_response(0x0000), IDOK)"
+ ],
+ "message_box_malformed_output_never_fabricates_yes": [
+  "(parse_message_box_button(\"\", 0x0004), IDCANCEL)",
+  "( parse_message_box_button(\"button returned:Maybe\", 0x0004), IDCANCEL )",
+  "( parse_message_box_button(\"button returned:Yes\", 0x0000), IDCANCEL )",
+  "(parse_message_box_button(\"BUTTON RETURNED:no\", 0x0004), IDNO)",
+  "( parse_message_box_button(\"button returned: \", 0x0004), IDCANCEL )",
+  "(message_box_button_id(\"bogus\"), None)"
+ ],
+ "message_box_osascript_spawn_failure_returns_cancel": [
+  "(response, IDCANCEL)"
+ ],
+ "message_box_osascript_success_without_button_falls_back_to_cancel": [
+  "(response, IDCANCEL)"
  ],
  "message_handler_registration_error_semantics": [
   "(peer.set_message_handler(0x1234), S_OK)",
@@ -9474,6 +9717,11 @@
   "(manager.set_event(file), Err(STATUS_OBJECT_TYPE_MISMATCH))",
   "(manager.release_object(file).unwrap(), 1)"
  ],
+ "native_close_queue_overflow_keeps_window_and_drops_close": [
+  "(close_delivered, false)",
+  "(user32.has_window(hwnd), true)",
+  "(first.kind, MessageKind::Other(0x0010))"
+ ],
  "native_execute_job_trace_records_the_digest_not_the_raw_host_environment": [
   "( outcome.canonical_output.exit_code, 0, \"/usr/bin/true must exit cleanly\" )"
  ],
@@ -9618,6 +9866,9 @@
   "(events[1].kind, RegistryEventKind::ValueSet)",
   "(events[1].value_name.as_deref(), Some(\"Name\"))",
   "(software_events.len(), 4)"
+ ],
+ "notify_pump_idle_advances_the_process_epoch_without_a_lost_wakeup": [
+  "(PUMP_IDLE.epoch(), observed.wrapping_add(1))"
  ],
  "nt_allocate_virtual_memory_dispatch_pins_bounds_and_conflicts": [
   "( rax_status(&state), nt::STATUS_SUCCESS.raw(), \"fixed reserve+commit succeeds\" )",
@@ -10506,6 +10757,10 @@
   "( read_guest_u32(&memory, desc1_ptr + 256).expect(\"vendor id\"), 0x10de )",
   "( read_guest_u32(&memory, desc1_ptr + 260).expect(\"device id\"), 0x2008 )",
   "(read_guest_u32(&memory, desc1_ptr + 304).expect(\"flags\"), 0)"
+ ],
+ "pending_close_requests_drain_exactly_once_no_duplicate": [
+  "(take_pending_close_requests(), vec![0x00c0_ffee])",
+  "(take_pending_close_requests(), Vec::<u32>::new())"
  ],
  "pending_completions_are_fifo_and_pid_scoped": [
   "(pending_activation_completions(pid_a), 0)",
@@ -11493,11 +11748,28 @@
  "proxy_system_proxy_appears_in_traces": [
   "( traces.last().unwrap().proxy.as_deref(), Some(\"http://system.proxy:3128\") )"
  ],
+ "pump_idle_budget_boundary_uses_timer_deadline_without_polling_ticks": [
+  "( pump_idle_budget(Some(Duration::from_millis(3))), Duration::from_millis(3) )",
+  "( pump_idle_budget(None), Duration::from_millis(100), \"the fallback is bounded housekeeping, not a 1ms/16ms poll\" )",
+  "(PUMP_IDLE_FALLBACK, Duration::from_millis(1))",
+  "(PUMP_IDLE_FALLBACK, Duration::from_millis(16))"
+ ],
  "pump_idle_deadline_timeout_returns_exact_timeout_state_not_early": [
   "(outcome, PumpWakeOutcome::TimedOut { epoch: observed })"
  ],
+ "pump_idle_wait_blocks_until_notified_and_has_no_lost_wakeup_race": [
+  "(wake.epoch(), observed.wrapping_add(1))"
+ ],
  "pump_idle_wait_blocks_until_notified_and_never_returns_early": [
   "( outcome, PumpWakeOutcome::Notified { epoch: observed.wrapping_add(1) } )"
+ ],
+ "pump_idle_wait_returns_at_deadline_boundary_without_a_spurious_wake": [
+  "( wake.epoch(), observed, \"deadline expiry must not advance the epoch\" )"
+ ],
+ "pump_main_queue_panicking_item_never_blocks_completion": [
+  "(lock.lock().unwrap().done, true)",
+  "(ran.load(std::sync::atomic::Ordering::SeqCst), true)",
+  "(second_lock.lock().unwrap().done, true)"
  ],
  "pump_wake_before_wait_has_no_lost_wakeup_race": [
   "(wake.epoch(), notified_epoch)",
@@ -11542,8 +11814,37 @@
   "( query_thread_u32(&mut session, query, handle, THREAD_AFFINITY_MASK_CLASS), 0xFF )",
   "( query_thread_u32(&mut session, query, handle, THREAD_IS_TERMINATED_CLASS), 0 )"
  ],
+ "quic_connect_rejects_untrusted_self_signed_root": [
+  "(error.code, crate::reason::ReasonCode::RcNetConnectionFailed)",
+  "(super::quic_connection_count(), 0)"
+ ],
  "quic_force_disabled_prevents_quic_usage": [
   "(protocol, HttpProtocol::Http11)"
+ ],
+ "quic_listener_forbids_lan_bind_and_rejects_duplicate_port_conflict": [
+  "(super::quic_bind_addr(\"0.0.0.0:0\", false), \"127.0.0.1:0\")",
+  "(super::quic_bind_addr(\"[::]:0\", false), \"[::1]:0\")",
+  "( super::quic_bind_addr(\"127.0.0.1:4430\", false), \"127.0.0.1:4430\" )",
+  "( super::quic_bind_addr(\"localhost:4430\", false), \"localhost:4430\" )",
+  "(super::quic_bind_addr(\"0.0.0.0:0\", true), \"0.0.0.0:0\")",
+  "(quic_create_listener(&held_addr).is_err(), true)"
+ ],
+ "quic_listener_handshake_failure_does_not_register_connection": [
+  "( outcome .expect_err(\"ALPN mismatch must fail the handshake\") .to_string() .is_empty(), false, \"failure carries a reason\" )",
+  "(super::quic_connection_count(), 0)"
+ ],
+ "quic_listener_handshake_timeout_leaves_no_connection": [
+  "(super::quic_connection_count(), 0)"
+ ],
+ "quic_listener_rejects_handshake_at_connection_cap": [
+  "(held.len(), super::QUIC_MAX_CONNECTIONS)",
+  "( refused.to_string().is_empty(), false, \"refusal carries a reason\" )",
+  "(super::quic_connection_count(), super::QUIC_MAX_CONNECTIONS)",
+  "(super::quic_connection_count(), 0)"
+ ],
+ "quic_listener_removal_after_close_prevents_state_leak": [
+  "(super::quic_connection_count(), 1)",
+  "(super::quic_connection_count(), 0)"
  ],
  "quic_negotiate_falls_back_to_http2_when_quic_unavailable": [
   "(protocol, HttpProtocol::Http2)"
@@ -11556,6 +11857,9 @@
  ],
  "quic_negotiate_uses_http2_when_only_http2_enabled": [
   "(protocol, HttpProtocol::Http2)"
+ ],
+ "quic_server_config_rejects_mismatched_certificate_key": [
+  "(error.code, crate::reason::ReasonCode::RcIo)"
  ],
  "random_sequences_vs_independent_reference_and_tiered_cache": [
   "(memory.stable_hash(), expected.memory_hash)",
@@ -11814,6 +12118,10 @@
  "register_touch_window_creates_entry": [
   "(user32.registered_windows(), &[0x1234])"
  ],
+ "register_wait_worker_notifies_pump_idle_on_timeout_boundary": [
+  "( call( &mut session, HostThunk::RegisterWaitForSingleObject, &[out, 0, 0, 0, 1, 0] ), 1 )",
+  "(PUMP_IDLE.epoch(), observed)"
+ ],
  "registry_create_set_query_enumerate_delete": [
   "( call( &mut session, HostThunk::RegCreateKeyExW, &[ HKEY_CURRENT_USER, subkey, 0, 0, 0, 0x20019, 0, key_out, disposition, ], ), 0 )",
   "(read_u32(&session, disposition), REG_CREATED_NEW_KEY)",
@@ -12045,6 +12353,12 @@
   "( wic_source_resolution(&objects, &broken), (WIC_DEFAULT_DPI, WIC_DEFAULT_DPI), \"a broken source chain reports the default\" )",
   "(wic_source_resolution(&objects, &bitmap), (200.0, 100.0))"
  ],
+ "resolve_create_window_geometry_cascades_cw_usedefault_at_slot_boundary": [
+  "( resolve_create_window_geometry( CW_USEDEFAULT as i32, CW_USEDEFAULT as i32, CW_USEDEFAULT, CW_USEDEFAULT, (10, 20, 900, 600), 0, ), (10, 20, 600, 400) )",
+  "( resolve_create_window_geometry( CW_USEDEFAULT as i32, CW_USEDEFAULT as i32, CW_USEDEFAULT, CW_USEDEFAULT, (10, 20, 900, 600), 9, ), (42, 52, 600, 400) )",
+  "( resolve_create_window_geometry(-7, -9, 0, 0, (10, 20, 900, 600), 3), (-7, -9, 1, 1) )",
+  "( resolve_create_window_geometry( 100, CW_USEDEFAULT as i32, 0, 0, (0, 0, 300, 300), 0 ), (100, 0, 1, 1) )"
+ ],
  "resource_creation_and_destruction_no_leaks": [
   "(buf_ids.len(), 10)",
   "(tex_ids.len(), 5)"
@@ -12134,6 +12448,10 @@
  ],
  "rtl_unwind_invalid_misaligned_context_is_rejected": [
   "(error.code, ReasonCode::SehException)"
+ ],
+ "run_on_main_background_worker_boundary_completes_and_propagates_panic": [
+  "(worker.join().expect(\"worker\"), 7)",
+  "(panicking.join().is_err(), true)"
  ],
  "running_object_table_rejects_unknown_monikers_and_wrong_state": [
   "( call_slot( &mut fixture, rot, 3, &[rot as u32, server as u32, server as u32, COOKIE as u32] ), E_INVALIDARG, \"non-moniker registration\" )",
@@ -12574,6 +12892,30 @@
   "( dispatch_x86_thunk( &mut runtime, &mut memory, sh_get_path, &[pidl as u32, path_buf as u32] ), 1 )",
   "(read_guest_utf16_string(&memory, path_buf, 260), \"C:\\\\Steam\")"
  ],
+ "shell_execute_ex_w_null_and_x86_malformed_boundaries_report_failure": [
+  "(call(&mut session, HostThunk::ShellExecuteExW, &[0]), 0)",
+  "(session.last_error(), crate::error::ERROR_ACCESS_DENIED)",
+  "(session.call_x86(thunk, &[0x40_000]), 0)"
+ ],
+ "shell_execute_ex_w_refused_target_pins_se_err_accessdenied_never_42": [
+  "(call(&mut session, HostThunk::ShellExecuteExW, &[info]), 0)",
+  "(read_u64(&session, info + 0x38), SE_ERR_ACCESSDENIED)",
+  "(read_u64(&session, info + 0x68), 0)",
+  "(session.last_error(), crate::error::ERROR_ACCESS_DENIED)"
+ ],
+ "shell_execute_ex_w_success_and_refusal_boundary_never_fakes_42": [
+  "(result, 1)",
+  "(read_u64(&session, info + 0x38), 42)",
+  "(read_u64(&session, info + 0x68), 0)",
+  "(session.last_error(), 0)"
+ ],
+ "shell_execute_w_refusal_and_empty_target_boundaries_are_exact": [
+  "( call( &mut session, HostThunk::ShellExecuteW, &[0, verb, blocked, 0, 0, 1] ), SE_ERR_ACCESSDENIED )",
+  "(session.last_error(), crate::error::ERROR_ACCESS_DENIED)",
+  "( call( &mut session, HostThunk::ShellExecuteW, &[0, verb, empty, 0, 0, 1] ), 0 )",
+  "(opened, 42)",
+  "(session.last_error(), 0)"
+ ],
  "shell_link_full_vtable_surface_round_trips_and_rejects_invalid_inputs": [
   "( dispatch_x86( &mut fixture, HostThunk::ShellLinkQueryInterface, &[shell_link as u32, IID as u32, OUT as u32] ), 0 )",
   "(read_out_pointer(&fixture, OUT), shell_link)",
@@ -12914,6 +13256,9 @@
  "steam_web_helper_launch": [
   "(shim.frame_count(), 0)",
   "(shim.bridge.state(), CefState::Initialized)"
+ ],
+ "steam_web_helper_query_delegation_rejects_invalid_json": [
+  "(error.code, ReasonCode::RcCliInvalid)"
  ],
  "steam_zero_touch_execute_job_trace_records_the_digest_not_the_raw_host_environment": [
   "( outcome.canonical_output.test_id, \"steam-trace-env\", \"the zero-touch run must produce its canonical output\" )"
@@ -15144,6 +15489,11 @@
   "(pump.total_fires(), 2)",
   "(pump.len(), 2, \"both timers remain in the pump\")"
  ],
+ "timer_queue_workers_notify_pump_idle_on_due_and_periodic_boundaries": [
+  "( call( &mut session, HostThunk::CreateTimerQueueTimer, &[out, 0, 0, 0, 0, 0, 0] ), 1 )",
+  "( call( &mut session, HostThunk::CreateTimerQueueTimer, &[out, 0, 0, 0, 0, 1, 0] ), 1 )",
+  "(PUMP_IDLE.epoch(), observed)"
+ ],
  "timers_fire_in_deadline_order_and_cancel_is_exact": [
   "(executive.timer_count(), 3)",
   "(executive.advance(0), 0)",
@@ -15657,6 +16007,27 @@
  "usb_unknown_transfer_flags_are_rejected_exactly": [
   "( request.validate_flags(), Err(DeviceError::UnsupportedTransferFlag { flag: 0x8000_0000 }) )"
  ],
+ "user32_abort_creation_leaves_no_half_created_record": [
+  "(user32.abort_window_creation(hwnd), true)",
+  "(user32.has_window(hwnd), false)",
+  "(user32.abort_window_creation(hwnd), false)",
+  "(user32.destroy_window(hwnd).expect(\"destroy aborted\"), false)",
+  "(mac_window::nswindow_for_hwnd(hwnd), None)",
+  "( crate::runtime::message_id(MessageKind::NcCalcSize), 0x0083, \"WM_NCCALCSIZE id\" )"
+ ],
+ "user32_activate_rejects_popup_child_and_noactivate_boundary": [
+  "(window_can_be_activated(0, 0, false), true)",
+  "(window_can_be_activated(0x8000_0000, 0, false), false)",
+  "(window_can_be_activated(0, WS_EX_NOACTIVATE, false), false)",
+  "(window_can_be_activated(0, 0, true), false)"
+ ],
+ "user32_destroy_releases_only_owned_nswindow_no_leak_boundary": [
+  "(mac_window::mark_nswindow_owned(owned), false)",
+  "(mac_window::mark_nswindow_owned(owned), true)",
+  "(user32.destroy_window(hwnd).expect(\"destroy owned\"), true)",
+  "(mac_window::nswindow_for_hwnd(hwnd), None)",
+  "(user32.destroy_window(hwnd).expect(\"destroy external\"), true)"
+ ],
  "user32_dialog_item_rejects_invalid_parent_and_id": [
   "( user32 .get_dlg_item(0xDEAD_BEEF, 1) .expect(\"unknown parent is not an error\"), None, \"an unknown parent must not materialize a dialog item\" )",
   "( user32.get_dlg_item(parent, 0).expect(\"zero id\"), None, \"control id zero is invalid\" )",
@@ -15664,6 +16035,38 @@
   "( user32.get_dlg_item(parent, 42).expect(\"cached item\"), Some(item), \"a dialog item handle must be stable across lookups\" )",
   "(preview.parent, Some(parent))",
   "(preview.control_id, 42)"
+ ],
+ "user32_first_move_resize_mismatch_is_prevented": [
+  "((before.width, before.height), (320, 200))",
+  "( user32 .move_window(hwnd, 50, 60, 320, 200, false) .expect(\"move\"), true )",
+  "((after.width, after.height), (320, 200))",
+  "(user32.window_origin(hwnd), (50, 60))",
+  "((client.right, client.bottom), (320, 177))"
+ ],
+ "user32_key_repeat_sets_lparam_bit_30_boundary": [
+  "(downs.len(), 2)",
+  "(downs[0].lparam & (1 << 30), 0)",
+  "(downs[1].lparam & (1 << 30), 1 << 30)",
+  "(repeats.len(), 10)",
+  "( repeats .iter() .all(|message| message.lparam & (1 << 30) != 0), true )"
+ ],
+ "user32_mouse_and_nc_message_ids_never_mismatch_kind_roundtrip": [
+  "(crate::runtime::message_id(kind), id)",
+  "(crate::runtime::message_kind(id), Ok(kind))"
+ ],
+ "user32_mouse_double_click_boundary_uses_system_interval": [
+  "(user32.get_double_click_time(), 500)",
+  "( kinds .iter() .filter(|kind| **kind == MessageKind::LButtonDblClk) .count(), 1 )",
+  "( kinds .iter() .filter(|kind| **kind == MessageKind::LButtonDown) .count(), 1 )",
+  "( kinds .iter() .filter(|kind| **kind == MessageKind::LButtonDblClk) .count(), 0 )"
+ ],
+ "user32_native_close_no_double_destroy_and_no_dangling_handle": [
+  "(message.kind, MessageKind::Other(0x0010))",
+  "(user32.has_window(hwnd), true)",
+  "(user32.dispatch_message_w(&message).expect(\"WM_CLOSE\"), 0)",
+  "(user32.has_window(hwnd), false)",
+  "(mac_window::nswindow_for_hwnd(hwnd), None)",
+  "(user32.destroy_window(hwnd).expect(\"second destroy\"), false)"
  ],
  "user32_nonzero_ns_window_pointer_owner_thread_edge_reaches_appkit_calls": [
   "( user32.show_window(hwnd, 1).expect(\"show window\"), false, \"the window was hidden before the show\" )",
@@ -15673,8 +16076,18 @@
   "(user32.window_origin(hwnd), (10, 20))",
   "( user32 .set_window_pos(hwnd, 0, 15, 25, 320, 240, 0x0040) .expect(\"show and resize\"), true )"
  ],
+ "user32_right_and_middle_buttons_emit_down_up_boundary": [
+  "( [ kinds.contains(&MessageKind::RButtonDown), kinds.contains(&MessageKind::RButtonUp), kinds.contains(&MessageKind::MButtonDown), kinds.contains(&MessageKind::RButtonDblClk), kinds.contains(&MessageKind::MButtonDblClk), ], [true, true, true, true, true] )",
+  "( kinds .iter() .filter(|kind| **kind == MessageKind::XButtonDown) .count(), 2 )"
+ ],
  "user32_track_popup_menu_invalid_hwnd_and_zero_target_edges": [
   "( kinds .iter() .filter(|kind| **kind == MessageKind::Paint) .count(), 0, \"a null owner window must not queue a paint\" )"
+ ],
+ "user32_window_and_client_rects_reject_title_bar_mismatch": [
+  "( (outer.left, outer.top, outer.right, outer.bottom), (50, 60, 370, 260) )",
+  "((client.left, client.top), (0, 0))",
+  "( (client.right, client.bottom), (320, (200 - TITLE_BAR_HEIGHT) as i32) )",
+  "(outer.bottom - outer.top, client.bottom)"
  ],
  "uuid_encoding_mixed_endian_garbage_rejected": [
   "( bytes, [ 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff ] )",
@@ -16419,6 +16832,13 @@
   "( cached.error, win_trust_error::TRUST_E_NOSIGNATURE, \"the unchanged cached verdict is returned without re-reading the file\" )",
   "( cached.description, first.description, \"cached hit returns the original description\" )"
  ],
+ "window_close_delegate_no_duplicate_close_boundary": [
+  "(delegate.is_null(), false)",
+  "(unsafe { window_close_delegate() }, delegate)",
+  "(returned, 0)",
+  "(take_pending_close_requests(), vec![0x00c0_1234])",
+  "(take_pending_close_requests(), Vec::<u32>::new())"
+ ],
  "windowed_present_double_stop_and_close_are_idempotent": [
   "(control.request_stop(), true)",
   "(control.request_stop(), false)",
@@ -16474,6 +16894,37 @@
   "(svc.state, ServiceState::Running)",
   "(svc.state, ServiceState::Stopped)"
  ],
+ "winhttp_callback_notifications_emitted_without_missing_events": [
+  "(available >= 5, true)",
+  "(body, b\"hello\".to_vec())",
+  "( control, vec![ WINHTTP_CALLBACK_STATUS_SENDING_REQUEST, WINHTTP_CALLBACK_STATUS_REQUEST_SENT, WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE, WINHTTP_CALLBACK_STATUS_READ_COMPLETE, ] )",
+  "(read_sum, 5)",
+  "(data_sum, 10)",
+  "(stack.win_http_close_handle(request).is_ok(), true)"
+ ],
+ "winhttp_https_proxy_config_used_for_http_request_without_direct_fallback": [
+  "(stack.request_status_code(direct_request), 200)",
+  "(error.code, ReasonCode::RcNetHttpRequestFailed)",
+  "(stack.last_response_error_code, 12029)",
+  "(cached_error.code, ReasonCode::RcNetHttpRequestFailed)"
+ ],
+ "winhttp_invalid_proxy_client_construction_fails_closed": [
+  "(error.code, ReasonCode::RcNetHttpRequestFailed)",
+  "( error.message, \"WinHttpSendRequest: invalid proxy configuration 'http://': builder error\" )",
+  "(stack.request_status_code(request), 0)"
+ ],
+ "winhttp_pin_failure_before_headers_and_cookies": [
+  "(error.code, ReasonCode::RcNetConnectionFailed)",
+  "( error.message, \"WinHttpSendRequest: certificate pin validation failed for 127.0.0.1\" )",
+  "(stack.request_status_code(request), 0)",
+  "(stack.get_cookies(\"127.0.0.1\", \"/\", false), Vec::new())",
+  "( stack.requests[&request].response_header_map.is_empty(), true )",
+  "( stack.requests[&request].state, WinHttpSessionState::Complete )"
+ ],
+ "winhttp_query_data_available_invalid_handle_pins_exact_error": [
+  "(error.code, ReasonCode::RcWin32InvalidHandle)",
+  "( error.message, \"WinHttpQueryDataAvailable: invalid handle 0xbeef\" )"
+ ],
  "winhttp_quic_negotiate_falls_back_when_quic_unavailable": [
   "(protocol, HttpProtocol::Http2)"
  ],
@@ -16483,6 +16934,73 @@
  "winhttp_quic_query_protocol_returns_http2_when_quic_unavailable": [
   "(protocol, WINHTTP_PROTOCOL_FLAG_HTTP2)"
  ],
+ "winhttp_raw_header_map_duplicates_and_non_utf8_bytes": [
+  "(stack.request_status_code(request), 200)",
+  "(bins, vec![vec![0xFF_u8, 0xFE]])",
+  "(cookies_raw.len(), 2)",
+  "(cookies_raw[0], b\"a=1; Path=/\" as &[u8])",
+  "(jar.len(), 2)",
+  "( stack .win_http_query_header_bytes(request.wrapping_add(0x9999), \"x\") .is_err(), true )"
+ ],
+ "winhttp_read_data_buffered_fallback_without_stream_boundary": [
+  "(empty, 0)",
+  "(read, 3)",
+  "(&buf[..3], b\"abc\")",
+  "(stack.requests[&request].response_body, Vec::<u8>::new())",
+  "(stack.requests[&request].response_read_offset, 0)"
+ ],
+ "winhttp_read_data_disconnected_stream_returns_eof_boundary": [
+  "(read, 0)"
+ ],
+ "winhttp_read_data_invalid_handle_pins_exact_error": [
+  "(error.code, ReasonCode::RcWin32InvalidHandle)",
+  "(error.message, \"WinHttpReadData: invalid handle 0xdead\")"
+ ],
+ "winhttp_read_data_io_error_is_sticky_before_eof": [
+  "(error.code, ReasonCode::RcNetHttpRequestFailed)",
+  "( error .message .contains(\"WinHttpReadData: response body read failed:\"), true )",
+  "(sticky.message, first_error)"
+ ],
+ "winhttp_read_data_streams_300k_body_boundary_no_buffer_cap": [
+  "(stack.request_status_code(request), 200)",
+  "(available > 0, true)",
+  "(last, 0, \"stream ends with a zero-length read\")",
+  "(total, body_len)",
+  "(sum, expected_sum)",
+  "( stack .win_http_query_data_available(request) .expect(\"eof query\"), 0 )"
+ ],
+ "winhttp_receive_idle_timeout_stalls_query_and_read": [
+  "(query_error.code, ReasonCode::RcNetHttpRequestFailed)",
+  "( query_error.message, \"WinHttpReadData: receive timeout after 300 ms\" )",
+  "(stack.last_response_error, query_error.to_string())",
+  "( read_error.message, \"WinHttpReadData: receive timeout after 300 ms\" )"
+ ],
+ "winhttp_redirect_disable_stops_without_following_boundary": [
+  "(stack.requests[&request].disable_redirects, true)",
+  "(stack.request_status_code(request), 302)"
+ ],
+ "winhttp_redirect_follows_same_scheme_boundary": [
+  "(stack.request_status_code(request), 200)",
+  "(String::from_utf8(body).expect(\"utf8 body\"), \"landed\")"
+ ],
+ "winhttp_redirect_refuses_https_to_http_downgrade_boundary": [
+  "( is_https_to_http_downgrade(std::slice::from_ref(&https), &http), true )",
+  "(is_https_to_http_downgrade(&[], &http), false)",
+  "( is_https_to_http_downgrade(std::slice::from_ref(&http), &https), false )",
+  "( is_https_to_http_downgrade(std::slice::from_ref(&https), &https_other), false )"
+ ],
+ "winhttp_response_without_set_cookie_leaves_jar_empty_boundary": [
+  "(stack.request_status_code(request), 200)",
+  "(stack.get_cookies(\"127.0.0.1\", \"/\", false), Vec::new())",
+  "( stack.requests[&request] .response_header_map .iter() .any(|(name, _)| name == \"set-cookie\"), false )"
+ ],
+ "winhttp_send_timeout_stalled_server_fails_closed": [
+  "(error.code, ReasonCode::RcNetHttpRequestFailed)",
+  "( error.message, \"WinHttpSendRequest: send timed out after 300 ms\" )",
+  "( stack.last_response_error, \"WinHttpSendRequest: send timed out after 300 ms\" )",
+  "(stack.last_response_error_code, 12002)",
+  "( stack.requests[&request].state, WinHttpSessionState::Complete )"
+ ],
  "winhttp_thunk_headers_write_credentials_and_proxy": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, add_headers, &[request as u32, headers as u32, 11, 0], ), 1 )",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, add_headers, &[0xDEAD, headers as u32, 11, 0], ), 0 )",
@@ -16490,6 +17008,14 @@
   "(written, 7)",
   "( dispatch_x86_thunk( &mut runtime, &mut memory, set_credentials, &[request as u32, 0, 1, user as u32, pass as u32], ), 1 )",
   "( dispatch_x86_thunk(&mut runtime, &mut memory, close, &[request as u32]), 1 )"
+ ],
+ "winhttp_timeout_options_map_to_separate_fields_boundary": [
+  "(stack.requests[&request].connect_timeout_ms, 2222)",
+  "(stack.requests[&request].send_timeout_ms, 3333)",
+  "(stack.requests[&request].receive_timeout_ms, 4444)",
+  "(optional_timeout(0), None)",
+  "(optional_timeout(1500), Some(Duration::from_millis(1500)))",
+  "(client_cache_key(\"\", 0, 0, 0, false), \"|0|0|0|false\")"
  ],
  "wininet_ftp_failure_domain_dispatch": [
   "( dispatch_x86_thunk( &mut runtime, &mut memory, open_file, &[0x1234, file as u32, 0, 0] ), 0, \"FtpOpenFileW fails without a control connection\" )",
@@ -16598,6 +17124,9 @@
   "( manager.poll_wmi(WmiSubscriptionId(404)), Err(STATUS_INVALID_HANDLE) )",
   "(manager.cancel_wmi_subscription(subscription), Ok(()))",
   "( manager.cancel_wmi_subscription(subscription), Err(STATUS_INVALID_HANDLE) )"
+ ],
+ "work_area_from_monitor_rejects_degenerate_rect_and_uses_fallback": [
+  "(work_area_from_monitor(None), (0, 0, 1024, 768))"
  ],
  "work_graph_chain_selects_launch_modes_arrays_and_mesh_nodes": [
   "(graph.node_array_size(\"root\"), 1)",
@@ -16815,6 +17344,11 @@
   "( memory.read_u16(page + 6).expect(\"terminator\"), 0, \"the fixed buffer is NUL-terminated at capacity - 1\" )",
   "( memory.read_u16(page + 8).expect(\"padding\"), 0, \"the remainder of the fixed buffer stays zero\" )"
  ],
+ "write_window_create_struct_rejects_no_layout_aliasing_for_x86_and_x64": [
+  "( read_guest_pointer(&session.memory, pointer, arch), Ok(0xDEAD_BEEF) )",
+  "(expected_size, struct_size)",
+  "( read_guest_pointer(&session.memory, pointer + instance_offset, arch), Ok(0x1111) )"
+ ],
  "wsa_lifecycle": [
   "(stack.wsa_refcount_check(), 2)",
   "(stack.wsa_refcount_check(), 0)"
@@ -16824,6 +17358,21 @@
   "(wsa_error_to_dos_error(10038), ERROR_INVALID_HANDLE)",
   "(wsa_error_to_dos_error(10060), ERROR_TIMEOUT)",
   "(wsa_error_to_dos_error(99999), ERROR_INVALID_PARAMETER)"
+ ],
+ "wsl_docker_image_rejects_leading_dash_and_metacharacter_names": [
+  "( validate_docker_image(rejected).unwrap_err(), format!(\"ERROR_INVALID_PARAMETER: invalid docker image '{rejected}'\") )",
+  "(validate_docker_image(allowed), Ok(()))",
+  "( launch_via_docker(\"-rf\", \"id\", None).unwrap_err(), \"ERROR_INVALID_PARAMETER: invalid docker image '-rf'\" )"
+ ],
+ "wsl_error_code_boundary_maps_invalid_parameter_and_generic_failure": [
+  "( wsl_error_code(\"ERROR_INVALID_PARAMETER: invalid docker image '-rf'\"), crate::error::ERROR_INVALID_PARAMETER )",
+  "(wsl_error_code(\"no Linux runtime available\"), 4)"
+ ],
+ "wsl_launch_rejects_bad_image_with_error_invalid_parameter": [
+  "( error, \"ERROR_INVALID_PARAMETER: invalid docker image '--privileged'\" )",
+  "(api_error.code, crate::error::ERROR_INVALID_PARAMETER)",
+  "(interactive.code, crate::error::ERROR_INVALID_PARAMETER)",
+  "assert!(api_error.message.starts_with(\"ERROR_INVALID_PARAMETER\")"
  ],
  "x64_format_stgmedium_statdata_oleverb_and_drop_paths_are_real": [
   "(decoded.cf_format, 1)",

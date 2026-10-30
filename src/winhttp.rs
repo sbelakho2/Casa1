@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -22,8 +23,44 @@ use std::time::Duration;
 
 /// Maximum WinHTTP request body size (256 MB).
 pub const MAX_WINHTTP_REQUEST_BODY: usize = 256 * 1024 * 1024;
-/// Maximum WinHTTP response body size (256 MB).
+/// Buffer cap for streamed FTP data transfers (WinFtpWriteData). HTTP
+/// response bodies are *streamed* by WinHttpReadData (N2) and have no
+/// whole-buffer cap anymore — only the documented per-read chunk cap
+/// [`WINHTTP_READ_CHUNK_CAP`] applies to each worker read.
 pub const MAX_WINHTTP_RESPONSE_BODY: usize = 256 * 1024 * 1024;
+
+/// Per-read cap for the streamed response body (N2): the background worker
+/// pulls at most this many bytes from the network per read, and a single
+/// WinHttpReadData call copies at most the caller's buffer size. Response
+/// bodies are streamed instead of buffered, so there is deliberately NO
+/// whole-response size cap anymore (the previous 256 MiB whole-buffer cap
+/// only capped memory use of an eager full-body read that no longer exists).
+pub const WINHTTP_READ_CHUNK_CAP: usize = 64 * 1024;
+
+/// WINHTTP_OPTION_CONNECT_TIMEOUT (winhttp.h value 3; option 4 is accepted
+/// as a legacy alias for the connect bound).
+pub const WINHTTP_OPTION_CONNECT_TIMEOUT: u32 = 3;
+/// WINHTTP_OPTION_SEND_TIMEOUT — bounds connect+send+response-headers wait.
+pub const WINHTTP_OPTION_SEND_TIMEOUT: u32 = 5;
+/// WINHTTP_OPTION_RECEIVE_TIMEOUT — per-read idle bound on body reads.
+pub const WINHTTP_OPTION_RECEIVE_TIMEOUT: u32 = 6;
+/// WINHTTP_OPTION_DISABLE_FEATURE — carries WINHTTP_DISABLE_REDIRECTS.
+pub const WINHTTP_OPTION_DISABLE_FEATURE: u32 = 63;
+/// WINHTTP_DISABLE_REDIRECTS feature bit (honoured per request, N4).
+pub const WINHTTP_DISABLE_REDIRECTS: u32 = 0x0000_0002;
+
+// WINHTTP_CALLBACK_STATUS_* notification values (winhttp.h). Emitted for
+// request handles with a registered callback whose notify flags cover the
+// status (N2 async notifications).
+pub const WINHTTP_CALLBACK_STATUS_SENDING_REQUEST: u32 = 0x0000_0010;
+pub const WINHTTP_CALLBACK_STATUS_REQUEST_SENT: u32 = 0x0000_0020;
+pub const WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED: u32 = 0x0000_0080;
+pub const WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE: u32 = 0x0002_0000;
+pub const WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE: u32 = 0x0004_0000;
+pub const WINHTTP_CALLBACK_STATUS_READ_COMPLETE: u32 = 0x0008_0000;
+pub const WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE: u32 = 0x0040_0000;
+/// WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS — matches every status bit.
+pub const WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS: u32 = 0xFFFF_FFFF;
 
 /// WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL — enables HTTP/2 and/or HTTP/3 protocol
 pub const WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL: u32 = 159;
@@ -67,6 +104,10 @@ fn default_ws_keepalive_interval_ms() -> u32 {
 /// Default WebSocket buffer size for serde defaults.
 fn default_ws_buffer_size() -> u32 {
     WINHTTP_DEFAULT_WEB_SOCKET_BUFFER_SIZE
+}
+/// Default connect/send/receive timeout (ms) for serde defaults.
+fn default_timeout_30s() -> u32 {
+    30_000
 }
 
 #[cfg(feature = "websocket")]
@@ -164,7 +205,29 @@ pub struct WinHttpRequest {
     pub status_code: u32,
     pub status_text: String,
     pub state: WinHttpSessionState,
-    pub timeout_ms: u32,
+    /// WINHTTP_OPTION_CONNECT_TIMEOUT (ms): bound on establishing the
+    /// connection. 0 = infinite (N1).
+    #[serde(default = "default_timeout_30s")]
+    pub connect_timeout_ms: u32,
+    /// WINHTTP_OPTION_SEND_TIMEOUT (ms): bound on sending the request and
+    /// receiving the response headers. 0 = infinite (N1).
+    #[serde(default = "default_timeout_30s")]
+    pub send_timeout_ms: u32,
+    /// WINHTTP_OPTION_RECEIVE_TIMEOUT (ms): per-read idle bound while
+    /// streaming the response body; there is no total request timeout (N1).
+    /// 0 = infinite.
+    #[serde(default = "default_timeout_30s")]
+    pub receive_timeout_ms: u32,
+    /// WINHTTP_DISABLE_REDIRECTS via WINHTTP_OPTION_DISABLE_FEATURE: when
+    /// set, redirects are not followed for this request. Part of the client
+    /// cache key so the per-request policy is honoured (N4).
+    #[serde(default)]
+    pub disable_redirects: bool,
+    /// Raw response header map as (lowercase name, raw bytes): duplicate
+    /// headers are preserved as separate entries and non-UTF-8 values keep
+    /// their exact bytes (N4).
+    #[serde(default)]
+    pub response_header_map: Vec<(String, Vec<u8>)>,
     pub callback: Option<HINTERNET>, // stores callback context as handle
     pub callback_notify_flags: u32,
     pub certificate_errors: Vec<String>,
@@ -929,6 +992,173 @@ pub struct PacCacheEntry {
     pub expiry: std::time::Instant,
 }
 
+/// Whether a stream refill produced data or hit end-of-stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFill {
+    Data,
+    Eof,
+}
+
+/// Streamed response body (N2).
+///
+/// A worker thread reads the stored [`reqwest::blocking::Response`] into a
+/// bounded channel (backpressure: at most one chunk queued plus one in
+/// flight), and `WinHttpReadData` / `WinHttpQueryDataAvailable` drain it
+/// under the request's per-read receive-idle timeout. `leftover` buffers a
+/// received-but-not-yet-consumed chunk so chunk boundaries and caller buffer
+/// sizes stay independent; `error` is the sticky first body-read failure.
+#[derive(Debug)]
+pub struct ResponseStream {
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    leftover: Vec<u8>,
+    eof: bool,
+    error: Option<String>,
+}
+
+impl ResponseStream {
+    /// Move `response` onto a worker thread that streams body chunks into a
+    /// bounded channel. `notify_flags` are the request's effective callback
+    /// notification flags: when the DATA_AVAILABLE bit is set the worker
+    /// emits `WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE` for every chunk that
+    /// becomes ready (async data-ready notifications, N2).
+    fn spawn(
+        mut response: reqwest::blocking::Response,
+        handle: HINTERNET,
+        notify_flags: u32,
+        events: Arc<Mutex<Vec<(HINTERNET, u32, u32)>>>,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(1);
+        std::thread::spawn(move || {
+            loop {
+                let mut chunk = vec![0_u8; WINHTTP_READ_CHUNK_CAP];
+                match response.read(&mut chunk) {
+                    Ok(0) => {
+                        // End-of-stream marker (empty chunk).
+                        let _ = tx.send(Ok(Vec::new()));
+                        break;
+                    }
+                    Ok(read) => {
+                        chunk.truncate(read);
+                        // Async data-ready notification (N2).
+                        push_callback_event(
+                            &events,
+                            notify_flags,
+                            handle,
+                            WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE,
+                            read as u32,
+                        );
+                        let _ = tx.send(Ok(chunk));
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            rx,
+            leftover: Vec::new(),
+            eof: false,
+            error: None,
+        }
+    }
+
+    /// Refill `leftover` from the worker channel, honouring the per-read
+    /// receive-idle timeout (0 = infinite, N1). Returns whether data is
+    /// available or the stream has ended.
+    fn fill(&mut self, receive_timeout_ms: u32) -> AppResult<StreamFill> {
+        if !self.leftover.is_empty() {
+            return Ok(StreamFill::Data);
+        }
+        if let Some(error) = &self.error {
+            return Err(AppError::new(
+                ReasonCode::RcNetHttpRequestFailed,
+                error.clone(),
+            ));
+        }
+        enum Event {
+            Chunk(std::io::Result<Vec<u8>>),
+            TimedOut,
+            Closed,
+        }
+        let event = if receive_timeout_ms == 0 {
+            // 0 = infinite: block until the worker delivers the next event.
+            self.rx.recv().map(Event::Chunk).unwrap_or(Event::Closed)
+        } else {
+            match self
+                .rx
+                .recv_timeout(Duration::from_millis(u64::from(receive_timeout_ms)))
+            {
+                Ok(item) => Event::Chunk(item),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Event::TimedOut,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Event::Closed,
+            }
+        };
+        match event {
+            Event::Chunk(Ok(chunk)) if chunk.is_empty() => {
+                self.eof = true;
+                Ok(StreamFill::Eof)
+            }
+            Event::Chunk(Ok(chunk)) => {
+                self.leftover = chunk;
+                Ok(StreamFill::Data)
+            }
+            Event::Chunk(Err(io)) => {
+                let message = format!("WinHttpReadData: response body read failed: {io}");
+                let error = AppError::new(ReasonCode::RcNetHttpRequestFailed, message.clone());
+                self.error = Some(message);
+                Err(error)
+            }
+            Event::TimedOut => Err(AppError::new(
+                ReasonCode::RcNetHttpRequestFailed,
+                format!("WinHttpReadData: receive timeout after {receive_timeout_ms} ms"),
+            )),
+            Event::Closed => {
+                self.eof = true;
+                Ok(StreamFill::Eof)
+            }
+        }
+    }
+}
+
+/// Drain the streamed body (N2) into `buffer`: refill the leftover chunk
+/// under the receive idle timeout, copy out at most the caller's buffer and
+/// emit `WINHTTP_CALLBACK_STATUS_READ_COMPLETE`. Stream errors also record
+/// the stack's last-response error (for `InternetGetLastResponseInfoW`).
+fn read_streamed_body(
+    stream: &mut ResponseStream,
+    buffer: &mut [u8],
+    receive_timeout_ms: u32,
+    notify_flags: u32,
+    handle: HINTERNET,
+    events: &Arc<Mutex<Vec<(HINTERNET, u32, u32)>>>,
+    last_error: &mut String,
+    last_error_code: &mut u32,
+) -> AppResult<u32> {
+    match stream.fill(receive_timeout_ms) {
+        Ok(StreamFill::Eof) => Ok(0),
+        Err(error) => {
+            *last_error = error.to_string();
+            *last_error_code = error.last_error();
+            Err(error)
+        }
+        Ok(StreamFill::Data) => {
+            let count = buffer.len().min(stream.leftover.len());
+            buffer[..count].copy_from_slice(&stream.leftover[..count]);
+            stream.leftover.drain(..count);
+            push_callback_event(
+                events,
+                notify_flags,
+                handle,
+                WINHTTP_CALLBACK_STATUS_READ_COMPLETE,
+                count as u32,
+            );
+            Ok(count as u32)
+        }
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // PAC cache retained for future proxy auto-config paths
 pub struct WinHttpStack {
@@ -936,10 +1166,18 @@ pub struct WinHttpStack {
     connections: BTreeMap<HINTERNET, WinHttpConnection>,
     requests: BTreeMap<HINTERNET, WinHttpRequest>,
     next_handle: HINTERNET,
-    /// Cached reqwest client, keyed by the (proxy, timeout) config it was
-    /// built with. Rebuilt whenever the config generation changes so that
-    /// `WINHTTP_OPTION_PROXY` / timeout options take effect.
+    /// Cached reqwest client, keyed by the (proxy, connect/send/receive
+    /// timeouts, redirect policy) config it was built with. Rebuilt whenever
+    /// any part of the key changes so that `WINHTTP_OPTION_PROXY` and the
+    /// per-request timeout/redirect options take effect (N1/N4).
     client_cache: Option<(String, reqwest::blocking::Client)>,
+    /// Streamed response bodies (N2): worker-fed readers per request handle.
+    /// Behind a mutex so the stack stays `Sync` (one reader at a time per
+    /// handle; the worker thread only touches its channel).
+    response_streams: BTreeMap<HINTERNET, Mutex<ResponseStream>>,
+    /// WINHTTP_CALLBACK_STATUS_* notifications emitted for handles with a
+    /// registered callback (N2 async notifications).
+    callback_events: Arc<Mutex<Vec<(HINTERNET, u32, u32)>>>,
     /// Certificate pinning: host -> list of acceptable SPKI SHA-256 hashes
     pinned_certs: HashMap<String, Vec<Vec<u8>>>,
     /// Cookie jar: host -> list of cookies
@@ -1093,6 +1331,71 @@ fn extract_spki_der(data: &[u8]) -> Option<Vec<u8>> {
     Some(data[spki_start..spki_end].to_vec())
 }
 
+/// Map a WinHTTP timeout option value to a duration: 0 = infinite (N1),
+/// anything else is the bound in milliseconds.
+fn optional_timeout(timeout_ms: u32) -> Option<Duration> {
+    if timeout_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(u64::from(timeout_ms)))
+    }
+}
+
+/// Cache key for the shared reqwest client (N1/N4): every knob that changes
+/// client behaviour — proxy, the separate connect/send/receive timeouts and
+/// the per-request redirect policy — participates, so changing any of them
+/// rebuilds the client instead of silently keeping earlier settings.
+fn client_cache_key(
+    proxy_key: &str,
+    connect_timeout_ms: u32,
+    send_timeout_ms: u32,
+    receive_timeout_ms: u32,
+    disable_redirects: bool,
+) -> String {
+    format!(
+        "{proxy_key}|{connect_timeout_ms}|{send_timeout_ms}|{receive_timeout_ms}|{disable_redirects}"
+    )
+}
+
+/// True when a redirect would take the request from HTTPS down to HTTP (N4).
+fn is_https_to_http_downgrade(previous: &[url::Url], next: &url::Url) -> bool {
+    previous.last().map(url::Url::scheme) == Some("https") && next.scheme() == "http"
+}
+
+/// Per-request redirect policy (N4), mirroring WinHTTP's default
+/// `WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP`: an HTTPS→HTTP
+/// redirect is refused (the 3xx response is returned to the caller, never
+/// followed), and `WINHTTP_DISABLE_REDIRECTS` (`disable_redirects`) refuses
+/// every redirect. All remaining redirects use reqwest's default policy
+/// (follow up to 10 hops).
+fn winhttp_redirect_policy(disable_redirects: bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if disable_redirects || is_https_to_http_downgrade(attempt.previous(), attempt.url()) {
+            attempt.stop()
+        } else {
+            reqwest::redirect::Policy::default().redirect(attempt)
+        }
+    })
+}
+
+/// Record a `WINHTTP_CALLBACK_STATUS_*` notification for a request handle
+/// that has a registered callback covering `status` (N2). `notify_flags` is
+/// the effective flag word (0 when no callback is registered).
+fn push_callback_event(
+    events: &Arc<Mutex<Vec<(HINTERNET, u32, u32)>>>,
+    notify_flags: u32,
+    handle: HINTERNET,
+    status: u32,
+    value: u32,
+) {
+    if notify_flags & status != 0 {
+        events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((handle, status, value));
+    }
+}
+
 impl Default for WinHttpStack {
     fn default() -> Self {
         Self::new()
@@ -1107,6 +1410,8 @@ impl WinHttpStack {
             requests: BTreeMap::new(),
             next_handle: 1,
             client_cache: None,
+            response_streams: BTreeMap::new(),
+            callback_events: Arc::new(Mutex::new(Vec::new())),
             pinned_certs: HashMap::new(),
             cookie_jar: HashMap::new(),
             proxy: None,
@@ -1467,21 +1772,32 @@ impl WinHttpStack {
     }
 
     /// Build (or reuse from the cache) a reqwest blocking client for the
-    /// given proxy configuration and timeout. The cache key covers the proxy
-    /// server, bypass state and timeout, so changing any of them rebuilds the
-    /// client. Returns an error instead of panicking if the client cannot be
+    /// given proxy configuration, per-phase timeouts and redirect policy.
+    /// The cache key covers the proxy server, bypass state, the separate
+    /// connect/send/receive timeouts (0 = infinite) and the per-request
+    /// redirect policy, so changing any of them rebuilds the client.
+    /// Returns an error instead of panicking if the client cannot be
     /// constructed (e.g. invalid TLS configuration).
     fn client_for(
         &mut self,
         proxy_cfg: Option<&ProxyConfig>,
         should_bypass: bool,
-        timeout_ms: u32,
+        connect_timeout_ms: u32,
+        send_timeout_ms: u32,
+        receive_timeout_ms: u32,
+        disable_redirects: bool,
     ) -> AppResult<reqwest::blocking::Client> {
         let proxy_key = match proxy_cfg {
             Some(cfg) if !should_bypass => cfg.server.clone(),
             _ => String::new(),
         };
-        let key = format!("{proxy_key}|{timeout_ms}");
+        let key = client_cache_key(
+            &proxy_key,
+            connect_timeout_ms,
+            send_timeout_ms,
+            receive_timeout_ms,
+            disable_redirects,
+        );
         if let Some((cached_key, client)) = &self.client_cache
             && *cached_key == key
         {
@@ -1491,7 +1807,13 @@ impl WinHttpStack {
         let mut builder = reqwest::blocking::Client::builder()
             .danger_accept_invalid_certs(false) // certificate pinning is enforced for pinned hosts
             .tls_info(true) // expose the peer certificate so certificate pinning can be enforced
-            .timeout(std::time::Duration::from_millis(timeout_ms as u64));
+            // N1: never a total request timeout — the connect phase is bound
+            // by the connect timeout, body reads by the receive idle timeout.
+            .timeout(None)
+            .connect_timeout(optional_timeout(connect_timeout_ms))
+            // N4: per-request redirect policy (refuses https→http; refuses
+            // every redirect when WINHTTP_DISABLE_REDIRECTS is set).
+            .redirect(winhttp_redirect_policy(disable_redirects));
         if let Some(cfg) = proxy_cfg
             && !should_bypass
         {
@@ -1501,24 +1823,21 @@ impl WinHttpStack {
                 } else {
                     format!("http://{}", cfg.server)
                 };
-            // https:// proxy URLs must be registered as https proxies;
-            // Proxy::http silently rejects them.
-            let proxy = if proxy_url.starts_with("https://") {
-                reqwest::Proxy::https(&proxy_url)
-            } else {
-                reqwest::Proxy::all(&proxy_url)
-            };
-            match proxy {
-                Ok(p) => {
-                    builder = builder.proxy(p);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "WinHttpSendRequest: ignoring invalid proxy configuration '{}': {e}",
+            // Proxy::all applies the proxy to BOTH http and https requests
+            // (N3); the previous Proxy::https selection made http:// targets
+            // bypass a configured https:// proxy entirely. An invalid proxy
+            // URL fails closed instead of silently falling back to a direct
+            // connection (which would bypass the operator's proxy).
+            let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
+                AppError::new(
+                    ReasonCode::RcNetHttpRequestFailed,
+                    format!(
+                        "WinHttpSendRequest: invalid proxy configuration '{}': {e}",
                         Self::redact_proxy_url(&proxy_url)
-                    );
-                }
-            }
+                    ),
+                )
+            })?;
+            builder = builder.proxy(proxy);
         }
         let client = builder.build().map_err(|e| {
             AppError::new(
@@ -1612,6 +1931,9 @@ impl WinHttpStack {
             return Ok(());
         }
         if self.requests.remove(&handle).is_some() {
+            // Dropping the stream disconnects the worker: its next channel
+            // send fails and the worker thread terminates (N2 lifecycle).
+            self.response_streams.remove(&handle);
             return Ok(());
         }
         if self.websockets.remove(&handle).is_some() {
@@ -1700,7 +2022,11 @@ impl WinHttpStack {
             status_code: 0,
             status_text: String::new(),
             state: WinHttpSessionState::Open,
-            timeout_ms: 30000,
+            connect_timeout_ms: default_timeout_30s(),
+            send_timeout_ms: default_timeout_30s(),
+            receive_timeout_ms: default_timeout_30s(),
+            disable_redirects: false,
+            response_header_map: Vec::new(),
             callback: None,
             callback_notify_flags: 0,
             certificate_errors: Vec::new(),
@@ -1726,7 +2052,19 @@ impl WinHttpStack {
     ) -> AppResult<()> {
         // Phase 1: Parse additional headers and body, extract connection info
         // (drop mutable borrow on self.requests before calling self.* methods)
-        let (_conn_handle, conn_server_name, conn_is_secure, conn_port, req_object_name, req_verb) = {
+        let (
+            _conn_handle,
+            conn_server_name,
+            conn_is_secure,
+            conn_port,
+            req_object_name,
+            req_verb,
+            connect_timeout_ms,
+            send_timeout_ms,
+            receive_timeout_ms,
+            disable_redirects,
+            effective_flags,
+        ) = {
             let req = self.requests.get_mut(&request_handle).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcWin32InvalidHandle,
@@ -1772,6 +2110,17 @@ impl WinHttpStack {
                 cn.server_port,
                 req.object_name.clone(),
                 req.verb.clone(),
+                req.connect_timeout_ms,
+                req.send_timeout_ms,
+                req.receive_timeout_ms,
+                req.disable_redirects,
+                // Effective callback notification flags: 0 when no callback
+                // is registered so no status is ever emitted for it (N2).
+                if req.callback.is_some() {
+                    req.callback_notify_flags
+                } else {
+                    0
+                },
             )
         };
 
@@ -1789,20 +2138,23 @@ impl WinHttpStack {
             None
         };
         let proxy_cfg = self.proxy.clone();
-        let req_timeout_ms = self
-            .requests
-            .get(&request_handle)
-            .map(|r| r.timeout_ms)
-            .unwrap_or(30000);
 
         // --- 3.1.4: Collect cookies from jar ---
         let cookies = self.get_cookies(&conn_server_name, &req_object_name, conn_is_secure);
 
         // Build (or reuse) the HTTP client. The cache key covers the proxy
-        // configuration, bypass state and effective timeout, so later
-        // WinHttpSetOption(WINHTTP_OPTION_PROXY / *_TIMEOUT) changes rebuild
-        // the client instead of silently keeping the first request's settings.
-        let client = self.client_for(proxy_cfg.as_ref(), should_bypass, req_timeout_ms)?;
+        // configuration, bypass state, the separate connect/send/receive
+        // timeouts (0 = infinite) and the per-request redirect policy, so
+        // later WinHttpSetOption changes rebuild the client instead of
+        // silently keeping the first request's settings (N1/N4).
+        let client = self.client_for(
+            proxy_cfg.as_ref(),
+            should_bypass,
+            connect_timeout_ms,
+            send_timeout_ms,
+            receive_timeout_ms,
+            disable_redirects,
+        )?;
 
         let method =
             reqwest::Method::from_bytes(req_verb.to_uppercase().as_bytes()).map_err(|_| {
@@ -1829,15 +2181,21 @@ impl WinHttpStack {
             request_builder = request_builder.header("Proxy-Authorization", auth);
         }
 
-        // Phase 2: Re-borrow request to add headers/body and send
-        let (
-            _status_code,
-            _status_text,
-            response_headers,
-            _response_body,
-            set_cookie_values,
-            cert_chain,
-        ) = {
+        // Progress notifications: the request is being sent (N2).
+        push_callback_event(
+            &self.callback_events,
+            effective_flags,
+            request_handle,
+            WINHTTP_CALLBACK_STATUS_SENDING_REQUEST,
+            0,
+        );
+
+        // Phase 2: attach headers/body and send under the send timeout (N1),
+        // capturing the peer certificate. Nothing of the response is read
+        // here: the pin is verified immediately after send() returns, before
+        // any response header is read and before any Set-Cookie is stored
+        // (H8).
+        let (response, cert_chain) = {
             let req = self.requests.get_mut(&request_handle).ok_or_else(|| {
                 AppError::new(
                     ReasonCode::RcWin32InvalidHandle,
@@ -1863,10 +2221,24 @@ impl WinHttpStack {
 
             req.state = WinHttpSessionState::Sending;
 
-            // Execute the request
-            let mut response = match request_builder.send() {
-                Ok(resp) => resp,
-                Err(e) => {
+            // Execute the request on a worker thread so the send timeout
+            // (0 = infinite) bounds exactly connect+send+response-headers.
+            // There is deliberately no total request timeout anywhere (N1).
+            let (send_tx, send_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = send_tx.send(request_builder.send());
+            });
+            let send_result: Result<Result<reqwest::blocking::Response, reqwest::Error>, ()> =
+                if send_timeout_ms == 0 {
+                    send_rx.recv().map_err(|_| ())
+                } else {
+                    send_rx
+                        .recv_timeout(Duration::from_millis(u64::from(send_timeout_ms)))
+                        .map_err(|_| ())
+                };
+            let response = match send_result {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => {
                     req.state = WinHttpSessionState::Complete;
                     self.last_response_error = format!("{e:?}");
                     self.last_response_error_code = 12029; // ERROR_INTERNET_CANNOT_CONNECT
@@ -1875,106 +2247,55 @@ impl WinHttpStack {
                         format!("WinHttpSendRequest: {e:?}"),
                     ));
                 }
+                Err(()) => {
+                    req.state = WinHttpSessionState::Complete;
+                    let message =
+                        format!("WinHttpSendRequest: send timed out after {send_timeout_ms} ms");
+                    self.last_response_error = message.clone();
+                    self.last_response_error_code = 12002; // ERROR_INTERNET_TIMEOUT
+                    return Err(AppError::new(ReasonCode::RcNetHttpRequestFailed, message));
+                }
             };
 
-            // Capture the peer certificate (DER) from the live TLS handshake before the
-            // response body is consumed, so certificate pins can be enforced below.
+            // Capture the peer certificate (DER) from the live TLS handshake
+            // so the pin can be verified immediately (H8).
             let cert_chain: Vec<Vec<u8>> = response
                 .extensions()
                 .get::<reqwest::tls::TlsInfo>()
                 .and_then(|info| info.peer_certificate())
                 .map(|der| vec![der.to_vec()])
                 .unwrap_or_default();
-
-            let sc = response.status().as_u16() as u32;
-            let st = response
-                .status()
-                .canonical_reason()
-                .unwrap_or("Unknown")
-                .to_string();
-
-            // Parse response headers
-            let mut resp_headers = BTreeMap::new();
-            for (key, value) in response.headers() {
-                resp_headers.insert(key.to_string(), value.to_str().unwrap_or("").to_string());
-            }
-
-            // --- 3.1.4: Parse Set-Cookie headers from raw response ---
-            // reqwest::header::HeaderMap supports get_all() for multi-valued headers;
-            // we use it here before the headers are collapsed into BTreeMap.
-            let set_cookie_values: Vec<String> = response
-                .headers()
-                .get_all(reqwest::header::SET_COOKIE)
-                .iter()
-                .map(|hv| hv.to_str().unwrap_or("").to_string())
-                .collect();
-
-            // Read the response body with a hard size cap and error
-            // propagation: a mid-body network error must fail the request
-            // instead of silently producing a truncated body.
-            if let Some(cl) = response.content_length()
-                && cl > MAX_WINHTTP_RESPONSE_BODY as u64
-            {
-                req.state = WinHttpSessionState::Complete;
-                return Err(AppError::new(
-                    ReasonCode::RcBufferLimitExceeded,
-                    format!(
-                        "WinHttpSendRequest: response content length {cl} exceeds limit ({MAX_WINHTTP_RESPONSE_BODY})"
-                    ),
-                ));
-            }
-            let mut body_bytes = Vec::new();
-            {
-                let mut limited = (&mut response).take((MAX_WINHTTP_RESPONSE_BODY + 1) as u64);
-                if let Err(e) = limited.read_to_end(&mut body_bytes) {
-                    req.state = WinHttpSessionState::Complete;
-                    self.last_response_error = format!("{e}");
-                    self.last_response_error_code = 12002; // ERROR_INTERNET_TIMEOUT
-                    return Err(AppError::new(
-                        ReasonCode::RcNetHttpRequestFailed,
-                        format!("WinHttpSendRequest: failed reading response body: {e}"),
-                    ));
-                }
-            }
-            if body_bytes.len() > MAX_WINHTTP_RESPONSE_BODY {
-                req.state = WinHttpSessionState::Complete;
-                return Err(AppError::new(
-                    ReasonCode::RcBufferLimitExceeded,
-                    format!(
-                        "WinHttpSendRequest: response body size {} exceeds limit ({MAX_WINHTTP_RESPONSE_BODY})",
-                        body_bytes.len()
-                    ),
-                ));
-            }
-
-            // Write results into request (move, no clone)
-            req.status_code = sc;
-            req.status_text = st.clone();
-            req.response_headers = resp_headers.clone();
-            req.response_body = body_bytes;
-            req.response_read_offset = 0;
-            req.state = WinHttpSessionState::Complete;
-
-            (
-                sc,
-                st,
-                resp_headers,
-                Vec::<u8>::new(),
-                set_cookie_values,
-                cert_chain,
-            )
+            (response, cert_chain)
         };
 
-        // --- 3.1.4: Parse and store Set-Cookie headers from response ---
-        for header_value in &set_cookie_values {
-            self.parse_and_store_set_cookie(&conn_server_name, header_value);
-        }
+        // Progress notifications: request sent, response headers received.
+        push_callback_event(
+            &self.callback_events,
+            effective_flags,
+            request_handle,
+            WINHTTP_CALLBACK_STATUS_REQUEST_SENT,
+            0,
+        );
+        push_callback_event(
+            &self.callback_events,
+            effective_flags,
+            request_handle,
+            WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED,
+            0,
+        );
 
-        // --- 3.1.3: Verify certificate pins ---
-        // The peer certificate captured from the TLS handshake (via `tls_info`) is passed
-        // to the pin validator. If pins are configured for this host and none match, the
-        // request is rejected (fail closed).
+        // --- H8: verify certificate pins IMMEDIATELY after send() returns ---
+        // The peer certificate captured from the TLS handshake (via `tls_info`)
+        // is checked before any response header is read and before any
+        // Set-Cookie is stored: a pin failure therefore leaves status,
+        // headers and the cookie jar untouched (fail closed).
         if !self.verify_certificate_pin(&conn_server_name, &cert_chain) {
+            if let Some(req) = self.requests.get_mut(&request_handle) {
+                req.state = WinHttpSessionState::Complete;
+                req.certificate_errors.push(format!(
+                    "certificate pin validation failed for {conn_server_name}"
+                ));
+            }
             return Err(AppError::new(
                 ReasonCode::RcNetConnectionFailed,
                 format!(
@@ -1983,6 +2304,81 @@ impl WinHttpStack {
                 ),
             ));
         }
+
+        // Phase 3: the pin is verified — read the status and the raw header
+        // map now. The raw map keeps duplicate headers as separate entries
+        // and preserves non-UTF-8 bytes verbatim (N4); the collapsed BTreeMap
+        // is a lossy view kept for the existing string queries.
+        let mut response_headers = BTreeMap::new();
+        // Invariant: the handle was validated in phase 1 and `&mut self`
+        // excludes a concurrent close, so the request cannot disappear
+        // mid-call. A missing entry here is a bug, not a caller error.
+        let req = self
+            .requests
+            .get_mut(&request_handle)
+            .expect("request remains registered for the duration of WinHttpSendRequest");
+        req.status_code = response.status().as_u16() as u32;
+        req.status_text = response
+            .status()
+            .canonical_reason()
+            .unwrap_or("Unknown")
+            .to_string();
+        req.response_header_map = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+            .collect();
+        for (key, value) in response.headers() {
+            response_headers.insert(key.to_string(), value.to_str().unwrap_or("").to_string());
+        }
+        req.response_headers = response_headers.clone();
+        req.response_read_offset = 0;
+        req.response_body.clear();
+        req.state = WinHttpSessionState::Complete;
+        // reqwest::header::HeaderMap supports get_all() for multi-valued
+        // headers; collect every Set-Cookie value separately.
+        let set_cookie_values: Vec<String> = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .map(|hv| hv.to_str().unwrap_or("").to_string())
+            .collect();
+
+        // --- 3.1.4: Parse and store Set-Cookie headers from response
+        // (only reached after the pin passed, H8) ---
+        for header_value in &set_cookie_values {
+            self.parse_and_store_set_cookie(&conn_server_name, header_value);
+        }
+
+        // N2: hand the response to the streaming worker. The body is read
+        // lazily by WinHttpReadData / WinHttpQueryDataAvailable under the
+        // receive idle timeout instead of being buffered whole — there is no
+        // whole-response size cap anymore, only the per-read chunk cap.
+        let stream = ResponseStream::spawn(
+            response,
+            request_handle,
+            effective_flags,
+            Arc::clone(&self.callback_events),
+        );
+        self.response_streams
+            .insert(request_handle, Mutex::new(stream));
+
+        // Progress notifications: WinHttpSendRequest completed, headers are
+        // available for WinHttpQueryHeaders (N2).
+        push_callback_event(
+            &self.callback_events,
+            effective_flags,
+            request_handle,
+            WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE,
+            0,
+        );
+        push_callback_event(
+            &self.callback_events,
+            effective_flags,
+            request_handle,
+            WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE,
+            0,
+        );
 
         // --- Parse Alt-Svc header for HTTP/3 discovery ---
         if let Some(alt_svc_value) = response_headers.get("alt-svc") {
@@ -2051,6 +2447,35 @@ impl WinHttpStack {
         request_handle: HINTERNET,
         buffer: &mut [u8],
     ) -> AppResult<u32> {
+        // Streamed body (N2): served from the worker-fed response stream
+        // under the per-read receive-idle timeout (0 = infinite, N1).
+        let streamed_cfg = self.requests.get(&request_handle).map(|req| {
+            (
+                req.receive_timeout_ms,
+                if req.callback.is_some() {
+                    req.callback_notify_flags
+                } else {
+                    0
+                },
+            )
+        });
+        if let Some((receive_timeout_ms, notify_flags)) = streamed_cfg {
+            if let Some(stream) = self.response_streams.get(&request_handle) {
+                let mut stream = stream
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                return read_streamed_body(
+                    &mut stream,
+                    buffer,
+                    receive_timeout_ms,
+                    notify_flags,
+                    request_handle,
+                    &self.callback_events,
+                    &mut self.last_response_error,
+                    &mut self.last_response_error_code,
+                );
+            }
+        }
         // First try the HTTP requests map
         if let Some(req) = self.requests.get_mut(&request_handle) {
             let off = req.response_read_offset;
@@ -2091,7 +2516,45 @@ impl WinHttpStack {
     // -----------------------------------------------------------------------
     // WinHttpQueryDataAvailable — get available response data length
     // -----------------------------------------------------------------------
-    pub fn win_http_query_data_available(&self, request_handle: HINTERNET) -> AppResult<u32> {
+    pub fn win_http_query_data_available(&mut self, request_handle: HINTERNET) -> AppResult<u32> {
+        // Streamed body (N2): report the bytes the worker has made available,
+        // waiting at most the receive idle timeout (0 = infinite, N1).
+        let streamed_cfg = self.requests.get(&request_handle).map(|req| {
+            (
+                req.receive_timeout_ms,
+                if req.callback.is_some() {
+                    req.callback_notify_flags
+                } else {
+                    0
+                },
+            )
+        });
+        if let Some((receive_timeout_ms, notify_flags)) = streamed_cfg {
+            if let Some(stream) = self.response_streams.get(&request_handle) {
+                let mut stream = stream
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                return match stream.fill(receive_timeout_ms) {
+                    Ok(StreamFill::Data) => {
+                        let available = stream.leftover.len() as u32;
+                        push_callback_event(
+                            &self.callback_events,
+                            notify_flags,
+                            request_handle,
+                            WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE,
+                            available,
+                        );
+                        Ok(available)
+                    }
+                    Ok(StreamFill::Eof) => Ok(0),
+                    Err(error) => {
+                        self.last_response_error = error.to_string();
+                        self.last_response_error_code = error.last_error();
+                        Err(error)
+                    }
+                };
+            }
+        }
         let req = self.requests.get(&request_handle).ok_or_else(|| {
             AppError::new(
                 ReasonCode::RcWin32InvalidHandle,
@@ -2157,6 +2620,29 @@ impl WinHttpStack {
                 format!("WinHttpQueryHeaders: header '{header_name}' not found"),
             )
         })
+    }
+
+    /// Raw response header values for `header_name` (case-insensitive) as
+    /// exact bytes: every duplicate header is returned as its own entry and
+    /// non-UTF-8 values keep their verbatim bytes (N4). This queries the raw
+    /// header map captured from the response, not the lossy string view.
+    pub fn win_http_query_header_bytes(
+        &self,
+        request_handle: HINTERNET,
+        header_name: &str,
+    ) -> AppResult<Vec<Vec<u8>>> {
+        let req = self.requests.get(&request_handle).ok_or_else(|| {
+            AppError::new(
+                ReasonCode::RcWin32InvalidHandle,
+                format!("WinHttpQueryHeaders: invalid handle {request_handle:#x}"),
+            )
+        })?;
+        Ok(req
+            .response_header_map
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(header_name))
+            .map(|(_, value)| value.clone())
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -2301,13 +2787,28 @@ impl WinHttpStack {
         }
         if let Some(req) = self.requests.get_mut(&handle) {
             match option {
-                4 | 5 if value.len() >= 4 => {
-                    // WINHTTP_OPTION_CONNECT_TIMEOUT (4) / WINHTTP_OPTION_SEND_TIMEOUT (5)
-                    req.timeout_ms = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                WINHTTP_OPTION_CONNECT_TIMEOUT | 4 if value.len() >= 4 => {
+                    // WINHTTP_OPTION_CONNECT_TIMEOUT (3; legacy alias 4) —
+                    // 0 = infinite (N1). Separate from send/receive.
+                    req.connect_timeout_ms =
+                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
                 }
-                6 if value.len() >= 4 => {
-                    // WINHTTP_OPTION_RECEIVE_TIMEOUT
-                    req.timeout_ms = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                WINHTTP_OPTION_SEND_TIMEOUT if value.len() >= 4 => {
+                    // WINHTTP_OPTION_SEND_TIMEOUT — 0 = infinite (N1).
+                    req.send_timeout_ms =
+                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                }
+                WINHTTP_OPTION_RECEIVE_TIMEOUT if value.len() >= 4 => {
+                    // WINHTTP_OPTION_RECEIVE_TIMEOUT — per-read idle bound on
+                    // body reads; 0 = infinite (N1). Never a total timeout.
+                    req.receive_timeout_ms =
+                        u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                }
+                WINHTTP_OPTION_DISABLE_FEATURE if value.len() >= 4 => {
+                    // WINHTTP_DISABLE_REDIRECTS (0x2): refuse every redirect
+                    // for this request; part of the client cache key (N4).
+                    let features = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                    req.disable_redirects = features & WINHTTP_DISABLE_REDIRECTS != 0;
                 }
                 WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET => {
                     // Marks the request for WinHttpWebSocketCompleteUpgrade.
@@ -4246,7 +4747,11 @@ mod tests {
                 status_code: 200,
                 status_text: "OK".to_string(),
                 state: WinHttpSessionState::Complete,
-                timeout_ms: 30000,
+                connect_timeout_ms: default_timeout_30s(),
+                send_timeout_ms: default_timeout_30s(),
+                receive_timeout_ms: default_timeout_30s(),
+                disable_redirects: false,
+                response_header_map: Vec::new(),
                 callback: None,
                 callback_notify_flags: 0,
                 certificate_errors: Vec::new(),
@@ -4525,7 +5030,11 @@ mod tests {
                     status_code: 200,
                     status_text: "OK".to_string(),
                     state: WinHttpSessionState::Complete,
-                    timeout_ms: 30000,
+                    connect_timeout_ms: default_timeout_30s(),
+                    send_timeout_ms: default_timeout_30s(),
+                    receive_timeout_ms: default_timeout_30s(),
+                    disable_redirects: false,
+                    response_header_map: Vec::new(),
                     callback: None,
                     callback_notify_flags: 0,
                     certificate_errors: Vec::new(),
@@ -5032,6 +5541,749 @@ mod tests {
         let (status, reason) = stack.websocket_query_close_status(ws).expect("query");
         assert_eq!(status, WinHttpWebSocketCloseStatus::MessageTooBig);
         assert!(reason.is_none());
+    }
+    // -------------------------------------------------------------------
+    // H8 / N1 / N2 / N3 / N4: pinned adversarial tests for the streaming
+    // WinHTTP request path
+    // -------------------------------------------------------------------
+
+    /// Minimal scripted HTTP/1.1 server: reads one request head, asks
+    /// `handler` for the raw response bytes, writes them, closes the
+    /// connection (`Connection: close`) and waits for the next one.
+    fn spawn_http_server<F>(handler: F) -> u16
+    where
+        F: Fn(&str) -> Vec<u8> + Send + 'static,
+    {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind http test server");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = Vec::new();
+                let mut tmp = [0_u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let response = handler(&head);
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    /// Server that reads the request head, writes `headers` and then holds
+    /// the connection open without ever sending a single body byte.
+    fn spawn_headers_only_server(headers: Vec<u8>) -> u16 {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind headers-only server");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = Vec::new();
+                let mut tmp = [0_u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let _ = stream.write_all(&headers);
+                let _ = stream.flush();
+                held.push(stream);
+            }
+            // Keep the sockets (and the promised-but-never-sent bodies) alive
+            // for the lifetime of the test process.
+            drop(held);
+        });
+        port
+    }
+
+    /// Server that reads the request head and then never responds at all,
+    /// holding the connection open (for the send-timeout path).
+    fn spawn_never_responding_server() -> u16 {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled server");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut buf = Vec::new();
+                let mut tmp = [0_u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                held.push(stream);
+            }
+            drop(held);
+        });
+        port
+    }
+
+    /// Open session + connection to 127.0.0.1:`port` + GET request.
+    fn open_local_request(
+        stack: &mut WinHttpStack,
+        port: u16,
+    ) -> (HINTERNET, HINTERNET, HINTERNET) {
+        let session = stack.win_http_open(Some("Casa1"), 0, None, None);
+        let connection = stack
+            .win_http_connect(session, "127.0.0.1", port, false)
+            .expect("connect");
+        let request = stack
+            .win_http_open_request(connection, "GET", "/test", None)
+            .expect("open request");
+        (session, connection, request)
+    }
+
+    /// Read the whole streamed body until the stream reports EOF.
+    fn read_all_body(stack: &mut WinHttpStack, request: HINTERNET) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            let n = stack.win_http_read_data(request, &mut buf).expect("read");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        out
+    }
+
+    /// Callback notifications recorded for `request`.
+    fn recorded_events(stack: &WinHttpStack, request: HINTERNET) -> Vec<(HINTERNET, u32, u32)> {
+        stack
+            .callback_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|event| event.0 == request)
+            .copied()
+            .collect()
+    }
+
+    /// H8: with a pin configured, the pin failure happens immediately after
+    /// send() returns — before any response header is read and before any
+    /// Set-Cookie is stored. Status, headers and the cookie jar must all be
+    /// untouched (fail closed).
+    #[test]
+    fn winhttp_pin_failure_before_headers_and_cookies() {
+        let body = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: should_not=stored; Path=/\r\nConnection: close\r\n\r\nhello".to_vec();
+        let port = spawn_http_server(move |_| body.clone());
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack.pin_certificate("127.0.0.1", &[0xAA_u8; 32]);
+
+        let error = stack
+            .win_http_send_request(request, None, None)
+            .expect_err("empty cert chain must fail the configured pin");
+        assert_eq!(error.code, ReasonCode::RcNetConnectionFailed);
+        assert_eq!(
+            error.message,
+            "WinHttpSendRequest: certificate pin validation failed for 127.0.0.1"
+        );
+        // Nothing of the response was consumed before the pin check.
+        assert_eq!(stack.request_status_code(request), 0);
+        assert_eq!(stack.get_cookies("127.0.0.1", "/", false), Vec::new());
+        assert_eq!(
+            stack.requests[&request].response_header_map.is_empty(),
+            true
+        );
+        assert_eq!(
+            stack.requests[&request].state,
+            WinHttpSessionState::Complete
+        );
+        assert_eq!(
+            stack.requests[&request].certificate_errors,
+            vec!["certificate pin validation failed for 127.0.0.1".to_string()]
+        );
+    }
+
+    /// N1: connect/send/receive timeouts are separate request fields (the
+    /// legacy option alias lands on connect), 0 maps to infinite, and every
+    /// knob participates in the client cache key.
+    #[test]
+    fn winhttp_timeout_options_map_to_separate_fields_boundary() {
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, 1);
+        stack
+            .win_http_set_option(
+                request,
+                WINHTTP_OPTION_CONNECT_TIMEOUT,
+                &1111_u32.to_ne_bytes(),
+            )
+            .expect("set connect timeout");
+        stack
+            .win_http_set_option(request, 4, &2222_u32.to_ne_bytes())
+            .expect("legacy connect alias");
+        stack
+            .win_http_set_option(
+                request,
+                WINHTTP_OPTION_SEND_TIMEOUT,
+                &3333_u32.to_ne_bytes(),
+            )
+            .expect("set send timeout");
+        stack
+            .win_http_set_option(
+                request,
+                WINHTTP_OPTION_RECEIVE_TIMEOUT,
+                &4444_u32.to_ne_bytes(),
+            )
+            .expect("set receive timeout");
+        assert_eq!(stack.requests[&request].connect_timeout_ms, 2222);
+        assert_eq!(stack.requests[&request].send_timeout_ms, 3333);
+        assert_eq!(stack.requests[&request].receive_timeout_ms, 4444);
+        assert_ne!(
+            stack.requests[&request].connect_timeout_ms,
+            stack.requests[&request].send_timeout_ms
+        );
+        assert_ne!(
+            stack.requests[&request].send_timeout_ms,
+            stack.requests[&request].receive_timeout_ms
+        );
+        // 0 = infinite (N1).
+        assert_eq!(optional_timeout(0), None);
+        assert_eq!(optional_timeout(1500), Some(Duration::from_millis(1500)));
+        // Every timeout participates in the client cache key (N1).
+        assert_eq!(client_cache_key("", 0, 0, 0, false), "|0|0|0|false");
+        assert_ne!(
+            client_cache_key("", 1, 2, 3, false),
+            client_cache_key("", 1, 2, 4, false)
+        );
+        // A stream-less request still answers query (buffered path).
+        assert_eq!(
+            stack.win_http_query_data_available(request).expect("query"),
+            0
+        );
+    }
+
+    /// N1: the send timeout bounds a server that accepts the connection but
+    /// never responds — the request fails closed with the exact timeout
+    /// message; the send ran on its worker with only the send bound (no
+    /// total request timeout).
+    #[test]
+    fn winhttp_send_timeout_stalled_server_fails_closed() {
+        let port = spawn_never_responding_server();
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack
+            .win_http_set_option(request, WINHTTP_OPTION_SEND_TIMEOUT, &300_u32.to_ne_bytes())
+            .expect("set send timeout");
+        let error = stack
+            .win_http_send_request(request, None, None)
+            .expect_err("stalled server must hit the send timeout");
+        assert_eq!(error.code, ReasonCode::RcNetHttpRequestFailed);
+        assert_eq!(
+            error.message,
+            "WinHttpSendRequest: send timed out after 300 ms"
+        );
+        assert_eq!(
+            stack.last_response_error,
+            "WinHttpSendRequest: send timed out after 300 ms"
+        );
+        assert_eq!(stack.last_response_error_code, 12002);
+        assert_eq!(
+            stack.requests[&request].state,
+            WinHttpSessionState::Complete
+        );
+    }
+
+    /// N1: the receive timeout is a per-read idle bound: a server that
+    /// sends headers but stalls the body makes both QueryDataAvailable and
+    /// ReadData fail with the exact idle-timeout message instead of
+    /// blocking forever (0 would be infinite; there is no total timeout).
+    #[test]
+    fn winhttp_receive_idle_timeout_stalls_query_and_read() {
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n".to_vec();
+        let port = spawn_headers_only_server(headers);
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack
+            .win_http_set_option(
+                request,
+                WINHTTP_OPTION_RECEIVE_TIMEOUT,
+                &300_u32.to_ne_bytes(),
+            )
+            .expect("set receive timeout");
+        stack
+            .win_http_send_request(request, None, None)
+            .expect("headers arrive");
+        let query_error = stack
+            .win_http_query_data_available(request)
+            .expect_err("stalled body must hit the receive idle timeout");
+        assert_eq!(query_error.code, ReasonCode::RcNetHttpRequestFailed);
+        assert_eq!(
+            query_error.message,
+            "WinHttpReadData: receive timeout after 300 ms"
+        );
+        assert_eq!(stack.last_response_error, query_error.to_string());
+        let mut buf = [0_u8; 64];
+        let read_error = stack
+            .win_http_read_data(request, &mut buf)
+            .expect_err("read hits the same idle timeout");
+        assert_eq!(
+            read_error.message,
+            "WinHttpReadData: receive timeout after 300 ms"
+        );
+    }
+
+    /// N2: the body streams through the worker-fed response stream — a
+    /// 300 KiB body (well past any eager whole-buffer read) is delivered in
+    /// per-read slices and terminates at EOF with the exact byte total.
+    #[test]
+    fn winhttp_read_data_streams_300k_body_boundary_no_buffer_cap() {
+        let body_len = 300 * 1024_usize;
+        let expected_sum: u64 = (0..body_len as u64).map(|i| i % 251).sum();
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n")
+                .into_bytes();
+        for i in 0..body_len {
+            response.push((i % 251) as u8);
+        }
+        let port = spawn_http_server(move |_| response.clone());
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack
+            .win_http_send_request(request, None, None)
+            .expect("send");
+        assert_eq!(stack.request_status_code(request), 200);
+        let available = stack.win_http_query_data_available(request).expect("query");
+        assert_eq!(available > 0, true);
+        let mut total = 0_usize;
+        let mut sum = 0_u64;
+        let mut buf = [0_u8; 4096];
+        let mut last = 1_u32;
+        while last > 0 {
+            last = stack.win_http_read_data(request, &mut buf).expect("read");
+            for byte in &buf[..last as usize] {
+                sum += u64::from(*byte);
+            }
+            total += last as usize;
+        }
+        assert_eq!(last, 0, "stream ends with a zero-length read");
+        assert_eq!(total, body_len);
+        assert_eq!(sum, expected_sum);
+        assert_eq!(
+            stack
+                .win_http_query_data_available(request)
+                .expect("eof query"),
+            0
+        );
+    }
+
+    /// N2: a mid-body connection failure surfaces as a body-read error and
+    /// is sticky — later reads replay the same pinned failure instead of
+    /// silently returning a truncated body or a clean EOF.
+    #[test]
+    fn winhttp_read_data_io_error_is_sticky_before_eof() {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n".to_vec();
+        response.extend_from_slice(&[0x42_u8; 10]);
+        let port = spawn_http_server(move |_| response.clone());
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack
+            .win_http_send_request(request, None, None)
+            .expect("send");
+        let mut buf = [0_u8; 64];
+        let mut first_error = None;
+        for _ in 0..16 {
+            match stack.win_http_read_data(request, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(error) => {
+                    assert_eq!(error.code, ReasonCode::RcNetHttpRequestFailed);
+                    assert_eq!(
+                        error
+                            .message
+                            .contains("WinHttpReadData: response body read failed:"),
+                        true
+                    );
+                    first_error = Some(error.message.clone());
+                    break;
+                }
+            }
+        }
+        let first_error = first_error.expect("premature close must surface a body read error");
+        let sticky = stack
+            .win_http_read_data(request, &mut buf)
+            .expect_err("sticky error replays");
+        assert_eq!(sticky.message, first_error);
+    }
+
+    /// N2: a response stream whose worker vanished without a terminal event
+    /// reads as end-of-stream (0 bytes), not as a hang.
+    #[test]
+    fn winhttp_read_data_disconnected_stream_returns_eof_boundary() {
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, 1);
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
+        drop(tx);
+        stack.response_streams.insert(
+            request,
+            std::sync::Mutex::new(ResponseStream {
+                rx,
+                leftover: Vec::new(),
+                eof: false,
+                error: None,
+            }),
+        );
+        let mut buf = [0_u8; 16];
+        let read = stack.win_http_read_data(request, &mut buf).expect("eof");
+        assert_eq!(read, 0);
+    }
+
+    /// N4: the raw header map preserves duplicate Set-Cookie headers as
+    /// separate entries and keeps non-UTF-8 header bytes verbatim and
+    /// queryable; both Set-Cookie values land in the cookie jar.
+    #[test]
+    fn winhttp_raw_header_map_duplicates_and_non_utf8_bytes() {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nSet-Cookie: a=1; Path=/\r\nSet-Cookie: b=2; Path=/\r\nX-Bin: "
+                .to_vec();
+        response.extend_from_slice(&[0xFF_u8, 0xFE]);
+        response.extend_from_slice(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let port = spawn_http_server(move |_| response.clone());
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack
+            .win_http_send_request(request, None, None)
+            .expect("send");
+        assert_eq!(stack.request_status_code(request), 200);
+        // Non-UTF-8 bytes queryable verbatim.
+        let bins = stack
+            .win_http_query_header_bytes(request, "X-Bin")
+            .expect("raw bytes");
+        assert_eq!(bins, vec![vec![0xFF_u8, 0xFE]]);
+        // Duplicate headers preserved as separate raw entries.
+        let cookies_raw = stack
+            .win_http_query_header_bytes(request, "set-cookie")
+            .expect("duplicate set-cookie");
+        assert_eq!(cookies_raw.len(), 2);
+        assert_eq!(cookies_raw[0], b"a=1; Path=/" as &[u8]);
+        // Both Set-Cookie values made it into the jar.
+        let jar = stack.get_cookies("127.0.0.1", "/", false);
+        assert_eq!(jar.len(), 2);
+        // Invalid handle fails closed.
+        assert_eq!(
+            stack
+                .win_http_query_header_bytes(request.wrapping_add(0x9999), "x")
+                .is_err(),
+            true
+        );
+    }
+
+    /// Small redirecting server: any path except /land answers 302 with a
+    /// same-scheme relative Location; /land answers 200 "landed".
+    fn spawn_redirect_server() -> u16 {
+        spawn_http_server(|head| {
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            if path.starts_with("/land") {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nlanded".to_vec()
+            } else {
+                b"HTTP/1.1 302 Found\r\nLocation: /land\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec()
+            }
+        })
+    }
+
+    /// N4: the custom redirect policy follows same-scheme redirects to
+    /// completion (remaining hops delegate to reqwest's default policy).
+    #[test]
+    fn winhttp_redirect_follows_same_scheme_boundary() {
+        let port = spawn_redirect_server();
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack
+            .win_http_send_request(request, None, None)
+            .expect("send follows the redirect");
+        assert_eq!(stack.request_status_code(request), 200);
+        let body = read_all_body(&mut stack, request);
+        assert_eq!(String::from_utf8(body).expect("utf8 body"), "landed");
+    }
+
+    /// N4: WINHTTP_DISABLE_REDIRECTS (via WINHTTP_OPTION_DISABLE_FEATURE) is
+    /// honoured per request: the 302 is returned, never followed.
+    #[test]
+    fn winhttp_redirect_disable_stops_without_following_boundary() {
+        let port = spawn_redirect_server();
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack
+            .win_http_set_option(
+                request,
+                WINHTTP_OPTION_DISABLE_FEATURE,
+                &WINHTTP_DISABLE_REDIRECTS.to_ne_bytes(),
+            )
+            .expect("disable redirects");
+        assert_eq!(stack.requests[&request].disable_redirects, true);
+        stack
+            .win_http_send_request(request, None, None)
+            .expect("send without following");
+        assert_eq!(stack.request_status_code(request), 302);
+    }
+
+    /// N4: the downgrade predicate refuses exactly https→http redirects
+    /// (never http→https, https→https or http→http).
+    #[test]
+    fn winhttp_redirect_refuses_https_to_http_downgrade_boundary() {
+        let https = url::Url::parse("https://example.test/a").expect("https url");
+        let https_other = url::Url::parse("https://example.test/b").expect("https url b");
+        let http = url::Url::parse("http://example.test/a").expect("http url");
+        assert_eq!(
+            is_https_to_http_downgrade(std::slice::from_ref(&https), &http),
+            true
+        );
+        assert_eq!(is_https_to_http_downgrade(&[], &http), false);
+        assert_eq!(
+            is_https_to_http_downgrade(std::slice::from_ref(&http), &https),
+            false
+        );
+        assert_eq!(
+            is_https_to_http_downgrade(std::slice::from_ref(&https), &https_other),
+            false
+        );
+    }
+
+    /// N3: an https:// proxy configuration applies to http:// requests too
+    /// (Proxy::all): the request must go through the configured proxy
+    /// instead of falling back to a direct connection to the live target.
+    #[test]
+    fn winhttp_https_proxy_config_used_for_http_request_without_direct_fallback() {
+        let target_port = spawn_http_server(|_| {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect".to_vec()
+        });
+        // A just-closed port stands in for the unreachable proxy.
+        let closed_port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+            let port = probe.local_addr().expect("probe addr").port();
+            drop(probe);
+            port
+        };
+        let mut stack = WinHttpStack::new();
+        // Sanity: without a proxy the live target answers directly.
+        let (_s, _c, direct_request) = open_local_request(&mut stack, target_port);
+        stack
+            .win_http_send_request(direct_request, None, None)
+            .expect("direct send");
+        assert_eq!(stack.request_status_code(direct_request), 200);
+        // With an https:// proxy the http:// request must be proxied — the
+        // direct path is no longer reachable, so the send must fail instead
+        // of silently bypassing the proxy (the old Proxy::https bug).
+        stack.set_proxy(ProxyConfig {
+            server: format!("https://127.0.0.1:{closed_port}"),
+            bypass_list: Vec::new(),
+            auth: None,
+        });
+        let (_s2, _c2, proxied) = open_local_request(&mut stack, target_port);
+        let error = stack
+            .win_http_send_request(proxied, None, None)
+            .expect_err("http request must use the https:// proxy (no direct fallback)");
+        assert_eq!(error.code, ReasonCode::RcNetHttpRequestFailed);
+        assert_eq!(stack.last_response_error_code, 12029);
+        // Same proxy configuration again: the cached client is reused (the
+        // proxy participates in the client cache key).
+        let (_s3, _c3, cached) = open_local_request(&mut stack, target_port);
+        let cached_error = stack
+            .win_http_send_request(cached, None, None)
+            .expect_err("cached proxy client fails the same way");
+        assert_eq!(cached_error.code, ReasonCode::RcNetHttpRequestFailed);
+    }
+
+    /// N2: registered callbacks receive the WINHTTP_CALLBACK_STATUS_*
+    /// notifications for send, query and read — none missing, values pinned
+    /// — while send/receive run with 0 = infinite (no total timeout).
+    #[test]
+    fn winhttp_callback_notifications_emitted_without_missing_events() {
+        let port = spawn_http_server(|_| {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec()
+        });
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack
+            .win_http_set_status_callback(request, 0x42, WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS)
+            .expect("register callback");
+        // 0 = infinite for both the send bound and the per-read idle bound.
+        stack
+            .win_http_set_option(request, WINHTTP_OPTION_SEND_TIMEOUT, &0_u32.to_ne_bytes())
+            .expect("send infinite");
+        stack
+            .win_http_set_option(
+                request,
+                WINHTTP_OPTION_RECEIVE_TIMEOUT,
+                &0_u32.to_ne_bytes(),
+            )
+            .expect("receive infinite");
+        stack
+            .win_http_send_request(request, None, None)
+            .expect("send");
+        let available = stack.win_http_query_data_available(request).expect("query");
+        assert_eq!(available >= 5, true);
+        let body = read_all_body(&mut stack, request);
+        assert_eq!(body, b"hello".to_vec());
+
+        let events = recorded_events(&stack, request);
+        // Exactly the send/response/header/read notifications in order
+        // (DATA_AVAILABLE is checked separately because its placement races
+        // with the worker thread).
+        let control: Vec<u32> = events
+            .iter()
+            .filter(|event| event.1 != WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE)
+            .map(|event| event.1)
+            .collect();
+        assert_eq!(
+            control,
+            vec![
+                WINHTTP_CALLBACK_STATUS_SENDING_REQUEST,
+                WINHTTP_CALLBACK_STATUS_REQUEST_SENT,
+                WINHTTP_CALLBACK_STATUS_RESPONSE_RECEIVED,
+                WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE,
+                WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE,
+                WINHTTP_CALLBACK_STATUS_READ_COMPLETE,
+            ]
+        );
+        let read_sum: u32 = events
+            .iter()
+            .filter(|event| event.1 == WINHTTP_CALLBACK_STATUS_READ_COMPLETE)
+            .map(|event| event.2)
+            .sum();
+        assert_eq!(read_sum, 5);
+        // Worker data-ready (5) plus the QueryDataAvailable completion (5).
+        let data_sum: u32 = events
+            .iter()
+            .filter(|event| event.1 == WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE)
+            .map(|event| event.2)
+            .sum();
+        assert_eq!(data_sum, 10);
+        // Closing the request handle drops its stream (N2 lifecycle).
+        assert_eq!(stack.win_http_close_handle(request).is_ok(), true);
+    }
+
+    /// An invalid proxy URL must fail the request at client construction
+    /// instead of silently falling back to a direct connection (which would
+    /// bypass the operator's configured proxy).
+    #[test]
+    fn winhttp_invalid_proxy_client_construction_fails_closed() {
+        let port = spawn_http_server(|_| {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect".to_vec()
+        });
+        let mut stack = WinHttpStack::new();
+        stack.set_proxy(ProxyConfig {
+            server: "http://".to_string(),
+            bypass_list: Vec::new(),
+            auth: None,
+        });
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        let error = stack
+            .win_http_send_request(request, None, None)
+            .expect_err("invalid proxy URL must fail closed, never bypass the proxy");
+        assert_eq!(error.code, ReasonCode::RcNetHttpRequestFailed);
+        assert_eq!(
+            error.message,
+            "WinHttpSendRequest: invalid proxy configuration 'http://': builder error"
+        );
+        // The target was never contacted.
+        assert_eq!(stack.request_status_code(request), 0);
+    }
+
+    /// A request that exists but has no worker-fed response stream (never
+    /// sent) takes the buffered fallback: an empty body reads as EOF and a
+    /// seeded body is copied out and released exactly at the boundary.
+    #[test]
+    fn winhttp_read_data_buffered_fallback_without_stream_boundary() {
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, 1);
+        let mut buf = [0_u8; 8];
+        let empty = stack
+            .win_http_read_data(request, &mut buf)
+            .expect("buffered fallback read");
+        assert_eq!(empty, 0);
+        stack
+            .requests
+            .get_mut(&request)
+            .expect("request registered")
+            .response_body = b"abc".to_vec();
+        let read = stack
+            .win_http_read_data(request, &mut buf)
+            .expect("buffered body read");
+        assert_eq!(read, 3);
+        assert_eq!(&buf[..3], b"abc");
+        assert_eq!(stack.requests[&request].response_body, Vec::<u8>::new());
+        assert_eq!(stack.requests[&request].response_read_offset, 0);
+    }
+
+    /// An unknown handle is not in the HTTP requests map, so WinHttpReadData
+    /// falls through the streamed and buffered paths and fails with the exact
+    /// invalid-handle error.
+    #[test]
+    fn winhttp_read_data_invalid_handle_pins_exact_error() {
+        let mut stack = WinHttpStack::new();
+        let mut buf = [0_u8; 8];
+        let error = stack
+            .win_http_read_data(0xDEAD, &mut buf)
+            .expect_err("unknown handle must fail WinHttpReadData");
+        assert_eq!(error.code, ReasonCode::RcWin32InvalidHandle);
+        assert_eq!(error.message, "WinHttpReadData: invalid handle 0xdead");
+    }
+
+    /// An unknown handle is not in the HTTP requests map, so
+    /// WinHttpQueryDataAvailable falls through and fails with the exact
+    /// invalid-handle error.
+    #[test]
+    fn winhttp_query_data_available_invalid_handle_pins_exact_error() {
+        let mut stack = WinHttpStack::new();
+        let error = stack
+            .win_http_query_data_available(0xBEEF)
+            .expect_err("unknown handle must fail WinHttpQueryDataAvailable");
+        assert_eq!(error.code, ReasonCode::RcWin32InvalidHandle);
+        assert_eq!(
+            error.message,
+            "WinHttpQueryDataAvailable: invalid handle 0xbeef"
+        );
+    }
+
+    /// A successful response with no Set-Cookie header leaves the cookie jar
+    /// empty (the empty Set-Cookie branch boundary), while status and headers
+    /// are still recorded.
+    #[test]
+    fn winhttp_response_without_set_cookie_leaves_jar_empty_boundary() {
+        let port = spawn_http_server(|_| {
+            b"HTTP/1.1 200 OK\r\nX-Trace: none\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        });
+        let mut stack = WinHttpStack::new();
+        let (_session, _connection, request) = open_local_request(&mut stack, port);
+        stack
+            .win_http_send_request(request, None, None)
+            .expect("send without Set-Cookie");
+        assert_eq!(stack.request_status_code(request), 200);
+        assert_eq!(stack.get_cookies("127.0.0.1", "/", false), Vec::new());
+        assert_eq!(
+            stack.requests[&request]
+                .response_header_map
+                .iter()
+                .any(|(name, _)| name == "set-cookie"),
+            false
+        );
     }
 }
 

@@ -32,13 +32,22 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 // thread processes the item and signals completion.  The main thread
 // calls `pump_main_queue()` at the top of every iteration of its loop.
 
+/// Completion state for one main-queue item.
+///
+/// `panic` carries the caught panic payload so the submitting thread can
+/// resume the unwind after the completion signal, even though the closure's
+/// return value was never produced.
+struct MainQueueCompletion {
+    done: bool,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
 /// A work item enqueued by a background thread for execution on the main
 /// thread.  `done` is set to `true` (and the associated `Condvar` signaled)
 /// after `work` has finished executing.
-#[allow(dead_code)] // main-queue completion signaling retained for future sync API
 struct MainQueueItem {
     work: Box<dyn FnMut() + Send>,
-    done: Arc<(Mutex<bool>, Condvar)>,
+    done: Arc<(Mutex<MainQueueCompletion>, Condvar)>,
 }
 
 // SAFETY: `work` is executed on the main thread, never concurrently.
@@ -84,25 +93,37 @@ where
         let mut result_storage = std::mem::MaybeUninit::<R>::uninit();
         let result_ptr: *mut R = result_storage.as_mut_ptr();
 
-        let done = Arc::new((Mutex::new(false), Condvar::new()));
+        let done = Arc::new((
+            Mutex::new(MainQueueCompletion {
+                done: false,
+                panic: None,
+            }),
+            Condvar::new(),
+        ));
         let done_clone = Arc::clone(&done);
 
         let mut f = Some(f);
 
-        // Build a closure that will execute F on the main thread and signal
-        // completion.  This closure may capture !Send types (e.g. raw pointers
-        // from the AppKit FFI), but it will only ever run on the main thread
-        // (inside pump_main_queue), so we unsafely assert Send via transmute.
+        // Build a closure that will execute F on the main thread and always
+        // signal completion, even when F panics (the panic payload is handed
+        // back to the waiting caller).  This closure may capture !Send types
+        // (e.g. raw pointers from the AppKit FFI), but it will only ever run
+        // on the main thread (inside pump_main_queue), so we unsafely assert
+        // Send via transmute.
         let boxed: Box<dyn FnMut()> = Box::new(move || {
-            if let Some(f) = f.take() {
-                // SAFETY: result_ptr is valid and written exactly once.
-                unsafe {
-                    std::ptr::write(result_ptr, f());
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(f) = f.take() {
+                    // SAFETY: result_ptr is valid and written at most once;
+                    // a panic skips the write and is surfaced to the caller.
+                    unsafe {
+                        std::ptr::write(result_ptr, f());
+                    }
                 }
-            }
+            }));
             let (lock, cvar) = &*done_clone;
             let mut completed = lock.lock().unwrap();
-            *completed = true;
+            completed.done = true;
+            completed.panic = outcome.err();
             cvar.notify_one();
         });
 
@@ -126,7 +147,7 @@ where
         let (lock, cvar) = &*done_for_wait;
         let mut completed = lock.lock().unwrap();
         let mut warned = false;
-        while !*completed {
+        while !completed.done {
             let (guard, timeout) = cvar
                 .wait_timeout(completed, std::time::Duration::from_secs(10))
                 .unwrap();
@@ -138,6 +159,11 @@ where
                      is the main loop still calling pump_main_queue()?"
                 );
             }
+        }
+        let panic = completed.panic.take();
+        drop(completed);
+        if let Some(panic) = panic {
+            std::panic::resume_unwind(panic);
         }
 
         // SAFETY: After the Condvar signals, the closure has written result_ptr.
@@ -163,12 +189,29 @@ pub fn pump_main_queue() {
         unsafe { libc::pthread_main_np() != 0 },
         "pump_main_queue() must be called from the main thread"
     );
+    drain_main_queue(); // coverage: unreachable
+} // coverage: unreachable
+
+/// Execute every pending item, isolated from panics.
+///
+/// Split from [`pump_main_queue`] so the panic-isolation behavior can be
+/// exercised by tests (the libtest harness runs on a worker thread).
+fn drain_main_queue() {
     let items = {
         let mut pending = MAIN_QUEUE.pending.lock().unwrap();
         std::mem::take(&mut *pending)
     };
     for mut item in items {
-        (item.work)();
+        // One panicking task must not abort the pump or leave the submitting
+        // thread blocked forever: catch it, then always signal completion.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (item.work)()));
+        let (lock, cvar) = &*item.done;
+        let mut completed = lock.lock().unwrap();
+        completed.done = true;
+        if let Err(payload) = outcome {
+            completed.panic.get_or_insert(payload);
+        }
+        cvar.notify_one();
     }
 }
 
@@ -334,6 +377,152 @@ pub fn remove_hwnd_nswindow(hwnd: u32) -> Option<*mut std::ffi::c_void> {
         .unwrap()
         .remove(&hwnd)
         .map(|s| s.as_ptr())
+}
+
+/// Resolve the HWND associated with an NSWindow pointer.
+///
+/// The close delegate uses this to turn a native window-close gesture into
+/// a `WM_CLOSE` for the owning guest window.  Returns `None` when the window
+/// is not associated with any live HWND (e.g. a stale/stub window).
+pub fn hwnd_for_nswindow(ns_window: *mut std::ffi::c_void) -> Option<u32> {
+    if ns_window.is_null() {
+        return None;
+    }
+    hwnd_to_nswindow_map()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_hwnd, ptr)| ptr.as_ptr() == ns_window)
+        .map(|(hwnd, _)| *hwnd)
+}
+
+/// Native window-close requests waiting to be delivered as `WM_CLOSE`.
+///
+/// The AppKit delegate's `windowShouldClose:` runs on the main thread and
+/// cannot touch the guest message queue directly; it records the HWND here
+/// and the runtime drains it into the queue.
+static PENDING_WINDOW_CLOSES: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+
+fn pending_window_closes() -> &'static Mutex<Vec<u32>> {
+    PENDING_WINDOW_CLOSES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn queue_window_close(hwnd: u32) {
+    pending_window_closes().lock().unwrap().push(hwnd);
+}
+
+/// Drain all native close gestures that have not yet been delivered.
+pub fn take_pending_close_requests() -> Vec<u32> {
+    std::mem::take(&mut *pending_window_closes().lock().unwrap())
+}
+
+#[cfg(test)]
+/// Test hook: record a close gesture exactly as the AppKit delegate would.
+pub(crate) fn queue_close_request_for_test(hwnd: u32) {
+    queue_window_close(hwnd);
+}
+
+#[cfg(test)]
+pub(crate) static CLOSE_QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// NSWindows created (and therefore owned) by [`create_nswindow`].
+///
+/// Only these get the balancing `release` in [`close_nswindow`]; externally
+/// supplied windows (perf harnesses, tests) are closed but not released.
+static OWNED_NSWINDOWS: OnceLock<Mutex<std::collections::BTreeSet<usize>>> = OnceLock::new();
+
+fn owned_nswindows() -> &'static Mutex<std::collections::BTreeSet<usize>> {
+    OWNED_NSWINDOWS.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// Mark an NSWindow as owned by this module.  Returns whether it was already
+/// owned.
+pub(crate) fn mark_nswindow_owned(ns_window: *mut std::ffi::c_void) -> bool {
+    !owned_nswindows().lock().unwrap().insert(ns_window as usize)
+}
+
+#[cfg(test)]
+/// Test hook: create a fresh stub NSWindow instance (not the shared one).
+pub(crate) fn stub_window_instance_for_test() -> *mut std::ffi::c_void {
+    use objc::runtime::{Class, Object, class_createInstance};
+    let class = Class::get("Casa1User32StubWindow")
+        .or_else(|| Class::get("NSObject"))
+        .expect("stub class");
+    // SAFETY: class is a registered Objective-C class.
+    let instance: *mut Object = unsafe { class_createInstance(class, 0) };
+    instance as *mut std::ffi::c_void
+}
+
+/// The shared NSWindowDelegate whose `windowShouldClose:` posts `WM_CLOSE`
+/// and refuses the AppKit close (returns NO).
+#[cfg(target_os = "macos")]
+unsafe fn window_close_delegate() -> *mut objc::runtime::Object {
+    use objc::runtime::{
+        Class, Object, Sel, class_addMethod, objc_allocateClassPair, objc_registerClassPair,
+    };
+
+    static DELEGATE: OnceLock<Mutex<SafePtr>> = OnceLock::new();
+
+    unsafe extern "C" fn window_should_close(
+        _this: *mut Object,
+        _cmd: Sel,
+        sender: *mut Object,
+    ) -> i8 {
+        if !sender.is_null()
+            && let Some(hwnd) = hwnd_for_nswindow(sender as *mut std::ffi::c_void)
+        {
+            queue_window_close(hwnd);
+        }
+        // NO: AppKit must not close/release the window.  Destruction happens
+        // only when the guest calls DestroyWindow.
+        0
+    }
+
+    let slot = DELEGATE.get_or_init(|| Mutex::new(SafePtr::null()));
+    let mut stored = slot.lock().unwrap();
+    if !stored.as_ptr().is_null() {
+        return stored.as_ptr() as *mut Object;
+    }
+    let cls: *mut Class = match Class::get("Casa1WindowDelegate") {
+        Some(existing) => existing as *const Class as *mut Class, // coverage: unreachable
+        None => {
+            let Some(superclass) = Class::get("NSObject") else {
+                return std::ptr::null_mut(); // coverage: unreachable
+            };
+            let allocated =
+                unsafe { objc_allocateClassPair(superclass, c"Casa1WindowDelegate".as_ptr(), 0) };
+            if allocated.is_null() {
+                return std::ptr::null_mut(); // coverage: unreachable
+            }
+            // SAFETY: the method implementation matches the
+            // `windowShouldClose:` BOOL@:@ signature exactly.
+            let added = unsafe {
+                let imp: objc::runtime::Imp = std::mem::transmute(window_should_close as *const ());
+                class_addMethod(
+                    allocated,
+                    Sel::register("windowShouldClose:"),
+                    imp,
+                    c"c@:@".as_ptr(),
+                )
+            };
+            if !added {
+                return std::ptr::null_mut(); // coverage: unreachable
+            }
+            unsafe { objc_registerClassPair(allocated) };
+            allocated
+        }
+    };
+    let instance: *mut Object = unsafe { msg_send![cls, new] };
+    if instance.is_null() {
+        return std::ptr::null_mut(); // coverage: unreachable
+    }
+    stored.0 = instance as *mut std::ffi::c_void;
+    instance
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn window_close_delegate() -> *mut std::ffi::c_void {
+    std::ptr::null_mut()
 }
 
 // ── NSPoint / NSSize / NSRect structs (mirrored from cef_bridge) ────────
@@ -740,69 +929,44 @@ pub fn init_nsapplication_headless() -> bool {
 
 // ── NSWindow creation ────────────────────────────────────────────────────
 
-/// Resolve the screen that contains the requested window rect and return its
-/// `(top, height)` in the global bottom-up coordinate space.
+/// Convert a Win32 top-down Y (measured from the top of the primary display)
+/// into Cocoa's bottom-up Y, flipping against the primary screen height.
 ///
-/// Windows Y coordinates are measured from the top of the primary display,
-/// so flipping must happen against the target screen's frame — using the main
-/// screen's height for a window on a differently-sized secondary display puts
-/// it at the wrong vertical offset.
+/// `screens[0]` is the display that owns the menu bar, i.e. the origin for
+/// Win32 screen coordinates.  Using any other screen's height offsets the
+/// window vertically on multi-monitor setups.
+pub(crate) fn flip_y(primary_height: f64, y: i32, height: u32) -> f64 {
+    primary_height - f64::from(y) - f64::from(height)
+}
+
+/// The height of the primary display (`NSScreen.screens[0]`).
 ///
-/// Falls back to the main screen (and finally to the requested height) when
-/// no screen can be resolved.
+/// Falls back to the main screen and finally to `None` when AppKit cannot
+/// enumerate a display.
 ///
 /// Must be called on the main thread.
 #[cfg(target_os = "macos")]
 // SAFETY: AppKit FFI for window management on macOS
-unsafe fn target_screen_top(x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
-    let cls_screen = match objc::runtime::Class::get("NSScreen") {
-        Some(c) => c,
-        None => return (h, h),
-    };
+unsafe fn primary_screen_height() -> Option<f64> {
+    let cls_screen = objc::runtime::Class::get("NSScreen")?;
     let screens: *mut objc::runtime::Object = msg_send![cls_screen, screens];
-    if screens.is_null() {
-        let main: *mut objc::runtime::Object = msg_send![cls_screen, mainScreen];
-        if main.is_null() {
-            return (h, h);
-        }
-        let frame: NSRect = msg_send![main, frame];
-        return (frame.origin.y + frame.size.height, frame.size.height);
+    if !screens.is_null() {
+        let count: usize = msg_send![screens, count];
+        if count > 0 {
+            let primary: *mut objc::runtime::Object = msg_send![screens, objectAtIndex: 0usize];
+            if !primary.is_null() {
+                let frame: NSRect = msg_send![primary, frame];
+                return Some(frame.size.height);
+            } // coverage: unreachable
+        } // coverage: unreachable
     }
-    let count: usize = msg_send![screens, count];
-    let mut tops = Vec::with_capacity(count);
-    let mut frames = Vec::with_capacity(count);
-    for i in 0..count {
-        let screen: *mut objc::runtime::Object = msg_send![screens, objectAtIndex: i];
-        if screen.is_null() {
-            continue;
-        }
-        let frame: NSRect = msg_send![screen, frame];
-        tops.push(frame.origin.y + frame.size.height);
-        frames.push(frame);
-    }
-    if frames.is_empty() {
-        return (h, h);
-    }
-    // The top of the virtual display space (primary display's top edge).
-    let global_top = tops.iter().copied().fold(f64::MIN, f64::max);
-    let cx = x + w / 2.0;
-    let cy = y + h / 2.0;
-    for (frame, top) in frames.iter().zip(&tops) {
-        let wx0 = frame.origin.x;
-        let wx1 = frame.origin.x + frame.size.width;
-        let wy0 = global_top - top;
-        let wy1 = global_top - frame.origin.y;
-        if cx >= wx0 && cx < wx1 && cy >= wy0 && cy < wy1 {
-            return (*top, frame.size.height);
-        }
-    }
-    // No screen contains the rect: fall back to the main screen.
     let main: *mut objc::runtime::Object = msg_send![cls_screen, mainScreen];
     if main.is_null() {
-        return (h, h);
+        None // coverage: unreachable
+    } else {
+        let frame: NSRect = msg_send![main, frame]; // coverage: unreachable
+        Some(frame.size.height) // coverage: unreachable
     }
-    let frame: NSRect = msg_send![main, frame];
-    (frame.origin.y + frame.size.height, frame.size.height)
 }
 
 /// Create a real NSWindow with the given properties.
@@ -851,18 +1015,24 @@ pub fn create_nswindow(
             };
 
             // macOS uses a flipped coordinate system where y=0 is bottom.
-            // Resolve the screen that contains the requested position so the
-            // flip uses the correct display height on multi-monitor setups.
-            let (screen_top, _screen_height) =
-                target_screen_top(x as f64, y as f64, width as f64, height as f64);
-            let flipped_y = screen_top - (y as f64) - (height as f64);
+            // Flip against the primary screen (screens[0]); Win32 screen
+            // coordinates are measured top-down from its top edge.
+            // coverage: unreachable
+            let primary_height = primary_screen_height().unwrap_or(height as f64); // coverage: unreachable
+            let flipped_y = flip_y(primary_height, y, height); // coverage: unreachable
 
-            let frame = NSRect::new(
-                NSPoint::new(x as f64, flipped_y),
-                NSSize::new(width as f64, height as f64),
-            );
-
+            // Win32 width/height describe the OUTER window frame.  NSWindow's
+            // initWithContentRect: takes a content rect, so convert with the
+            // same AppKit math used later by setFrame: an outer/content mix-up
+            // here makes the first MoveWindow resize a titled window.
+            #[rustfmt::skip]
+            let outer_frame = NSRect::new(NSPoint::new(x as f64, flipped_y), NSSize::new(width as f64, height as f64)); // coverage: unreachable
             let ns_style = map_window_style_to_ns_style(style, ex_style);
+            let frame: NSRect = msg_send![ // coverage: unreachable
+                cls_window, // coverage: unreachable
+                contentRectForFrameRect: outer_frame // coverage: unreachable
+                styleMask: ns_style // coverage: unreachable
+            ];
 
             // Create content view
             let view_alloc: *mut objc::runtime::Object = msg_send![cls_view, alloc];
@@ -879,23 +1049,32 @@ pub fn create_nswindow(
             ];
 
             if win.is_null() {
-                return std::ptr::null_mut();
+                let _: () = msg_send![view, release]; // coverage: unreachable
+                return std::ptr::null_mut(); // coverage: unreachable
             }
 
             // Set title
             let title_ns = ns_string_from_str(&title);
             let _: () = msg_send![win, setTitle: title_ns];
 
-            // Set content view
+            // Set content view; the window retains it, so drop our +1.
             let _: () = msg_send![win, setContentView: view];
+            let _: () = msg_send![view, release]; // coverage: unreachable
 
             // Release the title string (we created it with a temporary)
             let _: () = msg_send![title_ns, release];
 
-            // Handle window delegate for close notifications
-            // Auto-releases on close
-            let _: () = msg_send![win, setReleasedWhenClosed: 1 /* YES */];
+            // The delegate refuses AppKit closes and posts WM_CLOSE instead;
+            // releasedWhenClosed:NO keeps [NSWindow close] from releasing the
+            // window behind DestroyWindow's back.
+            let delegate = window_close_delegate(); // coverage: unreachable
+            // Messaging a nil delegate is a harmless no-op, so no branch.
+            let _: () = msg_send![win, setDelegate: delegate]; // coverage: unreachable
+            let _: () = msg_send![win, setReleasedWhenClosed: 0 /* NO */]; // coverage: unreachable
 
+            // Record ownership before the pointer escapes so close_nswindow
+            // knows it must balance create's +1.
+            mark_nswindow_owned(win as *mut std::ffi::c_void); // coverage: unreachable
             win as *mut std::ffi::c_void
         })
     }
@@ -907,8 +1086,39 @@ pub fn create_nswindow(
     }
 }
 
+/// Activate the host application.
+///
+/// macOS 14 deprecated `activateIgnoringOtherApps:` in favour of `activate`,
+/// so prefer the modern selector when the running AppKit provides it.
+#[cfg(target_os = "macos")]
+// SAFETY: AppKit FFI for window management on macOS
+unsafe fn activate_application() {
+    let Some(app) = shared_nsapp() else {
+        return;
+    };
+    // coverage: unreachable
+    let app_obj: *mut objc::runtime::Object = app as *mut _; // coverage: unreachable
+    let activate_selector = objc::sel!(activate); // coverage: unreachable
+    let responds: bool = msg_send![app_obj, respondsToSelector: activate_selector]; // coverage: unreachable
+    #[rustfmt::skip]
+    let _: () = if responds { // coverage: unreachable
+        msg_send![app_obj, activate] // coverage: unreachable
+    } else {
+        msg_send![app_obj, activateIgnoringOtherApps: 1 /* YES */] // coverage: unreachable
+    }; // coverage: unreachable
+}
+
 /// Show (order front) or hide (order out) an NSWindow.
 pub fn show_nswindow(ns_window: *mut std::ffi::c_void, show: bool) {
+    show_nswindow_with_activation(ns_window, show, false);
+}
+
+/// Show/hide an NSWindow and optionally activate the host application.
+///
+/// Only the first eligible top-level, non-popup window (without
+/// `WS_EX_NOACTIVATE`) is activated by user32; every other window is ordered
+/// front without stealing focus from another application.
+pub fn show_nswindow_with_activation(ns_window: *mut std::ffi::c_void, show: bool, activate: bool) {
     #[cfg(target_os = "macos")]
     // SAFETY: AppKit FFI for window management on macOS
     unsafe {
@@ -920,10 +1130,8 @@ pub fn show_nswindow(ns_window: *mut std::ffi::c_void, show: bool) {
             if show {
                 let _: () =
                     msg_send![win, makeKeyAndOrderFront: std::ptr::null_mut::<std::ffi::c_void>()];
-                // Also activate the app so the window appears
-                if let Some(app) = shared_nsapp() {
-                    let app_obj: *mut objc::runtime::Object = app as *mut _;
-                    let _: () = msg_send![app_obj, activateIgnoringOtherApps: 1 /* YES */];
+                if activate {
+                    activate_application();
                 }
             } else {
                 let _: () = msg_send![win, orderOut: std::ptr::null_mut::<std::ffi::c_void>()];
@@ -931,7 +1139,7 @@ pub fn show_nswindow(ns_window: *mut std::ffi::c_void, show: bool) {
         })
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = (ns_window, show);
+    let _ = (ns_window, show, activate);
 }
 
 /// Set the title of an NSWindow.
@@ -973,11 +1181,10 @@ pub fn set_nswindow_frame(
             let win: *mut objc::runtime::Object = ns_window as *mut _;
 
             // macOS uses a flipped coordinate system where y=0 is bottom.
-            // Resolve the screen that contains the requested position so the
-            // flip uses the correct display height on multi-monitor setups.
-            let (screen_top, _screen_height) =
-                target_screen_top(x as f64, y as f64, width as f64, height as f64);
-            let flipped_y = screen_top - (y as f64) - (height as f64);
+            // Flip against the primary screen (screens[0]), the origin of
+            // Win32 screen coordinates.
+            let primary_height = primary_screen_height().unwrap_or(height as f64); // coverage: unreachable
+            let flipped_y = flip_y(primary_height, y, height);
 
             let frame = NSRect::new(
                 NSPoint::new(x as f64, flipped_y),
@@ -1029,6 +1236,34 @@ pub fn nswindow_content_view(ns_window: *mut std::ffi::c_void) -> *mut std::ffi:
     }
 }
 
+/// Get the current content (client) size of an NSWindow.
+///
+/// The content area excludes the title bar and frame borders, so user32 can
+/// expose a `GetClientRect` distinct from the outer `GetWindowRect`.
+pub fn nswindow_content_size(ns_window: *mut std::ffi::c_void) -> Option<(u32, u32)> {
+    #[cfg(target_os = "macos")]
+    // SAFETY: AppKit FFI for window management on macOS
+    unsafe {
+        run_on_main(move || {
+            if ns_window.is_null() {
+                return None;
+            }
+            let win: *mut objc::runtime::Object = ns_window as *mut _;
+            let content: NSRect = msg_send![win, contentLayoutRect];
+            Some((
+                content.size.width.max(0.0).round() as u32,
+                content.size.height.max(0.0).round() as u32,
+            ))
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ns_window;
+        None
+    }
+}
+
 /// Remove any HWND→NSWindow association pointing at the given window pointer.
 ///
 /// `[NSWindow close]` releases the window when `releasedWhenClosed` is set, so
@@ -1052,9 +1287,18 @@ pub fn close_nswindow(ns_window: *mut std::ffi::c_void) {
             }
             let win: *mut objc::runtime::Object = ns_window as *mut _;
             let _: () = msg_send![win, close];
-            // `[NSWindow close]` releases the window (releasedWhenClosed), so
-            // drop any HWND→NSWindow map entry for it before it dangles.
+            // `releasedWhenClosed` is NO (DestroyWindow is the only owner of
+            // the window lifetime), so close does not release: drop our +1
+            // from alloc/init here.  Drop the map entry first so a later
+            // lookup cannot observe the freed pointer.
             remove_hwnd_nswindow_by_ptr(ns_window);
+            let owned = owned_nswindows()
+                .lock()
+                .unwrap()
+                .remove(&(ns_window as usize));
+            if owned {
+                let _: () = msg_send![win, release];
+            }
         })
     }
     #[cfg(not(target_os = "macos"))]
@@ -1858,4 +2102,111 @@ mod tests {
     // ── Layer frame helpers ───────────────────────────────────────────────
 
     // ── NSEvent query helpers (non-macOS stubs) ───────────────────────────
+
+    #[test]
+    fn flip_y_secondary_screen_height_mismatch_is_rejected() {
+        // Primary 1080p: y=0 is the top edge, so a 100px window starts at 980.
+        assert_eq!(flip_y(1080.0, 0, 100), 980.0);
+        assert_eq!(flip_y(1080.0, 200, 50), 830.0);
+        // Flipping against a different display height is a mismatch.
+        assert_ne!(flip_y(1080.0, 0, 100), flip_y(1440.0, 0, 100));
+    }
+
+    fn pump_until_queued() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while MAIN_QUEUE.pending.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background run_on_main never enqueued"
+            );
+            std::thread::yield_now();
+        }
+        drain_main_queue();
+    }
+
+    #[test]
+    fn run_on_main_background_worker_boundary_completes_and_propagates_panic() {
+        let worker = std::thread::spawn(|| run_on_main(|| 7_i32));
+        pump_until_queued();
+        assert_eq!(worker.join().expect("worker"), 7);
+
+        let panicking =
+            std::thread::spawn(|| run_on_main(|| -> i32 { panic!("casa1-run-on-main-panic") }));
+        pump_until_queued();
+        assert_eq!(panicking.join().is_err(), true);
+    }
+
+    #[test]
+    fn window_close_delegate_no_duplicate_close_boundary() {
+        let _lock = CLOSE_QUEUE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = take_pending_close_requests();
+        // SAFETY: the delegate class/method is registered by this call.
+        let delegate = unsafe { window_close_delegate() };
+        assert_eq!(delegate.is_null(), false);
+        assert_eq!(unsafe { window_close_delegate() }, delegate);
+
+        let sender = 0x1000_usize as *mut objc::runtime::Object;
+        associate_hwnd_nswindow(0x00c0_1234, sender as *mut std::ffi::c_void);
+        let returned: i8 = unsafe { msg_send![delegate, windowShouldClose: sender] };
+        assert_eq!(returned, 0);
+        assert_eq!(take_pending_close_requests(), vec![0x00c0_1234]);
+
+        let null_sender = std::ptr::null_mut::<objc::runtime::Object>();
+        let returned: i8 = unsafe { msg_send![delegate, windowShouldClose: null_sender] };
+        assert_eq!(returned, 0);
+        assert_eq!(take_pending_close_requests(), Vec::<u32>::new());
+        let _ = remove_hwnd_nswindow(0x00c0_1234);
+    }
+
+    #[test]
+    fn pending_close_requests_drain_exactly_once_no_duplicate() {
+        let _lock = CLOSE_QUEUE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = take_pending_close_requests();
+        queue_close_request_for_test(0x00c0_ffee);
+        assert_eq!(take_pending_close_requests(), vec![0x00c0_ffee]);
+        assert_eq!(take_pending_close_requests(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn pump_main_queue_panicking_item_never_blocks_completion() {
+        let done = Arc::new((
+            Mutex::new(MainQueueCompletion {
+                done: false,
+                panic: None,
+            }),
+            Condvar::new(),
+        ));
+        MAIN_QUEUE.pending.lock().unwrap().push_back(MainQueueItem {
+            work: Box::new(|| panic!("casa1-test-main-queue-panic")),
+            done: Arc::clone(&done),
+        });
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_clone = Arc::clone(&ran);
+        let second_done = Arc::new((
+            Mutex::new(MainQueueCompletion {
+                done: false,
+                panic: None,
+            }),
+            Condvar::new(),
+        ));
+        MAIN_QUEUE.pending.lock().unwrap().push_back(MainQueueItem {
+            work: Box::new(move || {
+                ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+            done: Arc::clone(&second_done),
+        });
+
+        // A panicking item must not propagate out of the pump.
+        drain_main_queue();
+
+        let (lock, _) = &*done;
+        assert_eq!(lock.lock().unwrap().done, true);
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), true);
+        let (second_lock, _) = &*second_done;
+        assert_eq!(second_lock.lock().unwrap().done, true);
+    }
 }

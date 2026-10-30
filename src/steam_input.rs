@@ -1057,13 +1057,11 @@ static SOFTWARE_HAPTICS: LazyLock<Mutex<[SoftwareHapticState; 4]>> = LazyLock::n
     ])
 });
 
-/// Convert a motor speed (0-255) and duration into a macOS system notification
-/// or log-based haptic indicator.
-///
-/// The `osascript` notification is rate-limited per slot (at most one spawn
-/// per [`SOFTWARE_HAPTIC_MIN_INTERVAL`]) and spawned asynchronously so a game
-/// firing repeated pulses never blocks the calling thread on a synchronous
-/// process spawn.
+/// Convert a motor speed (0-255) and duration into a log-based haptic
+/// indicator.  A rumble must never surface as a host notification banner:
+/// the guest controls the pulse rate, and a `display notification` banner
+/// steals focus from the game (and is visible to the user outside the
+/// emulated window).
 fn notify_software_haptic(slot: u8, left_speed: u8, right_speed: u8, duration_ms: u64) {
     let intensity = ((left_speed as u16 + right_speed as u16) / 2) as u8;
     let level = match intensity {
@@ -1076,48 +1074,7 @@ fn notify_software_haptic(slot: u8, left_speed: u8, right_speed: u8, duration_ms
     eprintln!(
         "[Haptic] slot={slot} {level} rumble (L={left_speed}, R={right_speed}, duration={duration_ms}ms)"
     );
-
-    // On macOS, post a lightweight NSUserNotification via script
-    #[cfg(target_os = "macos")]
-    if duration_ms >= 100 && intensity > 32 {
-        let mut last_notifications = SOFTWARE_HAPTIC_LAST_NOTIFICATIONS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let now = Instant::now();
-        let slot_index = usize::from(slot).min(last_notifications.len() - 1);
-        let last = last_notifications[slot_index];
-        if now.duration_since(last) < SOFTWARE_HAPTIC_MIN_INTERVAL {
-            return;
-        }
-        last_notifications[slot_index] = now;
-        drop(last_notifications);
-
-        let script = format!(
-            r#"display notification "Controller {slot} rumble ({level})" with title "Steam Haptics" subtitle "" sound name "Funk""#
-        );
-        match std::process::Command::new("osascript")
-            .args(["-e", &script])
-            .spawn()
-        {
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!(
-                    "[steam_input] failed to post haptic notification for slot {}: {}",
-                    slot, error
-                );
-            }
-        }
-    }
 }
-
-/// Minimum interval between `osascript` haptic notifications per slot.
-#[cfg(target_os = "macos")]
-const SOFTWARE_HAPTIC_MIN_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Per-slot timestamp of the last `osascript` haptic notification.
-#[cfg(target_os = "macos")]
-static SOFTWARE_HAPTIC_LAST_NOTIFICATIONS: LazyLock<Mutex<[Instant; 4]>> =
-    LazyLock::new(|| Mutex::new([Instant::now(); 4]));
 
 /// Sends a haptic rumble command to the physical controller associated with
 /// the given XInput `slot`.

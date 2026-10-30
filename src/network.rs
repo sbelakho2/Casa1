@@ -15,6 +15,7 @@ use rsa::pkcs1v15::{Signature as RsaSignature, SigningKey, VerifyingKey};
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use rsa::signature::{SignatureEncoding, Signer, Verifier};
 use rsa::{RsaPrivateKey, RsaPublicKey};
+use rustls_platform_verifier::BuilderVerifierExt;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -3778,7 +3779,14 @@ fn quic_ensure_pump() {
 }
 
 /// QUIC handshake timeout.
+///
+/// Test builds shorten the timeout so the listener's per-handshake task can
+/// exercise the timeout path without stalling the suite for the production
+/// duration; the code path is identical.
+#[cfg(not(test))]
 const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// QUIC stream I/O timeout.
 const QUIC_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Slack added to channel waits so the in-task timeout always wins.
@@ -3834,71 +3842,34 @@ pub fn recover_quic_state() -> AppResult<()> {
     Ok(())
 }
 
-/// Load native platform root certificates from well-known system paths.
-fn load_native_certs() -> Vec<rustls::pki_types::CertificateDer<'static>> {
-    let mut certs = Vec::new();
-    let cert_paths = [
-        "/etc/ssl/cert.pem",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/usr/local/share/certificates/ca-bundle.crt",
-        "/usr/local/etc/openssl/cert.pem",
-    ];
-    for path in &cert_paths {
-        if let Ok(data) = std::fs::read(path) {
-            let mut slice = data.as_slice();
-            let pem_certs = rustls_pemfile::certs(&mut slice);
-            for c in pem_certs.flatten() {
-                certs.push(c);
-            }
-            if !certs.is_empty() {
-                return certs;
-            }
-        }
-    }
-    // On macOS, try the Keychain via security command-line tool
-    if let Some(output) = std::process::Command::new("security")
-        .args(["find-certificate", "-a", "-p"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-    {
-        let mut slice = output.stdout.as_slice();
-        let pem_certs = rustls_pemfile::certs(&mut slice);
-        for c in pem_certs.flatten() {
-            certs.push(c);
-        }
-    }
-    if certs.is_empty() {
-        eprintln!("Warning: no native root certificates found for QUIC TLS");
-    }
-    certs
-}
-
-/// Cached native root store: loading it forks a `security` process and reads
-/// cert files, so it must not happen per connection.
-static NATIVE_ROOT_CERTS: std::sync::OnceLock<rustls::RootCertStore> = std::sync::OnceLock::new();
-
-/// Build a root certificate store from the system's trust store (cached).
-fn quic_root_certs() -> rustls::RootCertStore {
-    NATIVE_ROOT_CERTS
-        .get_or_init(|| {
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in load_native_certs() {
-                if let Err(error) = roots.add(cert) {
-                    eprintln!("[network] failed to add native QUIC root cert: {error}");
-                }
-            }
-            roots
-        })
-        .clone()
-}
-
 /// Build a Quinn client configuration with TLS 1.3.
+///
+/// # Trust roots (H7)
+///
+/// Server-certificate verification is delegated to
+/// [`rustls_platform_verifier`], which performs **live OS trust evaluation**
+/// (Security.framework on macOS: `SecTrustEvaluate` with the system anchors,
+/// user trust settings, and distrust/"Never Trust" markers honoured). This
+/// replaces the previous behaviour of loading the first PEM bundle found on
+/// disk or dumping *every* Keychain certificate — including certificates the
+/// user explicitly marked "Never Trust" and non-root intermediates — into a
+/// `RootCertStore` where each entry was silently trusted. With the platform
+/// verifier a distrusted certificate is never trusted, and there is no
+/// static root list to go stale.
+///
+/// The crypto provider is pinned to `ring` explicitly: both `ring` and
+/// `aws-lc-rs` are compiled into this crate's `rustls`, so
+/// `ClientConfig::builder()` (which resolves the *process-default* provider)
+/// would panic on the ambiguity; `builder_with_provider` is deterministic.
 fn quic_client_config() -> Result<quinn::ClientConfig, AppError> {
-    let mut crypto = rustls::ClientConfig::builder()
-        .with_root_certificates(quic_root_certs())
-        .with_no_client_auth();
+    // The platform-verifier init is infallible on Apple platforms
+    // (`Verifier::new` always returns `Ok` there); the error arm exists for
+    // parity with the fallible non-Apple backends.
+    #[rustfmt::skip]
+    let mut crypto = match rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider())).with_safe_default_protocol_versions().expect("ring supports the safe default protocol versions").with_platform_verifier() {
+        Ok(builder) => builder.with_no_client_auth(),
+        Err(error) => return Err(AppError::new(ReasonCode::RcIo, format!("QUIC platform verifier setup failed: {error}"))), // coverage: unreachable
+    };
     // Set ALPN for HTTP/3
     crypto.alpn_protocols = vec![b"h3".to_vec()];
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(|e| {
@@ -3929,16 +3900,32 @@ fn quic_server_config() -> Result<quinn::ServerConfig, AppError> {
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
         key_der,
     ));
+    quic_server_config_from_credentials(chain, key)
+}
 
-    let mut crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(chain, key)
-        .map_err(|e| {
-            AppError::new(
-                ReasonCode::RcIo,
-                format!("QUIC server crypto setup failed: {e}"),
-            )
-        })?;
+/// Build the server configuration from an explicit certificate chain and key.
+///
+/// Split out from [`quic_server_config`] so the certificate/key consistency
+/// check (and its error path) can be exercised with mismatched credentials.
+fn quic_server_config_from_credentials(
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<quinn::ServerConfig, AppError> {
+    // Provider pinned to `ring` (see `quic_client_config`): the process
+    // default is ambiguous with both `ring` and `aws-lc-rs` compiled in.
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports the safe default protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(chain, key)
+    .map_err(|e| {
+        AppError::new(
+            ReasonCode::RcIo,
+            format!("QUIC server crypto setup failed: {e}"),
+        )
+    })?;
     crypto.alpn_protocols = vec![b"h3".to_vec()];
     let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto).map_err(|e| {
         AppError::new(
@@ -3962,19 +3949,108 @@ pub fn http_socket_combine_ssl_scalers(socket_handle: u64, scaler_count: usize) 
     scaler_count.min(HTTP_SOCKET_MAX_COMBINE_SSL_SCALERS)
 }
 
+/// Maximum concurrent inbound QUIC connections accepted by one listener.
+/// Handshakes beyond the cap are refused before registration so a peer
+/// cannot exhaust memory or runtime tasks (N5).
+pub const QUIC_MAX_CONNECTIONS: usize = 16;
+
+/// Number of live QUIC connections currently registered in the global QUIC
+/// state (accepted and not yet closed/removed).
+pub fn quic_connection_count() -> usize {
+    QUIC_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .connections
+        .len()
+}
+
+/// Resolve the address a QUIC listener actually binds to (N5).
+///
+/// The default is loopback-only: wildcard (`0.0.0.0`/`::`) and any other
+/// non-loopback address are rewritten to the matching loopback address so a
+/// listener is never LAN-reachable unless the caller passes `allow_lan`.
+/// `localhost` and loopback IPs pass through unchanged.
+fn quic_bind_addr(addr: &str, allow_lan: bool) -> String {
+    if allow_lan {
+        return addr.to_string();
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return addr.to_string();
+    };
+    let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+    let is_loopback = bare_host == "localhost"
+        || bare_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if is_loopback {
+        return addr.to_string();
+    }
+    if host.starts_with('[') || bare_host.contains(':') {
+        format!("[::1]:{port}")
+    } else {
+        format!("127.0.0.1:{port}")
+    }
+}
+
+/// Complete one incoming QUIC handshake on its own task with a timeout (N5).
+///
+/// Completed connections are registered in the global QUIC state and are
+/// removed again by a watcher task as soon as the connection closes, so the
+/// state never accumulates dead connections.
+async fn quic_complete_handshake(incoming: quinn::Incoming) {
+    match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
+        Ok(Ok(connection)) => {
+            let handle = next_quic_handle();
+            {
+                let mut state = QUIC_STATE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.connections.insert(handle, connection.clone());
+            }
+            tokio::spawn(async move {
+                connection.closed().await;
+                QUIC_STATE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .connections
+                    .remove(&handle);
+            });
+        }
+        Ok(Err(error)) => eprintln!("[network] QUIC listener handshake failed: {error}"),
+        Err(_) => eprintln!("[network] QUIC listener handshake timed out"),
+    }
+}
+
 /// Create a QUIC listener on the given address.
 /// Returns a handle that can be used to accept incoming connections.
 ///
-/// The listener runs a background accept loop on the shared runtime: accepted
-/// connections are parked in the global QUIC state (keyed by fresh handles)
-/// where they can be driven by [`quic_udp_send`]/[`quic_udp_recv`].
+/// The listener is bound to loopback only; use
+/// [`quic_create_listener_with_options`] with `allow_lan` to expose it to
+/// the local network.
+///
+/// The listener runs a background accept loop on the shared runtime: each
+/// incoming handshake completes on its own spawned task (bounded by the
+/// handshake timeout and [`QUIC_MAX_CONNECTIONS`]) and accepted connections
+/// are parked in the global QUIC state (keyed by fresh handles) where they
+/// can be driven by [`quic_udp_send`]/[`quic_udp_recv`].
 pub fn quic_create_listener(addr: &str) -> Result<u64, AppError> {
+    quic_create_listener_with_options(addr, false)
+}
+
+/// Create a QUIC listener, optionally exposing it beyond loopback.
+///
+/// With `allow_lan == false` (the default via [`quic_create_listener`]) any
+/// non-loopback bind address is rewritten to the equivalent loopback
+/// address; with `allow_lan == true` the requested address is used as-is.
+pub fn quic_create_listener_with_options(addr: &str, allow_lan: bool) -> Result<u64, AppError> {
     quic_ensure_pump();
     let server_config = quic_server_config()?;
-    let socket = std::net::UdpSocket::bind(addr).map_err(|e| {
+    let bind_addr = quic_bind_addr(addr, allow_lan);
+    let socket = std::net::UdpSocket::bind(&bind_addr).map_err(|e| {
         AppError::new(
             ReasonCode::RcIo,
-            format!("QUIC listener bind to {addr} failed: {e}"),
+            format!("QUIC listener bind to {bind_addr} failed: {e}"),
         )
     })?;
 
@@ -4005,25 +4081,19 @@ pub fn quic_create_listener(addr: &str) -> Result<u64, AppError> {
         .map_err(|_| AppError::new(ReasonCode::RcIo, "QUIC endpoint creation timed out"))??;
 
     // Drive the accept loop on the runtime; the task is aborted when the
-    // listener is closed.
+    // listener is closed (N5). Every handshake runs on its own spawned task
+    // with a timeout so one stalled peer cannot block the accept loop, and
+    // handshakes arriving beyond the connection cap are refused.
     let accept_endpoint = endpoint.clone();
     let task = QUIC_RUNTIME.spawn(async move {
         while let Some(incoming) = accept_endpoint.accept().await {
-            match incoming.await {
-                Ok(connection) => match QUIC_STATE.lock() {
-                    Ok(mut state) => {
-                        let conn_handle = next_quic_handle();
-                        state.connections.insert(conn_handle, connection);
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "[network] QUIC state lock poisoned; listener accept loop exiting"
-                        );
-                        break;
-                    }
-                },
-                Err(e) => eprintln!("[network] QUIC accept failed: {e}"),
+            if quic_connection_count() >= QUIC_MAX_CONNECTIONS {
+                // Dropping the Incoming makes quinn refuse the handshake
+                // (CONNECTION_CLOSE) without allocating any state.
+                drop(incoming);
+                continue;
             }
+            tokio::spawn(quic_complete_handshake(incoming));
         }
     });
 
@@ -4347,7 +4417,7 @@ mod tests {
         AddressFamily, AltSvcEntry, Certificate, HttpProtocol, HttpProtocolFlags, NetworkStack,
         PinnedCertificates, QUIC_STATE, QuicConfig, SockAddr, build_spnego_token, is_quic_alpn,
         negotiate_http_protocol, parse_alt_svc_header, parse_host_port, parse_spnego_token,
-        recover_quic_state,
+        quic_create_listener, quic_create_listener_with_options, recover_quic_state,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -5436,5 +5506,395 @@ mod tests {
         // Accepting on the closed listener must fail.
         let result = network.accept(listener);
         assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // H7 + N5: QUIC trust roots and listener handshake lifecycle
+    // -------------------------------------------------------------------
+
+    /// Serialize QUIC tests: `quic_connection_count()` and the global QUIC
+    /// state are process-wide, so parallel tests would observe each other's
+    /// connections.
+    static QUIC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn quic_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        QUIC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn free_udp_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("probe socket")
+            .local_addr()
+            .expect("probe addr")
+            .port()
+    }
+
+    /// Drive a future on the shared QUIC runtime from a blocking test thread.
+    fn drive_quic<F>(future: F, timeout: Duration) -> Option<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::QUIC_RUNTIME.spawn(async move {
+            let _ = tx.send(future.await);
+        });
+        rx.recv_timeout(timeout).ok()
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if condition() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return condition();
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Create a client endpoint and start a handshake — both operations need
+    /// a runtime context (`Endpoint::client` resolves the current tokio
+    /// runtime), so they run on the shared QUIC runtime and the results are
+    /// handed back to the blocking test thread.
+    fn quic_test_connect(
+        server: std::net::SocketAddr,
+        alpn: &'static [u8],
+    ) -> Result<(quinn::Endpoint, quinn::Connecting), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::QUIC_RUNTIME.spawn(async move {
+            let outcome = match quinn::Endpoint::client("127.0.0.1:0".parse().expect("client bind"))
+            {
+                Ok(endpoint) => {
+                    match endpoint.connect_with(
+                        accept_any_quic_client_config(alpn),
+                        server,
+                        "localhost",
+                    ) {
+                        Ok(connecting) => Ok((endpoint, connecting)),
+                        Err(error) => Err(format!("connect: {error}")),
+                    }
+                }
+                Err(error) => Err(format!("endpoint: {error}")),
+            };
+            let _ = tx.send(outcome);
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("connect task driven")
+    }
+
+    /// Test-only verifier that accepts any server certificate; used to
+    /// complete loopback handshakes against the self-signed listener.
+    #[derive(Debug)]
+    struct AcceptAnyServerCert;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    fn accept_any_quic_client_config(alpn: &[u8]) -> quinn::ClientConfig {
+        let mut crypto = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the safe default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyServerCert))
+        .with_no_client_auth();
+        crypto.alpn_protocols = vec![alpn.to_vec()];
+        let quic_crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic crypto");
+        quinn::ClientConfig::new(std::sync::Arc::new(quic_crypto))
+    }
+
+    /// H7: the QUIC client uses the platform verifier, so a server whose
+    /// certificate is not in the OS trust store (here: freshly generated and
+    /// self-signed) must be REJECTED — never silently trusted — and no
+    /// connection may be registered.
+    #[test]
+    fn quic_connect_rejects_untrusted_self_signed_root() {
+        let _guard = quic_test_guard();
+        let port = free_udp_port();
+        let listener =
+            quic_create_listener(&format!("127.0.0.1:{port}")).expect("loopback listener");
+        let result = super::quic_create_connection(&format!("127.0.0.1:{port}"));
+        let error = result.expect_err("self-signed QUIC server must be rejected");
+        assert_eq!(error.code, crate::reason::ReasonCode::RcNetConnectionFailed);
+        assert!(
+            error.message.contains("QUIC handshake with 127.0.0.1"),
+            "unexpected error message: {}",
+            error.message
+        );
+        // "failed" (certificate rejected) rather than "timed out".
+        assert!(
+            error.message.contains("failed:"),
+            "handshake must fail, not time out: {}",
+            error.message
+        );
+        // Give the listener-side handshake task time to observe the TLS
+        // failure (this covers the accept-task error path), then verify no
+        // connection was ever registered.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(super::quic_connection_count(), 0);
+        super::quic_udp_close(listener);
+    }
+
+    /// N5: listeners bind loopback by default (wildcard/v6/non-loopback
+    /// addresses are rewritten), only an explicit LAN allowance keeps the
+    /// requested address, and bind conflicts fail closed.
+    #[test]
+    fn quic_listener_forbids_lan_bind_and_rejects_duplicate_port_conflict() {
+        let _guard = quic_test_guard();
+        assert_eq!(super::quic_bind_addr("0.0.0.0:0", false), "127.0.0.1:0");
+        assert_eq!(super::quic_bind_addr("[::]:0", false), "[::1]:0");
+        assert_eq!(
+            super::quic_bind_addr("127.0.0.1:4430", false),
+            "127.0.0.1:4430"
+        );
+        assert_eq!(
+            super::quic_bind_addr("localhost:4430", false),
+            "localhost:4430"
+        );
+        assert_eq!(super::quic_bind_addr("0.0.0.0:0", true), "0.0.0.0:0");
+        // Live: wildcard address defaults to a loopback bind.
+        let loopback = quic_create_listener("0.0.0.0:0").expect("loopback default bind");
+        // Live: explicit LAN allowance is honoured.
+        let lan = quic_create_listener_with_options("127.0.0.1:0", true).expect("lan-allowed bind");
+        // A duplicate bind of a held port fails with the bind error.
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("hold port");
+        let held_addr = held.local_addr().expect("held addr").to_string();
+        assert_eq!(quic_create_listener(&held_addr).is_err(), true);
+        // A portless bind address fails closed as well.
+        assert_eq!(quic_create_listener("localhost").is_err(), true);
+        super::quic_udp_close(loopback);
+        super::quic_udp_close(lan);
+    }
+
+    /// N5: accepted handshakes are registered once complete, and the state
+    /// entry is removed when the peer closes the connection (no stale
+    /// connection leak).
+    #[test]
+    fn quic_listener_removal_after_close_prevents_state_leak() {
+        let _guard = quic_test_guard();
+        let port = free_udp_port();
+        let listener =
+            quic_create_listener(&format!("127.0.0.1:{port}")).expect("loopback listener");
+        let server_addr = format!("127.0.0.1:{port}")
+            .parse::<std::net::SocketAddr>()
+            .expect("server addr");
+        let (endpoint, connecting) =
+            quic_test_connect(server_addr, b"h3").expect("connect started");
+        let client_conn = drive_quic(connecting, Duration::from_secs(5))
+            .expect("handshake driven")
+            .expect("handshake succeeds");
+        assert!(
+            wait_until(
+                || super::quic_connection_count() >= 1,
+                Duration::from_secs(5)
+            ),
+            "server must register the completed handshake"
+        );
+        assert_eq!(super::quic_connection_count(), 1);
+        // Peer-initiated close: the watcher task must remove the entry.
+        client_conn.close(0u32.into(), b"bye");
+        assert!(
+            wait_until(
+                || super::quic_connection_count() == 0,
+                Duration::from_secs(5)
+            ),
+            "closed connection must be removed from the QUIC state"
+        );
+        assert_eq!(super::quic_connection_count(), 0);
+        drop(endpoint);
+        super::quic_udp_close(listener);
+    }
+
+    /// N5: the listener refuses handshakes once the connection cap is
+    /// reached, and the cap boundary itself never registers a connection.
+    #[test]
+    fn quic_listener_rejects_handshake_at_connection_cap() {
+        let _guard = quic_test_guard();
+        let port = free_udp_port();
+        let listener =
+            quic_create_listener(&format!("127.0.0.1:{port}")).expect("loopback listener");
+        let server_addr = format!("127.0.0.1:{port}")
+            .parse::<std::net::SocketAddr>()
+            .expect("server addr");
+        // Keep every established connection (and its endpoint) alive so the
+        // server-side registrations stay at the cap.
+        let mut held: Vec<(quinn::Endpoint, quinn::Connection)> = Vec::new();
+        for _ in 0..super::QUIC_MAX_CONNECTIONS {
+            let (endpoint, connecting) =
+                quic_test_connect(server_addr, b"h3").expect("connect started");
+            let connection = drive_quic(connecting, Duration::from_secs(5))
+                .expect("driven")
+                .expect("handshake within cap succeeds");
+            held.push((endpoint, connection));
+        }
+        assert_eq!(held.len(), super::QUIC_MAX_CONNECTIONS);
+        assert!(
+            wait_until(
+                || super::quic_connection_count() == super::QUIC_MAX_CONNECTIONS,
+                Duration::from_secs(5)
+            ),
+            "server must register exactly the cap"
+        );
+        // One beyond the cap must be refused (an error, and no extra
+        // registered connection).
+        let (extra_endpoint, extra_connecting) =
+            quic_test_connect(server_addr, b"h3").expect("connect started");
+        let refused = drive_quic(extra_connecting, Duration::from_secs(5))
+            .expect("refusal completes")
+            .expect_err("handshake beyond the cap must be refused");
+        assert_eq!(
+            refused.to_string().is_empty(),
+            false,
+            "refusal carries a reason"
+        );
+        assert_eq!(super::quic_connection_count(), super::QUIC_MAX_CONNECTIONS);
+        // Cleanup: close every endpoint and verify the watchers drain the
+        // server-side state.
+        for (endpoint, _) in &held {
+            endpoint.close(0u32.into(), b"drain");
+        }
+        assert!(
+            wait_until(
+                || super::quic_connection_count() == 0,
+                Duration::from_secs(5)
+            ),
+            "all connections must be removed after close"
+        );
+        assert_eq!(super::quic_connection_count(), 0);
+        drop(extra_endpoint);
+        drop(held);
+        super::quic_udp_close(listener);
+    }
+
+    /// N5: a handshake task whose peer never completes (a captured Initial
+    /// replayed from a silent socket) times out without registering a
+    /// connection.
+    #[test]
+    fn quic_listener_handshake_timeout_leaves_no_connection() {
+        let _guard = quic_test_guard();
+        let port = free_udp_port();
+        let listener =
+            quic_create_listener(&format!("127.0.0.1:{port}")).expect("loopback listener");
+        // Capture a genuine client Initial packet by pointing a real client
+        // at a silent UDP socket.
+        let dummy = std::net::UdpSocket::bind("127.0.0.1:0").expect("dummy bind");
+        let dummy_addr = dummy.local_addr().expect("dummy addr");
+        dummy
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("dummy timeout");
+        let (endpoint, connecting) = quic_test_connect(dummy_addr, b"h3").expect("connect started");
+        let mut initial = [0u8; 2048];
+        let (len, _) = dummy.recv_from(&mut initial).expect("captured Initial");
+        // Replay the Initial at the listener from a socket that never
+        // answers: the server-side handshake task can never complete and
+        // must hit its timeout.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent bind");
+        silent
+            .send_to(&initial[..len], ("127.0.0.1", port))
+            .expect("replay Initial");
+        drop(connecting);
+        // Wait past the handshake timeout (test value plus slack).
+        std::thread::sleep(super::QUIC_HANDSHAKE_TIMEOUT + Duration::from_millis(1500));
+        assert_eq!(super::quic_connection_count(), 0);
+        drop(endpoint);
+        drop(silent);
+        super::quic_udp_close(listener);
+    }
+
+    /// N5: a failed handshake (client rejects the server's certificate) is
+    /// observed by the per-handshake task and never registers a connection.
+    #[test]
+    fn quic_listener_handshake_failure_does_not_register_connection() {
+        let _guard = quic_test_guard();
+        let port = free_udp_port();
+        let listener =
+            quic_create_listener(&format!("127.0.0.1:{port}")).expect("loopback listener");
+        // Client ALPN offers only "h2" while the server speaks "h3": the
+        // handshake fails and the server-side task takes the error path.
+        let server_addr = format!("127.0.0.1:{port}")
+            .parse::<std::net::SocketAddr>()
+            .expect("server addr");
+        let (endpoint, connecting) =
+            quic_test_connect(server_addr, b"h2").expect("connect started");
+        let outcome = drive_quic(connecting, Duration::from_secs(5)).expect("driven");
+        assert_eq!(
+            outcome
+                .expect_err("ALPN mismatch must fail the handshake")
+                .to_string()
+                .is_empty(),
+            false,
+            "failure carries a reason"
+        );
+        assert!(
+            wait_until(
+                || super::quic_connection_count() == 0,
+                Duration::from_secs(5)
+            ),
+            "failed handshake must not be registered"
+        );
+        assert_eq!(super::quic_connection_count(), 0);
+        drop(endpoint);
+        super::quic_udp_close(listener);
+    }
+
+    /// The server config builder refuses a certificate/key pair whose public
+    /// keys do not match instead of accepting broken credentials (the error
+    /// path otherwise unreachable from the self-signed generator).
+    #[test]
+    fn quic_server_config_rejects_mismatched_certificate_key() {
+        let cert_key =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("server cert");
+        let other_key =
+            rcgen::generate_simple_self_signed(vec!["other.invalid".into()]).expect("other cert");
+        let chain = vec![cert_key.cert.der().clone()];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(other_key.key_pair.serialize_der()),
+        );
+        let error = super::quic_server_config_from_credentials(chain, key)
+            .expect_err("mismatched certificate key must be rejected");
+        assert_eq!(error.code, crate::reason::ReasonCode::RcIo);
+        assert!(
+            error.message.contains("QUIC server crypto setup failed"),
+            "unexpected error message: {}",
+            error.message
+        );
     }
 }

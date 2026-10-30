@@ -182,16 +182,166 @@ pub(crate) fn synthetic_file_index(path: &str) -> u64 {
     hasher.finish()
 }
 
-pub(crate) fn message_box_response(style: u32) -> i32 {
+/// Win32 message-box button identifiers (`winuser.h`).
+pub(crate) const IDOK_: i32 = IDOK;
+const IDABORT_: i32 = IDABORT;
+const IDRETRY_: i32 = IDRETRY;
+const IDIGNORE_: i32 = IDIGNORE;
+const IDYES_: i32 = IDYES;
+const IDNO_: i32 = IDNO;
+const IDCANCEL_: i32 = IDCANCEL;
+const IDTRYAGAIN_: i32 = IDTRYAGAIN;
+const IDCONTINUE_: i32 = IDCONTINUE;
+
+/// The button labels a message box displays for its style.
+///
+/// `MB_OK`, `MB_OKCANCEL`, `MB_ABORTRETRYIGNORE`, `MB_YESNOCANCEL`,
+/// `MB_YESNO`, `MB_RETRYCANCEL` and `MB_CANCELTRYCONTINUE`; any other
+/// low-nibble value falls back to the OK-only set.
+pub(crate) fn message_box_labels(style: u32) -> &'static [&'static str] {
     match style & 0x0000_000f {
-        0x0000_0000 => IDOK,
-        0x0000_0001 => IDOK,
-        0x0000_0002 => IDIGNORE,
-        0x0000_0003 => IDYES,
-        0x0000_0004 => IDYES,
-        0x0000_0005 => IDRETRY,
-        0x0000_0006 => IDCONTINUE,
-        _ => IDCANCEL,
+        0x0000_0001 => &["OK", "Cancel"],
+        0x0000_0002 => &["Abort", "Retry", "Ignore"],
+        0x0000_0003 => &["Yes", "No", "Cancel"],
+        0x0000_0004 => &["Yes", "No"],
+        0x0000_0005 => &["Retry", "Cancel"],
+        0x0000_0006 => &["Cancel", "Try Again", "Continue"],
+        _ => &["OK"],
+    }
+}
+
+/// Index of the default button chosen by `MB_DEFBUTTON1..4`
+/// (`0x0000_0100 << (n - 1)`), clamped to the available button count.
+pub(crate) fn message_box_default_index(style: u32, buttons: usize) -> usize {
+    let default = match style & 0x0000_0300 {
+        0x0000_0100 => 1,
+        0x0000_0200 => 2,
+        0x0000_0300 => 3,
+        _ => 0,
+    };
+    default.min(buttons.saturating_sub(1))
+}
+
+/// Map a button label to its Win32 identifier.
+fn message_box_button_id(label: &str) -> Option<i32> {
+    match label.to_ascii_lowercase().as_str() {
+        "ok" => Some(IDOK_),
+        "cancel" => Some(IDCANCEL_),
+        "yes" => Some(IDYES_),
+        "no" => Some(IDNO_),
+        "abort" => Some(IDABORT_),
+        "retry" => Some(IDRETRY_),
+        "ignore" => Some(IDIGNORE_),
+        "try again" => Some(IDTRYAGAIN_),
+        "continue" => Some(IDCONTINUE_),
+        _ => None,
+    }
+}
+
+/// Parse the `button returned:` line AppleScript prints after a dialog.
+///
+/// Only a label that is actually part of `style`'s button set can produce a
+/// non-cancel answer.  Missing/unparseable output (an `osascript` failure or
+/// a dialog dismissed without a button) returns `IDCANCEL`; it never
+/// fabricates `IDYES`.
+pub(crate) fn parse_message_box_button(output: &str, style: u32) -> i32 {
+    let labels = message_box_labels(style);
+    let Some(position) = output.to_ascii_lowercase().find("button returned:") else {
+        return IDCANCEL_;
+    };
+    let remaining = output[position + "button returned:".len()..]
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|character| character == '"' || character == '\'')
+        .trim();
+    if remaining.is_empty() {
+        return IDCANCEL_;
+    }
+    for label in labels {
+        if label.eq_ignore_ascii_case(remaining)
+            && let Some(id) = message_box_button_id(label)
+        {
+            return id;
+        }
+    }
+    // A label outside the style's set is a malformed/hostile response:
+    // refuse it instead of guessing what the user accepted.
+    IDCANCEL_
+}
+
+/// Style-derived answer used when no interactive dialog is shown
+/// (`MessageBoxW` in deterministic/headless mode or a direct legacy call).
+pub(crate) fn default_message_box_response(style: u32) -> i32 {
+    let buttons = message_box_labels(style);
+    let index = message_box_default_index(style, buttons.len());
+    message_box_button_id(buttons[index]).unwrap_or(IDCANCEL_)
+}
+
+/// The osascript executable.  Tests override it with a harmless program so
+/// the dialog path (including spawn failure) is exercised without opening UI.
+fn osascript_program() -> String {
+    #[cfg(test)]
+    if let Some(program) = OSASCRIPT_PROGRAM.with(|slot| slot.borrow().clone()) {
+        return program;
+    }
+    "osascript".to_string()
+}
+
+#[cfg(test)]
+thread_local! {
+    static OSASCRIPT_PROGRAM: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_osascript_program<R>(program: &str, f: impl FnOnce() -> R) -> R {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OSASCRIPT_PROGRAM.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    OSASCRIPT_PROGRAM.with(|slot| *slot.borrow_mut() = Some(program.to_string()));
+    let _restore = Restore;
+    f()
+}
+
+/// Show the staged message box for `style` and return the chosen button ID.
+///
+/// The dialog has no `giving up after` timeout, so it stays up until the
+/// user presses a button.  A failure to spawn/parse `osascript` returns
+/// `IDCANCEL` rather than pretending the user accepted anything.
+pub(crate) fn message_box_response(style: u32) -> i32 {
+    let Some((title, text, dtm)) = crate::runtime::take_pending_message_box() else {
+        return default_message_box_response(style);
+    };
+    if dtm {
+        return default_message_box_response(style);
+    }
+    let labels = message_box_labels(style);
+    let default = message_box_default_index(style, labels.len());
+    let buttons = labels
+        .iter()
+        .map(|label| format!("\"{label}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = format!(
+        "display dialog {} with title {} buttons {{{buttons}}} default button {}",
+        apple_script_string(&text),
+        apple_script_string(&title),
+        apple_script_string(labels[default]),
+    );
+    let output = std::process::Command::new(osascript_program())
+        .arg("-e")
+        .arg(script)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            parse_message_box_button(&String::from_utf8_lossy(&output.stdout), style)
+        }
+        _ => IDCANCEL_,
     }
 }
 
@@ -447,5 +597,85 @@ pub(crate) fn append_field(rendered: &mut String, content: String, flags: &str, 
             rendered.push(' ');
         }
         rendered.push_str(&content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_box_button_ids_never_mismatch_their_labels() {
+        let cases = [
+            (0x0000_0000, "OK", IDOK),
+            (0x0000_0001, "Cancel", IDCANCEL),
+            (0x0000_0002, "Abort", IDABORT),
+            (0x0000_0002, "Retry", IDRETRY),
+            (0x0000_0002, "Ignore", IDIGNORE),
+            (0x0000_0003, "Yes", IDYES),
+            (0x0000_0004, "No", IDNO),
+            (0x0000_0005, "Retry", IDRETRY),
+            (0x0000_0006, "Try Again", IDTRYAGAIN),
+            (0x0000_0006, "Continue", IDCONTINUE),
+        ];
+        for (style, label, expected) in cases {
+            assert_eq!(
+                parse_message_box_button(&format!("button returned:{label}\n"), style),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn message_box_default_button_boundary_is_clamped() {
+        assert_eq!(default_message_box_response(0x0004 | 0x0100), IDNO);
+        assert_eq!(default_message_box_response(0x0004 | 0x0200), IDNO);
+        assert_eq!(default_message_box_response(0x0004 | 0x0300), IDNO);
+        assert_eq!(message_box_default_index(0x0300, 0), 0);
+        assert_eq!(message_box_default_index(0x0100, 3), 1);
+    }
+
+    #[test]
+    fn message_box_malformed_output_never_fabricates_yes() {
+        assert_eq!(parse_message_box_button("", 0x0004), IDCANCEL);
+        assert_eq!(
+            parse_message_box_button("button returned:Maybe", 0x0004),
+            IDCANCEL
+        );
+        // A label outside the style's button set is refused.
+        assert_eq!(
+            parse_message_box_button("button returned:Yes", 0x0000),
+            IDCANCEL
+        );
+        assert_eq!(parse_message_box_button("BUTTON RETURNED:no", 0x0004), IDNO);
+        assert_eq!(
+            parse_message_box_button("button returned:   ", 0x0004),
+            IDCANCEL
+        );
+        assert_eq!(message_box_button_id("bogus"), None);
+    }
+
+    #[test]
+    fn message_box_osascript_spawn_failure_returns_cancel() {
+        crate::runtime::show_host_message_box("title", "text", false).expect("stage message box");
+        let response = with_osascript_program("/nonexistent/casa1-osascript", || {
+            message_box_response(0x0004)
+        });
+        assert_eq!(response, IDCANCEL);
+    }
+
+    #[test]
+    fn message_box_osascript_success_without_button_falls_back_to_cancel() {
+        crate::runtime::show_host_message_box("title", "text", false).expect("stage message box");
+        let response = with_osascript_program("/bin/echo", || message_box_response(0x0004));
+        assert_eq!(response, IDCANCEL);
+    }
+
+    #[test]
+    fn message_box_dtm_mode_default_boundary_never_spawns() {
+        crate::runtime::show_host_message_box("title", "text", true).expect("stage message box");
+        assert_eq!(message_box_response(0x0004 | 0x0100), IDNO);
+        // No pending payload: the legacy direct call still returns a default.
+        assert_eq!(message_box_response(0x0000), IDOK);
     }
 }

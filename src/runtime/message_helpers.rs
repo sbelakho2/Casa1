@@ -78,6 +78,7 @@ pub(crate) fn message_id(kind: MessageKind) -> u32 {
         MessageKind::Input | MessageKind::RawInput => 0x00ff,
         MessageKind::NcCreate => 0x0081,
         MessageKind::NcDestroy => 0x0082,
+        MessageKind::NcCalcSize => 0x0083,
         MessageKind::KeyDown => 0x0100,
         MessageKind::KeyUp => 0x0101,
         MessageKind::Char => 0x0102,
@@ -86,6 +87,13 @@ pub(crate) fn message_id(kind: MessageKind) -> u32 {
         MessageKind::MouseMove => 0x0200,
         MessageKind::LButtonDown => 0x0201,
         MessageKind::LButtonUp => 0x0202,
+        MessageKind::LButtonDblClk => 0x0203,
+        MessageKind::RButtonDown => 0x0204,
+        MessageKind::RButtonUp => 0x0205,
+        MessageKind::RButtonDblClk => 0x0206,
+        MessageKind::MButtonDown => 0x0207,
+        MessageKind::MButtonUp => 0x0208,
+        MessageKind::MButtonDblClk => 0x0209,
         MessageKind::MouseWheel => 0x020a,
         MessageKind::XButtonDown => 0x020b,
         MessageKind::MouseHWheel => 0x020e,
@@ -107,6 +115,7 @@ pub(crate) fn message_kind(message_id: u32) -> AppResult<MessageKind> {
         0x0046 => Ok(MessageKind::WindowPosChanging),
         0x0081 => Ok(MessageKind::NcCreate),
         0x0082 => Ok(MessageKind::NcDestroy),
+        0x0083 => Ok(MessageKind::NcCalcSize),
         0x00fe => Ok(MessageKind::InputDeviceChange),
         0x00ff => Ok(MessageKind::Input),
         0x0100 => Ok(MessageKind::KeyDown),
@@ -117,6 +126,13 @@ pub(crate) fn message_kind(message_id: u32) -> AppResult<MessageKind> {
         0x0200 => Ok(MessageKind::MouseMove),
         0x0201 => Ok(MessageKind::LButtonDown),
         0x0202 => Ok(MessageKind::LButtonUp),
+        0x0203 => Ok(MessageKind::LButtonDblClk),
+        0x0204 => Ok(MessageKind::RButtonDown),
+        0x0205 => Ok(MessageKind::RButtonUp),
+        0x0206 => Ok(MessageKind::RButtonDblClk),
+        0x0207 => Ok(MessageKind::MButtonDown),
+        0x0208 => Ok(MessageKind::MButtonUp),
+        0x0209 => Ok(MessageKind::MButtonDblClk),
         0x020a => Ok(MessageKind::MouseWheel),
         0x020b => Ok(MessageKind::XButtonDown),
         0x020e => Ok(MessageKind::MouseHWheel),
@@ -139,6 +155,13 @@ pub(crate) fn is_guest_input_message_id(message_id: u32) -> bool {
             | MessageKind::MouseMove
             | MessageKind::LButtonDown
             | MessageKind::LButtonUp
+            | MessageKind::LButtonDblClk
+            | MessageKind::RButtonDown
+            | MessageKind::RButtonUp
+            | MessageKind::RButtonDblClk
+            | MessageKind::MButtonDown
+            | MessageKind::MButtonUp
+            | MessageKind::MButtonDblClk
             | MessageKind::MouseWheel
             | MessageKind::MouseHWheel
             | MessageKind::XButtonDown)

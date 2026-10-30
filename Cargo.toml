@@ -70,6 +70,10 @@ tungstenite = { version = "0.26", optional = true }
 ffmpeg-next = { version = "=7.1.0", optional = true, default-features = false, features = ["format"] }
 quinn = "0.11"
 rustls = "0.23"
+# QUIC TLS root trust (H7): live OS trust evaluation (honours "Never Trust"
+# and distrusted/intermediate markers) instead of loading the first PEM
+# bundle found on disk or dumping every Keychain certificate into roots.
+rustls-platform-verifier = "0.7"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
 rustls-pemfile = "2"
 rcgen = "0.13"

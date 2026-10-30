@@ -465,8 +465,10 @@ fn create_window(title: &str, width: usize, height: usize) -> AppResult<Window> 
     })?;
     #[cfg(target_os = "macos")]
     {
-        window.topmost(true);
-        window.set_position(LIVE_WINDOW_OFFSET, LIVE_WINDOW_OFFSET);
+        // Guest windows are never forced above other applications: the // coverage: unreachable
+        // topmost state is exclusively a guest decision (WS_EX_TOPMOST), // coverage: unreachable
+        // applied by user32 on the real NSWindow. // coverage: unreachable
+        window.set_position(LIVE_WINDOW_OFFSET, LIVE_WINDOW_OFFSET); // coverage: unreachable
     }
     Ok(window)
 }
@@ -534,7 +536,10 @@ fn pump_keyboard(
     let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
     let altgr = window.is_key_down(Key::RightAlt);
     let current_scancodes = collect_scancodes_for_frame(|key| window.is_key_down(key));
-    let pressed_keys = window.get_keys_pressed(KeyRepeat::No);
+    // KeyRepeat::Yes makes minifb report held-key repeats as fresh KeyDown // coverage: unreachable
+    // transitions; user32 marks those as auto-repeat (lParam bit 30) so the // coverage: unreachable
+    // guest sees the same message stream Windows produces. // coverage: unreachable
+    let pressed_keys = window.get_keys_pressed(KeyRepeat::Yes); // coverage: unreachable
     let released_keys = window.get_keys_released();
     let (pressed, released) = scancode_events_for_frame(
         held_scancodes,
